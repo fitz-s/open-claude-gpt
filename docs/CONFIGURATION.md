@@ -16,7 +16,8 @@ bin/cgc config                       # print the effective configuration
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CGC_PROJECT_URL` | `https://chatgpt.com/` (new chat) | URL a fresh consult opens. Set to **your** ChatGPT project (`…/g/g-p-<id>-<slug>/project`) to keep every consult grouped in one project. |
-| `CGC_MODEL` | `Pro Extended` | Model tier the composer selects before sending. A `Pro*` target is satisfied by any Pro tier ChatGPT offers (Pro / Pro Extended) but never by Instant/Medium/High. Use `skip` to send on whatever is shown. |
+| `CGC_AUTO_MODEL` | `1` | Auto model-selection toggle (see below). `1`/`true`/`on` = pick `CGC_MODEL` and fail closed if unavailable; `0`/`false`/`off` = don't touch the picker. |
+| `CGC_MODEL` | `Pro Extended` | Which tier auto-select targets (only used when `CGC_AUTO_MODEL` is on). A `Pro*` target is satisfied by any Pro tier ChatGPT offers (Pro / Pro Extended) but never by Instant/Medium/High. Per-consult override: `--model "High"` / `--model skip`. |
 | `CGC_PORT` | `9333` | Remote-debugging port of the dedicated Chrome. Must be free. |
 | `CGC_PROFILE` | `~/.cgc-chrome` | Dedicated Chrome profile dir. Kept separate from your normal Chrome (CDP is disallowed on the default profile since Chrome 136). |
 | `CGC_CHROME` | auto-detect | Explicit browser binary. Auto-detected across Chrome/Chromium/Edge on macOS + Linux; set only if detection fails. |
@@ -26,6 +27,25 @@ bin/cgc config                       # print the effective configuration
 Any variable can also be overridden per-invocation with a flag, e.g. `--port`,
 `--project-url`, `--model` on the relevant subcommand. The flag wins over the env
 var; the env var wins over the built-in default.
+
+### Auto model-selection (toggle)
+
+ChatGPT sometimes auto-downgrades a chat to a lighter model; a consult would then
+silently get a weaker answer. With `CGC_AUTO_MODEL=1` (default) the composer's
+model tier is **selected before every send and fails closed if it can't be
+picked** — you always get the tier you meant. This is where you actually spend
+your ChatGPT Pro subscription: set `CGC_MODEL` to the strongest tier your plan
+includes.
+
+```bash
+CGC_AUTO_MODEL=1  CGC_MODEL="Pro Extended"   # on: enforce Pro Extended (default)
+CGC_AUTO_MODEL=1  CGC_MODEL="High"           # on: enforce a tier your plan has
+CGC_AUTO_MODEL=0                             # off: send on whatever is shown
+```
+
+Off is equivalent to `--model skip`. The per-consult `--model` flag overrides both
+for a single call. Turn it off if you don't have a Pro plan and don't want the
+fail-closed guard, or if you manage the model manually in the ChatGPT UI.
 
 ### Finding your ChatGPT project URL
 

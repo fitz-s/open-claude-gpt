@@ -72,13 +72,19 @@ except ImportError:
 # skill ships no hard-coded identity. See docs/CONFIGURATION.md and .env.example.
 #   CGC_PORT         remote-debugging port of the dedicated Chrome  (default 9333)
 #   CGC_STATE_DIR    scratch dir for state + answer files           (default /tmp/cgc)
-#   CGC_MODEL        default model tier to select in the composer   (default "Pro Extended")
+#   CGC_AUTO_MODEL   auto-pick the model tier before sending? 1/0    (default 1 = on)
+#   CGC_MODEL        which tier to pick when auto-model is on        (default "Pro Extended")
 #   CGC_PROJECT_URL  ChatGPT URL a fresh consult opens; set this to YOUR project
 #                    (…/g/g-p-<id>-<slug>/project) to keep consults in one project,
 #                    or leave default to open a plain new chat.     (default new chat)
 CGC_PORT = int(os.environ.get("CGC_PORT", "9333"))
 CGC_STATE_DIR = os.environ.get("CGC_STATE_DIR", "/tmp/cgc")
-CGC_MODEL = os.environ.get("CGC_MODEL", "Pro Extended")
+# Auto model-selection is a toggle. ON (default): pick CGC_MODEL in the composer
+# and fail closed if it can't be selected. OFF (CGC_AUTO_MODEL=0/false/no): don't
+# touch the model picker — send on whatever the composer currently shows. This is
+# the same effect as `--model skip`, exposed as a global switch.
+CGC_AUTO_MODEL = os.environ.get("CGC_AUTO_MODEL", "1").strip().lower() not in ("0", "false", "no", "off", "")
+CGC_MODEL = os.environ.get("CGC_MODEL", "Pro Extended") if CGC_AUTO_MODEL else "skip"
 CGC_PROJECT_URL = os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/")
 
 # ---- active-thread state (makes follow-up zero-bookkeeping) -----------------
