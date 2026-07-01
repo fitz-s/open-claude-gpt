@@ -4,18 +4,36 @@ All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-based
 releases until it stabilizes.
 
-## [Unreleased] — pre-0.1 draft (work in progress; not yet a release)
+## [0.1.0] — 2026-07-01
+
+First public release. Experimental pre-release (the CDP/browser-automation path is
+functional and fenced, but early — expect rough edges).
 
 ### Added
 - Claude Code skill and `cgc` CLI for sending public-GitHub-linked consults to a
   logged-in ChatGPT web session; dedicated Chrome profile launch, doctor checks,
   model selection, background waiting, follow-up threads, and public-source delivery.
+- **Per-rid job registry** for concurrent consults (replaces the single-active
+  `active.json`): jobs keyed by request id, atomic + `flock`-guarded writes, tolerant
+  of stale/corrupt state, and the same ambiguity refusal when several threads are live.
+- **Cross-implementation parity test + CI** pinning all four sentinel parsers
+  (`_sentinel_parse`, `_sentinel_js`, `retrieval_window.js`, `poll_js`) against a
+  shared fixture corpus, so the parsers can't silently drift (Node runs it in CI).
 
 ### Hardened
 - Public-source provenance is fail-closed by default.
-- Remote debugging is loopback-bound and verified by the doctor.
-- Answer retrieval uses a fenced, line-anchored BEGIN/END sentinel parser.
-- Follow-up commands pin the intended conversation and request id.
+- Remote debugging is loopback-bound and verified by the doctor; `cgc doctor --secure`
+  now hard-fails when it can't verify the bind address (not just on a routable one).
+- Answer retrieval uses a fenced, line-anchored BEGIN/END sentinel parser; all four
+  implementations read the DOM via a block-newline `textContent` walk (not `innerText`,
+  which collapses on a backgrounded tab).
+- Follow-up commands pin the intended conversation and request id; conversation
+  identity matches on the URL path only (a spoofed `?x=/c/<id>` query can't fool it).
+- Waiter salvage writes an `<out>.raw` copy on both the timeout and stable paths;
+  `submit --reuse-tab` requires the user-message count to actually grow; `_write_state`
+  surfaces a `CGC_WARNING` instead of silently swallowing an unwritable state dir.
+- `uninstall.sh --purge` guards the Chrome-profile directory the same way it guards
+  the scratch dir (won't `rm -rf` a path that doesn't look like a dedicated cgc dir).
 
 ### Renamed
 - Project is now **Open Claude GPT** (`open-claude-gpt`). The `cgc` CLI and `CGC_*`
