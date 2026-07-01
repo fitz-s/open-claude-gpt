@@ -15,17 +15,23 @@
 #   cgc activation-hook               print an OPTIONAL SessionStart hook snippet
 #                                     (proactive offloading) — prints only, never edits settings
 #
+# Port: submit/followup/wait/status forward args as-is to cdp_consult.py, which
+# requires --port BEFORE the subcommand. Prefer the CGC_PORT env var instead,
+# e.g. `CGC_PORT=9334 cgc wait ...` — it works regardless of arg order.
+#
 # Resolves the skill scripts from (in order): $CGC_HOME, the installed skill,
 # or this repo's ./skill — so it works installed OR straight from a clone.
 set -euo pipefail
 
 find_scripts() {
-  local c
-  for c in \
-    "${CGC_HOME:-}/scripts" \
-    "$HOME/.claude/skills/open-claude-gpt/scripts" \
-    "$(cd "$(dirname "$0")/.." && pwd)/skill/scripts"; do
-    [ -n "$c" ] && [ -f "$c/consult.py" ] && { printf '%s' "$c"; return; }
+  local c candidates=()
+  [ -n "${CGC_HOME:-}" ] && candidates+=("$CGC_HOME/scripts")
+  candidates+=(
+    "$HOME/.claude/skills/open-claude-gpt/scripts"
+    "$(cd "$(dirname "$0")/.." && pwd)/skill/scripts"
+  )
+  for c in "${candidates[@]}"; do
+    [ -f "$c/consult.py" ] && { printf '%s' "$c"; return; }
   done
 }
 S="$(find_scripts)"

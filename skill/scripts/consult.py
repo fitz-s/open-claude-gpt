@@ -582,36 +582,51 @@ def cmd_prep(a: argparse.Namespace) -> int:
     # Ready-to-paste JS snippets with the request id baked in (no manual <id> fill-in).
     # Both return METADATA ONLY (booleans / counts) — never page content or URLs.
     begin = f"BEGIN_RESPONSE:{rid}"
-    # done is line-ANCHORED and FENCE-AWARE (shared v2 rule, matched exactly in
-    # retrieval_window.js and cdp_consult.py): scan lines tracking in_fence (a
-    # trimmed line starting with ``` or ~~~ toggles fence state and is itself
-    # never a sentinel); bi = first non-fenced line === BEGIN_RESPONSE:<rid>;
-    # ei = first non-fenced line AFTER bi === END_RESPONSE:<rid>, plus
-    # not-generating. A bare sentinel line ECHOED INSIDE a fenced code block is
-    # ignored — only bare sentinel lines outside any fence satisfy completion.
+    # done is line-ANCHORED and FENCE-AWARE (SHARED CONTRACT #1, v2 — mirrors
+    # _sentinel_parse / _sentinel_js in cdp_consult.py exactly): scan lines tracking
+    # in_fence (a trimmed line starting with ``` or ~~~ toggles fence state and is
+    # itself never a sentinel); bi = first non-fenced line === BEGIN_RESPONSE:<rid>;
+    # ei = first non-fenced line AFTER bi === END_RESPONSE:<rid>. A bare sentinel line
+    # ECHOED INSIDE a fenced code block is ignored — only bare sentinel lines outside
+    # any fence satisfy completion. Reads textContent (not innerText, which can be
+    # stale/empty on a backgrounded tab — see cdp_consult.py's textContent-vs-innerText
+    # note) and scans assistant nodes NEWEST-to-OLDEST, returning the first node whose
+    # parse is a complete non-empty wrapped answer — not just the last DOM node, since
+    # the sentinel-bearing turn need not be the last node in every layout. `done` does
+    # NOT depend on the stop button being gone (parity with the canonical _detect_js:
+    # the model writes END_RESPONSE only as its final line, so its presence alone means
+    # complete+extractable); `generating` still reports stop-button presence as
+    # telemetry only, never as a completion gate.
     poll_js = (
         "(function(){"
-        "var a=document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
-        'var n=a[a.length-1];var t=(n?n.innerText:"").replace(/\\r\\n/g,"\\n");var L=t.split("\\n");'
         "var BG=" + json.dumps(begin) + ",EN=" + json.dumps(end) + ";"
+        "function parse(t){"
+        "t=(t||'').replace(/\\r\\n/g,'\\n');var L=t.split('\\n');"
         "var inFence=false,bi=-1,ei=-1;"
         "for(var i=0;i<L.length;i++){"
         "var ln=L[i].trim();"
         "if(ln.slice(0,3)==='```'||ln.slice(0,3)==='~~~'){inFence=!inFence;continue;}"
         "if(inFence)continue;"
         "if(ln===BG&&bi<0){bi=i;continue;}"
-        "if(ln===EN&&bi>=0&&ei<0&&i>bi)ei=i;"
+        "if(ln===EN&&bi>=0&&ei<0&&i>bi){ei=i;break;}"
+        "}"
+        "var body=(bi>=0&&ei>bi)?L.slice(bi+1,ei).join('\\n').trim():'';"
+        "return {done:(bi>=0&&ei>bi&&body.length>0),len:t.length};"
+        "}"
+        "var a=document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+        "var res={done:false,len:0};"
+        "for(var k=a.length-1;k>=0;k--){"
+        "var r=parse(a[k].textContent);"
+        "if(r.done){res=r;break;}"
+        "if(k===a.length-1)res=r;"
         "}"
         "var stop=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"],button[aria-label*=\"停止\"]');"
         "var blocker=null;"
         "if(document.querySelector('input[type=\"password\"]')||/\\/auth|login/i.test(location.pathname))blocker='login';"
         "else if(document.querySelector('iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]'))blocker='captcha';"
         "else if(/rate limit|too many requests|usage limit/i.test((document.body.innerText||'').slice(0,4000)))blocker='rate_limit';"
-        # non-empty body required, for full parity with _sentinel_parse / _sentinel_js /
-        # retrieval_window.js (a wrapped-but-empty answer is not 'done').
-        "var body=(bi>=0&&ei>bi)?L.slice(bi+1,ei).join('\\n').trim():'';"
-        "var done=(!stop&&bi>=0&&ei>bi&&body.length>0&&a.length>0);"
-        "return JSON.stringify({generating:stop,done:done,blocker:blocker,assistantCount:a.length,len:t.length});})()"
+        "var done=(res.done&&a.length>0);"
+        "return JSON.stringify({generating:stop,done:done,blocker:blocker,assistantCount:a.length,len:res.len});})()"
     )
     preflight_js = (
         "(function(){"
