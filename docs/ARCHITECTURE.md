@@ -1,5 +1,10 @@
 # Architecture
 
+**Who this is for:** this page is for maintainers and anyone debugging the
+control plane. If you just want to *use* the tool, start with `README.md` and
+[`docs/INSTALL.md`](INSTALL.md) instead. What follows explains why the repo
+uses a dedicated Chrome profile, CDP, sentinels, and a detached waiter.
+
 ## Components
 
 | File | Role |
@@ -47,13 +52,13 @@ classifies it as loopback vs. routable, so a misconfigured or third-party Chrome
 that opens the port on `0.0.0.0`/`*` is caught by the doctor rather than assumed.
 
 ### Why sentinels
-The answer is wrapped in `BEGIN_RESPONSE:<rid>` / `END_RESPONSE:<rid>`. Completion
-uses a **line-anchored parser, not substring/`lastIndexOf`**: it fires only when a
-bare standalone line exactly equal to `BEGIN_RESPONSE:<rid>` (after trimming) is
-followed by a later bare standalone line exactly equal to `END_RESPONSE:<rid>`; the
-answer is the text strictly between them. A line that merely mentions or quotes the
-sentinel tokens — in prose or inside a code block — does not trigger completion,
-because it never exactly equals the bare token line.
+The answer is wrapped in `BEGIN_RESPONSE:<rid>` / `END_RESPONSE:<rid>`. The parser
+is **line-anchored AND fence-aware**: completion fires only when an **unfenced**
+standalone trimmed line equals `BEGIN_RESPONSE:<rid>` and a later **unfenced**
+standalone trimmed line equals `END_RESPONSE:<rid>`, with a non-empty body between
+them. Lines inside fenced code blocks (delimited by ` ``` ` or `~~~`) are ignored,
+even if they contain a bare sentinel line — this stops the model quoting or
+discussing the wrapper format from accidentally triggering completion.
 
 - **Accepted:** the model's final lines are
   ```
@@ -61,11 +66,12 @@ because it never exactly equals the bare token line.
   ...the answer body...
   END_RESPONSE:REQ-20260701-101500-ab12cd
   ```
-  Both sentinel lines stand alone with nothing else on them → completion fires.
-- **Rejected:** the answer discusses the wrapper without emitting real bare
-  sentinel lines, e.g. `` `The response should be wrapped like BEGIN_RESPONSE:REQ-...` `` inside prose or a fenced code block. That text contains the token but the line
-  is never *exactly* `BEGIN_RESPONSE:<rid>` after trimming, so it does not match and
-  completion does not fire.
+  Both sentinel lines stand alone, unfenced, with nothing else on them →
+  completion fires.
+- **Rejected:** the same bare sentinel lines, but sitting inside a fenced code
+  block (e.g. the model echoes the wrapper format for reference inside a
+  ` ``` ` block). Even though the lines match exactly after trimming, the
+  fence-aware rule ignores anything inside a fence, so completion does not fire.
 
 `rid` (request id) also pins the answer to the right conversation.
 

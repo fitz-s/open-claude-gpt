@@ -6,16 +6,17 @@ building. Claude then verifies the recommendation against your actual repo.
 
 ```bash
 # ground it in how you use the thing today, so the recommendation fits your code
-bin/cgc deliver --repo owner/repo --ref main --files src/http/client.py
+REFS_FILE="$(bin/cgc deliver --repo owner/repo --ref main --files src/http/client.py | python3 -c 'import json,sys; print(json.load(sys.stdin)["refs_file"])')"
 
 bin/cgc prep \
   --title "Replace our hand-rolled HTTP retry layer — with what?" \
   --role "senior engineer doing a build-vs-adopt evaluation with live web research" \
   --task "We maintain a custom retry/backoff/circuit-breaker layer in src/http/client.py. Research current options (tenacity, urllib3 Retry, httpx transports, resilience libs) as of now. Compare on: async support, jitter/backoff control, circuit breaking, maintenance health, and migration cost FROM our current code. Recommend one (or 'keep ours' with why). Cite sources inline; flag anything that needs a local benchmark." \
-  --refs-file /tmp/cgc/refs_*.md
+  --refs-file "$REFS_FILE"
 
 bin/cgc submit --rid <RID> --prompt-file /tmp/cgc/prompt_<RID>.md
-timeout 900 bin/cgc wait --rid <RID> --out /tmp/cgc/answer_<RID>.txt --timeout 870
+# Copy the exact waiter command printed by submit — it includes the conversation id.
+timeout 899 bin/cgc wait --rid <RID> --conversation <CONVERSATION_ID> --out ./cgc_answers/answer_<RID>.txt --poll 20 --timeout 870
 ```
 
 **Verify locally:** Claude reads the recommended library's real API, checks it

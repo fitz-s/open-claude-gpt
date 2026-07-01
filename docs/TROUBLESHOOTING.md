@@ -38,8 +38,17 @@ satisfy this — *prose about the code is not the code*.
 
 ## `CGC_ERROR model_not_selectable`
 The target model tier (`CGC_MODEL`) isn't offered in the composer for this
-account/thread. Either set a tier you have (`export CGC_MODEL="High"` or `skip`),
-or pass `--allow-model-mismatch` to send on whatever is shown.
+account/thread. Options, in order of preference:
+
+- **Set a tier your account actually has:** `export CGC_MODEL="High"` (or
+  whichever tier your plan offers).
+- **Disable auto-selection entirely:** `export CGC_AUTO_MODEL=0` — sends on
+  whatever tier is currently shown, no picking/enforcement.
+- **Per-command override:** `--model skip` — skip model selection for just this
+  one call, without changing your env config.
+- **Only when you deliberately want to proceed on a mismatched tier:**
+  `--allow-model-mismatch` — sends on whatever is shown even though the
+  requested tier couldn't be selected.
 
 ## `CGC_ERROR ambiguous_followup`
 Several consults are active and `--conversation auto` can't pick. Pass the exact

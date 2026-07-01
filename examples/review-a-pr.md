@@ -12,11 +12,13 @@ bin/cgc doctor --deep   # confirm ready + logged in
 
 ## 1. Deliver — resolve the code links
 
+Capture the refs file path from `deliver`'s JSON output — never a shell glob:
+
 ```bash
-bin/cgc deliver --repo owner/repo --pr 123
+REFS_FILE="$(bin/cgc deliver --repo owner/repo --pr 123 | python3 -c 'import json,sys; print(json.load(sys.stdin)["refs_file"])')"
 ```
 
-Output (trimmed):
+`deliver`'s output (trimmed) looks like:
 
 ```json
 {
@@ -33,6 +35,8 @@ Output (trimmed):
 ```
 
 Note it leads with the **public PR link** — never a gist for pushed, public code.
+(`refs_file` itself lives under `/tmp/cgc` — tool-owned scratch — which is why
+`$REFS_FILE` captures it rather than hardcoding the path.)
 
 ## 2. Prep — render the prompt
 
@@ -41,7 +45,7 @@ bin/cgc prep \
   --title "Review PR 123" \
   --role "senior reviewer auditing correctness, migration safety, and concurrency" \
   --task "Review this PR. Verify the approach before the diff; flag silent breakage, ordering/concurrency, and rollback. Recommend a simpler design if one dominates." \
-  --refs-file /tmp/cgc/refs_20260701-120000.md
+  --refs-file "$REFS_FILE"
 ```
 
 Prints a `request_id` (RID) and a `prompt_file` under `$CGC_STATE_DIR`.
@@ -58,7 +62,8 @@ It selects the model tier (`CGC_MODEL`), types, sends, and prints the exact
 ## 4. Wait — background, its exit is the wake
 
 ```bash
-timeout 900 bin/cgc wait --rid <RID> --out /tmp/cgc/answer_<RID>.txt --timeout 870
+# Copy the exact waiter command printed by submit — it includes the conversation id.
+timeout 899 bin/cgc wait --rid <RID> --conversation <CONVERSATION_ID> --out ./cgc_answers/answer_<RID>.txt --poll 20 --timeout 870
 ```
 
 (In Claude Code this runs with `run_in_background: true`; the process exit wakes
@@ -70,10 +75,10 @@ Read the answer, **verify each `verify locally: <check>` claim in your repo**,
 then feed results back in the same thread:
 
 ```bash
-timeout 900 bin/cgc followup \
+timeout 899 bin/cgc followup \
   --task "Confirmed findings 1-3 locally (tests pass). Finding 4 doesn't reproduce — here's why: … Re-assess." \
   --title "Round 2: local results" \
-  --watch --out /tmp/cgc/answer_r2.txt --timeout 870
+  --watch --conversation <CONVERSATION_ID> --out ./cgc_answers/answer_r2.txt --timeout 870
 ```
 
 Loop until the answer flags nothing new.

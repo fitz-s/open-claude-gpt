@@ -6,24 +6,36 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 
-**Use your ChatGPT Pro subscription *with* Claude Code — spend the plan you already pay for on planning, hard reasoning, and review, running in the background while Claude keeps working.**
+`open-claude-gpt` is a [Claude Code](https://claude.com/claude-code) skill (also a standalone CLI, `cgc`) that turns a logged-in **ChatGPT Pro** tab into a background coprocessor for your local agent. Claude fires a self-contained job to ChatGPT — a plan, a hard reasoning problem, a code review — keeps doing local work, and is woken by a background waiter when the full answer lands.
 
-`open-claude-gpt` is a [Claude Code](https://claude.com/claude-code) skill (also a standalone CLI) that turns a logged-in **ChatGPT Pro** tab into a background coprocessor for your local agent. Claude fires a self-contained job to ChatGPT — a plan, a hard reasoning problem, a code review — keeps doing local work, and is woken by a detached waiter when the full answer lands. **ChatGPT does the deep thinking; Claude puts it to work — a quick sanity-check on the load-bearing parts before shipping, not a line-by-line re-audit.**
+Three jobs it's good for: **planning** (an ordered, critiqued plan before Claude writes a line), **hard reasoning** (a tricky algorithm, proof, or tradeoff analysis offloaded while Claude keeps moving), and **grounded review** (a file-cited review of a public PR/tree link). ChatGPT does the deep thinking; Claude puts it to work — a quick sanity-check on the load-bearing parts before shipping, not a line-by-line re-audit.
+
+It drives the **ChatGPT web app you're already logged into** — not the OpenAI API, not Codex — so there's no API key and no per-token API bill; your normal ChatGPT web-plan limits and availability still apply.
+
+Send **public links, not secrets** — you log into the dedicated Chrome by hand, once, and the tool never handles your password or API keys.
 
 Think of it as a **background "ultra-everything"** for Claude Code: the same idea as its built-in `ultra-review` / `ultra-plan`, but powered by your ChatGPT Pro session and — crucially — run **in the background**, so Claude keeps executing locally while a long Pro reasoning run lands, instead of blocking on it. And it's not review-or-plan only: any deep, self-contained job qualifies (plan, hard reasoning, review, investigation, research, design, audit).
 
-No API keys, no per-token bill: it drives the **ChatGPT web app you're already logged into**, through an external Chrome DevTools client. If you pay for ChatGPT Pro, this is how you put that subscription to work next to Claude.
-
-**Near-unlimited — through the web app, not the API, not Codex.** Because it runs on your logged-in **ChatGPT web session**, usage is bounded by your Pro plan's generous web limits, not a metered API/Codex quota. Fire long, heavy consults freely: no token meter, no key, no Codex seat — just the subscription you already have.
-
 ---
+
+## Names you'll see
+
+| Name | What it is |
+| --- | --- |
+| **Open Claude GPT** | the project |
+| **cgc** | the CLI |
+| **CGC_*** | environment variables that configure it |
+| **consult** | one background ChatGPT job (plan / hard reasoning / review / etc.) |
+| **CDP** | Chrome DevTools Protocol — drives the dedicated Chrome tab |
+| **waiter** | the background process that waits for the wrapped answer |
+| **sentinel** | the `BEGIN_RESPONSE` / `END_RESPONSE` wrapper marking a complete answer |
 
 ## Why
 
 You already pay for ChatGPT Pro and for Claude Code. This lets them work *together* instead of you copy-pasting between two tabs:
 
 - **Spend the subscription, not an API budget.** It automates your real ChatGPT session — the same Pro plan you use in the browser. Nothing is billed per token.
-- **Near-unlimited, not metered.** Driving the web app (not the API, not Codex) means your Pro plan's web limits apply, not a per-token quota — send long, heavy, back-to-back consults without watching a meter.
+- **Web app, not API.** Driving the web app (not the API, not Codex) means no per-token API bill — your ChatGPT web-plan limits and availability apply, same as using ChatGPT by hand.
 - **Runs in the background.** Submit, keep coding, get woken on completion. The wait loop is a detached shell process holding zero agent context, so polling never reloads Claude's context.
 - **A thread, not a one-shot.** Feed local verification results back and follow up in the same conversation — loop until the answer is clean.
 - **High-value output — lean on it.** The consult does real reasoning worth acting on; treat it as a strong collaborator, not a suggestion box. Claude gives the load-bearing claims a quick local look (the `verify locally:` tags point at what's worth a glance) before shipping — not a per-claim re-audit.
@@ -60,7 +72,7 @@ Ship a **public GitHub PR/tree link** and get a grounded, file-cited review — 
 - **`consult.py prep`** — renders the outgoing prompt from a template, wrapping the answer in `BEGIN_RESPONSE:<rid>` / `END_RESPONSE:<rid>` sentinels so completion is unambiguous.
 - **`cdp_consult.py submit` / `followup` / `wait` / `status`** — the CDP control plane: open a chat, (optionally) select the model tier, type + send, and poll to completion in a detached process.
 
-The detached `wait` runs under an outer `timeout 899` (bounded so a background waiter can't hang a turn — a background-task guard blocks anything over the 900s cap) with an inner `--timeout 870` (~15 minutes, ~29s under the outer bound so a timeout-rescue grab still has time to run and exit cleanly). That ~15-minute cap is just a knob — raise both numbers together for a big review (keeping the outer at or under 900). See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+The waiter is bounded so a background task can't hang: default ~15 minutes, tunable — see [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full timeout math and how to raise it for a big review.
 
 A **dedicated Chrome profile** is used because CDP is disallowed on Chrome's default profile (anti-cookie-theft, Chrome 136+). You log into ChatGPT there once; your normal Chrome is untouched.
 
@@ -103,6 +115,25 @@ bin/cgc doctor --deep   # verify everything, including login state
 
 See [docs/INSTALL.md](docs/INSTALL.md).
 
+## First consult
+
+The canonical path — deliver → prep → submit → wait — end to end:
+
+```bash
+# 1. Resolve GitHub refs into a grouped refs file, and capture its path from the JSON output
+REFS_FILE="$(bin/cgc deliver --repo owner/repo --ref main | python3 -c 'import json,sys; print(json.load(sys.stdin)["refs_file"])')"
+
+# 2. Render the outgoing prompt from a template, using that refs file
+bin/cgc prep --refs-file "$REFS_FILE"
+
+# 3. Submit the prompt to your logged-in ChatGPT Pro tab
+bin/cgc submit
+
+# 4. Copy the exact waiter command that `submit` prints, and run it to wait for the answer
+```
+
+Durable answers land in `./cgc_answers/answer_<RID>.txt`; `/tmp/cgc` (`CGC_STATE_DIR`) is tool-owned scratch only.
+
 ## Examples
 
 Runnable walkthroughs in [examples/](examples/):
@@ -117,7 +148,7 @@ Runnable walkthroughs in [examples/](examples/):
 | 🐞 Second opinion on a stuck bug | [examples/debug-second-opinion.md](examples/debug-second-opinion.md) |
 | 💬 Toggle the model / group in a project | [examples/config-recipes.md](examples/config-recipes.md) |
 
-In Claude Code you don't run these by hand — the skill activates automatically and Claude orchestrates deliver → prep → submit → wait → verify → followup.
+In Claude Code you don't run these by hand — the skill activates automatically and Claude orchestrates deliver → prep → submit → wait → verify → followup. Copyable `--output-file` / `--output-replace` contracts live in [examples/_specs/](examples/_specs/).
 
 ## Configuration
 

@@ -6,6 +6,12 @@ body:
     attributes:
       value: |
         Thanks for the report. Please run `bin/cgc doctor --json` first — it pinpoints most issues.
+  - type: markdown
+    attributes:
+      value: |
+        **Before posting:** redact local usernames, home paths, ChatGPT project URLs,
+        conversation IDs, and any repo/customer names you don't want public. Never
+        paste secrets or `.env` contents.
   - type: textarea
     id: doctor
     attributes:

@@ -6,10 +6,16 @@ releases until it stabilizes.
 
 ## [Unreleased] — pre-0.1 draft (work in progress; not yet a release)
 
-- Consult-driven hardening converged to SHIP (4 rounds): follow-up thread integrity
-  (pathname-exact conv match + hostname-exact tab filter), legacy rid-guard, fence-aware
-  sentinel parser across all 4 impls, submit/state/concurrency, loopback bind + doctor,
-  public-source fail-closed. Remaining items are non-blocking (LOW/NIT).
+### Added
+- Claude Code skill and `cgc` CLI for sending public-GitHub-linked consults to a
+  logged-in ChatGPT web session; dedicated Chrome profile launch, doctor checks,
+  model selection, background waiting, follow-up threads, and public-source delivery.
+
+### Hardened
+- Public-source provenance is fail-closed by default.
+- Remote debugging is loopback-bound and verified by the doctor.
+- Answer retrieval uses a fenced, line-anchored BEGIN/END sentinel parser.
+- Follow-up commands pin the intended conversation and request id.
 
 ### Renamed
 - Project is now **Open Claude GPT** (`open-claude-gpt`). The `cgc` CLI and `CGC_*`

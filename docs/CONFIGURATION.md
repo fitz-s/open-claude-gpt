@@ -21,7 +21,7 @@ bin/cgc config                       # print the effective configuration
 | `CGC_PORT` | `9333` | Remote-debugging port of the dedicated Chrome. Must be free. |
 | `CGC_PROFILE` | `~/.cgc-chrome` | Dedicated Chrome profile dir. Kept separate from your normal Chrome (CDP is disallowed on the default profile since Chrome 136). |
 | `CGC_CHROME` | auto-detect | Explicit browser binary. Auto-detected across Chrome/Chromium/Edge on macOS + Linux; set only if detection fails. |
-| `CGC_STATE_DIR` | `/tmp/cgc` | Scratch dir for prompt/refs/answer files. Cleaned with `rm -rf` on that path. |
+| `CGC_STATE_DIR` | `/tmp/cgc` | **Tool-owned scratch** for prompt/refs/answer files — safe to `rm -rf` at any time. Not a durable store: don't rely on files here surviving a reboot or cleanup. If you want to keep an answer, copy it (or point `--out`) to a durable path like `./cgc_answers/`. |
 | `CLAUDE_SKILLS_DIR` | `~/.claude/skills` | Where `install.sh` puts the skill. |
 
 Any variable can also be overridden per-invocation with a flag, e.g. `--port`,
@@ -33,9 +33,10 @@ var; the env var wins over the built-in default.
 ChatGPT sometimes auto-downgrades a chat to a lighter model; a consult would then
 silently get a weaker answer. With `CGC_AUTO_MODEL=1` (default) the composer's
 model tier is **selected before every send and fails closed if it can't be
-picked** — you always get the tier you meant. This is where you actually spend
-your ChatGPT Pro subscription: set `CGC_MODEL` to the strongest tier your plan
-includes.
+picked** — so a send either uses the tier you asked for or is refused, instead of
+silently downgrading. This is where you actually spend your ChatGPT Pro plan's
+usage allowance: set `CGC_MODEL` to the strongest tier your plan includes, subject
+to whatever limits/availability your plan has.
 
 ```bash
 CGC_AUTO_MODEL=1  CGC_MODEL="Pro"   # on: enforce Pro (default)
@@ -82,21 +83,31 @@ Two string templates drive every consult:
 Edit these to change the house style (e.g. tighten the success criteria, change
 the default severity scale, add a project convention). Keep the
 `BEGIN_RESPONSE:{rid}` / `END_RESPONSE:{rid}` sentinel block **exactly** — the
-waiter uses a **line-anchored parser, not substring/`lastIndexOf`**: completion
-fires only when a bare standalone line exactly equal to `BEGIN_RESPONSE:<rid>`
-(after trimming) is followed by a later bare standalone line exactly equal to
-`END_RESPONSE:<rid>`, and the answer is the text strictly between them. A line
-that merely mentions or quotes those tokens in prose or a code block does not
-match. Example accepted final lines:
+parser is **line-anchored AND fence-aware**. Completion fires only when an
+**unfenced** standalone trimmed line equals `BEGIN_RESPONSE:<rid>` and a later
+**unfenced** standalone trimmed line equals `END_RESPONSE:<rid>`, with a
+non-empty body between them. Lines inside fenced code blocks (delimited by
+` ``` ` or `~~~`) are ignored, even if they contain a bare sentinel line.
+
+**Accepted** — the sentinel lines stand alone, outside any fence:
 ```
 BEGIN_RESPONSE:REQ-20260701-101500-ab12cd
 ...the answer body...
 END_RESPONSE:REQ-20260701-101500-ab12cd
 ```
-versus a rejected line like `` `wrap it as BEGIN_RESPONSE:REQ-...` `` quoted in
-prose — that never equals the bare token line, so it's ignored. Removing or
-reformatting the sentinel block (so it's no longer a bare standalone line) breaks
-answer retrieval.
+
+**Rejected** — a bare sentinel line sitting *inside* a fenced code block does
+not count, even though the line itself matches exactly:
+````
+Here's the wrapper format for reference:
+```
+BEGIN_RESPONSE:REQ-20260701-101500-ab12cd
+END_RESPONSE:REQ-20260701-101500-ab12cd
+```
+````
+Because those lines are fenced, the parser ignores them and completion does not
+fire. Removing or reformatting the sentinel block (so it's no longer an
+unfenced standalone line) breaks answer retrieval.
 
 ### Waiter timeouts are a knob, not a fixed limit
 
