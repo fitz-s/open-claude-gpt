@@ -10,6 +10,8 @@
 
 `open-claude-gpt` is a [Claude Code](https://claude.com/claude-code) skill (also a standalone CLI) that turns a logged-in **ChatGPT Pro** tab into a background coprocessor for your local agent. Claude fires a self-contained job to ChatGPT — a plan, a hard reasoning problem, a code review — keeps doing local work, and is woken by a detached waiter when the full answer lands. **ChatGPT does the deep thinking; Claude puts it to work — a quick sanity-check on the load-bearing parts before shipping, not a line-by-line re-audit.**
 
+Think of it as a **background "ultra-everything"** for Claude Code: the same idea as its built-in `ultra-review` / `ultra-plan`, but powered by your ChatGPT Pro session and — crucially — run **in the background**, so Claude keeps executing locally while a long Pro reasoning run lands, instead of blocking on it. And it's not review-or-plan only: any deep, self-contained job qualifies (plan, hard reasoning, review, investigation, research, design, audit).
+
 No API keys, no per-token bill: it drives the **ChatGPT web app you're already logged into**, through an external Chrome DevTools client. If you pay for ChatGPT Pro, this is how you put that subscription to work next to Claude.
 
 **Near-unlimited — through the web app, not the API, not Codex.** Because it runs on your logged-in **ChatGPT web session**, usage is bounded by your Pro plan's generous web limits, not a metered API/Codex quota. Fire long, heavy consults freely: no token meter, no key, no Codex seat — just the subscription you already have.
