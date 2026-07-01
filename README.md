@@ -8,7 +8,7 @@
 
 **Use your ChatGPT Pro subscription *with* Claude Code — spend the plan you already pay for on planning, hard reasoning, and review, running in the background while Claude keeps working.**
 
-`open-claude-gpt` is a [Claude Code](https://claude.com/claude-code) skill (also a standalone CLI) that turns a logged-in **ChatGPT Pro** tab into a background coprocessor for your local agent. Claude fires a self-contained job to ChatGPT — a plan, a hard reasoning problem, a code review — keeps doing local work, and is woken by a detached waiter when the full answer lands. **ChatGPT advises; Claude stays the source of truth and verifies every claim before acting on it.**
+`open-claude-gpt` is a [Claude Code](https://claude.com/claude-code) skill (also a standalone CLI) that turns a logged-in **ChatGPT Pro** tab into a background coprocessor for your local agent. Claude fires a self-contained job to ChatGPT — a plan, a hard reasoning problem, a code review — keeps doing local work, and is woken by a detached waiter when the full answer lands. **ChatGPT does the deep thinking; Claude puts it to work — a quick sanity-check on the load-bearing parts before shipping, not a line-by-line re-audit.**
 
 No API keys, no per-token bill: it drives the **ChatGPT web app you're already logged into**, through an external Chrome DevTools client. If you pay for ChatGPT Pro, this is how you put that subscription to work next to Claude.
 
@@ -24,7 +24,7 @@ You already pay for ChatGPT Pro and for Claude Code. This lets them work *togeth
 - **Near-unlimited, not metered.** Driving the web app (not the API, not Codex) means your Pro plan's web limits apply, not a per-token quota — send long, heavy, back-to-back consults without watching a meter.
 - **Runs in the background.** Submit, keep coding, get woken on completion. The wait loop is a detached shell process holding zero agent context, so polling never reloads Claude's context.
 - **A thread, not a one-shot.** Feed local verification results back and follow up in the same conversation — loop until the answer is clean.
-- **Claude verifies.** Every claim ChatGPT returns is a hypothesis Claude checks locally (`verify locally: <check>` tags make this explicit) before anything is merged, shipped, or declared done.
+- **High-value output — lean on it.** The consult does real reasoning worth acting on; treat it as a strong collaborator, not a suggestion box. Claude gives the load-bearing claims a quick local look (the `verify locally:` tags point at what's worth a glance) before shipping — not a per-claim re-audit.
 
 ## What to use it for
 
@@ -37,7 +37,7 @@ Hand ChatGPT the goal + the repo link and get an ordered, critiqued plan back �
 Offload the self-contained hard part: a tricky algorithm, a proof or heavy calculation, a concurrency/ordering argument, a "which of these designs actually dominates" tradeoff. Claude keeps the main task moving while ChatGPT thinks.
 
 ### 🔎 Review
-Ship a **public GitHub PR/tree link** and get a grounded, file-cited review — correctness, migration safety, concurrency, rollback — with a one-line verdict + confidence. Claude verifies each finding against the actual repo, then follows up until it flags nothing.
+Ship a **public GitHub PR/tree link** and get a grounded, file-cited review — correctness, migration safety, concurrency, rollback — with a one-line verdict + confidence. Claude acts on the findings, spot-checks the load-bearing ones, and follows up until it flags nothing.
 
 (Plus: investigation, research-backed decisions, RFC/design docs, long-context consistency audits, a devil's-advocate before an irreversible action, a draft-while-you-build second pair of eyes.)
 
@@ -136,7 +136,7 @@ Full reference + prompt customization: [docs/CONFIGURATION.md](docs/CONFIGURATIO
 - **The agent never handles your credentials.** You log into the dedicated Chrome by hand, once; the session persists in that profile.
 - **Ordinary browser automation against your own logged-in session** — it reads only the ChatGPT answer text, never cookies or cross-site data, and writes the answer to a local file you own.
 - **Never send secrets.** The skill refuses to fabricate a code source and is built to ship *links to already-public code*, not to exfiltrate private content. Don't put `.env`, keys, or tokens in a prompt, gist, or context file.
-- **ChatGPT is advisory.** Claude verifies every claim before merging, shipping, or declaring done.
+- **ChatGPT is a strong advisor.** Claude leans on its reasoning and spot-checks the load-bearing parts before shipping — no line-by-line re-audit.
 
 Details + threat model: [docs/SECURITY.md](docs/SECURITY.md).
 

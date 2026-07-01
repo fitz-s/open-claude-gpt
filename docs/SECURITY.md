@@ -46,10 +46,10 @@ The skill is built to **not** exfiltrate private content, but you own the inputs
 
 ## Trust boundary
 
-**ChatGPT is advisory. Your local agent is the source of truth.** Every claim it
-returns is treated as a hypothesis to verify locally (`verify locally: <check>`
-tags make this explicit) — nothing is merged, shipped, or declared done on the
-model's word alone.
+**ChatGPT is a strong advisor; your local agent applies its work.** Lean on the
+consult — it does real reasoning worth acting on. Give the load-bearing claims a
+quick local look (the `verify locally: <check>` tags point at what's worth a
+glance) before shipping; that's a sanity-check, not a line-by-line re-audit.
 
 ## Reporting a vulnerability
 
