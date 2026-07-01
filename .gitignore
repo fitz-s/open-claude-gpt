@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# scratch / runtime state (default CGC_STATE_DIR)
+/tmp/cgc/
+*.answer.txt
+
+# local env / secrets — never commit
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# install backups
+*.bak
