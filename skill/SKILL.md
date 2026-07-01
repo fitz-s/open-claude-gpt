@@ -43,7 +43,7 @@ Error → cause: `no_page_target` / `composer_not_ready` = step 0 skipped or log
 ## Roles (keep distinct)
 - **ChatGPT = external advisor.** Gives plans / reviews / risk analysis — treat its output as advisory input.
 - **Claude Code = local executor + verification authority.** Reads/edits the repo, runs all tests, owns correctness.
-- Feed ChatGPT context, take back its judgment, and verify locally; it advises, Claude Code decides.
+- Feed ChatGPT context, lean on its judgment, and give the load-bearing parts a quick local look; it advises with weight, Claude Code applies it.
 
 ## HARD RULE — link-first, gist-last (read this before delivering ANY code)
 If the code is on GitHub in ANY form — a **PR**, a pushed branch, a commit, a tag, `main` — deliver the GitHub **link** for ChatGPT to browse; it carries the diff + intent + discussion + CI + navigable code in one surface. Reserve gist/upload for content that is genuinely not on GitHub (unpushed or private-inaccessible state).
@@ -60,7 +60,7 @@ The win is **offload + parallelism**: fire a deep, self-contained job to the clo
 
 **Common jobs** (non-exhaustive): high-risk PR-merge gate (adversarial review), pre-refactor architecture plan, deep module/subsystem review, broad-investigation / research-backed decision, library/approach or prior-art research, dataset/log-corpus analysis, a proof or hard calculation, a design doc / RFC / strategy memo, design-dispute or stuck-bug second opinion, long-context consistency audit, devil's-advocate before an irreversible action, design/DX/naming sounding board, multi-round plan→execute→feed-back loop, background second-pair-of-eyes, draft-while-you-build. (Fuller playbook in [SKILL-NOTES](SKILL-NOTES.md).)
 
-**Invariant:** ChatGPT advises; Claude Code is the source of truth — verify every claim locally; never merge, ship, or declare done on Pro's word alone.
+**Invariant:** ChatGPT is a high-value advisor — lean on it and act on its output; give the load-bearing claims (and anything it tags `verify locally`) a quick local look before shipping. That's a sanity-check, not a line-by-line re-audit — don't burn runtime re-deriving what the consult already reasoned through. (Independent of this: never send secrets/`.env`/keys.)
 
 ## Steer the round — `--title`, `--role`, `--task` are the highest-leverage inputs
 Read references/gpt-5.5-prompting-principles.md first. The fixed template supplies the generic contract — verdict + confidence, file:line findings with evidence URLs, concrete fixes, local checks, an end-to-end depth mandate, plain prose. **You write the part the template can't know, and that is what turns a generic Q&A into a deep round.** Three levers, every consult:
