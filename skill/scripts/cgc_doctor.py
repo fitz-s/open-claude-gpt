@@ -272,11 +272,15 @@ def run(deep: bool, secure: bool = False) -> Report:
     if up:
         addrs, tool = _listen_addrs_for_port(PORT)
         if tool is None:
-            r.warn(f"loopback bind (port {PORT})", "no lsof/ss/netstat available to verify",
-                   "install lsof, ss (iproute2), or netstat to verify the bind address")
+            _report(r, secure, f"loopback bind (port {PORT})",
+                    "cannot verify DevTools bind address (no lsof/ss/netstat)"
+                    + (" — refusing under --secure" if secure else ""),
+                    "install lsof, ss (iproute2), or netstat to verify the bind address")
         elif not addrs:
-            r.warn(f"loopback bind (port {PORT})", f"{tool} found no LISTEN entry for the port",
-                   "verify manually, e.g. `lsof -nP -iTCP:%d -sTCP:LISTEN`" % PORT)
+            _report(r, secure, f"loopback bind (port {PORT})",
+                    f"no listener found for port {PORT}"
+                    + (" — refusing under --secure" if secure else f" (via {tool})"),
+                    "verify manually, e.g. `lsof -nP -iTCP:%d -sTCP:LISTEN`" % PORT)
         else:
             routable = [a for a in addrs if not is_loopback_addr(a)]
             if routable:

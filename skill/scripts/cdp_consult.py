@@ -41,7 +41,9 @@ Subcommands:
            open a fresh project chat, type the prompt, submit. (control plane)
   followup --conversation C --prompt-file F [--port P] [--rid R]
            send a follow-up into an existing conversation (continues the thread,
-           keeping its context + model). Round-1 wait must have used --keep-tab.
+           keeping its context + model). Attaches to an existing tab if one is still
+           open, or reopens the conversation at /c/<conversation_id> otherwise —
+           --keep-tab is an optional convenience, not a requirement.
   wait    --rid R --out F [--port P] [--poll S] [--timeout S]
           poll until the answer is complete, extract it between the bare-line BEGIN/END
           sentinels, write to --out, exit 0. Run as a detached background Bash;
@@ -177,7 +179,7 @@ def _write_state(**kw):
                 json.dump(cur, f)
             os.replace(tmp, STATE_PATH)
     except OSError:
-        pass
+        sys.stderr.write(f"CGC_WARNING state_not_written {STATE_PATH}\n")
 
 
 def _resolve_conv(conv):
@@ -746,6 +748,16 @@ def cmd_submit(a) -> int:
     else:
         c = CDP(a.port, create_url=a.project_url)
     try:
+        # REUSE-TAB false-positive guard: a reused tab may already hold OLD user messages
+        # from a prior conversation, so "at least one user message after send" can be
+        # satisfied by stale history even when THIS submit's composer insert/click failed.
+        # Capture the count before insertion so the post-send check can require a NEW
+        # message (after > before) on the reuse-tab path. A fresh tab always starts at 0,
+        # so this is a no-op there — new-tab behavior is unchanged.
+        before_user_count = 0
+        if a.reuse_tab:
+            before_user_count = c.eval(
+                "document.querySelectorAll('[data-message-author-role=\"user\"]').length") or 0
         # wait for composer to hydrate
         for _ in range(30):
             time.sleep(0.5)
@@ -795,14 +807,18 @@ def cmd_submit(a) -> int:
             "if(b&&!b.disabled){b.click();return true;}return false;})()")
         if not clicked:
             c.key("Enter", "Enter", 13)
-        # Confirm a user message actually landed (poll — render lags the click).
+        # Confirm a user message actually landed (poll — render lags the click). On a reused
+        # tab, requiring merely "count > 0" would false-positive on OLD messages already in
+        # the thread if THIS send's composer insert/click silently failed — so require the
+        # count to have grown past before_user_count there. A fresh tab always starts at 0,
+        # so ">0" and "> before_user_count" are equivalent and new-tab behavior is unchanged.
         n = 0
         for _ in range(10):
             time.sleep(0.5)
             n = c.eval("document.querySelectorAll('[data-message-author-role=\"user\"]').length")
-            if n and n > 0:
+            if n and n > before_user_count:
                 break
-        ok = bool(n and n > 0)
+        ok = bool(n and n > before_user_count)
         # The URL transitions /project -> /c/<id> a beat after the message sends; poll for it.
         # SUBMIT-RACE: a submit that reports ok=true with no captured conversation id is worse
         # than a clean failure — a later `wait`/`followup --conversation auto` would resolve to
@@ -1220,10 +1236,12 @@ def cmd_wait(a) -> int:
                     if len(raw) >= a.min_unwrapped:
                         with open(a.out, "w", encoding="utf-8") as f:
                             f.write(raw)
+                        with open(a.out + ".raw", "w", encoding="utf-8") as f:
+                            f.write(raw)
                         sys.stderr.write(
-                            f"CGC_UNWRAPPED wrote {len(raw)} chars to {a.out}: the model did NOT emit "
-                            f"BEGIN/END_RESPONSE:{rid}, so the whole last message was taken — verify it is "
-                            f"complete (not cut off) before trusting it.\n")
+                            f"CGC_UNWRAPPED wrote {len(raw)} chars to {a.out} (also saved to {a.out}.raw): "
+                            f"the model did NOT emit BEGIN/END_RESPONSE:{rid}, so the whole last message "
+                            f"was taken — verify it is complete (not cut off) before trusting it.\n")
                         if not a.keep_tab:
                             c.close_tab()
                         return 0

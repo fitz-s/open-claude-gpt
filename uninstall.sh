@@ -10,12 +10,12 @@ PURGE=0
 [ "${1:-}" = "--purge" ] && PURGE=1
 
 # guard_rm_rf PATH KIND
-#   KIND is "scratch" or "profile" — scratch dirs must additionally look like
-#   a dedicated cgc scratch dir (basename contains "cgc", or the dir contains
-#   a tool marker file/dir) before they're eligible for deletion.
+#   KIND is "scratch" or "profile" — both must additionally look like a
+#   dedicated cgc dir (basename contains "cgc", or the dir contains a tool
+#   marker file/dir) before they're eligible for deletion.
 # Refuses (prints a message, returns 1, does NOT abort the script) when the
-# resolved path is empty, "/", "$HOME", or "$HOME/", or (for scratch dirs)
-# doesn't look like a dedicated scratch dir.
+# resolved path is empty, "/", "$HOME", or "$HOME/", or doesn't look like a
+# dedicated cgc dir.
 guard_rm_rf() {
   raw_path="$1"
   kind="$2"
@@ -46,7 +46,7 @@ guard_rm_rf() {
     return 1
   fi
 
-  if [ "$kind" = "scratch" ]; then
+  if [ "$kind" = "scratch" ] || [ "$kind" = "profile" ]; then
     base="$(basename "$resolved")"
     has_marker=0
     case "$base" in
@@ -56,7 +56,7 @@ guard_rm_rf() {
       has_marker=1
     fi
     if [ "$has_marker" != "1" ]; then
-      echo "• refusing to delete '$resolved' — doesn't look like a dedicated cgc scratch dir (basename has no 'cgc' and no .cgc marker found)" >&2
+      echo "• refusing to delete '$resolved' — doesn't look like a dedicated cgc $kind dir (basename has no 'cgc' and no .cgc marker found)" >&2
       return 1
     fi
   fi
