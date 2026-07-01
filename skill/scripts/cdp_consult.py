@@ -1034,7 +1034,16 @@ def cmd_followup(a) -> int:
         # holds — do NOT silently adopt whatever conv the page now reports (that would let a
         # mid-send navigation/redirect to a DIFFERENT thread pass unnoticed, with the follow-up
         # believed sent into `conv` while it actually landed elsewhere, or vice versa).
+        # SETTLE: right after send the SPA can briefly report location.pathname as a transitional
+        # value (conversation_id() == '') for a beat before it re-settles on /c/<conv>. Reading
+        # once there false-positived a mismatch on a send that actually stayed on the right thread,
+        # so poll for the id to come back to `conv` (or to a genuinely DIFFERENT non-empty id)
+        # before deciding — a real thread switch resolves to another id and still fails closed.
         after_conv = c.conversation_id()
+        _adl = time.time() + 6
+        while after_conv != conv and after_conv == "" and time.time() < _adl:
+            time.sleep(0.5)
+            after_conv = c.conversation_id()
         if after_conv != conv:
             print(json.dumps({"ok": False, "userMsgs": n, "conversation_id": after_conv,
                               "rid": rid, "followup": True, "wanted_conversation": conv}))
