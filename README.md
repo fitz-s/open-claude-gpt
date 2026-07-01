@@ -1,6 +1,8 @@
 # Open Claude GPT
 
 > **`open-claude-gpt`** — use your **ChatGPT Pro** subscription *with* **Claude Code**. Open-source bridge between the two: Claude drives, ChatGPT thinks in the background.
+>
+> Put the frontier reasoning model you **already pay for** — **ChatGPT Pro** (the Pro not xhigh) — to work inside your Claude Code workflow.
 
 [![CI](https://github.com/fitz-s/open-claude-gpt/actions/workflows/ci.yml/badge.svg)](https://github.com/fitz-s/open-claude-gpt/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
