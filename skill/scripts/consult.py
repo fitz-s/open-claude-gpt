@@ -612,7 +612,10 @@ def cmd_prep(a: argparse.Namespace) -> int:
         "if(document.querySelector('input[type=\"password\"]')||/\\/auth|login/i.test(location.pathname))blocker='login';"
         "else if(document.querySelector('iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]'))blocker='captcha';"
         "else if(/rate limit|too many requests|usage limit/i.test((document.body.innerText||'').slice(0,4000)))blocker='rate_limit';"
-        "var done=(!stop&&bi>=0&&ei>bi&&a.length>0);"
+        # non-empty body required, for full parity with _sentinel_parse / _sentinel_js /
+        # retrieval_window.js (a wrapped-but-empty answer is not 'done').
+        "var body=(bi>=0&&ei>bi)?L.slice(bi+1,ei).join('\\n').trim():'';"
+        "var done=(!stop&&bi>=0&&ei>bi&&body.length>0&&a.length>0);"
         "return JSON.stringify({generating:stop,done:done,blocker:blocker,assistantCount:a.length,len:t.length});})()"
     )
     preflight_js = (

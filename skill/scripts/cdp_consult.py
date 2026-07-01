@@ -66,6 +66,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 try:
@@ -281,12 +282,14 @@ class CDP:
             info = json.load(urllib.request.urlopen(f"{base}/json", timeout=5))
             pages = [t for t in info if t.get("type") == "page" and "chatgpt.com" in (t.get("url") or "")]
             if match:
-                # Exact /c/<match> PATH SEGMENT match, not a loose substring — a URL that merely
-                # contains the id in a query string or hash (e.g. ?ref=<id> or #<id>) must NOT
-                # count as the same conversation. re.escape guards against a conv id containing
-                # regex-special characters.
-                seg_re = re.compile(r"/c/" + re.escape(match) + r"(?:[/?#]|$)")
-                hit = [t for t in pages if seg_re.search(t.get("url") or "")]
+                # Match the URL PATH ONLY (via urlparse), never the query/hash — a tab whose URL
+                # merely contains the id in a query string or hash (e.g. ?ref=/c/<id> or #/c/<id>)
+                # must NOT count as the same conversation. The path must be exactly /c/<match>
+                # (or /c/<match>/... if ChatGPT ever appends a path suffix).
+                def _is_conv_url(u):
+                    path = urllib.parse.urlparse(u or "").path
+                    return path == f"/c/{match}" or path.startswith(f"/c/{match}/")
+                hit = [t for t in pages if _is_conv_url(t.get("url"))]
                 if not hit:
                     raise SystemExit(f"CGC_ERROR conversation_not_found: no ChatGPT tab whose URL "
                                      f"path is /c/{match} — the tab may have been closed/navigated")
@@ -307,9 +310,11 @@ class CDP:
         self.call("Page.enable")
 
     def conversation_id(self):
-        """The /c/<id> conversation id of the attached tab, or '' if not in a conversation yet."""
-        href = self.eval("location.href") or ""
-        m = re.search(r"/c/([0-9a-f-]+)", href)
+        """The /c/<id> conversation id of the attached tab, or '' if not in a conversation yet.
+        Reads location.PATHNAME only — a /c/<id> that appears in the query string or hash of
+        some other page must never be mistaken for the attached conversation."""
+        path = self.eval("location.pathname") or ""
+        m = re.match(r"^/c/([0-9a-f-]+)(?:/|$)", path)
         return m.group(1) if m else ""
 
     def call(self, method, params=None, timeout=None):
