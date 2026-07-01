@@ -55,6 +55,28 @@ bin/cgc doctor --json   # machine-readable, for CI
 
 A green run means the skill is ready; in Claude Code it activates automatically.
 
+## Activation: on-demand vs. proactive
+
+**On-demand (default, nothing to configure).** Claude Code reads the skill's
+`SKILL.md` frontmatter `description` and invokes the skill on its own when a task
+fits ("offload a deep, self-contained job to ChatGPT in the background…"). This
+works the moment the skill is installed — the agent knows when to use it.
+
+**Proactive (optional).** If you also want Claude to *consider offloading a consult
+at the start of every session* — the aggressive "background ultra-everything"
+default — add a `SessionStart` hook that injects the skill's activation note
+(`~/.claude/skills/open-claude-gpt/ACTIVATION.md`). The installer does **not** do
+this for you, because it edits *your own* Claude settings; opt in yourself:
+
+```bash
+bin/cgc activation-hook        # prints a ready-to-paste snippet — it does NOT edit anything
+```
+
+Merge the printed `SessionStart` entry into the `hooks` object of your
+`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json` (keep any existing entries).
+To undo, delete that one entry. `ACTIVATION.md` is just the text the hook prints
+into context each session — edit it to tune how strongly Claude is nudged.
+
 ## Upgrade
 
 ```bash
