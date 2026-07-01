@@ -1,5 +1,9 @@
 # chatgpt-consult
 
+[![CI](https://github.com/YOUR_USER/chatgpt-consult/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USER/chatgpt-consult/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
+
 **Use your ChatGPT Pro subscription *with* Claude Code — spend the plan you already pay for on planning, hard reasoning, and review, running in the background while Claude keeps working.**
 
 `chatgpt-consult` is a [Claude Code](https://claude.com/claude-code) skill (also a standalone CLI) that turns a logged-in **ChatGPT Pro** tab into a background coprocessor for your local agent. Claude fires a self-contained job to ChatGPT — a plan, a hard reasoning problem, a code review — keeps doing local work, and is woken by a detached waiter when the full answer lands. **ChatGPT advises; Claude stays the source of truth and verifies every claim before acting on it.**
