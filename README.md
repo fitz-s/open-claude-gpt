@@ -12,6 +12,8 @@
 
 No API keys, no per-token bill: it drives the **ChatGPT web app you're already logged into**, through an external Chrome DevTools client. If you pay for ChatGPT Pro, this is how you put that subscription to work next to Claude.
 
+**Near-unlimited — through the web app, not the API, not Codex.** Because it runs on your logged-in **ChatGPT web session**, usage is bounded by your Pro plan's generous web limits, not a metered API/Codex quota. Fire long, heavy consults freely: no token meter, no key, no Codex seat — just the subscription you already have.
+
 ---
 
 ## Why
@@ -19,6 +21,7 @@ No API keys, no per-token bill: it drives the **ChatGPT web app you're already l
 You already pay for ChatGPT Pro and for Claude Code. This lets them work *together* instead of you copy-pasting between two tabs:
 
 - **Spend the subscription, not an API budget.** It automates your real ChatGPT session — the same Pro plan you use in the browser. Nothing is billed per token.
+- **Near-unlimited, not metered.** Driving the web app (not the API, not Codex) means your Pro plan's web limits apply, not a per-token quota — send long, heavy, back-to-back consults without watching a meter.
 - **Runs in the background.** Submit, keep coding, get woken on completion. The wait loop is a detached shell process holding zero agent context, so polling never reloads Claude's context.
 - **A thread, not a one-shot.** Feed local verification results back and follow up in the same conversation — loop until the answer is clean.
 - **Claude verifies.** Every claim ChatGPT returns is a hypothesis Claude checks locally (`verify locally: <check>` tags make this explicit) before anything is merged, shipped, or declared done.
