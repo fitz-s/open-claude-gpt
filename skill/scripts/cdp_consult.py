@@ -985,15 +985,15 @@ def cmd_followup(a) -> int:
         if a.model and a.model.lower() != "skip":
             target = a.model
             if reopened:
-                # ROBUSTNESS (not a blocker): a freshly re-opened composer often reports the
-                # model-tier switcher as None on the very first probe (the switcher button
-                # hasn't hydrated yet), which would otherwise read as "unselectable" and refuse
-                # closed on a thread that is actually fine. Give it a few short settle/retry
-                # beats before treating the tier as genuinely unselectable — but still fail
-                # closed afterwards if it truly never resolves.
-                for _ in range(6):
-                    if c.eval(_model_now_js()) is not None:
-                        break
+                # ROBUSTNESS: a freshly re-opened composer reports the model-tier switcher as
+                # None on the first probes (the switcher button hasn't hydrated yet) — reading
+                # that as "unselectable" is the recurring false refusal on reopen. Wait up to
+                # ~8s for the switcher to hydrate before letting _select_model act; only if it
+                # NEVER resolves do we fall through to the fail-closed path below. (_select_model
+                # itself then opens the picker and selects — this settle just gives it a live DOM
+                # to act on; the fail-closed guarantee is unchanged.)
+                _settle = time.time() + 8
+                while c.eval(_model_now_js()) is None and time.time() < _settle:
                     time.sleep(0.5)
             if not _select_model(c, target) and not a.allow_model_mismatch:
                 model_now = c.eval(_model_now_js())
