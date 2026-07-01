@@ -82,8 +82,31 @@ Two string templates drive every consult:
 Edit these to change the house style (e.g. tighten the success criteria, change
 the default severity scale, add a project convention). Keep the
 `BEGIN_RESPONSE:{rid}` / `END_RESPONSE:{rid}` sentinel block **exactly** — the
-waiter detects completion by those two bare lines; removing or reformatting them
-breaks answer retrieval.
+waiter uses a **line-anchored parser, not substring/`lastIndexOf`**: completion
+fires only when a bare standalone line exactly equal to `BEGIN_RESPONSE:<rid>`
+(after trimming) is followed by a later bare standalone line exactly equal to
+`END_RESPONSE:<rid>`, and the answer is the text strictly between them. A line
+that merely mentions or quotes those tokens in prose or a code block does not
+match. Example accepted final lines:
+```
+BEGIN_RESPONSE:REQ-20260701-101500-ab12cd
+...the answer body...
+END_RESPONSE:REQ-20260701-101500-ab12cd
+```
+versus a rejected line like `` `wrap it as BEGIN_RESPONSE:REQ-...` `` quoted in
+prose — that never equals the bare token line, so it's ignored. Removing or
+reformatting the sentinel block (so it's no longer a bare standalone line) breaks
+answer retrieval.
+
+### Waiter timeouts are a knob, not a fixed limit
+
+The waiter runs as `timeout 899 … wait … --timeout 870` — an outer `timeout 899`
+(bounded so the background-task guard doesn't block it; keep it ≤900) and an inner
+`--timeout 870` (~15 minutes, ~29s under the outer bound so a timeout-rescue grab
+still has time to complete and exit cleanly). That ~15-minute inner cap is not a
+hard ceiling on consult length — raise **both** numbers together for a large
+review (e.g. a big multi-hundred-file PR), keeping the outer at or under 900
+because of the background-task guard.
 
 ### 3. Reference material
 

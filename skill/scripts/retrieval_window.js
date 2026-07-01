@@ -1,6 +1,9 @@
 // Created: 2026-06-10
-// Last reused or audited: 2026-06-10
-// Authority basis: open-claude-gpt skill v1 — DOM retrieval windowing
+// Last reused or audited: 2026-07-01
+// Authority basis: open-claude-gpt skill v1 — DOM retrieval windowing;
+// sentinel parsing hardened to the line-anchored contract (bare trimmed-line
+// equality only, no indexOf/lastIndexOf substring matching) shared across
+// the MCP fallback backend's sentinel implementations.
 //
 // Purpose: read a large ChatGPT answer through get_page_text under the 50000-char
 // tool-output cap. get_page_text has no offset param, so this script renders the
@@ -27,15 +30,31 @@
   var BEGIN = "BEGIN_RESPONSE:" + RID;
   var END = "END_RESPONSE:" + RID;
 
+  // Line-anchored sentinel parser: a sentinel only matches a line whose
+  // TRIMMED content is EXACTLY equal to the sentinel token. A line that
+  // merely contains a sentinel (quoted in prose, or inside a code block
+  // alongside other characters) must NOT match — indexOf/lastIndexOf over
+  // the raw text is unsafe because the model can echo BEGIN_RESPONSE/
+  // END_RESPONSE inside its own answer body and trigger early/wrong
+  // completion or extraction. Scanning bare, whole lines avoids that.
   function extractAnswer() {
     var nodes = document.querySelectorAll('[data-message-author-role="assistant"]');
     for (var k = nodes.length - 1; k >= 0; k--) {
       var t = (nodes[k].innerText || "").replace(/\r\n/g, "\n");
-      var e = t.lastIndexOf(END);   // last occurrence = the real closing sentinel, even if echoed earlier
-      if (e < 0) continue;
-      var b = t.lastIndexOf(BEGIN, e);
-      if (b < 0) return null;       // require a matching BEGIN before END; no silent fallback
-      return t.slice(b + BEGIN.length, e).trim();
+      var lines = t.split("\n");
+      var i = -1;
+      for (var a = 0; a < lines.length; a++) {
+        if (lines[a].trim() === BEGIN) { i = a; break; }
+      }
+      if (i < 0) continue;
+      var j = -1;
+      for (var b = i + 1; b < lines.length; b++) {
+        if (lines[b].trim() === END) { j = b; break; }
+      }
+      if (!(j > i)) return null;   // require a matching END after BEGIN; no silent fallback
+      var body = lines.slice(i + 1, j).join("\n").trim();
+      if (!body) return null;      // extracted body must be non-empty
+      return body;
     }
     return null;
   }

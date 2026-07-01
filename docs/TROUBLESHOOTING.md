@@ -51,6 +51,34 @@ reading; if you hit this, make sure the tab wasn't manually closed and that the
 consult actually completed (`bin/cgc status --rid <RID>`). Increase `--timeout`
 for very long consults (the bound is a safety cap, not the expected duration).
 
+## Waiter exit codes
+- **`0`** — the wrapped answer was retrieved (clean `BEGIN_RESPONSE:<rid>` /
+  `END_RESPONSE:<rid>` extraction), **or** a best-effort salvage at timeout (see
+  below). Both cases write the answer to `--out`.
+- **`4`** — genuine no-answer timeout: nothing usable was present when the waiter
+  gave up.
+- **`3`** — a blocker was detected (login, CAPTCHA, or rate-limit).
+- **`2`** — usage error (bad flags/arguments).
+
+## `sentinel_missing` / `CGC_UNWRAPPED` / `.raw`
+If the model never emits a clean `BEGIN_RESPONSE:<rid>` / `END_RESPONSE:<rid>`
+pair before the inner `--timeout` expires, the waiter does one last best-effort
+salvage instead of failing outright: if a substantial answer is present in the
+tab (even without the wrapper), it writes that text to `--out` **and** to a
+sibling `<out>.raw` file, and logs `CGC_UNWRAPPED` to the task output. This still
+exits `0` — the consult produced *something*, just not through the sentinel
+contract — whereas exit `4` is reserved for the case where nothing usable was
+present at all.
+
+**Do not fully trust unwrapped output.** Because it was taken without the
+sentinel boundary, there's no guarantee the model was actually finished — the
+salvage can be a mid-stream snapshot or otherwise cut off. Before acting on it:
+check whether it reads as a complete answer (ends on a natural conclusion, not
+mid-sentence/mid-list), and prefer following up (`followup --task "did that
+answer finish? re-send the rest"`) if it looks truncated. The `.raw` sibling file
+preserves exactly what was salvaged, in case the primary `--out` file gets
+overwritten by a later step.
+
 ## `gh` warnings in doctor
 `gh` is optional but recommended. Without it, `deliver` can't verify repo
 visibility or resolve PR associations. Install from https://cli.github.com and

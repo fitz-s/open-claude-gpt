@@ -103,6 +103,117 @@ def test_doctor_json_shape():
     assert "ok" in d and isinstance(d["checks"], list) and d["checks"]
 
 
+# ---- SHARED CONTRACT #1: line-anchored sentinel parser fixtures -------------
+# The parser (skill/scripts/cdp_consult.py:_sentinel_parse) must fire `done` ONLY on a bare
+# standalone sentinel line (trimmed value exactly equal to "BEGIN_RESPONSE:<rid>" / "END_RESPONSE:
+# <rid>") — a line that merely CONTAINS the sentinel text (quoted in prose, or inside a fenced
+# code block) must NOT match. The JS mirror (_sentinel_js) implements the identical rule; these
+# tests exercise the importable Python helper directly.
+
+_RID = "REQ-20260701-120000-abcdef"
+
+
+def _cdp():
+    return _load("cdp_consult.py")
+
+
+def test_sentinel_parse_quoted_inline_then_real_wrapper():
+    # (1) body quotes both BEGIN_RESPONSE/END_RESPONSE inline (in prose) before the real final
+    # bare wrapper — the inline quoting must NOT be mistaken for the real markers.
+    m = _cdp()
+    text = (
+        "some text\n"
+        f"mentions BEGIN_RESPONSE:{_RID} inline in prose, and END_RESPONSE:{_RID} too, not real\n"
+        f"BEGIN_RESPONSE:{_RID}\n"
+        "real body line 1\n"
+        "real body line 2\n"
+        f"END_RESPONSE:{_RID}\n"
+    )
+    done, body = m._sentinel_parse(text, _RID)
+    assert done is True
+    assert body == "real body line 1\nreal body line 2"
+
+
+def test_sentinel_parse_end_inside_fenced_code_block():
+    # (2) END token inside a fenced code block (not a bare standalone line) must not satisfy done.
+    m = _cdp()
+    text = (
+        f"BEGIN_RESPONSE:{_RID}\n"
+        "here is some content\n"
+        "```\n"
+        f"END_RESPONSE:{_RID} is the marker\n"
+        "```\n"
+        "more content\n"
+    )
+    done, body = m._sentinel_parse(text, _RID)
+    assert done is False
+    assert body == ""
+
+
+def test_sentinel_parse_missing_end():
+    # (3) missing END entirely.
+    m = _cdp()
+    text = f"BEGIN_RESPONSE:{_RID}\nsome content, never terminated\n"
+    done, body = m._sentinel_parse(text, _RID)
+    assert done is False
+    assert body == ""
+
+
+def test_sentinel_parse_two_assistant_messages():
+    # (4) extraneous text before/after the wrapper (as if two assistant messages/turns were
+    # concatenated) — the parser must still find the FIRST bare BEGIN and the FIRST bare END
+    # after it, ignoring trailing junk.
+    m = _cdp()
+    text = (
+        "irrelevant text before\n"
+        f"BEGIN_RESPONSE:{_RID}\n"
+        "first body\n"
+        f"END_RESPONSE:{_RID}\n"
+        "trailing junk not part of any block\n"
+    )
+    done, body = m._sentinel_parse(text, _RID)
+    assert done is True
+    assert body == "first body"
+
+
+def test_sentinel_parse_valid_final_bare_wrapper():
+    # (5) a valid final bare wrapper, no surrounding noise.
+    m = _cdp()
+    text = f"BEGIN_RESPONSE:{_RID}\nhello world\nEND_RESPONSE:{_RID}"
+    done, body = m._sentinel_parse(text, _RID)
+    assert done is True
+    assert body == "hello world"
+
+
+def test_sentinel_parse_trailing_whitespace_on_wrapper_lines():
+    # (6) trailing/leading whitespace on the wrapper lines should still match after trim().
+    m = _cdp()
+    text = f"BEGIN_RESPONSE:{_RID}   \nhello world\n   END_RESPONSE:{_RID}  \n"
+    done, body = m._sentinel_parse(text, _RID)
+    assert done is True
+    assert body == "hello world"
+
+
+def test_sentinel_parse_crlf_normalized():
+    # \r\n must normalize to \n before line-splitting, per the shared contract.
+    m = _cdp()
+    text = f"BEGIN_RESPONSE:{_RID}\r\nhello\r\nEND_RESPONSE:{_RID}\r\n"
+    done, body = m._sentinel_parse(text, _RID)
+    assert done is True
+    assert body == "hello"
+
+
+def test_code_url_re_requires_real_url():
+    # PROVENANCE gate: the code-link check must require an actual github/gist URL, not merely
+    # the substring "github" (the old spoofable check).
+    m = _cdp()
+    assert m._CODE_URL_RE.search("please read https://github.com/acme/widgets/tree/abc123")
+    assert m._CODE_URL_RE.search("see https://gist.github.com/user/deadbeef")
+    assert m._CODE_URL_RE.search("raw: https://raw.githubusercontent.com/acme/widgets/main/x.py")
+    assert not m._CODE_URL_RE.search("this mentions github but has no link")
+    assert not m._CODE_URL_RE.search("github.com/acme/widgets")  # no scheme
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

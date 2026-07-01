@@ -58,6 +58,8 @@ Ship a **public GitHub PR/tree link** and get a grounded, file-cited review — 
 - **`consult.py prep`** — renders the outgoing prompt from a template, wrapping the answer in `BEGIN_RESPONSE:<rid>` / `END_RESPONSE:<rid>` sentinels so completion is unambiguous.
 - **`cdp_consult.py submit` / `followup` / `wait` / `status`** — the CDP control plane: open a chat, (optionally) select the model tier, type + send, and poll to completion in a detached process.
 
+The detached `wait` runs under an outer `timeout 899` (bounded so a background waiter can't hang a turn — a background-task guard blocks anything over the 900s cap) with an inner `--timeout 870` (~15 minutes, ~29s under the outer bound so a timeout-rescue grab still has time to run and exit cleanly). That ~15-minute cap is just a knob — raise both numbers together for a big review (keeping the outer at or under 900). See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
 A **dedicated Chrome profile** is used because CDP is disallowed on Chrome's default profile (anti-cookie-theft, Chrome 136+). You log into ChatGPT there once; your normal Chrome is untouched.
 
 ## Auto model-selection (toggleable)

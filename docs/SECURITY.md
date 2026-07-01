@@ -18,8 +18,12 @@ It is designed so the agent never touches your credentials and so consults ship
   credential path — it drives an already-authenticated session.
 - The login persists in the dedicated profile (`CGC_PROFILE`, default
   `~/.cgc-chrome`), isolated from your normal Chrome.
-- Remote debugging is scoped to loopback (`--remote-allow-origins=http://127.0.0.1:<port>`),
-  not `*`. Only a local client on that port can attach.
+- Remote debugging is scoped to loopback in two layers: the debug Chrome is
+  launched with `--remote-debugging-address=127.0.0.1`, so the DevTools socket
+  itself never binds to a routable interface, plus `--remote-allow-origins=http://127.0.0.1:<port>`
+  (not `*`), so only a same-origin local client on that port can attach. `bin/cgc
+  doctor` verifies the port is actually listening on loopback only, not just that
+  the allow-origins flag was passed.
 
 ## Don't send secrets
 

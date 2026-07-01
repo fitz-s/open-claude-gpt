@@ -13,6 +13,7 @@ gate CI or a first-run setup.
     python3 cgc_doctor.py              # human-readable report
     python3 cgc_doctor.py --json       # machine-readable
     python3 cgc_doctor.py --deep       # also probe login state via CDP (needs Chrome up)
+    python3 cgc_doctor.py --secure     # hard-fail on loopback-bind / gh-auth advisories
 """
 from __future__ import annotations
 
@@ -59,6 +60,37 @@ def _find_chrome():
     return None
 
 
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def is_loopback_addr(addr: str) -> bool:
+    """Classify a listen-address string as loopback (True) or routable (False).
+
+    Accepts forms seen across `lsof`/`ss`/`netstat` output, e.g.:
+      "127.0.0.1:9333", "127.0.0.1", "[::1]:9333", "::1", "localhost:9333",
+      "0.0.0.0:9333", "*:9333", "0.0.0.0", "::", "192.168.1.5:9333".
+    """
+    a = addr.strip()
+    if not a:
+        return False
+    # Strip IPv6 brackets, e.g. "[::1]:9333" -> "::1:9333" handled below.
+    if a.startswith("["):
+        host, _, rest = a[1:].partition("]")
+        return host in LOOPBACK_HOSTS
+    # Bare "*" (netstat/lsof wildcard) is routable (binds all interfaces).
+    if a in ("*", "0.0.0.0", "::"):
+        return False
+    # host:port form — split on the LAST colon so bare IPv6 (multiple colons)
+    # without brackets is still handled reasonably.
+    if ":" in a:
+        host, _, port = a.rpartition(":")
+        if port.isdigit() or port == "*":
+            if host in LOOPBACK_HOSTS or host in ("0.0.0.0", "*"):
+                return host in LOOPBACK_HOSTS
+            # No port separator matched a digit/star — fall through to full-string check.
+    return a in LOOPBACK_HOSTS
+
+
 class Report:
     def __init__(self):
         self.rows = []       # (level, name, detail, fix)
@@ -94,7 +126,81 @@ class Report:
             print(f"{GREEN}✓ all checks passed — open-claude-gpt is ready.{RESET}")
 
 
-def run(deep: bool) -> Report:
+def _report(r: "Report", secure: bool, name, detail="", fix=""):
+    """Warn by default; under --secure, escalate to a hard fail."""
+    if secure:
+        r.fail(name, detail, fix)
+    else:
+        r.warn(name, detail, fix)
+
+
+def _listen_addrs_for_port(port: int):
+    """Best-effort list of listen addresses bound to `port`, using whichever
+    of lsof/ss/netstat is available on the host. Returns (addrs, tool_used);
+    tool_used is None if no suitable tool was found.
+    """
+    # lsof -nP -iTCP:<port> -sTCP:LISTEN
+    if shutil.which("lsof"):
+        try:
+            out = subprocess.run(
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                capture_output=True, text=True, timeout=5,
+            )
+            addrs = []
+            for line in out.stdout.splitlines()[1:]:  # skip header
+                parts = line.split()
+                if not parts:
+                    continue
+                name_field = parts[-2] if len(parts) >= 2 and parts[-1] == "(LISTEN)" else parts[-1]
+                # NAME field looks like "127.0.0.1:9333" or "*:9333"
+                addrs.append(name_field.rsplit("->", 1)[0])
+            if addrs:
+                return addrs, "lsof"
+        except Exception:
+            pass
+
+    # ss -ltnp
+    if shutil.which("ss"):
+        try:
+            out = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=5)
+            addrs = []
+            for line in out.stdout.splitlines():
+                if f":{port}" not in line:
+                    continue
+                cols = line.split()
+                for col in cols:
+                    if col.rstrip("0123456789").endswith(":") or ":" in col:
+                        if col.endswith(f":{port}"):
+                            addrs.append(col)
+                            break
+            if addrs:
+                return addrs, "ss"
+        except Exception:
+            pass
+
+    # netstat -an
+    if shutil.which("netstat"):
+        try:
+            out = subprocess.run(["netstat", "-an"], capture_output=True, text=True, timeout=5)
+            addrs = []
+            for line in out.stdout.splitlines():
+                if f".{port} " not in line and f":{port} " not in line and \
+                   not line.rstrip().endswith(f".{port}") and not line.rstrip().endswith(f":{port}"):
+                    continue
+                if "LISTEN" not in line:
+                    continue
+                cols = line.split()
+                if len(cols) >= 4:
+                    addrs.append(cols[3])
+            if addrs:
+                return addrs, "netstat"
+        except Exception:
+            pass
+
+    return [], None
+
+
+def run(deep: bool, secure: bool = False) -> Report:
     r = Report()
 
     # 1. Python
@@ -118,19 +224,30 @@ def run(deep: bool) -> Report:
 
     # 3. gh CLI (used by `deliver` to resolve PRs / repo visibility)
     gh = shutil.which("gh")
+    gh_authed = False
     if gh:
         try:
             auth = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=10)
             if auth.returncode == 0:
+                gh_authed = True
                 r.ok("gh CLI", "installed + authenticated")
             else:
-                r.warn("gh CLI", "installed but not authenticated",
-                       "run `gh auth login` (needed for private-repo visibility checks + PR resolution)")
+                _report(r, secure, "gh CLI", "installed but not authenticated",
+                        "run `gh auth login` (needed for private-repo visibility checks + PR resolution)")
         except Exception:
-            r.warn("gh CLI", "installed, auth status unknown", "run `gh auth login`")
+            _report(r, secure, "gh CLI", "installed, auth status unknown", "run `gh auth login`")
     else:
-        r.warn("gh CLI", "not found",
-               "install from https://cli.github.com — `deliver` uses it to resolve PRs and repo visibility")
+        _report(r, secure, "gh CLI", "not found",
+                "install from https://cli.github.com — `deliver` uses it to resolve PRs and repo visibility")
+
+    # 3b. release-safe advisory: without gh auth, `deliver`'s public-visibility
+    # stamping degrades to best-effort. Lenient by default; hard fail under --secure.
+    if not gh_authed:
+        _report(r, secure, "release-safe (gh auth)",
+                "public-visibility stamping in `deliver` is best-effort without gh auth",
+                "run `gh auth login` before relying on deliver's visibility checks")
+    else:
+        r.ok("release-safe (gh auth)", "gh authenticated — visibility stamping fully supported")
 
     # 4. Chrome / Chromium / Edge
     chrome = _find_chrome()
@@ -150,6 +267,27 @@ def run(deep: bool) -> Report:
     except Exception:
         r.warn(f"debug Chrome (port {PORT})", "not running",
                f"start it: `bash {os.path.join(HERE, 'cdp_launch.sh')}` (then log into ChatGPT once)")
+
+    # 5b. Debug port bound to loopback only (security: must not be reachable off-host).
+    if up:
+        addrs, tool = _listen_addrs_for_port(PORT)
+        if tool is None:
+            r.warn(f"loopback bind (port {PORT})", "no lsof/ss/netstat available to verify",
+                   "install lsof, ss (iproute2), or netstat to verify the bind address")
+        elif not addrs:
+            r.warn(f"loopback bind (port {PORT})", f"{tool} found no LISTEN entry for the port",
+                   "verify manually, e.g. `lsof -nP -iTCP:%d -sTCP:LISTEN`" % PORT)
+        else:
+            routable = [a for a in addrs if not is_loopback_addr(a)]
+            if routable:
+                _report(r, secure, f"loopback bind (port {PORT})",
+                        f"listening on non-loopback address(es) via {tool}: {', '.join(routable)}",
+                        "restart with `--remote-debugging-address=127.0.0.1` (see cdp_launch.sh); "
+                        "never expose the CDP port beyond localhost")
+            else:
+                r.ok(f"loopback bind (port {PORT})", f"loopback-only via {tool}: {', '.join(addrs)}")
+    else:
+        r.warn(f"loopback bind (port {PORT})", "skipped (Chrome not up)")
 
     # 6. Login state (deep only — needs Chrome up)
     if deep and up:
@@ -215,8 +353,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(prog="cgc doctor")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--deep", action="store_true", help="also probe ChatGPT login via CDP (needs Chrome up)")
+    ap.add_argument("--secure", action="store_true",
+                     help="hard-fail on loopback-bind and gh-auth advisories instead of warning")
     a = ap.parse_args()
-    rep = run(a.deep)
+    rep = run(a.deep, a.secure)
     if a.json:
         print(json.dumps({
             "ok": not rep.hard_fail,
