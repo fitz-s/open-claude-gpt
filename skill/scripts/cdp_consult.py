@@ -249,8 +249,9 @@ class CDP:
         """Attach to a ChatGPT page target.
         - create_url: open a NEW tab at this URL and attach to it (isolates a consult
           so concurrent consults never clobber each other's conversation).
-        - match: attach only to the page whose URL contains this substring (a /c/<id>
-          conversation id) — pins wait/status to the exact conversation.
+        - match: attach only to the page whose parsed URL pathname is /c/<id> (or
+          /c/<id>/...) for this conversation id — matched on pathname + hostname, never a
+          full-URL substring — so it pins wait/status to the exact conversation.
         - neither: attach to the single ChatGPT page; ERROR if there are several
           (ambiguous — caller must pin with a conversation id).
         """
@@ -280,7 +281,12 @@ class CDP:
                 raise SystemExit("CGC_ERROR new_tab_no_ws")
         else:
             info = json.load(urllib.request.urlopen(f"{base}/json", timeout=5))
-            pages = [t for t in info if t.get("type") == "page" and "chatgpt.com" in (t.get("url") or "")]
+            # Hostname-exact (not a substring like "chatgpt.com" anywhere in the URL) —
+            # defense-in-depth so a page at e.g. /c/<id>?x=chatgpt.com is never attachable.
+            def _is_chatgpt(u):
+                h = (urllib.parse.urlparse(u or "").hostname or "").lower()
+                return h == "chatgpt.com" or h.endswith(".chatgpt.com")
+            pages = [t for t in info if t.get("type") == "page" and _is_chatgpt(t.get("url"))]
             if match:
                 # Match the URL PATH ONLY (via urlparse), never the query/hash — a tab whose URL
                 # merely contains the id in a query string or hash (e.g. ?ref=/c/<id> or #/c/<id>)
