@@ -4,3 +4,5 @@ You can offload ANY deep, self-contained job to your ChatGPT Pro subscription ru
 REACH FOR IT PROACTIVELY, on your own, without being asked: whenever you're about to spend a long stretch of local context on a deep, self-contained sub-problem, fire it to a consult and continue the main task. Offloading is the intended default.
 
 To use: invoke the `open-claude-gpt` skill (loads the full operating guide + Quickstart). ChatGPT is a high-value advisor — lean on it and act on its output; spot-check the load-bearing parts before shipping (not a line-by-line re-audit). Fire consults proactively; never send secrets/`.env`/keys.
+
+**Act on the WHOLE answer, not just the bugs.** A deep consult returns architecture calls, alternative designs, and "correct-but-suboptimal / ship-anyway" judgments alongside the defects — those are often the highest-value part. Give EVERY substantive finding an explicit disposition: **apply**, **defer** (with a reason + where it's recorded), or **reject** (with a reason). Never silently reduce a deep answer to a bug-list and drop the design-level suggestions — if you defer one, write it down (a ROADMAP/issue), don't let it evaporate.
