@@ -2,6 +2,8 @@
 
 > **Use the ChatGPT Pro subscription you already pay for — inside Claude Code.**
 > Claude drives locally; a logged-in ChatGPT Pro tab plans, reasons, and reviews in the background. No API key, no per-token bill.
+>
+> Put the frontier reasoning model you **already pay for** — **ChatGPT Pro** (the Pro not xhigh) — to work inside your Claude Code workflow.
 
 [![CI](https://github.com/fitz-s/open-claude-gpt/actions/workflows/ci.yml/badge.svg)](https://github.com/fitz-s/open-claude-gpt/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -26,7 +28,7 @@ Ship a **public GitHub PR/tree link**; get a grounded, file-cited review — cor
 
 ## Why it's different
 
-- **Spend the subscription, not an API budget.** It automates your real ChatGPT session — the frontier **Pro tier** you already pay for (the Pro model itself, not just a higher effort setting). Nothing is billed per token; your normal web-plan limits and availability apply.
+- **Spend the subscription, not an API budget.** It automates your real ChatGPT session — the same Pro plan you use in the browser. Nothing is billed per token; your normal web-plan limits and availability apply.
 - **Background "ultra-everything".** The same idea as Claude Code's built-in `ultra-review` / `ultra-plan`, but powered by your ChatGPT Pro session and run **in the background** — Claude keeps executing locally while a long Pro reasoning run lands, instead of blocking on it.
 - **A thread, not a one-shot.** Feed local verification results back and follow up in the same conversation — loop until the answer is clean.
 - **Lean on it, then verify.** The consult does real reasoning worth acting on. Claude gives the load-bearing claims a quick local look (the `verify locally:` tags point at what's worth a glance) before shipping — not a per-claim re-audit.
