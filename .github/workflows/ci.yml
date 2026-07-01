@@ -15,7 +15,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install runtime dep
-        run: pip install websocket-client
+        run: pip install websocket-client pyyaml
 
       - name: Python scripts parse
         run: |

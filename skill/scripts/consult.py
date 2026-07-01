@@ -49,7 +49,7 @@ Role: {role}
 - Ground each claim in the actual source you read (code, docs, data), cited precisely — file + symbol/line or the source URL, inline.
 - Name the main alternatives or competing explanations you weighed and rejected, and the strongest case against your recommendation.
 - Cover the full chain end-to-end (inputs → state/data changes → side effects → outputs/edges), not a spot check; flag the error, boundary, ordering/concurrency, and rollback cases that apply.
-- Mark any claim that needs a local run as "verify locally: <check>", so Claude Code can apply and confirm it.
+- Answer with the confidence your evidence supports and commit to a call — Claude Code acts on this directly, it does not re-derive it. Reserve "verify locally: <check>" for the few claims that genuinely hinge on a runtime result you can't see from the source; do NOT hedge every point behind local verification.
 {refs_block}{context_block}
 # Constraints
 - Where you lack the source for a claim, say so and mark it unknown rather than guessing; don't assert results you didn't verify.
@@ -79,8 +79,9 @@ Continuing this consult — Claude Code acted on your last answer locally; the r
 # How to answer
 Where the local results contradict an earlier finding, revise it explicitly ("Revising <finding>: …") and \
 say why; where they confirm it, say so and move on. If asked for a new plan or design, challenge whether the \
-approach is right and name a superior alternative if one exists before detailing it. Tag claims that need a \
-local run "verify locally: <check>". Lead with a one-line verdict + confidence, then keep the finding shape:
+approach is right and name a superior alternative if one exists before detailing it. Commit to calls Claude Code \
+can act on directly; reserve "verify locally: <check>" for the few claims that truly hinge on a runtime result \
+you can't see (not a hedge on every point). Lead with a one-line verdict + confidence, then keep the finding shape:
 `[SEVERITY] category — file:path:line — impact — concrete fix — verify locally: <check>`
 
 # Final output format
@@ -101,14 +102,16 @@ DEFAULT_OUTPUT_BODY = (
     "then list the findings, one per entry in this shape:\n"
     "`[SEVERITY] category — file:path:line — impact (one sentence) — concrete fix — verify locally: <command/test>`\n"
     "(SEVERITY is one of BLOCKER / HIGH / MEDIUM / LOW / NIT). For other deep work (research, analysis, "
-    "design, a plan), structure the body the way the task and any output spec above require. Close with the "
-    "highest-value local checks, the sources you used (and any you couldn't read), and any load-bearing "
-    "assumptions. Keep everything except a findings list in plain prose."
+    "design, a plan), structure the body the way the task and any output spec above require. Answer with "
+    "conviction Claude Code can act on; append \"verify locally: <check>\" only on the few findings that "
+    "genuinely need a runtime you can't see, not one per finding. Close with the sources you used (and any "
+    "you couldn't read) and any load-bearing assumptions. Keep everything except a findings list in plain prose."
 )
 REPLACE_OUTPUT_CLOSE = (
     "Produce exactly the output structure above. Use ONE consistent severity scale and finding shape "
-    "throughout — do not introduce a second. Tag any claim that needs a local run with \"verify locally: "
-    "<check>\". Close with the highest-value local checks, the sources you used (and any you couldn't read), "
+    "throughout — do not introduce a second. Commit to calls Claude Code can act on directly; reserve "
+    "\"verify locally: <check>\" for the few claims that truly hinge on a runtime result you can't see, "
+    "not a hedge on every point. Close with the sources you used (and any you couldn't read) "
     "and any load-bearing assumptions."
 )
 

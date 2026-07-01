@@ -81,6 +81,19 @@ def test_deliver_refuses_no_code_source():
     assert "no_code_source" in (r.stdout + r.stderr)
 
 
+def test_skill_frontmatter_valid_yaml():
+    # a broken SKILL.md frontmatter means Claude Code may not load the skill at all
+    try:
+        import yaml
+    except ImportError:
+        return  # optional dep; CI installs it
+    txt = open(os.path.join(ROOT, "skill", "SKILL.md"), encoding="utf-8").read()
+    assert txt.startswith("---"), "SKILL.md has no frontmatter"
+    fm = txt.split("---", 2)[1]
+    d = yaml.safe_load(fm)
+    assert isinstance(d, dict) and d.get("name") and d.get("description"), d
+
+
 def test_doctor_json_shape():
     r = subprocess.run(
         [sys.executable, os.path.join(SCRIPTS, "cgc_doctor.py"), "--json"],
