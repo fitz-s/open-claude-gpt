@@ -48,11 +48,12 @@ Role: {role}
 {task}
 
 # Success criteria
-- Open with a one-line verdict/recommendation and your confidence (high / medium / low).
-- Ground each claim in the actual source you read (code, docs, data), cited precisely — file + symbol/line or the source URL, inline.
-- Name the main alternatives or competing explanations you weighed and rejected, and the strongest case against your recommendation.
-- Cover the full chain end-to-end (inputs → state/data changes → side effects → outputs/edges), not a spot check; flag the error, boundary, ordering/concurrency, and rollback cases that apply.
-- Answer with the confidence your evidence supports and commit to a call — Claude Code acts on this directly, it does not re-derive it. Reserve "verify locally: <check>" for the few claims that genuinely hinge on a runtime result you can't see from the source; do NOT hedge every point behind local verification.
+- Open with the answer or recommendation and your confidence.
+- Ground factual claims in the supplied sources or clearly named external sources.
+- State the strongest alternative or counterargument you considered.
+- For code/review tasks: cover correctness, security, migration/rollback, concurrency/ordering, and boundary cases.
+- For plans/research/design/math tasks: use the task's requested structure and name the assumptions that would change the answer.
+- Mark only claims that genuinely need a local runtime check as "verify locally: <check>".
 {refs_block}{context_block}
 # Constraints
 - Where you lack the source for a claim, say so and mark it unknown rather than guessing; don't assert results you didn't verify.
@@ -104,11 +105,12 @@ DEFAULT_OUTPUT_BODY = (
     "Open with the verdict and the reasoning behind it. For a review/code consult, "
     "then list the findings, one per entry in this shape:\n"
     "`[SEVERITY] category — file:path:line — impact (one sentence) — concrete fix — verify locally: <command/test>`\n"
-    "(SEVERITY is one of BLOCKER / HIGH / MEDIUM / LOW / NIT). For other deep work (research, analysis, "
-    "design, a plan), structure the body the way the task and any output spec above require. Answer with "
-    "conviction Claude Code can act on; append \"verify locally: <check>\" only on the few findings that "
-    "genuinely need a runtime you can't see, not one per finding. Close with the sources you used (and any "
-    "you couldn't read) and any load-bearing assumptions. Keep everything except a findings list in plain prose."
+    "(SEVERITY is one of BLOCKER / HIGH / MEDIUM / LOW / NIT). This findings list is for review/code consults; "
+    "other deep work (research, analysis, design, a plan, math) follows the task's requested structure instead "
+    "of the findings shape. Answer with conviction Claude Code can act on; append \"verify locally: <check>\" "
+    "only on the few claims that genuinely need a runtime you can't see, not one per finding. Close with the "
+    "sources you used (and any you couldn't read) and any load-bearing assumptions. Keep everything except a "
+    "findings list in plain prose."
 )
 REPLACE_OUTPUT_CLOSE = (
     "Produce exactly the output structure above. Use ONE consistent severity scale and finding shape "

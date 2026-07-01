@@ -29,15 +29,25 @@ It is designed so the agent never touches your credentials and so consults ship
 
 The skill is built to **not** exfiltrate private content, but you own the inputs:
 
-- **Never** put `.env` files, API keys, tokens, or unrelated personal data in a
-  prompt, gist, context file, or link.
+- **Never** put `.env` files, API keys, tokens, credentials, log output, or any
+  private/customer/proprietary data in a prompt, gist, context file, or link —
+  including inside a **public** gist. A public gist is still public: anything
+  pasted into one is world-readable the moment it's created, same as a public
+  repo link.
 - `deliver` checks repo visibility (`gh`) and stamps the payload: a **public**
   repo's links are declared world-readable; a **private** repo is flagged as
   exfiltration and points you at pushing to a public repo or keeping it local.
 - **Prefer links to pushed, public code.** A pushed commit with an associated PR
-  always resolves to that public PR link. Gist is a last resort for genuinely
-  unpushed/private-inaccessible state, and gisting content that is *already* on
-  GitHub is explicitly disallowed by the skill's rules.
+  always resolves to that public PR link. A **public gist** is a last resort for
+  genuinely unpushed/private-inaccessible state — never a private gist, and never
+  a substitute for keeping secrets out in the first place. Gisting content that
+  is *already* on GitHub is explicitly disallowed by the skill's rules: the
+  model gets a link to the existing public code, not a copy.
+- **What must never go in a gist (public or otherwise):** `.env` files or any
+  file containing secrets, API keys/tokens/credentials, session cookies, log
+  files that may contain internal hostnames or user data, and any
+  customer/proprietary data. If content doesn't belong in a public repo, it
+  doesn't belong in a gist either.
 
 ## Fail-closed guarantees
 

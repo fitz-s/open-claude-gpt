@@ -50,4 +50,6 @@ CI runs the same checks (`.github/workflows/ci.yml`).
 ## Reporting bugs
 
 Include your OS, Chrome version, `bin/cgc doctor --json` output, and the exact
-`CGC_ERROR …` line if any.
+`CGC_ERROR …` line if any. Before posting, redact local usernames, home paths,
+ChatGPT project URLs, conversation IDs, and any repo/customer names you don't
+want public; never paste secrets or `.env` contents.

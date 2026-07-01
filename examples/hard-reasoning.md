@@ -8,16 +8,17 @@ math) before trusting it.
 ## A. A concurrency / correctness argument (code-grounded)
 
 ```bash
-bin/cgc deliver --repo owner/repo --ref main --files src/scheduler/queue.rs
+REFS_FILE="$(bin/cgc deliver --repo owner/repo --ref main --files src/scheduler/queue.rs | python3 -c 'import json,sys; print(json.load(sys.stdin)["refs_file"])')"
 
 bin/cgc prep \
   --title "Is the lock-free queue actually linearizable?" \
   --role "concurrency theorist auditing a lock-free data structure" \
   --task "Prove or refute that the MPSC queue in src/scheduler/queue.rs is linearizable. Walk the interleavings that matter (concurrent push vs pop, the CAS on tail, ABA). If it's buggy, give the exact interleaving that violates it and a fix. Mark anything needing a runtime check 'verify locally'." \
-  --refs-file /tmp/cgc/refs_*.md
+  --refs-file "$REFS_FILE"
 
 bin/cgc submit --rid <RID> --prompt-file /tmp/cgc/prompt_<RID>.md
-timeout 900 bin/cgc wait --rid <RID> --out /tmp/cgc/answer_<RID>.txt --timeout 870
+# Copy the exact waiter command printed by submit — it includes the conversation id.
+timeout 899 bin/cgc wait --rid <RID> --conversation <CONVERSATION_ID> --out ./cgc_answers/answer_<RID>.txt --poll 20 --timeout 870
 ```
 
 Then **verify locally**: Claude writes the stress test / loom model the answer
@@ -26,15 +27,30 @@ suggests and runs it — the proof is a hypothesis until the test passes.
 ## B. A self-contained math / calculation problem (no repo)
 
 No code source? A design doc or the problem statement itself can be the source via
-a gist:
+a gist — **public gist only**, never for private source, secrets, logs, `.env`, or
+customer data:
 
 ```bash
-gh gist create problem.md          # only for content genuinely not already on GitHub
+# only for content genuinely not already on GitHub, and only if it's safe to make public
+GIST_URL="$(gh gist create --public problem.md | tail -n1)"
+
+cat > /tmp/cgc/refs_problem.md <<EOF
+> Source visibility: PUBLIC — public gist created for this consult.
+
+# References
+
+- $GIST_URL — public problem statement
+EOF
+
 bin/cgc prep \
   --title "Closed-form for the retry-budget expectation" \
   --role "applied mathematician" \
   --task "Derive the expected total retries under exponential backoff with jitter, cap C, base b, max attempts n. Show the derivation; give the closed form; sanity-check against n=1 and C→∞." \
-  --refs-file <gist-url-refs-file>
+  --refs-file /tmp/cgc/refs_problem.md
+
+bin/cgc submit --rid <RID> --prompt-file /tmp/cgc/prompt_<RID>.md
+# Copy the exact waiter command printed by submit — it includes the conversation id.
+timeout 899 bin/cgc wait --rid <RID> --conversation <CONVERSATION_ID> --out ./cgc_answers/answer_<RID>.txt --poll 20 --timeout 870
 ```
 
 Verify locally: Claude runs a quick Monte-Carlo simulation and checks the closed

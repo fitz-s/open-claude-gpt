@@ -1,5 +1,8 @@
 # Output spec: architecture decision record
 
+Copyable contract for `bin/cgc prep --output-file`/`--output-replace` — pass this
+file's path to shape the answer instead of the default findings list.
+
 Use ONE consistent structure (this replaces the default findings list):
 
 1. **Recommendation** — one line + confidence (high/medium/low).
