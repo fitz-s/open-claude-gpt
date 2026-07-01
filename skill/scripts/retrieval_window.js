@@ -1,6 +1,6 @@
 // Created: 2026-06-10
 // Last reused or audited: 2026-06-10
-// Authority basis: chatgpt-consult skill v1 — DOM retrieval windowing
+// Authority basis: open-claude-gpt skill v1 — DOM retrieval windowing
 //
 // Purpose: read a large ChatGPT answer through get_page_text under the 50000-char
 // tool-output cap. get_page_text has no offset param, so this script renders the

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # Created: 2026-06-10
 # Last reused or audited: 2026-06-15
-# Authority basis: chatgpt-consult skill v2 — prep renders the GPT-5.5 outcome-first
+# Authority basis: open-claude-gpt skill v2 — prep renders the GPT-5.5 outcome-first
 #   PROMPT_TEMPLATE (title + steerable role + end-to-end depth mandate) and, with
 #   --followup, the FOLLOWUP_TEMPLATE for a continuing thread; deliver builds
 #   purpose-grouped GitHub refs. Used by both the CDP backend (primary) and the MCP
 #   fallback.
 """
-Prep helper for the chatgpt-consult skill.
+Prep helper for the open-claude-gpt skill.
 
 Generates a per-consult REQUEST_ID, renders the prompt file (sentinel contract +
 "keep raw reference URLs inline"), and renders retrieval_window.js with the

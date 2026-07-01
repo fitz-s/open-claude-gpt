@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # Created: 2026-07-01
 # Last reused or audited: 2026-07-01
-# Authority basis: chatgpt-consult OSS packaging — health check / preflight.
+# Authority basis: open-claude-gpt OSS packaging — health check / preflight.
 """
-cgc doctor — verify a chatgpt-consult install end-to-end.
+cgc doctor — verify a open-claude-gpt install end-to-end.
 
 Runs a sequence of independent checks (deps, browser, debug port, login,
 scratch dir, skill files, config) and prints a pass/warn/fail line for each
@@ -31,7 +31,7 @@ if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
 PORT = int(os.environ.get("CGC_PORT", "9333"))
 PROFILE = os.environ.get("CGC_PROFILE", os.path.expanduser("~/.cgc-chrome"))
 STATE_DIR = os.environ.get("CGC_STATE_DIR", "/tmp/cgc")
-MODEL = os.environ.get("CGC_MODEL", "Pro Extended")
+MODEL = os.environ.get("CGC_MODEL", "Pro")
 PROJECT_URL = os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/ (new chat)")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -91,7 +91,7 @@ class Report:
         elif n_warn:
             print(f"{YELLOW}! ready, with {n_warn} warning(s).{RESET} Consults will run; warnings are optional polish.")
         else:
-            print(f"{GREEN}✓ all checks passed — chatgpt-consult is ready.{RESET}")
+            print(f"{GREEN}✓ all checks passed — open-claude-gpt is ready.{RESET}")
 
 
 def run(deep: bool) -> Report:
@@ -223,7 +223,7 @@ def main() -> int:
             "checks": [{"level": lv, "name": n, "detail": d, "fix": fx} for lv, n, d, fx in rep.rows],
         }, indent=2))
     else:
-        print(f"\n{DIM}chatgpt-consult doctor{RESET}\n")
+        print(f"\n{DIM}open-claude-gpt doctor{RESET}\n")
         rep.render()
     return 1 if rep.hard_fail else 0
 

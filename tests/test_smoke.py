@@ -45,7 +45,7 @@ def test_config_true_defaults():
     m = _load("cdp_consult.py")
     assert m.CGC_PORT == 9333
     assert m.CGC_AUTO_MODEL is True
-    assert m.CGC_MODEL == "Pro Extended"
+    assert m.CGC_MODEL == "Pro"
     assert m.STATE_PATH == "/tmp/cgc/active.json"
 
 

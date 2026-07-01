@@ -4,7 +4,15 @@ All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-based
 releases until it stabilizes.
 
-## [Unreleased]
+## [Unreleased] — pre-0.1 draft (work in progress; not yet a release)
+
+### Renamed
+- Project is now **Open Claude GPT** (`open-claude-gpt`). The `cgc` CLI and `CGC_*`
+  environment prefix are unchanged.
+
+### Changed
+- Default model tier is now **`Pro`** (matches any Pro tier ChatGPT offers) instead
+  of `Pro Extended`; override with `CGC_MODEL` / `--model`.
 
 ### Added
 - Open-source packaging: `install.sh` / `uninstall.sh`, `bin/cgc` CLI dispatcher,

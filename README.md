@@ -1,12 +1,14 @@
-# chatgpt-consult
+# Open Claude GPT
 
-[![CI](https://github.com/YOUR_USER/chatgpt-consult/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USER/chatgpt-consult/actions/workflows/ci.yml)
+> **`open-claude-gpt`** — use your **ChatGPT Pro** subscription *with* **Claude Code**. Open-source bridge between the two: Claude drives, ChatGPT thinks in the background.
+
+[![CI](https://github.com/fitz-s/open-claude-gpt/actions/workflows/ci.yml/badge.svg)](https://github.com/fitz-s/open-claude-gpt/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 
 **Use your ChatGPT Pro subscription *with* Claude Code — spend the plan you already pay for on planning, hard reasoning, and review, running in the background while Claude keeps working.**
 
-`chatgpt-consult` is a [Claude Code](https://claude.com/claude-code) skill (also a standalone CLI) that turns a logged-in **ChatGPT Pro** tab into a background coprocessor for your local agent. Claude fires a self-contained job to ChatGPT — a plan, a hard reasoning problem, a code review — keeps doing local work, and is woken by a detached waiter when the full answer lands. **ChatGPT advises; Claude stays the source of truth and verifies every claim before acting on it.**
+`open-claude-gpt` is a [Claude Code](https://claude.com/claude-code) skill (also a standalone CLI) that turns a logged-in **ChatGPT Pro** tab into a background coprocessor for your local agent. Claude fires a self-contained job to ChatGPT — a plan, a hard reasoning problem, a code review — keeps doing local work, and is woken by a detached waiter when the full answer lands. **ChatGPT advises; Claude stays the source of truth and verifies every claim before acting on it.**
 
 No API keys, no per-token bill: it drives the **ChatGPT web app you're already logged into**, through an external Chrome DevTools client. If you pay for ChatGPT Pro, this is how you put that subscription to work next to Claude.
 
@@ -63,11 +65,11 @@ It's a switch:
 
 ```bash
 CGC_AUTO_MODEL=1                 # ON (default): select CGC_MODEL, fail closed if unavailable
-CGC_MODEL="Pro Extended"         # which tier to target (set the strongest your plan has)
+CGC_MODEL="Pro"         # which tier to target (set the strongest your plan has)
 CGC_AUTO_MODEL=0                 # OFF: don't touch the picker, send on whatever is shown
 ```
 
-Per-consult override: `--model "High"` or `--model skip`. On a plan you have but not `Pro Extended`, just set `CGC_MODEL` to it.
+Per-consult override: `--model "High"` or `--model skip`. On a plan you have but not `Pro`, just set `CGC_MODEL` to it.
 
 ## Requirements
 
@@ -79,9 +81,9 @@ Per-consult override: `--model "High"` or `--model skip`. On a plan you have but
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USER/chatgpt-consult
-cd chatgpt-consult
-./install.sh            # copies the skill into ~/.claude/skills/chatgpt-consult, checks deps, runs doctor
+git clone https://github.com/fitz-s/open-claude-gpt
+cd open-claude-gpt
+./install.sh            # copies the skill into ~/.claude/skills/open-claude-gpt, checks deps, runs doctor
 # or: ./install.sh --link   (symlink — edits in the clone go live; good for hacking)
 ```
 
@@ -118,7 +120,7 @@ Everything host- or preference-specific is read from the environment — the pub
 | --- | --- | --- |
 | `CGC_PROJECT_URL` | new chat | ChatGPT URL a fresh consult opens — set to *your* project to group consults |
 | `CGC_AUTO_MODEL` | `1` | auto-pick the model tier before sending (fail closed) — on/off |
-| `CGC_MODEL` | `Pro Extended` | which tier auto-select targets |
+| `CGC_MODEL` | `Pro` | which tier auto-select targets |
 | `CGC_PORT` | `9333` | remote-debugging port for the dedicated Chrome |
 | `CGC_PROFILE` | `~/.cgc-chrome` | dedicated Chrome profile dir |
 | `CGC_CHROME` | auto-detect | explicit browser binary |

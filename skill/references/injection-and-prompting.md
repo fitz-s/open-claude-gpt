@@ -6,7 +6,7 @@
 > - **Superseded / historical:** §1 "Core Contract", §3 "Deliver-Step Decision Procedure", §10 "Master Template", §12 "Implementation Checklist" — these describe the manual, pre-`deliver` workflow and a second prompt skeleton that no longer matches the tooling. Don't compose prompts from them.
 > - **§4 scenario templates** are GPT-5.5-era *legacy* (process-heavy, ALWAYS/NEVER, heading-per-finding). Mine them only as raw material for an `--output-file` contract; the live template owns the actual prompt structure.
 
-chatgpt-consult Information-Injection and Prompting Layer
+open-claude-gpt Information-Injection and Prompting Layer
 
 This section defines how Claude Code should package repository context for ChatGPT consults. Claude Code remains the local executor. ChatGPT is a remote reviewer that can browse URLs, reason over code, and return advisory output that Claude Code verifies locally.
 

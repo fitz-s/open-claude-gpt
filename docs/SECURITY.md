@@ -1,6 +1,6 @@
 # Security model
 
-`chatgpt-consult` automates a browser session **you** have already authenticated.
+`open-claude-gpt` automates a browser session **you** have already authenticated.
 It is designed so the agent never touches your credentials and so consults ship
 *links to already-public code*, not private content.
 

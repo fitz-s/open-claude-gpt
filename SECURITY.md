@@ -10,7 +10,7 @@ For non-sensitive hardening ideas, a normal issue is fine.
 
 ## Scope & model
 
-`chatgpt-consult` automates a browser session **you** have already authenticated.
+`open-claude-gpt` automates a browser session **you** have already authenticated.
 It never handles your credentials, calls no private ChatGPT API, and is built to
 ship *links to already-public code* rather than exfiltrate private content. The
 full threat model, credential handling, and fail-closed guarantees are documented

@@ -11,15 +11,15 @@
 ## Install the skill
 
 ```bash
-git clone https://github.com/YOUR_USER/chatgpt-consult
-cd chatgpt-consult
+git clone https://github.com/fitz-s/open-claude-gpt
+cd open-claude-gpt
 ./install.sh
 ```
 
 `install.sh`:
 
 1. checks `python3` + auto-installs `websocket-client` if missing,
-2. copies `skill/` into `~/.claude/skills/chatgpt-consult` (backing up any prior install to `.bak`),
+2. copies `skill/` into `~/.claude/skills/open-claude-gpt` (backing up any prior install to `.bak`),
 3. makes the scripts executable,
 4. runs `cgc doctor`.
 
@@ -58,10 +58,10 @@ A green run means the skill is ready; in Claude Code it activates automatically.
 ## Upgrade
 
 ```bash
-cd chatgpt-consult && git pull && ./install.sh
+cd open-claude-gpt && git pull && ./install.sh
 ```
 
-The prior install is moved to `~/.claude/skills/chatgpt-consult.bak` first.
+The prior install is moved to `~/.claude/skills/open-claude-gpt.bak` first.
 
 ## Uninstall
 

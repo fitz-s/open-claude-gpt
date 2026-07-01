@@ -57,6 +57,6 @@ visibility or resolve PR associations. Install from https://cli.github.com and
 `gh auth login`.
 
 ## Nothing activates in Claude Code
-Confirm the skill is installed at `~/.claude/skills/chatgpt-consult/SKILL.md`
+Confirm the skill is installed at `~/.claude/skills/open-claude-gpt/SKILL.md`
 (`bin/cgc doctor` checks this) and restart the Claude Code session so it re-scans
 skills.

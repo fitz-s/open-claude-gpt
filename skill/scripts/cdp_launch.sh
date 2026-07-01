@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Created: 2026-06-11
 # Last reused or audited: 2026-06-15
-# Authority basis: chatgpt-consult skill v2 (CDP backend). Adds CGC_GATE automated
+# Authority basis: open-claude-gpt skill v2 (CDP backend). Adds CGC_GATE automated
 #   gate mode so submit/wait can self-heal Step 0 with no LLM step.
 #
-# Launch / ensure the DEDICATED Chrome debug profile for chatgpt-consult.
+# Launch / ensure the DEDICATED Chrome debug profile for open-claude-gpt.
 # The agent never types credentials — the user logs into ChatGPT Pro once in the
 # window that opens; the profile PERSISTS the session across Chrome restarts.
 #
