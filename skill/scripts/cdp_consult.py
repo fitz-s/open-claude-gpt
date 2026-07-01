@@ -102,12 +102,19 @@ CGC_AUTO_MODEL = os.environ.get("CGC_AUTO_MODEL", "1").strip().lower() not in ("
 CGC_MODEL = os.environ.get("CGC_MODEL", "Pro") if CGC_AUTO_MODEL else "skip"
 CGC_PROJECT_URL = os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/")
 
-# ---- active-thread state (makes follow-up zero-bookkeeping) -----------------
-# submit/followup record the live conversation here so a follow-up never has to
-# track the conversation_id across turns/background tasks: `--conversation auto`
-# (the default) reads it back. This is THE thing that makes follow-up a habit
-# instead of a chore. Single-thread by design; pass an explicit --conversation
-# to override when juggling several consults at once.
+# ---- per-rid job registry (makes follow-up zero-bookkeeping) ----------------
+# submit/followup record the live conversation here, keyed by rid, so a follow-up never has to
+# track the conversation_id across turns/background tasks: `--conversation auto` (the default)
+# reads it back. This is THE thing that makes follow-up a habit instead of a chore. Multiple
+# concurrent consults are addressable by their own rid; pass an explicit --conversation/--rid
+# to pin one when juggling several at once.
+#
+# On-disk shape (registry keyed by rid — one entry per consult):
+#   {"jobs": {"<rid>": {"conversation_id": "<conv>", "title": null,
+#                        "ts": 1234.5, "status": "submitted"}, ...}}
+# `status`: "submitted" (submit/followup sent) -> "answered" (wait wrote the answer).
+# "active"/"recent" are VIEWS over jobs (most-recent-by-ts within the window), not separate
+# stored fields — so there is nothing but the jobs dict to keep consistent.
 STATE_PATH = os.path.join(CGC_STATE_DIR, "active.json")
 
 
@@ -137,43 +144,67 @@ def _state_lock():
 
 
 def _read_state():
+    """Tolerant read: missing file, corrupt JSON, or an OLD (pre-registry) shape all degrade to
+    an empty registry rather than crashing — a stale active.json on disk must never break a
+    consult. A dict without a "jobs" key (old single-active shape, or garbage) is treated as
+    having no jobs; it gets overwritten wholesale on the next write."""
     try:
         with open(STATE_PATH, encoding="utf-8") as f:
-            return json.load(f)
+            raw = json.load(f)
     except (OSError, ValueError):
-        return {}
+        return {"jobs": {}}
+    if not isinstance(raw, dict) or not isinstance(raw.get("jobs"), dict):
+        return {"jobs": {}}  # old shape ({"conversation":...,"recent":[...]}) or corrupt — ignore
+    return raw
 
 
 _RECENT_WINDOW_S = 2 * 3600  # a consult counts as "active" for ambiguity for this long
 
 
-def _record_recent(cur, conv, rid):
-    """Append/refresh a {conv,rid,ts} entry so `auto` can tell when MORE THAN ONE consult is
-    in play — the single `conversation` slot only ever holds the LAST one, which is exactly
-    how an earlier consult's follow-up used to silently land on the newest thread. Each consult
-    stays addressable by its own conv id; the ambiguity error lists them so a specific one
-    (A among B/C/D) can be pinned even after its tab auto-closed."""
-    prior = next((r for r in cur.get("recent", []) if r.get("conv") == conv), None)
-    if rid is None and prior:  # wait-done refreshes a conv without a rid — keep the submit rid
-        rid = prior.get("rid")
-    recent = [r for r in cur.get("recent", []) if r.get("conv") and r.get("conv") != conv]
-    recent.append({"conv": conv, "rid": rid, "ts": time.time()})
+def _active_jobs(state):
+    """VIEW over state["jobs"]: (rid, job) pairs within the ambiguity window, newest first."""
     cutoff = time.time() - _RECENT_WINDOW_S
-    cur["recent"] = [r for r in recent if r.get("ts", 0) >= cutoff][-12:]
+    jobs = [(rid, j) for rid, j in state.get("jobs", {}).items()
+            if isinstance(j, dict) and j.get("ts", 0) >= cutoff and j.get("conversation_id")]
+    jobs.sort(key=lambda kv: kv[1].get("ts", 0), reverse=True)
+    return jobs
 
 
-def _write_state(**kw):
+def _write_state(*, conversation=None, rid=None, status=None, title=None):
     """Read-modify-write active.json under an advisory exclusive lock (see _state_lock), so 2-3
     concurrent submits/followups never race each other's read-modify-write. The write itself is
     atomic: a temp file in the same directory is written then os.replace()'d over the target, so
-    a concurrent reader never observes a truncated/partial file even without the lock."""
+    a concurrent reader never observes a truncated/partial file even without the lock.
+
+    Upserts ONE job keyed by `rid`. If `rid` is None (the wait-done conversation-refresh call),
+    the job matching `conversation` is refreshed in place instead (keeps its original rid) — this
+    is the per-rid equivalent of the old "wait-done refreshes a conv without a rid" behavior."""
+    if not conversation:
+        return
     try:
         os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
         with _state_lock():
             cur = _read_state()
-            cur.update({k: v for k, v in kw.items() if v is not None})
-            if kw.get("conversation"):
-                _record_recent(cur, kw["conversation"], kw.get("rid"))
+            jobs = cur.setdefault("jobs", {})
+            key = rid
+            if key is None:
+                # find the existing job for this conversation to refresh (preserve its rid)
+                key = next((r for r, j in jobs.items()
+                           if isinstance(j, dict) and j.get("conversation_id") == conversation), None)
+            if key is None:
+                return  # nothing to key this job by — no-op rather than inventing a rid
+            job = dict(jobs.get(key) or {})
+            job["conversation_id"] = conversation
+            job["ts"] = time.time()
+            if status is not None:
+                job["status"] = status
+            elif "status" not in job:
+                job["status"] = "submitted"
+            if title is not None:
+                job["title"] = title
+            elif "title" not in job:
+                job["title"] = None
+            jobs[key] = job
             tmp = STATE_PATH + f".tmp-{os.getpid()}"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(cur, f)
@@ -188,31 +219,33 @@ def _resolve_conv(conv):
     silently target the most RECENT one (so an earlier consult's follow-up lands on the wrong
     thread) — refuse and make the caller pin the one it means."""
     if conv and conv != "auto":
-        # Accept the ORIGINAL consult's rid as a handle too — recent maps rid->conv, and a
-        # rid (REQ-…) never collides with a conversation uuid, so an agent can pin a specific
-        # consult by either its conv id or the rid it already has from submit / the answer file.
-        for r in _read_state().get("recent", []):
-            if r.get("rid") == conv and r.get("conv"):
-                return r["conv"]
+        # Accept the ORIGINAL consult's rid as a handle too — jobs are keyed by rid, and a rid
+        # (REQ-…) never collides with a conversation uuid, so an agent can pin a specific consult
+        # by either its conv id or the rid it already has from submit / the answer file.
+        job = _read_state().get("jobs", {}).get(conv)
+        if isinstance(job, dict) and job.get("conversation_id"):
+            return job["conversation_id"]
         return conv
     st = _read_state()
-    cutoff = time.time() - _RECENT_WINDOW_S
-    recent = [r for r in st.get("recent", []) if r.get("ts", 0) >= cutoff and r.get("conv")]
-    seen, distinct = set(), []
-    for r in recent:
-        if r["conv"] not in seen:
-            seen.add(r["conv"]); distinct.append(r)
-    if len(distinct) > 1:
-        lines = "\n".join(f"    --conversation {r['conv']}   (rid {r.get('rid') or '?'})"
-                          for r in distinct)
+    distinct = _active_jobs(st)
+    # de-dup by conversation_id (two rids could in principle point at the same conv, e.g. a
+    # followup refresh) so ambiguity is measured in THREADS, not job records.
+    seen, uniq = set(), []
+    for rid, j in distinct:
+        cid = j["conversation_id"]
+        if cid not in seen:
+            seen.add(cid); uniq.append((rid, j))
+    if len(uniq) > 1:
+        lines = "\n".join(f"    --conversation {j['conversation_id']}   (rid {rid or '?'})"
+                          for rid, j in uniq)
         raise SystemExit(
             "CGC_ERROR ambiguous_followup: %d consults are active — `--conversation auto` would "
             "silently continue the most RECENT one, so an earlier consult's follow-up would land "
             "on the wrong thread. Pin the one you mean (the conversation_id submit printed):\n%s"
-            % (len(distinct), lines))
-    if distinct:
-        return distinct[0]["conv"]
-    return st.get("conversation") or None
+            % (len(uniq), lines))
+    if uniq:
+        return uniq[0][1]["conversation_id"]
+    return None
 
 
 # ---- automated Step-0 gate (no LLM) -----------------------------------------
@@ -1191,7 +1224,7 @@ def cmd_wait(a) -> int:
                     f.write(ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
                 sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out}\n")
                 conv = conv or c.conversation_id()
-                _write_state(conversation=conv)  # keep the active thread pointer fresh for follow-up
+                _write_state(conversation=conv, status="answered")  # mark this job answered
                 if not a.keep_tab:
                     c.close_tab()  # free the tab; the conversation still PERSISTS at /c/<id>
                 # On wake the agent sees this on the task output. To CONTINUE the thread (feed
