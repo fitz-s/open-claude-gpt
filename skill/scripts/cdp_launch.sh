@@ -18,6 +18,9 @@
 #   CGC_PORT=9444 bash cdp_launch.sh    # custom port
 #   CGC_CHROME=/path/to/chrome ...      # explicit Chrome/Chromium/Edge binary
 #   CGC_PROJECT_URL=https://chatgpt.com/g/g-p-<id>-<slug>/project   # your project (else new chat)
+#
+#   "$CHROME" --remote-debugging-port=9333 --remote-debugging-address=127.0.0.1 \
+#     --remote-allow-origins=http://127.0.0.1:9333 --user-data-dir="$PROFILE" ...
 set -euo pipefail
 
 PORT="${CGC_PORT:-9333}"
@@ -100,8 +103,10 @@ fi
 # Not up → start it (this is the no-LLM auto-start the gate guarantees).
 mkdir -p "$PROFILE"
 # allow-origins scoped to loopback (NOT '*') — the CDP client connects from this origin.
+# debugging-address pinned to loopback so the port is never reachable off-host.
 "$CHROME" \
   --remote-debugging-port="$PORT" \
+  --remote-debugging-address=127.0.0.1 \
   --remote-allow-origins="http://127.0.0.1:$PORT" \
   --user-data-dir="$PROFILE" \
   --no-first-run --no-default-browser-check \

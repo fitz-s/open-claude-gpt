@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # Created: 2026-06-10
-# Last reused or audited: 2026-06-15
+# Last reused or audited: 2026-07-01
 # Authority basis: open-claude-gpt skill v2 — prep renders the GPT-5.5 outcome-first
 #   PROMPT_TEMPLATE (title + steerable role + end-to-end depth mandate) and, with
 #   --followup, the FOLLOWUP_TEMPLATE for a continuing thread; deliver builds
 #   purpose-grouped GitHub refs. Used by both the CDP backend (primary) and the MCP
-#   fallback.
+#   fallback. 2026-07-01: deliver hardened fail-closed on public-source provenance —
+#   PUBLIC stamp requires gh-confirmed visibility=="public"; private/unknown visibility
+#   refuses to emit refs unless --allow-nonpublic is passed; refs must always contain
+#   >=1 real browsable URL (github.com/gist.github.com/raw.githubusercontent.com).
 """
 Prep helper for the open-claude-gpt skill.
 
@@ -178,6 +181,19 @@ def _github_slug(remote_url):
     return path
 
 
+def _has_browsable_url(groups):
+    """True if at least one ref across all groups is a real browsable URL
+    (github.com / gist.github.com / raw.githubusercontent.com). Guards against
+    a refs file that reads as a source delivery but carries no actual link the
+    external model could open."""
+    for items in groups.values():
+        for url, _purpose in items or []:
+            if isinstance(url, str) and re.match(
+                r"^https://(github\.com|gist\.github\.com|raw\.githubusercontent\.com)/", url):
+                return True
+    return False
+
+
 def _render_groups(groups):
     """Render purpose-grouped refs into the markdown sections the prompt expects."""
     titles = [
@@ -214,7 +230,8 @@ def cmd_deliver(a: argparse.Namespace) -> int:
     repo = a.repo_dir
     root = _git(["rev-parse", "--show-toplevel"], repo)
     out = {"mode": None, "slug": None, "groups": {}, "needs_gist": False,
-           "refs_file": "", "note": "", "head_sha": None, "base_sha": None}
+           "refs_file": "", "note": "", "head_sha": None, "base_sha": None,
+           "visibility": None, "public_ok": False}
 
     # slug: explicit --repo wins; else the local origin.
     slug = a.repo or (_github_slug(_git(["remote", "get-url", "origin"], root)) if root else None)
@@ -389,21 +406,55 @@ def cmd_deliver(a: argparse.Namespace) -> int:
     out["groups"] = {k: v for k, v in groups.items() if v}
     if not any(groups.values()):
         print(json.dumps(out, ensure_ascii=False, indent=2)); return 0
-    pathlib.Path(CGC_STATE_DIR).mkdir(parents=True, exist_ok=True)
-    refs_file = os.path.join(CGC_STATE_DIR, f"refs_{time.strftime('%Y%m%d-%H%M%S')}.md")
+
+    # Fail-closed browsable-URL guarantee: a refs file that carries no actual
+    # github.com / gist.github.com / raw.githubusercontent.com link is not a source
+    # delivery at all — refuse rather than emit a file that reads as one.
+    if not _has_browsable_url(groups):
+        out.update(needs_gist=True)
+        out["note"] = ((out["note"] + " ") if out["note"] else "") + (
+            "NO BROWSABLE URL: none of the rendered refs are a github.com / gist.github.com / "
+            "raw.githubusercontent.com link — refusing to emit a refs file. Push the code and pass "
+            "--ref/--pr, or `gh gist create` and use the gist link.")
+        print(json.dumps(out, ensure_ascii=False, indent=2)); return 0
+
     body = _render_groups(groups)
-    if visibility == "public":
+    is_public = visibility == "public"
+    # Fail-closed: only a CONFIRMED public repo gets the PUBLIC stamp. Anything else —
+    # PRIVATE, or visibility UNKNOWN because `gh` is missing/unauthenticated/errored —
+    # must NOT emit a refs file that reads as a public delivery. The caller can override
+    # with --allow-nonpublic, which stamps the file as explicitly non-public instead.
+    if is_public:
+        out["public_ok"] = True
         # Stamp the payload so it's self-evidently a public-link delivery, not private exfiltration.
         body = ("> Source visibility: PUBLIC — every link below is world-readable on github.com; this "
                 "delivers public URLs, not private or internal repo content.\n\n") + body
-    elif visibility and visibility != "public":
-        # A private repo's link is NOT browsable by an external model and delivering it IS
-        # exfiltration — surface it loudly so the caller gists a redacted slice or keeps it local.
+    elif a.allow_nonpublic:
+        out["public_ok"] = False
+        reason = f"{visibility} repo" if visibility else "visibility UNKNOWN (gh missing/unauthenticated/errored)"
         out["note"] = ((out["note"] + " ") if out["note"] else "") + (
-            f"PRIVATE repo ({visibility}): ChatGPT cannot open these links and delivering private "
-            f"repo content externally is exfiltration — push the reviewed commit to a public repo, "
-            f"or deliver a redacted gist, instead of a private link.")
-        body = (f"> Source visibility: {visibility.upper()} — NOTE: these links are NOT world-readable.\n\n") + body
+            f"NON-PUBLIC delivery explicitly allowed via --allow-nonpublic ({reason}). These links may "
+            f"not be world-readable — verify the consult destination can actually open them.")
+        body = (f"> Source visibility: NON-PUBLIC (explicitly allowed) — {reason}; these links are NOT "
+                f"confirmed world-readable.\n\n") + body
+    else:
+        # Refuse: do not write a refs file that could pass for a public delivery.
+        out["needs_gist"] = True
+        if visibility:
+            out["note"] = ((out["note"] + " ") if out["note"] else "") + (
+                f"PRIVATE repo ({visibility}): ChatGPT cannot open these links and delivering private "
+                f"repo content externally is exfiltration — refusing to emit a refs file. Push the "
+                f"reviewed commit to a public repo, deliver a redacted gist, or pass --allow-nonpublic "
+                f"to explicitly override.")
+        else:
+            out["note"] = ((out["note"] + " ") if out["note"] else "") + (
+                "VISIBILITY UNKNOWN: could not confirm this repo is public (gh missing, unauthenticated, "
+                "or errored) — refusing to emit a refs file that would read as a public delivery. "
+                "Auth gh (gh auth login) and re-run, or pass --allow-nonpublic to explicitly override.")
+        print(json.dumps(out, ensure_ascii=False, indent=2)); return 0
+
+    pathlib.Path(CGC_STATE_DIR).mkdir(parents=True, exist_ok=True)
+    refs_file = os.path.join(CGC_STATE_DIR, f"refs_{time.strftime('%Y%m%d-%H%M%S')}.md")
     pathlib.Path(refs_file).write_text(body, encoding="utf-8")
     out["refs_file"] = refs_file
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -632,6 +683,13 @@ def main() -> int:
     pd.add_argument("--files", nargs="*", help="repo-relative paths for close-reading blob links (need --ref for a non-local repo)")
     pd.add_argument("--issues", nargs="*", help="issue numbers to add to intent refs")
     pd.add_argument("--base", help="base ref for AUTO compare (default: merge-base with origin HEAD)")
+    pd.add_argument("--allow-nonpublic", action="store_true",
+                    help="explicitly allow delivering refs when the repo is PRIVATE or visibility "
+                         "could not be confirmed (gh missing/unauthenticated/errored). Without this, "
+                         "deliver REFUSES to write a refs file in those cases (fail-closed) — it will "
+                         "only ever stamp PUBLIC when gh confirms visibility=='public'. With this flag "
+                         "set, the refs file is written with a 'NON-PUBLIC (explicitly allowed)' stamp "
+                         "instead of the PUBLIC stamp.")
     pd.set_defaults(fn=cmd_deliver)
 
     a = p.parse_args()

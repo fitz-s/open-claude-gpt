@@ -6,17 +6,20 @@
 #   ./install.sh            # copy the skill into ~/.claude/skills
 #   ./install.sh --link     # symlink instead (dev: edits in the repo go live)
 #   ./install.sh --dir DIR  # install into a different skills root
+#   ./install.sh --force    # keep exit 0 even if the doctor reports not-ready
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
 SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
 NAME="open-claude-gpt"
 MODE="copy"
+FORCE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --link) MODE="link"; shift ;;
     --dir)  SKILLS_DIR="$2"; shift 2 ;;
+    --force) FORCE=1; shift ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -51,7 +54,8 @@ chmod +x "$DEST"/scripts/*.sh "$DEST"/scripts/*.py 2>/dev/null || true
 
 echo "• installed. running doctor…"
 echo
-CGC_STATE_DIR="${CGC_STATE_DIR:-/tmp/cgc}" python3 "$DEST/scripts/cgc_doctor.py" || true
+DOCTOR_STATUS=0
+CGC_STATE_DIR="${CGC_STATE_DIR:-/tmp/cgc}" python3 "$DEST/scripts/cgc_doctor.py" || DOCTOR_STATUS=$?
 
 cat <<EOF
 
@@ -65,3 +69,14 @@ Next steps
 
 Config lives in the environment — see docs/CONFIGURATION.md and .env.example.
 EOF
+
+if [ "$DOCTOR_STATUS" -ne 0 ]; then
+  if [ "$FORCE" = "1" ]; then
+    echo
+    echo "• installed, but NOT ready — see doctor output above (--force: continuing anyway)"
+    exit 0
+  fi
+  echo
+  echo "installed, but NOT ready — see doctor output above" >&2
+  exit "$DOCTOR_STATUS"
+fi

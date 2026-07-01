@@ -43,16 +43,23 @@ Subcommands:
            send a follow-up into an existing conversation (continues the thread,
            keeping its context + model). Round-1 wait must have used --keep-tab.
   wait    --rid R --out F [--port P] [--poll S] [--timeout S]
-          poll until the answer is complete, extract it between the BEGIN/END
+          poll until the answer is complete, extract it between the bare-line BEGIN/END
           sentinels, write to --out, exit 0. Run as a detached background Bash;
           its exit re-invokes the agent = the wake. Exit codes:
-            0 done (answer written)   3 blocker (login/captcha/rate-limit)
-            4 timeout                 2 usage error
+            0 done — either a properly WRAPPED answer was extracted and written to --out,
+              OR (at timeout, no wrapper) a substantial last-assistant message existed and
+              was salvaged: written to --out, ALSO to a sibling "<out>.raw", with a
+              CGC_UNWRAPPED log line (best-effort — never lose a present answer)
+            3 blocker (login/captcha/rate-limit)
+            4 timeout with NO usable answer at all (empty / only short streaming stubs) —
+              a genuine no-answer timeout, distinct from the exit-0 salvage case above
+            2 usage error
   status  --rid R [--port P]   one-shot JSON {generating,done,blocker,len}
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -60,6 +67,11 @@ import subprocess
 import sys
 import time
 import urllib.request
+
+try:
+    import fcntl  # advisory file locking (POSIX only) — degrade gracefully if unavailable
+except ImportError:
+    fcntl = None
 
 try:
     import websocket  # websocket-client
@@ -96,6 +108,31 @@ CGC_PROJECT_URL = os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/")
 STATE_PATH = os.path.join(CGC_STATE_DIR, "active.json")
 
 
+STATE_LOCK_PATH = STATE_PATH + ".lock"
+
+
+@contextlib.contextmanager
+def _state_lock():
+    """Advisory exclusive lock (fcntl.flock) around a read-modify-write of active.json, so 2-3
+    concurrent submits/followups never interleave and truncate or lose each other's records.
+    Degrades gracefully to a no-op if fcntl is unavailable (non-POSIX) — best-effort, not a hard
+    requirement for correctness of a single writer."""
+    if fcntl is None:
+        yield
+        return
+    os.makedirs(os.path.dirname(STATE_LOCK_PATH), exist_ok=True)
+    lf = open(STATE_LOCK_PATH, "a+")
+    try:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lf.close()
+
+
 def _read_state():
     try:
         with open(STATE_PATH, encoding="utf-8") as f:
@@ -123,14 +160,21 @@ def _record_recent(cur, conv, rid):
 
 
 def _write_state(**kw):
+    """Read-modify-write active.json under an advisory exclusive lock (see _state_lock), so 2-3
+    concurrent submits/followups never race each other's read-modify-write. The write itself is
+    atomic: a temp file in the same directory is written then os.replace()'d over the target, so
+    a concurrent reader never observes a truncated/partial file even without the lock."""
     try:
         os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-        cur = _read_state()
-        cur.update({k: v for k, v in kw.items() if v is not None})
-        if kw.get("conversation"):
-            _record_recent(cur, kw["conversation"], kw.get("rid"))
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(cur, f)
+        with _state_lock():
+            cur = _read_state()
+            cur.update({k: v for k, v in kw.items() if v is not None})
+            if kw.get("conversation"):
+                _record_recent(cur, kw["conversation"], kw.get("rid"))
+            tmp = STATE_PATH + f".tmp-{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cur, f)
+            os.replace(tmp, STATE_PATH)
     except OSError:
         pass
 
@@ -348,29 +392,94 @@ _TEXT_FN = ("function __cgcText(el){if(!el)return '';"
             "return out.replace(/[ \\t]+\\n/g,'\\n').replace(/\\n{3,}/g,'\\n\\n');}")
 
 
-def _detect_js(rid: str) -> str:
-    """Returns JSON {generating,done,blocker,len,begin,end,ac} for the answer node.
-    done is SENTINEL-driven (END_RESPONSE after BEGIN_RESPONSE present), NOT stop-button driven:
-    the model writes END_RESPONSE only as its final line, so its presence == complete + extractable.
-    Depending on the stop-button was fragile — if that UI selector ever persists, done would never
-    fire and wait would only return on timeout. begin/end/ac are diagnostics for the heartbeat."""
+# ---- SHARED CONTRACT #1: line-anchored sentinel parser -----------------------
+# The ONLY completion/extraction rule, in Python AND in the JS this file builds. A line merely
+# CONTAINING the sentinel text (quoted in prose, inside a fenced code block, etc.) must NOT match —
+# only a bare standalone line equal to the sentinel after trim() matches. This is what lets the
+# model safely quote BEGIN_RESPONSE:/END_RESPONSE: tokens in its own answer without those quotes
+# being mistaken for the real wrapper. Canonical Python implementation below; the JS builder
+# (_sentinel_js) mirrors it exactly so detect/extract/status/timeout-rescue never drift apart.
+
+def _sentinel_parse(text: str, rid: str):
+    """Line-anchored sentinel parser (SHARED CONTRACT #1).
+    begin = index of the FIRST line whose trimmed value == 'BEGIN_RESPONSE:<rid>'
+    end   = index of the FIRST line AFTER begin whose trimmed value == 'END_RESPONSE:<rid>'
+    done  = begin found AND end found AND end > begin AND the extracted body is non-empty.
+    Returns (done: bool, body: str) — body is '' when not done.
+    """
+    norm = (text or "").replace("\r\n", "\n")
+    lines = norm.split("\n")
+    begin_tok = f"BEGIN_RESPONSE:{rid}"
+    end_tok = f"END_RESPONSE:{rid}"
+    i = None
+    for idx, line in enumerate(lines):
+        if line.strip() == begin_tok:
+            i = idx
+            break
+    if i is None:
+        return False, ""
+    j = None
+    for idx in range(i + 1, len(lines)):
+        if lines[idx].strip() == end_tok:
+            j = idx
+            break
+    if j is None or j <= i:
+        return False, ""
+    body = "\n".join(lines[i + 1:j]).strip()
+    if not body:
+        return False, ""
+    return True, body
+
+
+def _sentinel_js(rid: str, text_expr: str) -> str:
+    """JS mirror of _sentinel_parse, operating on the LINE-STRUCTURED text produced by `text_expr`
+    (a JS expression evaluating to a string — pass __cgcText(node) output, not raw .textContent,
+    so block-element boundaries survive as line breaks and bare-line matching is meaningful).
+    Returns {done, body} as a JS object literal — embed via `(function(){...return X;})()`. This is
+    the ONE canonical bare-line JS implementation; detect, extract, status and the timeout-rescue
+    path all call it instead of re-deriving the rule."""
     begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
     end = json.dumps(f"END_RESPONSE:{rid}")
     return (
-        "(function(){" + _NODE_FN +
+        "(function(){"
+        "var __t=((" + text_expr + ")||'').replace(/\\r\\n/g,'\\n');"
+        "var __lines=__t.split('\\n');var __BG=" + begin + ",__EN=" + end + ";"
+        "var __i=-1;for(var __a=0;__a<__lines.length;__a++){if(__lines[__a].trim()===__BG){__i=__a;break;}}"
+        "if(__i<0)return {done:false,body:''};"
+        "var __j=-1;for(var __b=__i+1;__b<__lines.length;__b++){if(__lines[__b].trim()===__EN){__j=__b;break;}}"
+        "if(__j<0||__j<=__i)return {done:false,body:''};"
+        "var __body=__lines.slice(__i+1,__j).join('\\n').trim();"
+        "if(!__body)return {done:false,body:''};"
+        "return {done:true,body:__body};})()"
+    )
+
+
+def _detect_js(rid: str) -> str:
+    """Returns JSON {generating,done,blocker,len,begin,end,ac} for the answer node.
+    done comes from the canonical bare-line _sentinel_js parser (SHARED CONTRACT #1) — a line
+    merely CONTAINING BEGIN/END_RESPONSE:<rid> (quoted in prose or a code block) never counts,
+    only a bare standalone sentinel line does. This is NOT stop-button driven: the model writes
+    END_RESPONSE only as its final line, so its presence == complete + extractable. Depending on
+    the stop-button was fragile — if that UI selector ever persists, done would never fire and
+    wait would only return on timeout. begin/end/ac are diagnostics for the heartbeat."""
+    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
+    end = json.dumps(f"END_RESPONSE:{rid}")
+    sentinel = _sentinel_js(rid, "__cgcText(node)")
+    return (
+        "(function(){" + _NODE_FN + _TEXT_FN +
         "var a=document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
         "var BG=" + begin + ",EN=" + end + ";"
         "var node=__cgcNode(BG);"
-        "var t=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
-        "var e=t.lastIndexOf(EN);var b=(e>=0)?t.lastIndexOf(BG,e):-1;"
-        "var hasB=t.indexOf(BG)>=0,hasE=t.indexOf(EN)>=0;"
+        "var rawT=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
+        "var res=" + sentinel + ";"
+        "var hasB=rawT.indexOf(BG)>=0,hasE=rawT.indexOf(EN)>=0;"
         "var stop=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"],button[aria-label*=\"\\u505c\\u6b62\"]');"
         "var blocker=null;"
         "if(document.querySelector('input[type=\"password\"]')||/^\\/(auth|login)(\\/|$)/i.test(location.pathname))blocker='login';"
         "else if(document.querySelector('iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]'))blocker='captcha';"
         "else{var al=document.querySelector('[role=\"alert\"]');if(al&&/rate limit|too many requests|usage limit/i.test(al.textContent||''))blocker='rate_limit';}"
-        "var done=(b>=0&&e>b&&a.length>0);"
-        "return JSON.stringify({generating:stop,done:done,blocker:blocker,len:t.length,begin:hasB,end:hasE,ac:a.length});})()"
+        "var done=(res.done&&a.length>0);"
+        "return JSON.stringify({generating:stop,done:done,blocker:blocker,len:rawT.length,begin:hasB,end:hasE,ac:a.length});})()"
     )
 
 
@@ -412,16 +521,14 @@ def _last_assistant_js(rid: str) -> str:
 
 
 def _extract_js(rid: str) -> str:
-    """Returns the answer text BETWEEN the sentinels of the answer node (textContent walk), or ''."""
+    """Returns the answer text BETWEEN the bare-line sentinels of the answer node (SHARED
+    CONTRACT #1, via the canonical _sentinel_js parser), or '' if no valid wrapper is present."""
     begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
-    end = json.dumps(f"END_RESPONSE:{rid}")
+    sentinel = _sentinel_js(rid, "__cgcText(__cgcNode(" + begin + "))")
     return (
         "(function(){" + _NODE_FN + _TEXT_FN +
-        "var BG=" + begin + ",EN=" + end + ";"
-        "var t=__cgcText(__cgcNode(BG)).replace(/\\r\\n/g,'\\n');"
-        "var e=t.lastIndexOf(EN);if(e<0)return '';"
-        "var b=t.lastIndexOf(BG,e);if(b<0)return '';"
-        "return t.slice(b+BG.length,e).trim();})()"
+        "var res=" + sentinel + ";"
+        "return res.done?res.body:'';})()"
     )
 
 
@@ -553,14 +660,26 @@ def _select_model(c, target):
     return c.eval(_model_confirm_js(target))
 
 
+# A real code-source URL: https:// on github.com / gist.github.com / raw.githubusercontent.com,
+# with at least one path segment after the host (a bare domain isn't a link to anything).
+# Deliberately does NOT match the bare word "github" — that substring alone used to fail-open
+# the no_code_source gate (spoofable by prose that merely mentions "GitHub").
+_CODE_URL_RE = re.compile(
+    r"https://(?:www\.)?(?:github\.com|gist\.github\.com|raw\.githubusercontent\.com)/\S+",
+    re.IGNORECASE)
+
+
 def cmd_submit(a) -> int:
     prompt = open(a.prompt_file, encoding="utf-8").read()
     # Backstop (prep already hard-blocks at render): refuse to send a prompt with no actual CODE LINK.
     # A prose Context section is NOT the code — ChatGPT can't read the repo from a description and
     # answers blind ("no file access / can't cite file:line"). Require a github/gist link unless it's a
     # follow-up (the thread already holds the code). No override — fail closed.
+    # PROVENANCE: a real https URL on github.com/gist.github.com/raw.githubusercontent.com, NOT
+    # merely the substring "github" anywhere in the prompt (spoofable by e.g. writing the word
+    # "github" in prose with no actual link — that used to satisfy the old `"github" in low` gate).
     low = prompt.lower()
-    has_code_link = "github" in low  # github.com / gist.github.com / raw.githubusercontent.com
+    has_code_link = bool(_CODE_URL_RE.search(prompt))
     is_followup = "continuing this consult" in low
     if not has_code_link and not is_followup:
         sys.stderr.write(
@@ -641,32 +760,49 @@ def cmd_submit(a) -> int:
                 break
         ok = bool(n and n > 0)
         # The URL transitions /project -> /c/<id> a beat after the message sends; poll for it.
+        # SUBMIT-RACE: a submit that reports ok=true with no captured conversation id is worse
+        # than a clean failure — a later `wait`/`followup --conversation auto` would resolve to
+        # whatever OTHER tab/thread is active and silently answer the wrong request. So poll a
+        # little longer here (up to ~25s total) and, if still no conv id, fail closed: do NOT
+        # write active-thread state (that would point `auto` at a request with no known tab) and
+        # do NOT return success.
         conv = ""
-        for _ in range(20):
+        for _ in range(40):
             conv = c.conversation_id()
             if conv:
                 break
             time.sleep(0.5)
-        if ok and conv:
-            _write_state(conversation=conv, rid=a.rid)  # so `followup`/`wait` can auto-resolve
+        if not ok:
+            print(json.dumps({"ok": False, "userMsgs": n, "model": model_now,
+                              "modelConfirmed": model_confirmed, "conversation_id": conv}))
+            return 2
+        if not conv:
+            print(json.dumps({"ok": False, "userMsgs": n, "model": model_now,
+                              "modelConfirmed": model_confirmed, "conversation_id": ""}))
+            sys.stderr.write(
+                "CGC_ERROR no_conversation_id: the message sent but the tab never transitioned to "
+                "/c/<id> within the grace window — NOT recording active-thread state (a follow-up/"
+                "wait using --conversation auto would otherwise silently target the wrong thread). "
+                "Recovery: retry submit, or attach manually with `status --conversation <id>` once "
+                "the tab's URL shows a /c/<id>.\n")
+            return 2
+        _write_state(conversation=conv, rid=a.rid)  # so `followup`/`wait` can auto-resolve
         print(json.dumps({"ok": ok, "userMsgs": n, "model": model_now,
                           "modelConfirmed": model_confirmed, "conversation_id": conv}))
-        if ok and conv:
-            out = os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
-            # Hand the agent the EXACT bounded waiter to run (run_in_background:true). The
-            # `timeout 900` prefix is REQUIRED — the goal-guard denies an un-prefixed bg waiter,
-            # and the nohup escape it suggests makes an UNTRACKED process that never wakes you.
-            sys.stderr.write(
-                "CGC_SUBMITTED. Now run the detached waiter (run_in_background:true) — copy verbatim:\n"
-                f"  timeout 900 python3 {os.path.abspath(__file__)} wait --rid {a.rid} "
-                f"--conversation {conv} --out {out} --poll 20 --timeout 870\n"
-                "MANDATORY: keep the `timeout 900` prefix. If the goal-guard fires, ADD/KEEP `timeout 900` "
-                "(option a) — NEVER use `nohup … & disown` (option c): an untracked process's exit does "
-                "NOT wake you, so the answer lands silently and you wait forever.\n")
-        if ok and not conv:
-            sys.stderr.write("CGC_WARN no /c/<id> captured — pin wait with --rid and watch for "
-                             "ambiguity; the tab may not have transitioned to a conversation URL\n")
-        return 0 if ok else 2
+        out = os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
+        # Hand the agent the EXACT bounded waiter to run (run_in_background:true). The
+        # `timeout 899` outer prefix is REQUIRED (must be <=900 — the goal-guard denies an
+        # over-cap/un-prefixed bg waiter) and clears the inner --timeout 870 by ~29s so the
+        # salvage grab runs before the hard kill. The nohup escape it suggests makes an
+        # UNTRACKED process that never wakes you.
+        sys.stderr.write(
+            "CGC_SUBMITTED. Now run the detached waiter (run_in_background:true) — copy verbatim:\n"
+            f"  timeout 899 python3 {os.path.abspath(__file__)} wait --rid {a.rid} "
+            f"--conversation {conv} --out {out} --poll 20 --timeout 870\n"
+            "MANDATORY: keep the `timeout 899` prefix. If the goal-guard fires, ADD/KEEP `timeout 899` "
+            "(option a) — NEVER use `nohup … & disown` (option c): an untracked process's exit does "
+            "NOT wake you, so the answer lands silently and you wait forever.\n")
+        return 0
     finally:
         c.close()
 
@@ -793,6 +929,24 @@ def cmd_followup(a) -> int:
             print(json.dumps({"ok": False, "userMsgs": n, "conversation_id": conv,
                               "rid": rid, "followup": True}))
             return 2
+        # RID-ECHO VERIFICATION: before proceeding to watch, confirm the NEW last-user-message
+        # actually contains the expected BEGIN_RESPONSE:<rid> echo. Without this, a race (the
+        # click landed but the composer text was stale, or a concurrent consult's message
+        # interleaved) would have the waiter watch a STALE/OLD round and either time out or
+        # (worse) extract a previous answer under this rid. Only checked when we know the rid
+        # (one-shot rendering always yields one; explicit --prompt-file without --rid cannot be
+        # verified this way and is skipped).
+        if rid:
+            echoed = c.eval(_user_rid_js()) or ""
+            if echoed != rid:
+                print(json.dumps({"ok": False, "userMsgs": n, "conversation_id": conv,
+                                  "rid": rid, "followup": True, "echoedRid": echoed}))
+                sys.stderr.write(
+                    f"CGC_ERROR rid_echo_mismatch: sent follow-up for rid '{rid}' but the last user "
+                    f"message on the page echoes '{echoed or '(none)'}' — this looks like a stale/old "
+                    f"round, not the one just sent. NOT watching. Retry the follow-up, or verify no "
+                    f"other consult is concurrently writing into this same conversation.\n")
+                return 2
         _write_state(conversation=conv, rid=rid)  # keep the active thread current
         default_out = os.path.join(CGC_STATE_DIR, f"answer_{rid}.txt" if rid else "answer_followup.txt")
         print(json.dumps({"ok": True, "userMsgs": n, "conversation_id": conv, "rid": rid,
@@ -810,7 +964,7 @@ def cmd_followup(a) -> int:
         return cmd_wait(a)
     sys.stderr.write(
         "CGC_FOLLOWUP sent. Run the detached waiter (run_in_background:true) — conv+rid pre-filled:\n"
-        f"  timeout 900 python3 {os.path.abspath(__file__)} wait --rid {rid or 'auto'} "
+        f"  timeout 899 python3 {os.path.abspath(__file__)} wait --rid {rid or 'auto'} "
         f"--conversation {conv} --out {default_out} --poll 20 --timeout 870\n"
         "(Or skip this: pass --watch --out <file> to followup so send+wait is ONE backgrounded command.)\n")
     return 0
@@ -906,7 +1060,7 @@ def cmd_wait(a) -> int:
                     "that opens a new conversation and loses ChatGPT's context, and do NOT arm a bare "
                     "`until [ -s file ]` watcher — nothing writes that file). It's ONE backgrounded "
                     "command that sends AND waits (its exit is the wake — no separate step to forget):\n"
-                    f"  timeout 900 python3 {os.path.abspath(__file__)} followup "
+                    f"  timeout 899 python3 {os.path.abspath(__file__)} followup "
                     "--task \"<local results + next question>\" --title \"<what's new>\" "
                     f"--watch --out {os.path.join(CGC_STATE_DIR, 'answer_<r2>.txt')} --timeout 870\n"
                     "  (run_in_background:true; --conversation defaults to this thread; read --out on wake.)\n"
@@ -965,24 +1119,43 @@ def cmd_wait(a) -> int:
         except Exception:
             pass
         time.sleep(2)
-        # After force-render the answer node is materialized, so SOMETHING is always present
-        # at the deadline — take it unconditionally. A sentinel-wrapped reply slices clean;
-        # otherwise take the WHOLE last assistant message (no length gate — at the deadline
-        # there is no reason to discard present content). The old "no answer present" exit-4
-        # was a false negative from reading a virtualized DOM; it is removed.
+        # After force-render the answer node is (usually) materialized. SHARED CONTRACT #2:
+        # - a properly WRAPPED answer (bare-line sentinels, non-empty body) → exit 0, clean extract.
+        # - no wrapper but a SUBSTANTIAL last-assistant message (>= --min-unwrapped) → best-effort
+        #   salvage: write --out AND a sibling --out.raw, log CGC_UNWRAPPED, exit 0 (never lose a
+        #   present answer).
+        # - empty / only short streaming stubs → exit 4, a genuine no-answer timeout, DISTINCT from
+        #   the salvage case above (they do not conflict).
         rescue = c.eval(_extract_js(rid)) or ""
-        unwrapped = not rescue
-        if unwrapped:
-            rescue = c.eval(_last_assistant_js(rid)) or ""
-        with open(a.out, "w", encoding="utf-8") as f:
-            f.write(rescue)
+        if rescue:
+            with open(a.out, "w", encoding="utf-8") as f:
+                f.write(rescue)
+            sys.stderr.write(f"CGC_DONE wrote {len(rescue)} chars to {a.out} (rescued at timeout)\n")
+            if not a.keep_tab:
+                c.close_tab()
+            return 0
+        raw = c.eval(_last_assistant_js(rid)) or ""
+        if len(raw) >= a.min_unwrapped:
+            with open(a.out, "w", encoding="utf-8") as f:
+                f.write(raw)
+            with open(a.out + ".raw", "w", encoding="utf-8") as f:
+                f.write(raw)
+            sys.stderr.write(
+                f"CGC_UNWRAPPED wrote {len(raw)} chars to {a.out} (also saved to {a.out}.raw): the "
+                f"model did NOT emit BEGIN/END_RESPONSE:{rid} — best-effort salvage at timeout; "
+                f"verify it is complete (not cut off) before trusting it.\n")
+            if not a.keep_tab:
+                c.close_tab()
+            return 0
+        # Genuinely empty / only short streaming stubs — no usable answer at all.
+        with open(a.out + ".raw", "w", encoding="utf-8") as f:
+            f.write(raw)
         sys.stderr.write(
-            ("CGC_UNWRAPPED " if unwrapped else "CGC_DONE ") +
-            f"wrote {len(rescue)} chars to {a.out} (rescued at timeout"
-            + ("; no BEGIN/END sentinel — verify completeness" if unwrapped else "") + ")\n")
+            f"CGC_ERROR timeout_no_answer: no wrapped answer and no substantial unwrapped message "
+            f"({len(raw)} chars, raw saved to {a.out}.raw) at timeout for {rid}.\n")
         if not a.keep_tab:
             c.close_tab()
-        return 0
+        return 4
     finally:
         c.close()
 
@@ -1054,7 +1227,9 @@ def main() -> int:
                          "(one-shot send+wait; the exit is the wake). REQUIRES --out.")
     fu.add_argument("--out", help="answer file for --watch mode")
     fu.add_argument("--poll", type=int, default=20, help="(--watch) seconds between DOM checks")
-    fu.add_argument("--timeout", type=int, default=900, help="(--watch) give up after N seconds")
+    fu.add_argument("--timeout", type=int, default=870, help="(--watch) give up after N seconds "
+                    "(default 870 — clears the mandatory outer `timeout 899` wrapper by ~29s so "
+                    "the salvage grab runs before the hard kill)")
     fu.add_argument("--settle-seconds", type=int, default=300, help="(--watch) unwrapped-answer settle window")
     fu.add_argument("--min-unwrapped", type=int, default=1500, help="(--watch) min chars to accept an unwrapped answer")
     fu.add_argument("--keep-tab", action="store_true", help="(--watch) keep the tab after retrieving")
@@ -1068,7 +1243,9 @@ def main() -> int:
                         "if the tab was closed.")
     w.add_argument("--out", required=True)
     w.add_argument("--poll", type=int, default=20, help="seconds between DOM checks")
-    w.add_argument("--timeout", type=int, default=900, help="give up after N seconds (default 15 min)")
+    w.add_argument("--timeout", type=int, default=870, help="give up after N seconds (default 870s "
+                   "≈ 15 min — clears the mandatory outer `timeout 899` wrapper by ~29s so the "
+                   "salvage grab runs before the hard kill)")
     w.add_argument("--keep-tab", action="store_true",
                    help="do not close the consult's tab after retrieving (default: close it, so "
                         "concurrent consults' tabs don't accumulate)")
