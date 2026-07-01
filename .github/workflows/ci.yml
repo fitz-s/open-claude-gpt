@@ -34,6 +34,9 @@ jobs:
           echo "$out"
           echo "$out" | python -c "import json,sys; d=json.load(sys.stdin); assert 'ok' in d and d['checks']; print('doctor produced', len(d['checks']), 'checks')"
 
+      - name: Smoke tests (offline)
+        run: python tests/test_smoke.py
+
       - name: No personal identifiers
         run: |
           if grep -rniE "leofitz|/Users/[a-z]|g-p-[0-9a-f]{20}|fitz-s" \
