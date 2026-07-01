@@ -12,6 +12,8 @@
 #   cgc wait    <args…>               poll until the answer is complete    (cdp_consult.py wait)
 #   cgc status  <args…>               one-shot progress JSON               (cdp_consult.py status)
 #   cgc config                        print the effective configuration
+#   cgc activation-hook               print an OPTIONAL SessionStart hook snippet
+#                                     (proactive offloading) — prints only, never edits settings
 #
 # Resolves the skill scripts from (in order): $CGC_HOME, the installed skill,
 # or this repo's ./skill — so it works installed OR straight from a clone.
@@ -47,6 +49,33 @@ case "$cmd" in
     echo "CGC_MODEL       ${CGC_MODEL:-Pro}"
     echo "CGC_PROJECT_URL ${CGC_PROJECT_URL:-https://chatgpt.com/ (new chat)}"
     echo "CGC_CHROME      ${CGC_CHROME:-<auto-detect>}"
+    ;;
+  activation-hook)
+    # Print a ready-to-paste SessionStart hook that injects this skill's ACTIVATION.md
+    # every session, so Claude reaches for a consult proactively. PRINTS ONLY — it never
+    # edits your settings. You decide whether to add it to your own Claude settings.json.
+    ACT="$(cd "$S/.." && pwd)/ACTIVATION.md"
+    cat <<EOF
+Proactive activation (OPTIONAL) — this only PRINTS a snippet; it does not change any settings.
+
+On demand, the skill already activates on its own (Claude reads its SKILL.md description).
+Add the hook below ONLY if you also want Claude to consider offloading a consult at the
+start of every session. It injects: $ACT
+
+Merge this into the "hooks" object of your Claude settings.json
+(\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/settings.json) — keep any existing SessionStart entries:
+
+  "SessionStart": [
+    {
+      "matcher": "",
+      "hooks": [
+        { "type": "command", "command": "cat '$ACT' 2>/dev/null || true", "timeout": 10 }
+      ]
+    }
+  ]
+
+To undo, remove that one entry again. See docs/INSTALL.md → "Proactive activation".
+EOF
     ;;
   ""|-h|--help)
     grep '^#' "$0" | sed 's/^# \{0,1\}//'

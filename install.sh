@@ -64,8 +64,16 @@ Next steps
        bash "$DEST/scripts/cdp_launch.sh"
   2. (optional) Point consults at your own ChatGPT project:
        export CGC_PROJECT_URL="https://chatgpt.com/g/g-p-<id>-<slug>/project"
-  3. In Claude Code, the skill auto-activates. Or drive it directly:
-       bin/cgc doctor         # re-check health anytime
+  3. In Claude Code the skill auto-activates ON DEMAND: Claude reads its SKILL.md
+     description and invokes it when a task fits. Nothing else is required.
+  4. (optional) PROACTIVE background offloading — if you want Claude to reach for a
+     consult on its own every session, add a SessionStart hook that injects this
+     skill's activation note. This edits YOUR OWN Claude settings, so the installer
+     does NOT do it for you — print the ready-to-paste snippet with:
+       bin/cgc activation-hook
+     (See docs/INSTALL.md → "Proactive activation". The note lives at
+      $DEST/ACTIVATION.md.)
+     bin/cgc doctor         # re-check health anytime
 
 Config lives in the environment — see docs/CONFIGURATION.md and .env.example.
 EOF
