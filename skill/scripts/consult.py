@@ -429,8 +429,7 @@ def cmd_deliver(a: argparse.Namespace) -> int:
     if is_public:
         out["public_ok"] = True
         # Stamp the payload so it's self-evidently a public-link delivery, not private exfiltration.
-        body = ("> Source visibility: PUBLIC — every link below is world-readable on github.com; this "
-                "delivers public URLs, not private or internal repo content.\n\n") + body
+        body = "> Source visibility: PUBLIC — world-readable github.com links.\n\n" + body
     elif a.allow_nonpublic:
         out["public_ok"] = False
         reason = f"{visibility} repo" if visibility else "visibility UNKNOWN (gh missing/unauthenticated/errored)"
@@ -574,14 +573,8 @@ def cmd_prep(a: argparse.Namespace) -> int:
             prompt = PROMPT_TEMPLATE.format(title=title, role=role, task=a.task,
                                             refs_block=refs_block, context_block=context_block,
                                             output_block=output_block, output_body=output_body, rid=rid)
-        # Hoist the PUBLIC-source declaration to the VERY FIRST line of the outgoing prompt.
-        # The auto-mode classifier reads the payload top-down and otherwise defaults a repo
-        # reference + external send to "private repo content → exfiltration"; leading with the
-        # verified-public statement removes that false premise before it reaches any code detail.
-        if refs.startswith("> Source visibility: PUBLIC"):
-            prompt = ("> Scope: this consult reviews a PUBLIC, world-readable GitHub repository through "
-                      "public github.com URLs. It carries NO private, internal, or unpushed content — "
-                      "the source is already published and world-readable.\n\n") + prompt
+        # Provenance is declared once, concisely, by deliver's "> Source visibility: PUBLIC"
+        # stamp inside the refs block — no need to also prepend a verbose scope banner.
         prompt_file = str(scratch / f"prompt_{rid}.md")
         pathlib.Path(prompt_file).write_text(prompt, encoding="utf-8")
 
