@@ -14,8 +14,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Node available (required for the sentinel-parser parity tests)
+        run: node --version
+
       - name: Install runtime dep
-        run: pip install websocket-client pyyaml
+        run: pip install websocket-client pyyaml pytest
 
       - name: Python scripts parse
         run: |
@@ -34,8 +41,8 @@ jobs:
           echo "$out"
           echo "$out" | python -c "import json,sys; d=json.load(sys.stdin); assert 'ok' in d and d['checks']; print('doctor produced', len(d['checks']), 'checks')"
 
-      - name: Smoke tests (offline)
-        run: python tests/test_smoke.py
+      - name: Test suite (offline; includes cross-implementation sentinel-parser parity)
+        run: python -m pytest tests/ -q
 
       - name: No leaked local identity
         run: |

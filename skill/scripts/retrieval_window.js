@@ -44,10 +44,39 @@
     return trimmed.slice(0, 3) === "```" || trimmed.slice(0, 3) === "~~~";
   }
 
+  // Layout-independent innerText approximation: a textContent walk that
+  // re-inserts newlines at block-element boundaries. Read the answer this way,
+  // NOT via .innerText — innerText depends on the tab being rendered and
+  // collapses to ~empty on a BACKGROUNDED tab (the answer would read as a
+  // stub, the sentinels vanish, and extraction silently fails). textContent is
+  // always populated but drops the line breaks that the line-anchored sentinel
+  // parser relies on, so this walk restores block boundaries as newlines.
+  // Mirrors cdp_consult.py's __cgcText so all four sentinel readers agree.
+  var BLOCK_TAGS = /^(P|DIV|LI|UL|OL|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE|TABLE|TR|THEAD|TBODY|SECTION|ARTICLE|HR)$/;
+  function cgcText(el) {
+    if (!el) return "";
+    var out = "";
+    (function walk(n) {
+      for (var i = 0; i < n.childNodes.length; i++) {
+        var c = n.childNodes[i];
+        if (c.nodeType === 3) {
+          out += c.nodeValue;
+        } else if (c.nodeType === 1) {
+          if (c.tagName === "BR") { out += "\n"; continue; }
+          var b = BLOCK_TAGS.test(c.tagName);
+          if (b) out += "\n";
+          walk(c);
+          if (b) out += "\n";
+        }
+      }
+    })(el);
+    return out.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+  }
+
   function extractAnswer() {
     var nodes = document.querySelectorAll('[data-message-author-role="assistant"]');
     for (var k = nodes.length - 1; k >= 0; k--) {
-      var t = (nodes[k].innerText || "").replace(/\r\n/g, "\n");
+      var t = cgcText(nodes[k]).replace(/\r\n/g, "\n");
       var lines = t.split("\n");
       var inFence = false;
       var i = -1;
