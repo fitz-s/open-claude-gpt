@@ -1,9 +1,10 @@
 // Created: 2026-06-10
 // Last reused or audited: 2026-07-01
-// Authority basis: open-claude-gpt skill v1 — DOM retrieval windowing;
-// sentinel parsing hardened to the line-anchored contract (bare trimmed-line
-// equality only, no indexOf/lastIndexOf substring matching) shared across
-// the MCP fallback backend's sentinel implementations.
+// Authority basis: open-claude-gpt skill v2 — DOM retrieval windowing;
+// sentinel parsing hardened to the fence-aware, line-anchored contract (bare
+// trimmed-line equality only, no indexOf/lastIndexOf substring matching, and
+// sentinel lines inside a ``` / ~~~ fence are ignored) shared across the
+// MCP fallback backend's sentinel implementations (cdp_consult.py, consult.py).
 //
 // Purpose: read a large ChatGPT answer through get_page_text under the 50000-char
 // tool-output cap. get_page_text has no offset param, so this script renders the
@@ -30,26 +31,37 @@
   var BEGIN = "BEGIN_RESPONSE:" + RID;
   var END = "END_RESPONSE:" + RID;
 
-  // Line-anchored sentinel parser: a sentinel only matches a line whose
-  // TRIMMED content is EXACTLY equal to the sentinel token. A line that
-  // merely contains a sentinel (quoted in prose, or inside a code block
-  // alongside other characters) must NOT match — indexOf/lastIndexOf over
-  // the raw text is unsafe because the model can echo BEGIN_RESPONSE/
-  // END_RESPONSE inside its own answer body and trigger early/wrong
-  // completion or extraction. Scanning bare, whole lines avoids that.
+  // Fence-aware, line-anchored sentinel parser: a sentinel only matches a
+  // line whose TRIMMED content is EXACTLY equal to the sentinel token, AND
+  // that line must be OUTSIDE any ``` / ~~~ fence. A line that merely
+  // contains a sentinel (quoted in prose, or inside a code block alongside
+  // other characters) must NOT match — indexOf/lastIndexOf over the raw
+  // text is unsafe because the model can echo BEGIN_RESPONSE/END_RESPONSE
+  // inside its own answer body (including inside a fenced code block) and
+  // trigger early/wrong completion or extraction. Scanning bare, whole
+  // lines while tracking fence state avoids that.
+  function isFenceToggle(trimmed) {
+    return trimmed.slice(0, 3) === "```" || trimmed.slice(0, 3) === "~~~";
+  }
+
   function extractAnswer() {
     var nodes = document.querySelectorAll('[data-message-author-role="assistant"]');
     for (var k = nodes.length - 1; k >= 0; k--) {
       var t = (nodes[k].innerText || "").replace(/\r\n/g, "\n");
       var lines = t.split("\n");
+      var inFence = false;
       var i = -1;
       for (var a = 0; a < lines.length; a++) {
-        if (lines[a].trim() === BEGIN) { i = a; break; }
+        var trimmedA = lines[a].trim();
+        if (isFenceToggle(trimmedA)) { inFence = !inFence; continue; }
+        if (!inFence && trimmedA === BEGIN) { i = a; break; }
       }
       if (i < 0) continue;
       var j = -1;
       for (var b = i + 1; b < lines.length; b++) {
-        if (lines[b].trim() === END) { j = b; break; }
+        var trimmedB = lines[b].trim();
+        if (isFenceToggle(trimmedB)) { inFence = !inFence; continue; }
+        if (!inFence && trimmedB === END) { j = b; break; }
       }
       if (!(j > i)) return null;   // require a matching END after BEGIN; no silent fallback
       var body = lines.slice(i + 1, j).join("\n").trim();

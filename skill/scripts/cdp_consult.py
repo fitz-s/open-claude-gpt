@@ -281,10 +281,15 @@ class CDP:
             info = json.load(urllib.request.urlopen(f"{base}/json", timeout=5))
             pages = [t for t in info if t.get("type") == "page" and "chatgpt.com" in (t.get("url") or "")]
             if match:
-                hit = [t for t in pages if match in (t.get("url") or "")]
+                # Exact /c/<match> PATH SEGMENT match, not a loose substring — a URL that merely
+                # contains the id in a query string or hash (e.g. ?ref=<id> or #<id>) must NOT
+                # count as the same conversation. re.escape guards against a conv id containing
+                # regex-special characters.
+                seg_re = re.compile(r"/c/" + re.escape(match) + r"(?:[/?#]|$)")
+                hit = [t for t in pages if seg_re.search(t.get("url") or "")]
                 if not hit:
                     raise SystemExit(f"CGC_ERROR conversation_not_found: no ChatGPT tab whose URL "
-                                     f"contains '{match}' — the tab may have been closed/navigated")
+                                     f"path is /c/{match} — the tab may have been closed/navigated")
                 target = hit[0]
             else:
                 if not pages:
@@ -392,35 +397,56 @@ _TEXT_FN = ("function __cgcText(el){if(!el)return '';"
             "return out.replace(/[ \\t]+\\n/g,'\\n').replace(/\\n{3,}/g,'\\n\\n');}")
 
 
-# ---- SHARED CONTRACT #1: line-anchored sentinel parser -----------------------
+# ---- SHARED CONTRACT #1: fence-aware line-anchored sentinel parser (v2) -----
 # The ONLY completion/extraction rule, in Python AND in the JS this file builds. A line merely
 # CONTAINING the sentinel text (quoted in prose, inside a fenced code block, etc.) must NOT match —
-# only a bare standalone line equal to the sentinel after trim() matches. This is what lets the
-# model safely quote BEGIN_RESPONSE:/END_RESPONSE: tokens in its own answer without those quotes
-# being mistaken for the real wrapper. Canonical Python implementation below; the JS builder
-# (_sentinel_js) mirrors it exactly so detect/extract/status/timeout-rescue never drift apart.
+# only a bare standalone line equal to the sentinel after trim() matches. v2 additionally ignores a
+# bare sentinel line that sits INSIDE a ``` / ~~~ fenced code block (v1 only ignored non-bare
+# occurrences; a bare sentinel-lookalike inside a fence used to false-match). This is what lets the
+# model safely quote BEGIN_RESPONSE:/END_RESPONSE: tokens — even as a bare line inside its own fenced
+# code — without those being mistaken for the real wrapper. Canonical Python implementation below;
+# the JS builder (_sentinel_js) mirrors it exactly so detect/extract/status/timeout-rescue never
+# drift apart.
 
 def _sentinel_parse(text: str, rid: str):
-    """Line-anchored sentinel parser (SHARED CONTRACT #1).
-    begin = index of the FIRST line whose trimmed value == 'BEGIN_RESPONSE:<rid>'
-    end   = index of the FIRST line AFTER begin whose trimmed value == 'END_RESPONSE:<rid>'
+    """Fence-aware, line-anchored sentinel parser (SHARED CONTRACT #1, v2).
+    Scans lines tracking a boolean in_fence: a line whose trimmed value STARTS WITH ``` or ~~~ is a
+    fence toggle — it flips in_fence and is never itself treated as a sentinel line.
+    begin = index of the FIRST line that is NOT in_fence AND whose trimmed value == 'BEGIN_RESPONSE:<rid>'
+    end   = index of the FIRST line AFTER begin that is NOT in_fence AND whose trimmed value ==
+            'END_RESPONSE:<rid>'
     done  = begin found AND end found AND end > begin AND the extracted body is non-empty.
-    Returns (done: bool, body: str) — body is '' when not done.
+    Returns (done: bool, body: str) — body is '' when not done. The body itself MAY contain fenced
+    sentinel-lookalikes; only the boundary sentinels must be bare AND outside any fence.
     """
     norm = (text or "").replace("\r\n", "\n")
     lines = norm.split("\n")
     begin_tok = f"BEGIN_RESPONSE:{rid}"
     end_tok = f"END_RESPONSE:{rid}"
+
+    def _is_fence_toggle(line: str) -> bool:
+        s = line.strip()
+        return s.startswith("```") or s.startswith("~~~")
+
+    in_fence = False
     i = None
     for idx, line in enumerate(lines):
-        if line.strip() == begin_tok:
+        if _is_fence_toggle(line):
+            in_fence = not in_fence
+            continue
+        if not in_fence and line.strip() == begin_tok:
             i = idx
             break
     if i is None:
         return False, ""
+    in_fence = False
     j = None
     for idx in range(i + 1, len(lines)):
-        if lines[idx].strip() == end_tok:
+        line = lines[idx]
+        if _is_fence_toggle(line):
+            in_fence = not in_fence
+            continue
+        if not in_fence and line.strip() == end_tok:
             j = idx
             break
     if j is None or j <= i:
@@ -432,21 +458,28 @@ def _sentinel_parse(text: str, rid: str):
 
 
 def _sentinel_js(rid: str, text_expr: str) -> str:
-    """JS mirror of _sentinel_parse, operating on the LINE-STRUCTURED text produced by `text_expr`
-    (a JS expression evaluating to a string — pass __cgcText(node) output, not raw .textContent,
-    so block-element boundaries survive as line breaks and bare-line matching is meaningful).
-    Returns {done, body} as a JS object literal — embed via `(function(){...return X;})()`. This is
-    the ONE canonical bare-line JS implementation; detect, extract, status and the timeout-rescue
-    path all call it instead of re-deriving the rule."""
+    """JS mirror of _sentinel_parse (v2, fence-aware), operating on the LINE-STRUCTURED text produced
+    by `text_expr` (a JS expression evaluating to a string — pass __cgcText(node) output, not raw
+    .textContent, so block-element boundaries survive as line breaks and bare-line matching is
+    meaningful). Returns {done, body} as a JS object literal — embed via `(function(){...return
+    X;})()`. This is the ONE canonical fence-aware JS implementation; detect, extract, status and the
+    timeout-rescue path all call it instead of re-deriving the rule."""
     begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
     end = json.dumps(f"END_RESPONSE:{rid}")
     return (
         "(function(){"
         "var __t=((" + text_expr + ")||'').replace(/\\r\\n/g,'\\n');"
         "var __lines=__t.split('\\n');var __BG=" + begin + ",__EN=" + end + ";"
-        "var __i=-1;for(var __a=0;__a<__lines.length;__a++){if(__lines[__a].trim()===__BG){__i=__a;break;}}"
+        "function __fence(l){var s=l.trim();return s.indexOf('```')===0||s.indexOf('~~~')===0;}"
+        "var __inFence=false;var __i=-1;"
+        "for(var __a=0;__a<__lines.length;__a++){"
+        "if(__fence(__lines[__a])){__inFence=!__inFence;continue;}"
+        "if(!__inFence&&__lines[__a].trim()===__BG){__i=__a;break;}}"
         "if(__i<0)return {done:false,body:''};"
-        "var __j=-1;for(var __b=__i+1;__b<__lines.length;__b++){if(__lines[__b].trim()===__EN){__j=__b;break;}}"
+        "__inFence=false;var __j=-1;"
+        "for(var __b=__i+1;__b<__lines.length;__b++){"
+        "if(__fence(__lines[__b])){__inFence=!__inFence;continue;}"
+        "if(!__inFence&&__lines[__b].trim()===__EN){__j=__b;break;}}"
         "if(__j<0||__j<=__i)return {done:false,body:''};"
         "var __body=__lines.slice(__i+1,__j).join('\\n').trim();"
         "if(!__body)return {done:false,body:''};"
@@ -830,6 +863,32 @@ def _render_followup(a):
     return out["prompt_file"], out.get("request_id")
 
 
+_PROMPT_FILE_RID_RE = re.compile(r"^BEGIN_RESPONSE:(REQ-\d{8}-\d{6}-[0-9a-f]{6})\s*$", re.MULTILINE)
+
+
+def _extract_rid_from_prompt_file(prompt_file: str) -> str:
+    """LEGACY-PATH RID GUARD: when `followup --prompt-file` is given with no `--rid`, this is the
+    ONLY place that rid comes from. Scan the prompt file for lines matching
+    'BEGIN_RESPONSE:REQ-...'. Exactly ONE distinct rid must be present — zero or more-than-one is a
+    hard failure BEFORE sending, since the caller has no way to know which round the prompt actually
+    belongs to and a wrong guess would let `wait --rid auto` watch a stale round."""
+    try:
+        text = open(prompt_file, encoding="utf-8").read()
+    except OSError as e:
+        raise SystemExit(f"CGC_ERROR prompt_file_unreadable: {prompt_file}: {e}")
+    rids = sorted(set(m.group(1) for m in _PROMPT_FILE_RID_RE.finditer(text)))
+    if len(rids) == 0:
+        raise SystemExit(
+            f"CGC_ERROR rid_not_found_in_prompt_file: {prompt_file} has no bare "
+            "'BEGIN_RESPONSE:REQ-...' line — pass --rid explicitly or use a prompt file rendered "
+            "by consult.py prep --followup.")
+    if len(rids) > 1:
+        raise SystemExit(
+            f"CGC_ERROR ambiguous_rid_in_prompt_file: {prompt_file} contains {len(rids)} distinct "
+            f"rids ({', '.join(rids)}) — pass --rid explicitly to disambiguate.")
+    return rids[0]
+
+
 def cmd_followup(a) -> int:
     """Continue a consult THREAD (ChatGPT keeps the conversation's full context + model).
     Two ways to call it, both zero-bookkeeping:
@@ -852,6 +911,13 @@ def cmd_followup(a) -> int:
     rid = a.rid
     if a.prompt_file:
         prompt_file = a.prompt_file
+        if not rid:
+            # LEGACY PATH: --prompt-file with no --rid used to skip the rid-echo check entirely
+            # and hand `wait --rid auto` a rid resolved AFTER send (which can watch a stale round).
+            # Parse the one rid the prompt file itself declares so the SAME echo check the
+            # one-shot path gets is enforced here too.
+            rid = _extract_rid_from_prompt_file(prompt_file)
+            sys.stderr.write(f"CGC_FOLLOWUP rid parsed from prompt file: {rid}\n")
     else:
         prompt_file, rid = _render_followup(a)
         sys.stderr.write(f"CGC_FOLLOWUP rendered {prompt_file} (rid {rid})\n")
@@ -859,6 +925,7 @@ def cmd_followup(a) -> int:
     # A consult is a THREAD: the conversation persists server-side at /c/<id> even after
     # its tab is closed (default), so follow-up must NOT depend on round-1 having kept the
     # tab. Attach to a live tab if one exists; otherwise RE-OPEN the conversation by URL.
+    reopened = False
     try:
         c = CDP(a.port, match=conv)
     except SystemExit as e:
@@ -866,6 +933,7 @@ def cmd_followup(a) -> int:
             sys.stderr.write(f"CGC_FOLLOWUP tab gone — re-opening conversation {conv} "
                              f"server-side (thread persists; --keep-tab was not required)\n")
             c = CDP(a.port, create_url=f"https://chatgpt.com/c/{conv}")
+            reopened = True
         else:
             raise
     try:
@@ -880,6 +948,22 @@ def cmd_followup(a) -> int:
             time.sleep(0.5)
         else:
             raise SystemExit("CGC_ERROR composer_not_ready")
+        # CONVERSATION-INTEGRITY GUARD (before any model-selection/insert): after attaching to a
+        # live tab or re-opening the closed thread above, the page's URL can lag a beat behind
+        # the target /c/<conv> (freshly-created tab still on about:blank/transitional URL, or a
+        # re-open that briefly redirects). Poll for EXACT equality — not substring — before doing
+        # anything that could land on the WRONG thread. Bounded wait; fail closed without sending.
+        gdl = time.time() + 20
+        while c.conversation_id() != conv and time.time() < gdl:
+            time.sleep(0.5)
+        if c.conversation_id() != conv:
+            print(json.dumps({"ok": False, "followup": True, "conversation_id": c.conversation_id(),
+                              "rid": rid, "wanted_conversation": conv}))
+            sys.stderr.write(
+                f"CGC_ERROR conversation_mismatch: attached tab is at conversation "
+                f"'{c.conversation_id() or '(none)'}', not the expected '{conv}' — NOT sending "
+                f"(would land the follow-up on the wrong thread).\n")
+            return 2
         # MODEL GATE (mirrors submit; fail-closed). A thread can silently downgrade to a
         # non-Pro tier mid-session — Pro quota exhausted, ChatGPT auto-falls back to Instant —
         # and a follow-up used to INHERIT that blindly ("keep the thread's model"), answering
@@ -889,6 +973,17 @@ def cmd_followup(a) -> int:
         # composer text.
         if a.model and a.model.lower() != "skip":
             target = a.model
+            if reopened:
+                # ROBUSTNESS (not a blocker): a freshly re-opened composer often reports the
+                # model-tier switcher as None on the very first probe (the switcher button
+                # hasn't hydrated yet), which would otherwise read as "unselectable" and refuse
+                # closed on a thread that is actually fine. Give it a few short settle/retry
+                # beats before treating the tier as genuinely unselectable — but still fail
+                # closed afterwards if it truly never resolves.
+                for _ in range(6):
+                    if c.eval(_model_now_js()) is not None:
+                        break
+                    time.sleep(0.5)
             if not _select_model(c, target) and not a.allow_model_mismatch:
                 model_now = c.eval(_model_now_js())
                 print(json.dumps({"ok": False, "followup": True, "conversation_id": conv,
@@ -924,7 +1019,19 @@ def cmd_followup(a) -> int:
             if n > u_before:
                 break
         ok = bool(n > u_before)
-        conv = c.conversation_id() or conv
+        # CONVERSATION-INTEGRITY GUARD (after send): require the EXACT same conversation still
+        # holds — do NOT silently adopt whatever conv the page now reports (that would let a
+        # mid-send navigation/redirect to a DIFFERENT thread pass unnoticed, with the follow-up
+        # believed sent into `conv` while it actually landed elsewhere, or vice versa).
+        after_conv = c.conversation_id()
+        if after_conv != conv:
+            print(json.dumps({"ok": False, "userMsgs": n, "conversation_id": after_conv,
+                              "rid": rid, "followup": True, "wanted_conversation": conv}))
+            sys.stderr.write(
+                f"CGC_ERROR conversation_mismatch: after sending, the page is at conversation "
+                f"'{after_conv or '(none)'}', not the expected '{conv}' — the thread changed "
+                f"mid-send. NOT adopting the new id.\n")
+            return 2
         if not ok:
             print(json.dumps({"ok": False, "userMsgs": n, "conversation_id": conv,
                               "rid": rid, "followup": True}))
@@ -933,9 +1040,10 @@ def cmd_followup(a) -> int:
         # actually contains the expected BEGIN_RESPONSE:<rid> echo. Without this, a race (the
         # click landed but the composer text was stale, or a concurrent consult's message
         # interleaved) would have the waiter watch a STALE/OLD round and either time out or
-        # (worse) extract a previous answer under this rid. Only checked when we know the rid
-        # (one-shot rendering always yields one; explicit --prompt-file without --rid cannot be
-        # verified this way and is skipped).
+        # (worse) extract a previous answer under this rid. `rid` is always known here: one-shot
+        # rendering yields one, and the explicit --prompt-file path without --rid now parses it
+        # from the prompt file itself (_extract_rid_from_prompt_file, which fails closed before
+        # send if the file has zero or multiple distinct rids) — so this check always runs.
         if rid:
             echoed = c.eval(_user_rid_js()) or ""
             if echoed != rid:

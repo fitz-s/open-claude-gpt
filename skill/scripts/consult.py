@@ -587,15 +587,26 @@ def cmd_prep(a: argparse.Namespace) -> int:
     # Ready-to-paste JS snippets with the request id baked in (no manual <id> fill-in).
     # Both return METADATA ONLY (booleans / counts) — never page content or URLs.
     begin = f"BEGIN_RESPONSE:{rid}"
-    # done is line-ANCHORED: a standalone line == BEGIN_RESPONSE:<rid> and a later
-    # standalone line == END_RESPONSE:<rid>, plus not-generating. Echoed sentinel
-    # substrings or mid-text mentions do not satisfy it.
+    # done is line-ANCHORED and FENCE-AWARE (shared v2 rule, matched exactly in
+    # retrieval_window.js and cdp_consult.py): scan lines tracking in_fence (a
+    # trimmed line starting with ``` or ~~~ toggles fence state and is itself
+    # never a sentinel); bi = first non-fenced line === BEGIN_RESPONSE:<rid>;
+    # ei = first non-fenced line AFTER bi === END_RESPONSE:<rid>, plus
+    # not-generating. A bare sentinel line ECHOED INSIDE a fenced code block is
+    # ignored — only bare sentinel lines outside any fence satisfy completion.
     poll_js = (
         "(function(){"
         "var a=document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
         'var n=a[a.length-1];var t=(n?n.innerText:"").replace(/\\r\\n/g,"\\n");var L=t.split("\\n");'
         "var BG=" + json.dumps(begin) + ",EN=" + json.dumps(end) + ";"
-        "var bi=-1,ei=-1;for(var i=0;i<L.length;i++){var ln=L[i].trim();if(ln===BG&&bi<0)bi=i;if(ln===EN)ei=i;}"
+        "var inFence=false,bi=-1,ei=-1;"
+        "for(var i=0;i<L.length;i++){"
+        "var ln=L[i].trim();"
+        "if(ln.slice(0,3)==='```'||ln.slice(0,3)==='~~~'){inFence=!inFence;continue;}"
+        "if(inFence)continue;"
+        "if(ln===BG&&bi<0){bi=i;continue;}"
+        "if(ln===EN&&bi>=0&&ei<0&&i>bi)ei=i;"
+        "}"
         "var stop=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"],button[aria-label*=\"停止\"]');"
         "var blocker=null;"
         "if(document.querySelector('input[type=\"password\"]')||/\\/auth|login/i.test(location.pathname))blocker='login';"

@@ -203,6 +203,50 @@ def test_sentinel_parse_crlf_normalized():
     assert body == "hello"
 
 
+def test_sentinel_parse_v2_bare_end_inside_fence_then_real_end():
+    # v2 fence-awareness (a): a fenced code block contains a BARE END_RESPONSE:<rid> line (no
+    # surrounding prose on that line) — it must NOT satisfy done, because it sits inside a ```
+    # fence. Only the REAL bare wrapper OUTSIDE the fence, appearing later, must be matched.
+    m = _cdp()
+    text = (
+        f"BEGIN_RESPONSE:{_RID}\n"
+        "here is the real body, part 1\n"
+        "```\n"
+        f"END_RESPONSE:{_RID}\n"  # bare, but fenced — must be ignored
+        "```\n"
+        "here is the real body, part 2\n"
+        f"END_RESPONSE:{_RID}\n"  # the real, unfenced terminator
+    )
+    done, body = m._sentinel_parse(text, _RID)
+    assert done is True
+    assert body == (
+        "here is the real body, part 1\n"
+        "```\n"
+        f"END_RESPONSE:{_RID}\n"
+        "```\n"
+        "here is the real body, part 2"
+    )
+
+
+def test_sentinel_parse_v2_bare_begin_inside_fence_then_real_begin():
+    # v2 fence-awareness (b): symmetric case — a fenced code block contains a BARE
+    # BEGIN_RESPONSE:<rid> line before the real one. The fenced bare BEGIN must be ignored; the
+    # real BEGIN outside any fence (appearing after) is the one that starts the block.
+    m = _cdp()
+    text = (
+        "leading prose\n"
+        "```\n"
+        f"BEGIN_RESPONSE:{_RID}\n"  # bare, but fenced — must be ignored
+        "```\n"
+        f"BEGIN_RESPONSE:{_RID}\n"  # the real, unfenced start
+        "real body\n"
+        f"END_RESPONSE:{_RID}\n"
+    )
+    done, body = m._sentinel_parse(text, _RID)
+    assert done is True
+    assert body == "real body"
+
+
 def test_code_url_re_requires_real_url():
     # PROVENANCE gate: the code-link check must require an actual github/gist URL, not merely
     # the substring "github" (the old spoofable check).
