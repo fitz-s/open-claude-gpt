@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install runtime dep
+        run: pip install websocket-client
+
+      - name: Python scripts parse
+        run: |
+          python -c "import ast, glob; [ast.parse(open(f).read()) for f in glob.glob('skill/scripts/*.py')]"
+          echo "all scripts parse"
+
+      - name: Shell syntax
+        run: |
+          for f in install.sh uninstall.sh bin/cgc skill/scripts/*.sh; do
+            bash -n "$f" && echo "ok: $f"
+          done
+
+      - name: Doctor runs without crashing (no browser in CI is an expected fail)
+        run: |
+          out=$(NO_COLOR=1 CGC_HOME="$PWD/skill" python skill/scripts/cgc_doctor.py --json || true)
+          echo "$out"
+          echo "$out" | python -c "import json,sys; d=json.load(sys.stdin); assert 'ok' in d and d['checks']; print('doctor produced', len(d['checks']), 'checks')"
+
+      - name: No personal identifiers
+        run: |
+          if grep -rniE "leofitz|/Users/[a-z]|g-p-[0-9a-f]{20}|fitz-s" \
+               --include='*.py' --include='*.sh' --include='*.md' . ; then
+            echo "::error::personal identifier leaked into the repo"; exit 1
+          fi
+          echo "clean"

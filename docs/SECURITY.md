@@ -1,0 +1,57 @@
+# Security model
+
+`chatgpt-consult` automates a browser session **you** have already authenticated.
+It is designed so the agent never touches your credentials and so consults ship
+*links to already-public code*, not private content.
+
+## What it does and does not do
+
+- **Does:** open a tab in a Chrome profile you logged into, type a prompt, read
+  the answer text back, and write it to a local file you own.
+- **Does not:** handle your ChatGPT password or session cookies, read cross-site
+  data, call any private/hidden ChatGPT API, or bypass login, CAPTCHA, or rate
+  limits.
+
+## Credentials
+
+- **You log in once, by hand,** in the dedicated Chrome window. The agent has no
+  credential path — it drives an already-authenticated session.
+- The login persists in the dedicated profile (`CGC_PROFILE`, default
+  `~/.cgc-chrome`), isolated from your normal Chrome.
+- Remote debugging is scoped to loopback (`--remote-allow-origins=http://127.0.0.1:<port>`),
+  not `*`. Only a local client on that port can attach.
+
+## Don't send secrets
+
+The skill is built to **not** exfiltrate private content, but you own the inputs:
+
+- **Never** put `.env` files, API keys, tokens, or unrelated personal data in a
+  prompt, gist, context file, or link.
+- `deliver` checks repo visibility (`gh`) and stamps the payload: a **public**
+  repo's links are declared world-readable; a **private** repo is flagged as
+  exfiltration and points you at pushing to a public repo or keeping it local.
+- **Prefer links to pushed, public code.** A pushed commit with an associated PR
+  always resolves to that public PR link. Gist is a last resort for genuinely
+  unpushed/private-inaccessible state, and gisting content that is *already* on
+  GitHub is explicitly disallowed by the skill's rules.
+
+## Fail-closed guarantees
+
+- **No code source → no send.** `prep`/`submit` refuse a non-followup consult
+  with no real code link (`CGC_ERROR no_code_source`). Prose about code is not a
+  substitute for the code.
+- **Wrong model → no send.** `submit`/`followup` refuse to send if the target
+  model tier can't be selected, rather than silently degrading (override only
+  with an explicit `--allow-model-mismatch`).
+
+## Trust boundary
+
+**ChatGPT is advisory. Your local agent is the source of truth.** Every claim it
+returns is treated as a hypothesis to verify locally (`verify locally: <check>`
+tags make this explicit) — nothing is merged, shipped, or declared done on the
+model's word alone.
+
+## Reporting a vulnerability
+
+Open a GitHub issue for non-sensitive reports, or use private disclosure for
+anything exploitable. Please include repro steps and the affected script/version.

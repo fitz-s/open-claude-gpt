@@ -1,0 +1,1084 @@
+#!/usr/bin/env python3
+# Created: 2026-06-11
+# Last reused or audited: 2026-06-15
+# Authority basis: chatgpt-consult skill v2 (CDP backend — external DevTools client).
+#   Adds `followup` (continue an existing conversation) so a consult is a multi-round
+#   thread, not a one-shot, and an automated Step-0 gate (_ensure_chrome) so submit/
+#   followup self-start the debug Chrome + check login with no LLM step. Answer
+#   detect/extract read via textContent + a DOM walk (NOT innerText, which collapses on
+#   a backgrounded tab — the cause of "1-char answer / waiter only returns on timeout").
+"""
+Pure-CDP backend for the chatgpt-consult skill.
+
+WHY THIS EXISTS
+---------------
+The Claude-in-Chrome MCP path works with zero setup but pays three taxes:
+javascript_tool RETURN values are privacy-scanned (URLs blocked), get_page_text
+is hard-capped at 50000 chars (forcing DOM windowing), and every ScheduleWakeup
+poll reloads the whole main-agent context (cache miss). An *external* Chrome
+DevTools Protocol client is bound by none of these: the page CSP only constrains
+the page's own JS, not a DevTools client; there is no MCP scanner and no 50k cap;
+and the wait-loop runs in a detached shell process holding no agent context.
+
+The cost is a one-time setup: a DEDICATED Chrome profile launched with a remote
+debugging port, logged into ChatGPT Pro once. CDP is disallowed on Chrome's
+default profile (anti-cookie-theft, Chrome 136+), so a separate --user-data-dir
+is mandatory anyway. Use this profile ONLY for consults.
+
+Launch (the user does this once; the agent never types credentials):
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    --remote-debugging-port=9333 "--remote-allow-origins=http://127.0.0.1:9333" \
+    --user-data-dir="$HOME/.cgc-chrome" --no-first-run --no-default-browser-check \
+    "$CGC_PROJECT_URL"   # e.g. https://chatgpt.com/g/g-p-<id>-<slug>/project, or plain https://chatgpt.com/
+Then log into ChatGPT Pro in that window. Leave it open.
+
+SECURITY: this is ordinary browser automation against the user's own logged-in
+session, in a profile they set up, writing the answer to a local file they own.
+It reads only the ChatGPT answer text — never cookies, never cross-site data.
+
+Subcommands:
+  submit   --rid R --prompt-file F [--port P] [--project-url U]
+           open a fresh project chat, type the prompt, submit. (control plane)
+  followup --conversation C --prompt-file F [--port P] [--rid R]
+           send a follow-up into an existing conversation (continues the thread,
+           keeping its context + model). Round-1 wait must have used --keep-tab.
+  wait    --rid R --out F [--port P] [--poll S] [--timeout S]
+          poll until the answer is complete, extract it between the BEGIN/END
+          sentinels, write to --out, exit 0. Run as a detached background Bash;
+          its exit re-invokes the agent = the wake. Exit codes:
+            0 done (answer written)   3 blocker (login/captcha/rate-limit)
+            4 timeout                 2 usage error
+  status  --rid R [--port P]   one-shot JSON {generating,done,blocker,len}
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+
+try:
+    import websocket  # websocket-client
+except ImportError:
+    sys.stderr.write("CGC_ERROR missing_dep: pip install websocket-client\n")
+    raise SystemExit(2)
+
+# ---- configuration (all overridable via environment) ------------------------
+# Everything personal/host-specific is read from the environment so the public
+# skill ships no hard-coded identity. See docs/CONFIGURATION.md and .env.example.
+#   CGC_PORT         remote-debugging port of the dedicated Chrome  (default 9333)
+#   CGC_STATE_DIR    scratch dir for state + answer files           (default /tmp/cgc)
+#   CGC_MODEL        default model tier to select in the composer   (default "Pro Extended")
+#   CGC_PROJECT_URL  ChatGPT URL a fresh consult opens; set this to YOUR project
+#                    (…/g/g-p-<id>-<slug>/project) to keep consults in one project,
+#                    or leave default to open a plain new chat.     (default new chat)
+CGC_PORT = int(os.environ.get("CGC_PORT", "9333"))
+CGC_STATE_DIR = os.environ.get("CGC_STATE_DIR", "/tmp/cgc")
+CGC_MODEL = os.environ.get("CGC_MODEL", "Pro Extended")
+CGC_PROJECT_URL = os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/")
+
+# ---- active-thread state (makes follow-up zero-bookkeeping) -----------------
+# submit/followup record the live conversation here so a follow-up never has to
+# track the conversation_id across turns/background tasks: `--conversation auto`
+# (the default) reads it back. This is THE thing that makes follow-up a habit
+# instead of a chore. Single-thread by design; pass an explicit --conversation
+# to override when juggling several consults at once.
+STATE_PATH = os.path.join(CGC_STATE_DIR, "active.json")
+
+
+def _read_state():
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+_RECENT_WINDOW_S = 2 * 3600  # a consult counts as "active" for ambiguity for this long
+
+
+def _record_recent(cur, conv, rid):
+    """Append/refresh a {conv,rid,ts} entry so `auto` can tell when MORE THAN ONE consult is
+    in play — the single `conversation` slot only ever holds the LAST one, which is exactly
+    how an earlier consult's follow-up used to silently land on the newest thread. Each consult
+    stays addressable by its own conv id; the ambiguity error lists them so a specific one
+    (A among B/C/D) can be pinned even after its tab auto-closed."""
+    prior = next((r for r in cur.get("recent", []) if r.get("conv") == conv), None)
+    if rid is None and prior:  # wait-done refreshes a conv without a rid — keep the submit rid
+        rid = prior.get("rid")
+    recent = [r for r in cur.get("recent", []) if r.get("conv") and r.get("conv") != conv]
+    recent.append({"conv": conv, "rid": rid, "ts": time.time()})
+    cutoff = time.time() - _RECENT_WINDOW_S
+    cur["recent"] = [r for r in recent if r.get("ts", 0) >= cutoff][-12:]
+
+
+def _write_state(**kw):
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        cur = _read_state()
+        cur.update({k: v for k, v in kw.items() if v is not None})
+        if kw.get("conversation"):
+            _record_recent(cur, kw["conversation"], kw.get("rid"))
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(cur, f)
+    except OSError:
+        pass
+
+
+def _resolve_conv(conv):
+    """Explicit --conversation always wins. `auto`/None resolves to the active thread, but ONLY
+    when it is unambiguous: if 2+ consults have been active within the window, `auto` would
+    silently target the most RECENT one (so an earlier consult's follow-up lands on the wrong
+    thread) — refuse and make the caller pin the one it means."""
+    if conv and conv != "auto":
+        # Accept the ORIGINAL consult's rid as a handle too — recent maps rid->conv, and a
+        # rid (REQ-…) never collides with a conversation uuid, so an agent can pin a specific
+        # consult by either its conv id or the rid it already has from submit / the answer file.
+        for r in _read_state().get("recent", []):
+            if r.get("rid") == conv and r.get("conv"):
+                return r["conv"]
+        return conv
+    st = _read_state()
+    cutoff = time.time() - _RECENT_WINDOW_S
+    recent = [r for r in st.get("recent", []) if r.get("ts", 0) >= cutoff and r.get("conv")]
+    seen, distinct = set(), []
+    for r in recent:
+        if r["conv"] not in seen:
+            seen.add(r["conv"]); distinct.append(r)
+    if len(distinct) > 1:
+        lines = "\n".join(f"    --conversation {r['conv']}   (rid {r.get('rid') or '?'})"
+                          for r in distinct)
+        raise SystemExit(
+            "CGC_ERROR ambiguous_followup: %d consults are active — `--conversation auto` would "
+            "silently continue the most RECENT one, so an earlier consult's follow-up would land "
+            "on the wrong thread. Pin the one you mean (the conversation_id submit printed):\n%s"
+            % (len(distinct), lines))
+    if distinct:
+        return distinct[0]["conv"]
+    return st.get("conversation") or None
+
+
+# ---- automated Step-0 gate (no LLM) -----------------------------------------
+
+def _ensure_chrome(port: int) -> None:
+    """Self-heal Step 0 before a consult: start the debug Chrome if it's down and
+    probe login — all deterministic, no LLM. Runs cdp_launch.sh in CGC_GATE mode.
+    Aborts with a clear alert ONLY when the user must act (login needed) or Chrome
+    can't start; otherwise returns and lets the caller proceed (submit's own
+    composer/login checks catch anything the gate couldn't verify). This is what
+    makes Step 0 fire automatically on every consult instead of being a manual step."""
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cdp_launch.sh")
+    if not os.path.exists(script):
+        return
+    try:
+        r = subprocess.run(["bash", script], text=True, capture_output=True, timeout=45,
+                           env={**os.environ, "CGC_GATE": "1", "CGC_PORT": str(port)})
+    except Exception as e:
+        sys.stderr.write(f"CGC_WARN gate_skipped: {e}\n")
+        return
+    if r.returncode == 2:
+        sys.stderr.write((r.stderr or "CGC_LOGIN needed").strip() + "\n")
+        raise SystemExit("CGC_ERROR login_needed: ask the user to log into ChatGPT Pro in the "
+                         "debug Chrome window that is open, then retry the consult.")
+    if r.returncode == 1:
+        sys.stderr.write((r.stderr or "CGC_ERROR chrome").strip() + "\n")
+        raise SystemExit("CGC_ERROR chrome_unavailable: the dedicated debug Chrome could not be "
+                         "started — check the Chrome path / port and retry.")
+    # returncode 0 (ready, possibly login-unverified) → proceed
+
+
+# ---- minimal CDP client -----------------------------------------------------
+
+class CDP:
+    def __init__(self, port: int, timeout: float = 10.0, match=None, create_url=None):
+        """Attach to a ChatGPT page target.
+        - create_url: open a NEW tab at this URL and attach to it (isolates a consult
+          so concurrent consults never clobber each other's conversation).
+        - match: attach only to the page whose URL contains this substring (a /c/<id>
+          conversation id) — pins wait/status to the exact conversation.
+        - neither: attach to the single ChatGPT page; ERROR if there are several
+          (ambiguous — caller must pin with a conversation id).
+        """
+        self.port = port
+        self._id = 0
+        base = f"http://127.0.0.1:{port}"
+        target = None
+        if create_url:
+            ver = json.load(urllib.request.urlopen(f"{base}/json/version", timeout=5))
+            bw = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=timeout)
+            bw.send(json.dumps({"id": 1, "method": "Target.createTarget", "params": {"url": create_url}}))
+            tid = None
+            for _ in range(50):
+                m = json.loads(bw.recv())
+                if m.get("id") == 1:
+                    tid = m.get("result", {}).get("targetId"); break
+            bw.close()
+            if not tid:
+                raise SystemExit("CGC_ERROR new_tab_failed")
+            for _ in range(20):
+                info = json.load(urllib.request.urlopen(f"{base}/json", timeout=5))
+                hit = [t for t in info if t.get("id") == tid and t.get("webSocketDebuggerUrl")]
+                if hit:
+                    target = hit[0]; break
+                time.sleep(0.2)
+            if not target:
+                raise SystemExit("CGC_ERROR new_tab_no_ws")
+        else:
+            info = json.load(urllib.request.urlopen(f"{base}/json", timeout=5))
+            pages = [t for t in info if t.get("type") == "page" and "chatgpt.com" in (t.get("url") or "")]
+            if match:
+                hit = [t for t in pages if match in (t.get("url") or "")]
+                if not hit:
+                    raise SystemExit(f"CGC_ERROR conversation_not_found: no ChatGPT tab whose URL "
+                                     f"contains '{match}' — the tab may have been closed/navigated")
+                target = hit[0]
+            else:
+                if not pages:
+                    pages = [t for t in info if t.get("type") == "page"]
+                if not pages:
+                    raise SystemExit("CGC_ERROR no_page_target: open the ChatGPT tab in the debug profile")
+                if len(pages) > 1:
+                    raise SystemExit("CGC_ERROR ambiguous_target: %d ChatGPT tabs open — pass "
+                                     "--conversation <id> to pin the right one" % len(pages))
+                target = pages[0]
+        self.target_id = target.get("id")
+        self.target_url = target.get("url", "")
+        self.ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=timeout)
+        self.call("Runtime.enable")
+        self.call("Page.enable")
+
+    def conversation_id(self):
+        """The /c/<id> conversation id of the attached tab, or '' if not in a conversation yet."""
+        href = self.eval("location.href") or ""
+        m = re.search(r"/c/([0-9a-f-]+)", href)
+        return m.group(1) if m else ""
+
+    def call(self, method, params=None, timeout=None):
+        self._id += 1
+        mid = self._id
+        self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        deadline = time.time() + (timeout or 30)
+        while time.time() < deadline:
+            msg = json.loads(self.ws.recv())
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise RuntimeError(f"CDP {method} error: {msg['error']}")
+                return msg.get("result", {})
+        raise RuntimeError(f"CDP {method} timeout")
+
+    def eval(self, expr):
+        r = self.call("Runtime.evaluate",
+                      {"expression": expr, "returnByValue": True, "awaitPromise": True})
+        return r.get("result", {}).get("value")
+
+    def key(self, key_name, code, keycode):
+        for t in ("keyDown", "keyUp"):
+            self.call("Input.dispatchKeyEvent",
+                      {"type": t, "key": key_name, "code": code,
+                       "windowsVirtualKeyCode": keycode, "nativeVirtualKeyCode": keycode})
+
+    def close(self):
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+
+    def close_tab(self):
+        """Close the attached browser tab (Target.closeTarget via the browser endpoint).
+        Used to clean up a consult's dedicated tab after its answer is retrieved, so
+        concurrent consults stay isolated without accumulating tabs."""
+        tid = getattr(self, "target_id", None)
+        if not tid:
+            return
+        try:
+            ver = json.load(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json/version", timeout=5))
+            bw = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=5)
+            bw.send(json.dumps({"id": 1, "method": "Target.closeTarget", "params": {"targetId": tid}}))
+            bw.recv()
+            bw.close()
+        except Exception:
+            pass
+
+
+# ---- page logic (textContent-based, layout-INDEPENDENT) ---------------------
+# CRITICAL: read the answer via textContent + a DOM walk, NOT innerText. innerText depends on
+# layout/rendering, which Chrome throttles for a BACKGROUND tab — and the detached waiter polls
+# while the user's foreground tab is elsewhere, so innerText there collapses to ~empty: the
+# answer reads as "1 char", `done` never fires, and wait only returns on timeout. textContent
+# and childNodes are populated regardless of tab visibility. (_user_rid_js already used
+# textContent, which is exactly why rid-resolution worked while answer-extraction silently
+# failed on the same backgrounded tab.)
+
+# Pick the assistant node that actually CONTAINS our BEGIN sentinel (by textContent), not blindly
+# the last node — a trailing empty/streaming assistant node would otherwise read as ~1 char.
+_NODE_FN = (
+    "function __cgcNode(BG){"
+    "var all=document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+    # 1) exact: any assistant node containing our (unique) BEGIN sentinel — global search.
+    "for(var i=all.length-1;i>=0;i--){if((all[i].textContent||'').indexOf(BG)>=0)return all[i];}"
+    # 2) fallback (no sentinel yet): the LARGEST assistant node of the CURRENT turn (after the
+    #    last user message). NOT a[last] — that is often a 1-char trailing streaming placeholder,
+    #    so the waiter saw len=1 for 25 min while the model was actually producing content in
+    #    sibling nodes. NOT a global max either — that would read a PRIOR round's big answer.
+    "var nx=document.querySelectorAll('[data-message-author-role]');"
+    "var lu=-1;for(var j=0;j<nx.length;j++){if(nx[j].getAttribute('data-message-author-role')==='user')lu=j;}"
+    "var best=null,bl=-1;"
+    "for(var k=lu+1;k<nx.length;k++){if(nx[k].getAttribute('data-message-author-role')==='assistant'){"
+    "var L=(nx[k].textContent||'').length;if(L>bl){bl=L;best=nx[k];}}}"
+    "return best;}"
+)
+
+# Layout-independent innerText approximation: a textContent walk that re-inserts newlines at block
+# boundaries, so the extracted answer keeps its line structure WITHOUT needing the tab rendered.
+_TEXT_FN = ("function __cgcText(el){if(!el)return '';"
+            "var BLOCK=/^(P|DIV|LI|UL|OL|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE|TABLE|TR|THEAD|TBODY|SECTION|ARTICLE|HR)$/;"
+            "var out='';(function w(n){for(var i=0;i<n.childNodes.length;i++){var c=n.childNodes[i];"
+            "if(c.nodeType===3){out+=c.nodeValue;}else if(c.nodeType===1){"
+            "if(c.tagName==='BR'){out+='\\n';continue;}var b=BLOCK.test(c.tagName);if(b)out+='\\n';w(c);if(b)out+='\\n';}}})(el);"
+            "return out.replace(/[ \\t]+\\n/g,'\\n').replace(/\\n{3,}/g,'\\n\\n');}")
+
+
+def _detect_js(rid: str) -> str:
+    """Returns JSON {generating,done,blocker,len,begin,end,ac} for the answer node.
+    done is SENTINEL-driven (END_RESPONSE after BEGIN_RESPONSE present), NOT stop-button driven:
+    the model writes END_RESPONSE only as its final line, so its presence == complete + extractable.
+    Depending on the stop-button was fragile — if that UI selector ever persists, done would never
+    fire and wait would only return on timeout. begin/end/ac are diagnostics for the heartbeat."""
+    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
+    end = json.dumps(f"END_RESPONSE:{rid}")
+    return (
+        "(function(){" + _NODE_FN +
+        "var a=document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+        "var BG=" + begin + ",EN=" + end + ";"
+        "var node=__cgcNode(BG);"
+        "var t=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
+        "var e=t.lastIndexOf(EN);var b=(e>=0)?t.lastIndexOf(BG,e):-1;"
+        "var hasB=t.indexOf(BG)>=0,hasE=t.indexOf(EN)>=0;"
+        "var stop=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"],button[aria-label*=\"\\u505c\\u6b62\"]');"
+        "var blocker=null;"
+        "if(document.querySelector('input[type=\"password\"]')||/^\\/(auth|login)(\\/|$)/i.test(location.pathname))blocker='login';"
+        "else if(document.querySelector('iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]'))blocker='captcha';"
+        "else{var al=document.querySelector('[role=\"alert\"]');if(al&&/rate limit|too many requests|usage limit/i.test(al.textContent||''))blocker='rate_limit';}"
+        "var done=(b>=0&&e>b&&a.length>0);"
+        "return JSON.stringify({generating:stop,done:done,blocker:blocker,len:t.length,begin:hasB,end:hasE,ac:a.length});})()"
+    )
+
+
+def _user_rid_js() -> str:
+    """Read the request id from the LAST user message's `BEGIN_RESPONSE:<rid>` echo.
+    Lets `wait`/`status` watch the rid that was actually submitted in THIS conversation,
+    making a submit/wait rid mismatch structurally impossible."""
+    # Exact rid shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) so a missing whitespace boundary in
+    # concatenated text can't make the capture swallow trailing characters.
+    return ("(function(){var u=document.querySelectorAll('[data-message-author-role=\"user\"]');"
+            "var n=u[u.length-1];var t=n?n.textContent:'';"
+            "var m=t.match(/BEGIN_RESPONSE:(REQ-\\d{8}-\\d{6}-[0-9a-f]{6})/);return m?m[1]:'';})()")
+
+
+def _resolve_rid(c, rid):
+    """Resolve + VERIFY the rid against the attached conversation.
+    - rid=='auto': read it from the page's last user message.
+    - explicit rid: confirm the page actually holds THAT request — if the page's rid
+      differs, the wrong tab/conversation is attached → fail loudly (prevents one
+      request from receiving another's answer)."""
+    page_rid = c.eval(_user_rid_js()) or ""
+    if rid == "auto":
+        if not page_rid:
+            raise SystemExit("CGC_ERROR rid_autodetect_failed: no BEGIN_RESPONSE:<rid> in the last "
+                             "user message — wrong/empty conversation attached?")
+        sys.stderr.write(f"CGC_RID resolved {page_rid}\n")
+        return page_rid
+    if page_rid and page_rid != rid:
+        raise SystemExit(f"CGC_ERROR rid_mismatch: attached conversation is for '{page_rid}', "
+                         f"not the expected '{rid}' — wrong tab. Pin with --conversation <id>.")
+    return rid
+
+
+def _last_assistant_js(rid: str) -> str:
+    """Reconstructed text of the answer node (no sentinel slicing) — for the stall raw dump."""
+    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
+    return ("(function(){" + _NODE_FN + _TEXT_FN +
+            "return __cgcText(__cgcNode(" + begin + "));})()")
+
+
+def _extract_js(rid: str) -> str:
+    """Returns the answer text BETWEEN the sentinels of the answer node (textContent walk), or ''."""
+    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
+    end = json.dumps(f"END_RESPONSE:{rid}")
+    return (
+        "(function(){" + _NODE_FN + _TEXT_FN +
+        "var BG=" + begin + ",EN=" + end + ";"
+        "var t=__cgcText(__cgcNode(BG)).replace(/\\r\\n/g,'\\n');"
+        "var e=t.lastIndexOf(EN);if(e<0)return '';"
+        "var b=t.lastIndexOf(BG,e);if(b<0)return '';"
+        "return t.slice(b+BG.length,e).trim();})()"
+    )
+
+
+# ChatGPT VIRTUALIZES message nodes on a backgrounded/inactive tab: the completed answer node
+# can be absent from the DOM (its textContent unreadable) while the tab is in the background, so
+# a passive CDP read sees only short thinking/streaming stubs, `done` never fires, and the waiter
+# times out on an answer that is actually PRESENT (the "no answer" exit-4 on a finished consult).
+# Scrolling the list to the bottom fires the virtualizer's scroll handler synchronously, which
+# renders+commits the final node so textContent becomes readable — no foregrounding needed.
+_FORCE_RENDER_JS = ("(function(){try{var sc=document.querySelector('main')||document.scrollingElement;"
+                    "if(sc)sc.scrollTop=sc.scrollHeight;"
+                    "var a=document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+                    "if(a.length)a[a.length-1].scrollIntoView(false);}catch(e){}return 1;})()")
+
+
+# ---- subcommands ------------------------------------------------------------
+
+def cmd_status(a) -> int:
+    # A self-check AFTER the waiter retrieved + auto-closed the tab must NOT look like a
+    # failure: if --out holds a non-empty answer, report retrieved/done even though the
+    # tab (and thus the live conversation) is gone.
+    out_chars = 0
+    if a.out:
+        try:
+            with open(a.out, encoding="utf-8") as f:
+                out_chars = len(f.read().strip())
+        except OSError:
+            out_chars = 0
+    try:
+        c = CDP(a.port, match=_resolve_conv(a.conversation))
+    except SystemExit as e:
+        if out_chars > 0:
+            print(json.dumps({"done": True, "retrieved": True, "out": a.out,
+                              "len": out_chars, "note": "tab closed; answer already retrieved"}))
+            return 0
+        raise
+    try:
+        rid = _resolve_rid(c, a.rid)
+        print(c.eval(_detect_js(rid)))
+    finally:
+        c.close()
+    return 0
+
+
+# ---- model selection (two-menu aware: model menu vs reasoning-effort menu) ----
+# The composer has more than one switcher button. The reasoning-effort menu
+# (Instant/Medium/High/Extra High) does NOT contain 'Pro' — 'Pro' lives in the model
+# menu. So we must try EACH candidate switcher, open its menu, and pick the one whose
+# menu actually contains the target. Detection is by short button label, not a fixed
+# whitelist, so it survives ChatGPT renaming the tiers.
+# Candidate = a COMPOSER model/effort switcher only. Scoped tightly so a stray
+# 'Pro'-reading button elsewhere (e.g. 'Upgrade to Pro', a plan badge, account chrome)
+# can NEVER false-confirm the model. A real switcher: short label, opens a menu
+# (aria-haspopup) or is aria-labelled as a model picker; and is NOT an action/nav button.
+_CAND_JS = ("[].slice.call(document.querySelectorAll('button')).filter(function(b){"
+            "var t=(b.innerText||'').trim().split('\\n')[0];"
+            "if(!t||t.length>28||/^(projects?|share|copy|send|search|attach|new chat|cancel|stop|upgrade|get |settings|log ?in|sign|account)/i.test(t))return false;"
+            "var hp=(b.getAttribute('aria-haspopup')||'');"
+            "var al=(b.getAttribute('aria-label')||'');"
+            "var menuish=/menu|listbox|dialog|true/i.test(hp)||/model/i.test(al);"
+            "var labelish=/^(Instant|Medium|High|Extra High|Pro|Auto|Thinking|GPT|ChatGPT|o[0-9]|[0-9]\\.[0-9])/.test(t);"
+            "return menuish||labelish;})")
+
+
+def _cand_count_js():
+    return "(function(){return %s.length;})()" % _CAND_JS
+
+
+# ChatGPT's model pill is a Radix popover: it opens ONLY on a real pointer-event
+# sequence, NOT on a bare .click(). A plain click left the menu closed, so no
+# menuitems ever appeared and selection silently fell back to the project default
+# (looked fine only because the default was already Pro). Dispatch the full gesture.
+_GESTURE = ("['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){"
+            "EL.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));});")
+
+
+def _open_cand_js(i):
+    return ("(function(){var c=%s;var EL=c[%d];if(!EL)return null;%s"
+            "return (EL.innerText||'').trim().split('\\n')[0];})()" % (_CAND_JS, i, _GESTURE))
+
+
+def _click_item_js(target):
+    # EXACT first-line match only — a loose `contains` would click a description/other
+    # item that merely mentions the word (e.g. anything containing 'pro'). Same Radix
+    # gesture as opening: a bare .click() can miss on the menuitem too.
+    t = json.dumps(target.lower())
+    return ("(function(){var T=%s;var ms=[].slice.call(document.querySelectorAll("
+            "'[role=\"menuitem\"],[role=\"option\"],[role=\"menuitemradio\"]'));"
+            "var EL=ms.find(function(x){return (x.innerText||'').trim().toLowerCase().split('\\n')[0]===T;});"
+            "if(EL){%s return true;}return false;})()" % (t, _GESTURE))
+
+
+def _model_now_js():
+    """First-line label of the composer model switcher (or null)."""
+    return "(function(){var c=%s;return c.length?(c[0].innerText||'').trim().split('\\n')[0]:null;})()" % _CAND_JS
+
+
+def _model_confirm_js(target):
+    # Pro-family aware: a 'Pro' target is satisfied by ANY Pro tier the switcher shows
+    # ('Pro' or 'Pro Extended'), but NOT by Medium/Instant/High/Auto/GPT-effort. A
+    # non-Pro target must match exactly. This is what keeps a consult off Medium while
+    # accepting the project's default top tier ('Pro Extended').
+    t = json.dumps(target.lower())
+    return ("(function(){var T=%s;return %s.some(function(b){"
+            "var f=(b.innerText||'').trim().toLowerCase().split('\\n')[0];"
+            "return f===T||(T.indexOf('pro')===0&&f.indexOf('pro')===0);});})()" % (t, _CAND_JS))
+
+
+def _select_model(c, target):
+    """Switch the composer to `target` by trying each switcher menu. Returns True if a
+    button now shows the target. Fully automated — no human step."""
+    if c.eval(_model_confirm_js(target)):
+        return True
+    for attempt in range(2):
+        n = c.eval(_cand_count_js()) or 0
+        for i in range(min(int(n), 8)):
+            opened = c.eval(_open_cand_js(i))
+            if opened is None:
+                continue
+            time.sleep(1.0)  # Radix menu renders async after the gesture
+            if c.eval(_click_item_js(target)):
+                time.sleep(0.7)
+                if c.eval(_model_confirm_js(target)):
+                    return True
+            # wrong menu (target not in it) → close and try the next switcher
+            c.key("Escape", "Escape", 27)
+            time.sleep(0.25)
+        time.sleep(0.4)
+    return c.eval(_model_confirm_js(target))
+
+
+def cmd_submit(a) -> int:
+    prompt = open(a.prompt_file, encoding="utf-8").read()
+    # Backstop (prep already hard-blocks at render): refuse to send a prompt with no actual CODE LINK.
+    # A prose Context section is NOT the code — ChatGPT can't read the repo from a description and
+    # answers blind ("no file access / can't cite file:line"). Require a github/gist link unless it's a
+    # follow-up (the thread already holds the code). No override — fail closed.
+    low = prompt.lower()
+    has_code_link = "github" in low  # github.com / gist.github.com / raw.githubusercontent.com
+    is_followup = "continuing this consult" in low
+    if not has_code_link and not is_followup:
+        sys.stderr.write(
+            "CGC_ERROR no_code_source: this prompt has no code link (no github/gist URL) — ChatGPT "
+            "cannot read your repo and would answer BLIND (the recurring 'no file access' failure; a "
+            "prose Context section is NOT the code). Deliver the link first: consult.py deliver "
+            "--repo <owner/repo> --ref <sha> (whole-repo /tree link) → pass its refs_file to prep "
+            "--refs-file. NOT submitting.\n")
+        return 2
+    if not a.no_gate:
+        _ensure_chrome(a.port)  # automated Step 0: start debug Chrome if down + check login
+    # Tab policy: each consult gets its OWN dedicated tab by default, so multiple
+    # consults run concurrently without clobbering each other's conversation. The
+    # waiter pins to this tab's conversation id and (by default) CLOSES it after
+    # retrieving the answer, so tabs don't accumulate. Pass --reuse-tab to instead
+    # navigate the existing single tab (only safe when no other consult is in flight).
+    if a.reuse_tab:
+        c = CDP(a.port)
+        c.call("Page.navigate", {"url": a.project_url})
+    else:
+        c = CDP(a.port, create_url=a.project_url)
+    try:
+        # wait for composer to hydrate
+        for _ in range(30):
+            time.sleep(0.5)
+            ready = c.eval(
+                "(function(){var d=document.querySelector('div[role=\"textbox\"][contenteditable=\"true\"],#prompt-textarea');"
+                "return !!d;})()")
+            if ready:
+                break
+        else:
+            raise SystemExit("CGC_ERROR composer_not_ready")
+        # Model selection — fully automated (must run AFTER navigate, which resets the
+        # model to the project default). Tries each switcher menu until the target tier
+        # is selected. FAIL-CLOSED: if it genuinely cannot select the target, do NOT send.
+        model_confirmed = None
+        model_now = None
+        if a.model and a.model.lower() != "skip":
+            target = a.model
+            model_confirmed = _select_model(c, target)
+            model_now = c.eval(_model_now_js())
+            if not model_confirmed and not a.allow_model_mismatch:
+                if not a.reuse_tab:
+                    c.close_tab()  # don't orphan the dedicated tab we opened for this submit
+                c.close()
+                print(json.dumps({"ok": False, "submitted": False,
+                                  "modelConfirmed": False, "model": model_now, "wanted": target}))
+                sys.stderr.write(
+                    f"CGC_ERROR model_not_selectable: wanted '{target}', switcher shows "
+                    f"'{model_now}' and it could not be changed — NOT submitting. Set a "
+                    f"'{target}' tier in the ChatGPT window, or pass --allow-model-mismatch.\n")
+                return 3
+            if not model_confirmed:
+                sys.stderr.write(f"CGC_WARN proceeding on '{model_now}' not '{target}' "
+                                 f"(--allow-model-mismatch)\n")
+            time.sleep(0.3)
+        # Focus composer + insert text via execCommand (typed newlines would submit early).
+        c.call("Runtime.evaluate", {"expression":
+            "(function(){var d=document.querySelector('div[role=\"textbox\"][contenteditable=\"true\"]')"
+            "||document.querySelector('#prompt-textarea');d.focus();"
+            "document.execCommand('selectAll',false,null);"
+            "document.execCommand('insertText',false," + json.dumps(prompt) + ");"
+            "return d.innerText.length;})()", "returnByValue": True})
+        time.sleep(0.3)
+        # Submit. Prefer the send button; fall back to Enter.
+        clicked = c.eval(
+            "(function(){var b=document.querySelector('button[data-testid=\"send-button\"],"
+            "button[aria-label*=\"Send\" i],button[aria-label*=\"\\u53d1\\u9001\"]');"
+            "if(b&&!b.disabled){b.click();return true;}return false;})()")
+        if not clicked:
+            c.key("Enter", "Enter", 13)
+        # Confirm a user message actually landed (poll — render lags the click).
+        n = 0
+        for _ in range(10):
+            time.sleep(0.5)
+            n = c.eval("document.querySelectorAll('[data-message-author-role=\"user\"]').length")
+            if n and n > 0:
+                break
+        ok = bool(n and n > 0)
+        # The URL transitions /project -> /c/<id> a beat after the message sends; poll for it.
+        conv = ""
+        for _ in range(20):
+            conv = c.conversation_id()
+            if conv:
+                break
+            time.sleep(0.5)
+        if ok and conv:
+            _write_state(conversation=conv, rid=a.rid)  # so `followup`/`wait` can auto-resolve
+        print(json.dumps({"ok": ok, "userMsgs": n, "model": model_now,
+                          "modelConfirmed": model_confirmed, "conversation_id": conv}))
+        if ok and conv:
+            out = os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
+            # Hand the agent the EXACT bounded waiter to run (run_in_background:true). The
+            # `timeout 900` prefix is REQUIRED — the goal-guard denies an un-prefixed bg waiter,
+            # and the nohup escape it suggests makes an UNTRACKED process that never wakes you.
+            sys.stderr.write(
+                "CGC_SUBMITTED. Now run the detached waiter (run_in_background:true) — copy verbatim:\n"
+                f"  timeout 900 python3 {os.path.abspath(__file__)} wait --rid {a.rid} "
+                f"--conversation {conv} --out {out} --poll 20 --timeout 870\n"
+                "MANDATORY: keep the `timeout 900` prefix. If the goal-guard fires, ADD/KEEP `timeout 900` "
+                "(option a) — NEVER use `nohup … & disown` (option c): an untracked process's exit does "
+                "NOT wake you, so the answer lands silently and you wait forever.\n")
+        if ok and not conv:
+            sys.stderr.write("CGC_WARN no /c/<id> captured — pin wait with --rid and watch for "
+                             "ambiguity; the tab may not have transitioned to a conversation URL\n")
+        return 0 if ok else 2
+    finally:
+        c.close()
+
+
+def _render_followup(a):
+    """One-shot ergonomics: if the caller gave --task instead of a pre-rendered
+    --prompt-file, render the follow-up prompt here by shelling out to
+    `consult.py prep --followup`. Returns (prompt_file, rid)."""
+    consult = os.path.join(os.path.dirname(os.path.abspath(__file__)), "consult.py")
+    cmd = [sys.executable, consult, "prep", "--followup", "--task", a.task]
+    if a.title:
+        cmd += ["--title", a.title]
+    if a.context_file:
+        cmd += ["--context-file", a.context_file]
+    if a.refs_file:
+        cmd += ["--refs-file", a.refs_file]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"CGC_ERROR followup_prep_failed: consult.py prep --followup exited "
+                         f"{r.returncode}: {r.stderr.strip()}")
+    try:
+        out = json.loads(r.stdout)
+    except ValueError:
+        raise SystemExit(f"CGC_ERROR followup_prep_unparseable: {r.stdout[:400]}")
+    return out["prompt_file"], out.get("request_id")
+
+
+def cmd_followup(a) -> int:
+    """Continue a consult THREAD (ChatGPT keeps the conversation's full context + model).
+    Two ways to call it, both zero-bookkeeping:
+      • One-shot:  followup --task "<results + next ask>" [--title ..] [--context-file ..] [--refs-file ..]
+                   (renders the follow-up prompt for you — no separate `prep` step)
+      • Explicit:  followup --prompt-file <from consult.py prep --followup>
+    --conversation defaults to the active thread (the last submit/followup); pass it
+    explicitly only when juggling several consults. If the tab was closed, the
+    conversation is RE-OPENED server-side at /c/<id> — --keep-tab is never required.
+    After sending, prints the ready-to-run `wait` command (conv + rid pre-filled)."""
+    if not a.no_gate:
+        _ensure_chrome(a.port)  # automated Step 0: ensure debug Chrome is up + logged in
+    conv = _resolve_conv(a.conversation)
+    if not conv:
+        raise SystemExit("CGC_ERROR no_active_thread: no --conversation given and no active "
+                         "consult on record. Pass --conversation <id> from the original submit.")
+    if not a.prompt_file and not a.task:
+        raise SystemExit("CGC_ERROR followup_no_input: give either --task \"<results + next ask>\" "
+                         "(one-shot, renders for you) or --prompt-file <pre-rendered>.")
+    rid = a.rid
+    if a.prompt_file:
+        prompt_file = a.prompt_file
+    else:
+        prompt_file, rid = _render_followup(a)
+        sys.stderr.write(f"CGC_FOLLOWUP rendered {prompt_file} (rid {rid})\n")
+    prompt = open(prompt_file, encoding="utf-8").read()
+    # A consult is a THREAD: the conversation persists server-side at /c/<id> even after
+    # its tab is closed (default), so follow-up must NOT depend on round-1 having kept the
+    # tab. Attach to a live tab if one exists; otherwise RE-OPEN the conversation by URL.
+    try:
+        c = CDP(a.port, match=conv)
+    except SystemExit as e:
+        if "conversation_not_found" in str(e):
+            sys.stderr.write(f"CGC_FOLLOWUP tab gone — re-opening conversation {conv} "
+                             f"server-side (thread persists; --keep-tab was not required)\n")
+            c = CDP(a.port, create_url=f"https://chatgpt.com/c/{conv}")
+        else:
+            raise
+    try:
+        # composer should already be present at the bottom of an existing conversation
+        # (re-opened tabs need a beat longer to hydrate the thread + composer)
+        for _ in range(40):
+            ready = c.eval(
+                "(function(){var d=document.querySelector('div[role=\"textbox\"][contenteditable=\"true\"],#prompt-textarea');"
+                "return !!d;})()")
+            if ready:
+                break
+            time.sleep(0.5)
+        else:
+            raise SystemExit("CGC_ERROR composer_not_ready")
+        # MODEL GATE (mirrors submit; fail-closed). A thread can silently downgrade to a
+        # non-Pro tier mid-session — Pro quota exhausted, ChatGPT auto-falls back to Instant —
+        # and a follow-up used to INHERIT that blindly ("keep the thread's model"), answering
+        # on Instant with no check. That is the degraded-consult hole. Re-assert the target
+        # tier on the thread BEFORE inserting the prompt; refuse to send on the wrong model
+        # unless --allow-model-mismatch. Runs before insert so the menu clicks can't clobber
+        # composer text.
+        if a.model and a.model.lower() != "skip":
+            target = a.model
+            if not _select_model(c, target) and not a.allow_model_mismatch:
+                model_now = c.eval(_model_now_js())
+                print(json.dumps({"ok": False, "followup": True, "conversation_id": conv,
+                                  "rid": rid, "modelConfirmed": False, "model": model_now,
+                                  "wanted": target}))
+                sys.stderr.write(
+                    f"CGC_ERROR model_not_selectable: thread offers '{model_now}', not '{target}' "
+                    f"— NOT sending this follow-up (it would answer on a DEGRADED model, the "
+                    f"Instant-stall failure). Restore the '{target}' tier in the ChatGPT window, "
+                    f"or pass --allow-model-mismatch to override.\n")
+                return 2
+        # Count user messages BEFORE sending so we can confirm a NEW one landed (the
+        # thread already has >=1 user message, so an absolute >0 check would false-pass).
+        u_before = c.eval("document.querySelectorAll('[data-message-author-role=\"user\"]').length") or 0
+        # Insert via execCommand (typed newlines submit early). Model already gated above.
+        c.call("Runtime.evaluate", {"expression":
+            "(function(){var d=document.querySelector('div[role=\"textbox\"][contenteditable=\"true\"]')"
+            "||document.querySelector('#prompt-textarea');d.focus();"
+            "document.execCommand('selectAll',false,null);"
+            "document.execCommand('insertText',false," + json.dumps(prompt) + ");"
+            "return d.innerText.length;})()", "returnByValue": True})
+        time.sleep(0.3)
+        clicked = c.eval(
+            "(function(){var b=document.querySelector('button[data-testid=\"send-button\"],"
+            "button[aria-label*=\"Send\" i],button[aria-label*=\"\\u53d1\\u9001\"]');"
+            "if(b&&!b.disabled){b.click();return true;}return false;})()")
+        if not clicked:
+            c.key("Enter", "Enter", 13)
+        n = u_before
+        for _ in range(10):
+            time.sleep(0.5)
+            n = c.eval("document.querySelectorAll('[data-message-author-role=\"user\"]').length") or 0
+            if n > u_before:
+                break
+        ok = bool(n > u_before)
+        conv = c.conversation_id() or conv
+        if not ok:
+            print(json.dumps({"ok": False, "userMsgs": n, "conversation_id": conv,
+                              "rid": rid, "followup": True}))
+            return 2
+        _write_state(conversation=conv, rid=rid)  # keep the active thread current
+        default_out = os.path.join(CGC_STATE_DIR, f"answer_{rid}.txt" if rid else "answer_followup.txt")
+        print(json.dumps({"ok": True, "userMsgs": n, "conversation_id": conv, "rid": rid,
+                          "followup": True, "wait_out": default_out, "watching": bool(a.watch)}))
+    finally:
+        c.close()
+    if a.watch:
+        # Same process now waits for the answer → the agent runs ONE backgrounded command for
+        # the whole round (send+wait) and its exit IS the wake. No separate `wait` to mis-arm.
+        a.conversation = conv
+        a.rid = rid or "auto"
+        if not a.out:
+            a.out = default_out
+        sys.stderr.write(f"CGC_FOLLOWUP sent — now watching inline (out {a.out})\n")
+        return cmd_wait(a)
+    sys.stderr.write(
+        "CGC_FOLLOWUP sent. Run the detached waiter (run_in_background:true) — conv+rid pre-filled:\n"
+        f"  timeout 900 python3 {os.path.abspath(__file__)} wait --rid {rid or 'auto'} "
+        f"--conversation {conv} --out {default_out} --poll 20 --timeout 870\n"
+        "(Or skip this: pass --watch --out <file> to followup so send+wait is ONE backgrounded command.)\n")
+    return 0
+
+
+def cmd_wait(a) -> int:
+    deadline = time.time() + a.timeout
+    conv = _resolve_conv(a.conversation)  # 'auto'/None → the active thread
+    # The detached waiter can launch a beat before the tab transitions to /c/<id> (submit
+    # warns it may not capture the conversation id instantly), so RETRY the attach instead of
+    # dying at birth on that race. If the tab was closed (follow-up flow), re-open it.
+    c = None
+    adl = time.time() + min(120, a.timeout)
+    while time.time() < adl:
+        try:
+            c = CDP(a.port, match=conv)
+            break
+        except SystemExit as e:
+            if conv and "conversation_not_found" in str(e):
+                try:
+                    c = CDP(a.port, create_url=f"https://chatgpt.com/c/{conv}")
+                    sys.stderr.write(f"CGC_WAIT re-opened conversation {conv} (tab was closed)\n")
+                    break
+                except SystemExit:
+                    pass
+            sys.stderr.write(f"CGC_WAIT attaching… ({e})\n")
+            time.sleep(5)
+    if c is None:
+        sys.stderr.write("CGC_ERROR attach_failed: no matching ChatGPT tab within the grace window — "
+                         "pass --conversation <id> from submit and ensure the debug Chrome is up.\n")
+        return 2
+    try:
+        # Ensure the answer's directory exists so a completed answer is never lost on write.
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
+        # Tolerant rid resolution: right after submit the conversation/sentinel echo may
+        # still be settling, so RETRY instead of dying. A patient waiter must reach its
+        # poll loop — never hard-exit at startup over a transient.
+        rid = None
+        rdl = time.time() + min(120, a.timeout)
+        while time.time() < rdl:
+            try:
+                rid = _resolve_rid(c, a.rid)
+                break
+            except SystemExit as e:
+                sys.stderr.write(f"CGC_WAIT resolving rid… ({e})\n")
+                time.sleep(5)
+        if rid is None:
+            sys.stderr.write("CGC_ERROR rid_unresolved: could not resolve/verify the rid in the "
+                             "attached conversation within the grace window — wrong tab or no "
+                             "submitted prompt. Pass --conversation <id> from submit.\n")
+            return 2
+        sys.stderr.write(f"CGC_WAIT watching {rid} (poll {a.poll}s, timeout {a.timeout}s, "
+                         f"settle {a.settle_seconds}s)\n")
+        last_len = -1
+        settle_start = None  # wall-clock when the answer FIRST became non-generating + byte-stable
+        ticks = 0
+        while time.time() < deadline:
+            try:
+                c.eval(_FORCE_RENDER_JS)  # materialize the virtualized answer node before reading
+            except Exception:
+                pass
+            try:
+                st = json.loads(c.eval(_detect_js(rid)) or "{}")
+            except Exception as e:
+                # transient CDP/eval hiccup — log and keep waiting, don't die
+                sys.stderr.write(f"CGC_WAIT eval-retry: {e}\n")
+                time.sleep(a.poll)
+                continue
+            ticks += 1
+            if ticks == 1 or ticks % 5 == 0:  # heartbeat so the .output shows it's alive + diagnosable
+                sys.stderr.write(f"CGC_WAIT alive: gen={st.get('generating')} len={st.get('len')} "
+                                 f"done={st.get('done')} begin={st.get('begin')} end={st.get('end')} "
+                                 f"ac={st.get('ac')} t+{int(time.time()-(deadline-a.timeout))}s\n")
+            if st.get("blocker"):
+                sys.stderr.write(f"CGC_BLOCKER {st['blocker']}\n")
+                return 3
+            if st.get("done"):
+                ans = c.eval(_extract_js(rid)) or ""
+                with open(a.out, "w", encoding="utf-8") as f:
+                    f.write(ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
+                sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out}\n")
+                conv = conv or c.conversation_id()
+                _write_state(conversation=conv)  # keep the active thread pointer fresh for follow-up
+                if not a.keep_tab:
+                    c.close_tab()  # free the tab; the conversation still PERSISTS at /c/<id>
+                # On wake the agent sees this on the task output. To CONTINUE the thread (feed
+                # local results back / next round) ALWAYS use `followup` on THIS conversation —
+                # NEVER `prep` (no --followup) + `submit`, which starts a BRAND-NEW thread and
+                # throws away ChatGPT's context. Follow-up works even though the tab auto-closed:
+                # followup re-opens /c/<id> server-side (the thread persists; --keep-tab not needed).
+                sys.stderr.write(
+                    "CGC_NEXT to CONTINUE this consult as a thread (do NOT start a new prep+submit — "
+                    "that opens a new conversation and loses ChatGPT's context, and do NOT arm a bare "
+                    "`until [ -s file ]` watcher — nothing writes that file). It's ONE backgrounded "
+                    "command that sends AND waits (its exit is the wake — no separate step to forget):\n"
+                    f"  timeout 900 python3 {os.path.abspath(__file__)} followup "
+                    "--task \"<local results + next question>\" --title \"<what's new>\" "
+                    f"--watch --out {os.path.join(CGC_STATE_DIR, 'answer_<r2>.txt')} --timeout 870\n"
+                    "  (run_in_background:true; --conversation defaults to this thread; read --out on wake.)\n"
+                    "Do this each time local verification raises a question/disagreement; when the user "
+                    "says 'follow up till it flags nothing', loop until the answer is clean.\n")
+                return 0
+            # The model SHOULD wrap its answer in BEGIN/END_RESPONSE:<rid> (done fires on that).
+            # But it sometimes skips the wrapper — especially on a short follow-up. So when
+            # generation looks finished AND the text is byte-stable, decide: present sentinel →
+            # clean extract (done above); a SUBSTANTIAL unwrapped message (>= --min-unwrapped) →
+            # take it whole with a warning; a TINY stable message → a thinking/streaming stub or a
+            # gap before the real answer, NOT a stall → keep waiting (timeout is the backstop).
+            # NOTE: thinking-summary stub nodes can be 100-250 chars, so the threshold must be well
+            # above that — a real deep answer is many KB.
+            cur_len = st.get("len", 0)
+            if not st.get("generating") and cur_len > 0 and cur_len == last_len:
+                if settle_start is None:
+                    settle_start = time.time()
+                elif time.time() - settle_start >= a.settle_seconds:
+                    ans = c.eval(_extract_js(rid)) or ""
+                    if ans:
+                        with open(a.out, "w", encoding="utf-8") as f:
+                            f.write(ans)
+                        sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out} (recovered at settle)\n")
+                        if not a.keep_tab:
+                            c.close_tab()
+                        return 0
+                    raw = c.eval(_last_assistant_js(rid)) or ""
+                    if len(raw) >= a.min_unwrapped:
+                        with open(a.out, "w", encoding="utf-8") as f:
+                            f.write(raw)
+                        sys.stderr.write(
+                            f"CGC_UNWRAPPED wrote {len(raw)} chars to {a.out}: the model did NOT emit "
+                            f"BEGIN/END_RESPONSE:{rid}, so the whole last message was taken — verify it is "
+                            f"complete (not cut off) before trusting it.\n")
+                        if not a.keep_tab:
+                            c.close_tab()
+                        return 0
+                    # tiny + stable + no sentinel → stub/gap, not a dead answer. Keep polling.
+                    with open(a.out + ".raw", "w", encoding="utf-8") as f:
+                        f.write(raw)
+                    sys.stderr.write(
+                        f"CGC_WAIT stub-stable: last assistant only {len(raw)} chars, no sentinel — "
+                        f"likely a thinking/streaming gap; still waiting (raw saved to {a.out}.raw).\n")
+                    settle_start = None
+            else:
+                settle_start = None
+                last_len = cur_len
+            time.sleep(a.poll)
+        # Timeout: the answer is usually PRESENT but was virtualized out of the inactive tab's
+        # DOM (the failure that returned "no answer" on a completed consult). Force-render hard
+        # — bring the tab to front AND scroll — so React commits the answer node, then re-read.
+        try:
+            c.call("Page.bringToFront", {})
+            c.eval(_FORCE_RENDER_JS)
+        except Exception:
+            pass
+        time.sleep(2)
+        # After force-render the answer node is materialized, so SOMETHING is always present
+        # at the deadline — take it unconditionally. A sentinel-wrapped reply slices clean;
+        # otherwise take the WHOLE last assistant message (no length gate — at the deadline
+        # there is no reason to discard present content). The old "no answer present" exit-4
+        # was a false negative from reading a virtualized DOM; it is removed.
+        rescue = c.eval(_extract_js(rid)) or ""
+        unwrapped = not rescue
+        if unwrapped:
+            rescue = c.eval(_last_assistant_js(rid)) or ""
+        with open(a.out, "w", encoding="utf-8") as f:
+            f.write(rescue)
+        sys.stderr.write(
+            ("CGC_UNWRAPPED " if unwrapped else "CGC_DONE ") +
+            f"wrote {len(rescue)} chars to {a.out} (rescued at timeout"
+            + ("; no BEGIN/END sentinel — verify completeness" if unwrapped else "") + ")\n")
+        if not a.keep_tab:
+            c.close_tab()
+        return 0
+    finally:
+        c.close()
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="cdp_consult.py")
+    p.add_argument("--port", type=int, default=CGC_PORT)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("status")
+    s.add_argument("--rid", required=True, help="expected rid (verified against the conversation) or 'auto'")
+    s.add_argument("--conversation", default="auto", help="/c/<id> to pin the exact tab (default 'auto' = active thread)")
+    s.add_argument("--out", help="the waiter's answer file; if the tab is already closed but this "
+                                 "holds a non-empty answer, status reports done/retrieved instead of "
+                                 "erroring conversation_not_found")
+    s.set_defaults(fn=cmd_status)
+
+    su = sub.add_parser("submit")
+    su.add_argument("--rid", required=True)
+    su.add_argument("--prompt-file", required=True)
+    su.add_argument("--project-url", default=CGC_PROJECT_URL,
+                    help="URL a fresh consult opens (default $CGC_PROJECT_URL, else a new chat). "
+                         "Set CGC_PROJECT_URL to your own ChatGPT project to keep consults grouped.")
+    su.add_argument("--model", default=CGC_MODEL,
+                    help="target model tier (default $CGC_MODEL or 'Pro Extended'). A 'Pro*' target is satisfied "
+                         "by any Pro tier the switcher shows (Pro / Pro Extended) but never by "
+                         "Medium/Instant/etc. Pass 'skip' to leave as-is.")
+    su.add_argument("--reuse-tab", action="store_true",
+                    help="navigate the existing single tab instead of opening a dedicated one "
+                         "(default: own tab per consult, for safe concurrency)")
+    su.add_argument("--allow-model-mismatch", action="store_true",
+                    help="send even if the target model could not be selected (default: fail-closed, "
+                         "do not submit on the wrong model)")
+    su.add_argument("--no-gate", action="store_true",
+                    help="skip the automated Step-0 gate (don't auto-start/-check the debug Chrome). "
+                         "Use only if you manage the debug Chrome yourself.")
+    su.set_defaults(fn=cmd_submit)
+
+    fu = sub.add_parser("followup", help="continue a consult thread (keeps its context + model); "
+                                         "one-shot with --task, or --prompt-file from prep --followup")
+    fu.add_argument("--conversation", default="auto",
+                    help="/c/<id> to continue; default 'auto' = the active thread (last submit/followup). "
+                         "Re-opens the conversation server-side if its tab was closed.")
+    # One-shot input (renders the follow-up prompt for you) …
+    fu.add_argument("--task", help="ONE-SHOT: the local results + the next ask. Renders the follow-up "
+                                   "prompt internally (no separate `prep` step).")
+    fu.add_argument("--title", help="one-shot: short title for the new round")
+    fu.add_argument("--context-file", help="one-shot: local results / what diverged (supplement)")
+    fu.add_argument("--refs-file", help="one-shot: new/changed code link from `deliver` (if any)")
+    # … OR a pre-rendered prompt:
+    fu.add_argument("--prompt-file", help="pre-rendered follow-up prompt from `consult.py prep --followup` "
+                                          "(alternative to --task)")
+    fu.add_argument("--rid", help="the new round's rid (auto-filled in one-shot mode from the rendered prompt)")
+    fu.add_argument("--model", default=CGC_MODEL,
+                    help="tier to ENFORCE on the thread before sending (default $CGC_MODEL or 'Pro Extended'). A "
+                         "follow-up no longer blindly inherits a thread that silently downgraded to "
+                         "Instant — it re-selects the target and fails closed if it can't. 'skip' = "
+                         "leave as-is (old behavior).")
+    fu.add_argument("--allow-model-mismatch", action="store_true",
+                    help="send the follow-up even if the target tier can't be selected (default: "
+                         "fail-closed — do NOT answer on a degraded model).")
+    fu.add_argument("--no-gate", action="store_true",
+                    help="skip the automated Step-0 gate (don't auto-start/-check the debug Chrome).")
+    # --watch: send AND wait in ONE process, so a follow-up is a single backgrounded command
+    # (run_in_background:true) whose exit wakes the agent — no separate `wait` step to forget
+    # or mis-arm. This is the recommended way to run a follow-up.
+    fu.add_argument("--watch", action="store_true",
+                    help="after sending, wait inline for the answer and write it to --out, then exit "
+                         "(one-shot send+wait; the exit is the wake). REQUIRES --out.")
+    fu.add_argument("--out", help="answer file for --watch mode")
+    fu.add_argument("--poll", type=int, default=20, help="(--watch) seconds between DOM checks")
+    fu.add_argument("--timeout", type=int, default=900, help="(--watch) give up after N seconds")
+    fu.add_argument("--settle-seconds", type=int, default=300, help="(--watch) unwrapped-answer settle window")
+    fu.add_argument("--min-unwrapped", type=int, default=1500, help="(--watch) min chars to accept an unwrapped answer")
+    fu.add_argument("--keep-tab", action="store_true", help="(--watch) keep the tab after retrieving")
+    fu.set_defaults(fn=cmd_followup)
+
+    w = sub.add_parser("wait")
+    w.add_argument("--rid", required=True, help="expected rid (verified against the conversation) or 'auto'")
+    w.add_argument("--conversation", default="auto",
+                   help="/c/<id> from submit — pins the exact tab so this waiter cannot pick up "
+                        "another request's answer. Default 'auto' = the active thread; re-opens it "
+                        "if the tab was closed.")
+    w.add_argument("--out", required=True)
+    w.add_argument("--poll", type=int, default=20, help="seconds between DOM checks")
+    w.add_argument("--timeout", type=int, default=900, help="give up after N seconds (default 15 min)")
+    w.add_argument("--keep-tab", action="store_true",
+                   help="do not close the consult's tab after retrieving (default: close it, so "
+                        "concurrent consults' tabs don't accumulate)")
+    w.add_argument("--settle-seconds", type=int, default=300,
+                   help="consider completion only after the answer is non-generating AND byte-stable "
+                        "this long (default 300s — long enough not to trip on a Pro Thinking pause)")
+    w.add_argument("--min-unwrapped", type=int, default=1500,
+                   help="if the model skips the BEGIN/END_RESPONSE wrapper, accept the whole last "
+                        "message as the answer only when it is at least this many chars (default 1500 "
+                        "— well above ChatGPT's ~100-250 char thinking-summary stubs). Smaller stable "
+                        "messages are treated as streaming stubs and the waiter keeps polling.")
+    w.set_defaults(fn=cmd_wait)
+
+    a = p.parse_args()  # --port goes before the subcommand: cdp_consult.py --port N submit ...
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
