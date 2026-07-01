@@ -43,6 +43,7 @@ case "$cmd" in
     echo "CGC_PORT        ${CGC_PORT:-9333}"
     echo "CGC_PROFILE     ${CGC_PROFILE:-$HOME/.cgc-chrome}"
     echo "CGC_STATE_DIR   ${CGC_STATE_DIR:-/tmp/cgc}"
+    echo "CGC_AUTO_MODEL  ${CGC_AUTO_MODEL:-1}"
     echo "CGC_MODEL       ${CGC_MODEL:-Pro Extended}"
     echo "CGC_PROJECT_URL ${CGC_PROJECT_URL:-https://chatgpt.com/ (new chat)}"
     echo "CGC_CHROME      ${CGC_CHROME:-<auto-detect>}"

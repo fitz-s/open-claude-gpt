@@ -17,9 +17,19 @@ releases until it stabilizes.
   security model, troubleshooting.
 - CI: parse + shell-syntax + doctor + no-personal-identifier checks.
 
+- `CGC_AUTO_MODEL` toggle: auto-pick the model tier before every send and fail
+  closed if it can't be selected (on by default), or turn it off to send on
+  whatever the composer shows.
+- More example walkthroughs: plan a feature, hard reasoning / proof, architecture
+  decision, research-backed decision, stuck-bug second opinion, config recipes
+  (plus `--output-file` spec stubs).
+
 ### Changed
 - All host-/account-specific values moved out of the scripts into the environment;
   the repo ships no hard-coded identity.
+- Repositioned around **using your ChatGPT Pro subscription with Claude Code** for
+  **planning, hard reasoning, and review** — dropped the "frontier model / ~7× cost"
+  framing in favor of the subscription + three-pillars story.
 - `deliver` now resolves a commit's associated PR via `commits/<sha>/pulls` and
   leads with that public PR link even for `--ref <sha>` and the auto-detect
   gist-fallback — a pushed commit with a PR never falls back to a gist.
