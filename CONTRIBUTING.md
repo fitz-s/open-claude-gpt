@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve `chatgpt-consult`.
+Thanks for helping improve `open-claude-gpt`.
 
 ## Ground rules
 
@@ -17,8 +17,8 @@ Thanks for helping improve `chatgpt-consult`.
 ## Dev setup
 
 ```bash
-git clone https://github.com/YOUR_USER/chatgpt-consult
-cd chatgpt-consult
+git clone https://github.com/fitz-s/open-claude-gpt
+cd open-claude-gpt
 ./install.sh --link      # symlink so edits go live
 pip install websocket-client
 ```

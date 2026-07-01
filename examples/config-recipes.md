@@ -10,10 +10,10 @@ available — so a consult never silently runs on a weaker model:
 
 ```bash
 export CGC_AUTO_MODEL=1
-export CGC_MODEL="Pro Extended"
+export CGC_MODEL="Pro"
 ```
 
-## On a plan that doesn't have Pro Extended
+## On a plan that doesn't have Pro
 
 Target whatever tier your plan includes:
 

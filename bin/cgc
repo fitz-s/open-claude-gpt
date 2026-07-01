@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cgc — human-facing CLI for chatgpt-consult.
+# cgc — human-facing CLI for open-claude-gpt.
 # Thin dispatcher over the skill scripts so you can drive a consult by hand
 # (Claude Code invokes the same scripts automatically via the skill).
 #
@@ -21,7 +21,7 @@ find_scripts() {
   local c
   for c in \
     "${CGC_HOME:-}/scripts" \
-    "$HOME/.claude/skills/chatgpt-consult/scripts" \
+    "$HOME/.claude/skills/open-claude-gpt/scripts" \
     "$(cd "$(dirname "$0")/.." && pwd)/skill/scripts"; do
     [ -n "$c" ] && [ -f "$c/consult.py" ] && { printf '%s' "$c"; return; }
   done

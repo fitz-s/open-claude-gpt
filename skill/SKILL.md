@@ -1,10 +1,10 @@
 ---
-name: chatgpt-consult
+name: open-claude-gpt
 description: Use proactively whenever ANY deep, self-contained job — code review, architecture/planning, investigation, research, analysis, writing, math, design, a hard second opinion, audit, RFC — can run in parallel with local work and its result isn't needed this second: offload it to your ChatGPT Pro subscription in the background, keep working, and get woken with the full result, which Claude Code then verifies. A multi-round thread, not a one-shot — follow up with local results. Never send secrets/`.env`/keys.
 allowed-tools: Read, Write, Grep, Glob, Bash(python3:*), Bash(bash:*), Bash(curl:*), Bash(mkdir:*), Bash(pbcopy:*), Bash(gh gist create:*), Bash(gh api gists/*), Bash(gh pr view:*), Bash(git status:*), Bash(git diff:*), Bash(git ls-files:*), Bash(git rev-parse:*), Bash(git remote:*), Bash(git branch:*), ScheduleWakeup, mcp__Claude_in_Chrome__list_connected_browsers, mcp__Claude_in_Chrome__select_browser, mcp__Claude_in_Chrome__tabs_context_mcp, mcp__Claude_in_Chrome__tabs_create_mcp, mcp__Claude_in_Chrome__navigate, mcp__Claude_in_Chrome__find, mcp__Claude_in_Chrome__read_page, mcp__Claude_in_Chrome__computer, mcp__Claude_in_Chrome__javascript_tool, mcp__Claude_in_Chrome__get_page_text
 ---
 
-# chatgpt-consult
+# open-claude-gpt
 
 Drive a visible, logged-in ChatGPT Pro session from Claude Code as an **async cloud coprocessor**: hand it a deep, self-contained job (review, plan, investigation, second opinion, audit, design), **fire it to the cloud, and keep working locally while it runs** — the detached waiter wakes you with the full result when it's done. It is an upgraded `ultraplan`/`ultrareview` that runs *off* your local context budget, *in parallel* with your current task, on a *different model family* (independent blind spots) with a huge context + long reasoning budget and web browsing. It runs on the **ChatGPT Pro subscription you already pay for** (no API bill) — spend it on the three things it's best at: **planning, hard reasoning, and review** of your *hardest, most open-ended* deep work. Calibrate what you send to match, and steer it hard (see "Steer the round"). ChatGPT advises; Claude Code executes and verifies. A consult sends repo context to an external surface and drives a logged-in browser — fire proactively without asking; never send secrets/`.env`/keys.
 
@@ -15,24 +15,24 @@ Prereqs (once per machine): `pip install websocket-client`; `gh auth status` OK;
 # 0. Setup gate is AUTOMATIC (no LLM step): `submit` self-heals it — starts the dedicated debug Chrome
 #    if it's down and checks login. You act ONLY if submit aborts with "CGC_ERROR login_needed":
 #    ask the USER to log into ChatGPT Pro in the window that opened, then re-run submit.
-#    (Manual gate if you ever want it: bash ~/.claude/skills/chatgpt-consult/scripts/cdp_launch.sh)
+#    (Manual gate if you ever want it: bash ~/.claude/skills/open-claude-gpt/scripts/cdp_launch.sh)
 
 # 1. Deliver the code as a link (public-PR example). Note "refs_file" in the JSON.
-python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py deliver --repo owner/repo --pr 123
+python3 ~/.claude/skills/open-claude-gpt/scripts/consult.py deliver --repo owner/repo --pr 123
 
 # 2. Prep the prompt (writes the prompt file; capture request_id from the JSON). See "Steer the round".
 #    --title + --role + --task are the steering levers — pass a sharp title and a job-matched role.
-python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py prep --refs-file <refs_file> \
+python3 ~/.claude/skills/open-claude-gpt/scripts/consult.py prep --refs-file <refs_file> \
   --title "<sharp headline>" --role "You are a <persona matched to the job>." --task "<the question>"
 
-# 3. Submit (seconds). Capture conversation_id from the JSON. Model defaults to "Pro Extended".
-python3 ~/.claude/skills/chatgpt-consult/scripts/cdp_consult.py submit --rid <request_id> --prompt-file <prompt_file>
+# 3. Submit (seconds). Capture conversation_id from the JSON. Model defaults to "Pro".
+python3 ~/.claude/skills/open-claude-gpt/scripts/cdp_consult.py submit --rid <request_id> --prompt-file <prompt_file>
 
 # 4. Wait DETACHED — dispatch with run_in_background:true, then go do other work; it wakes you on done.
 #    The `timeout 900` prefix is MANDATORY (the goal-guard denies an un-prefixed background waiter).
 #    If goal-guard still fires, the fix is ALWAYS (a) add/keep `timeout 900` — NEVER (c) `nohup … & disown`:
 #    nohup makes an UNTRACKED process whose exit does NOT wake you, so the answer lands and you never know.
-timeout 900 python3 ~/.claude/skills/chatgpt-consult/scripts/cdp_consult.py wait --rid <request_id> --conversation <conversation_id> --out /tmp/cgc_answer_<request_id>.txt --timeout 870
+timeout 900 python3 ~/.claude/skills/open-claude-gpt/scripts/cdp_consult.py wait --rid <request_id> --conversation <conversation_id> --out /tmp/cgc_answer_<request_id>.txt --timeout 870
 
 # 5. On wake: read the answer, then verify locally.
 #    Read /tmp/cgc_answer_<request_id>.txt    (top-level, NOT under /tmp/cgc/ which is disposable scratch)
@@ -81,14 +81,14 @@ The `--task` is the question — keep code out of it (diffs/file bodies go throu
 
 Worked example — judgment consult (PR merge gate):
 ```bash
-python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py prep --refs-file <refs_file> \
+python3 ~/.claude/skills/open-claude-gpt/scripts/consult.py prep --refs-file <refs_file> \
   --title "Merge-safety gate: PR #406 — data-loss, migration-ordering, back-compat" \
   --role "You are a distributed-systems reviewer focused on concurrency and data integrity." \
   --task "Decide whether PR #406 is safe to merge to main. Safe only if there's no data-loss, migration-ordering, or back-compat risk and the new EMOS offset path keeps settlement math correct. Look hardest at writer/settlement concurrency and any city crossing the DST boundary. Must preserve existing settings.json keys and the public reactor API."
 ```
 Worked example — generative consult (pre-refactor plan; pair with `--output-file` for the per-phase shape):
 ```bash
-python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py prep --refs-file <refs_file> --output-file <shape> \
+python3 ~/.claude/skills/open-claude-gpt/scripts/consult.py prep --refs-file <refs_file> --output-file <shape> \
   --title "Pre-refactor plan: extract the settlement engine out of reactor/" \
   --role "You are a staff engineer planning a behavior-preserving refactor under a live concurrency constraint." \
   --task "Recommend a staged plan to extract the settlement engine out of reactor/, and whether to do it at all. Lowest-risk behavior-preserving step first; never break the public reactor API or settings.json keys mid-sequence; p99 settlement latency must not regress. Hardest part: the writer/settlement concurrency coupling."
@@ -109,18 +109,18 @@ There are two ways to drive the page. **Prefer Backend A (CDP) whenever the debu
 **Selecting the backend:** default to Backend A — `submit` runs the automated Step-0 gate itself (starts the debug Chrome if down, checks login), so you don't probe or launch anything by hand. It aborts with `CGC_ERROR login_needed` only when the user must log into ChatGPT Pro in the window that opened (the agent never types credentials); re-run submit after. Fall back to Backend B only if the user declines the dedicated-profile setup entirely.
 
 ## Pipeline A — CDP backend (preferred; setup once, then near-zero-cost waits)
-0. **Step 0 is automatic — `submit` self-heals it (no LLM step).** Before sending, `submit` runs the gate (`cdp_launch.sh` in `CGC_GATE` mode): it starts the dedicated debug Chrome if it's down and probes login, silently when all is well. It aborts the submit with `CGC_ERROR login_needed` *only* when the user must log into ChatGPT Pro in the window that opened — then ask the user, and re-run submit. **The profile persists the session across Chrome restarts**, so login is one-time *per machine*, not per run (verified); their normal Chrome is untouched; the port uses loopback-scoped `--remote-allow-origins` (not `*`). Pass `submit --no-gate` only if you manage the debug Chrome yourself. (Manual gate: `bash ~/.claude/skills/chatgpt-consult/scripts/cdp_launch.sh`.)
+0. **Step 0 is automatic — `submit` self-heals it (no LLM step).** Before sending, `submit` runs the gate (`cdp_launch.sh` in `CGC_GATE` mode): it starts the dedicated debug Chrome if it's down and probes login, silently when all is well. It aborts the submit with `CGC_ERROR login_needed` *only* when the user must log into ChatGPT Pro in the window that opened — then ask the user, and re-run submit. **The profile persists the session across Chrome restarts**, so login is one-time *per machine*, not per run (verified); their normal Chrome is untouched; the port uses loopback-scoped `--remote-allow-origins` (not `*`). Pass `submit --no-gate` only if you manage the debug Chrome yourself. (Manual gate: `bash ~/.claude/skills/open-claude-gpt/scripts/cdp_launch.sh`.)
 1. **Deliver + Prep.** If ChatGPT needs to see code, run `consult.py deliver --repo-dir <repo> [--files ...]` first (see **File delivery**); pass the resulting `refs_file` to prep as `--refs-file` (prefer a PR/blob link over a gist). Then `consult.py prep` — reuse `request_id` and `prompt_file`. The `--expect-minutes`/wake-plan fields are irrelevant here (no ScheduleWakeup).
 2. **Submit (control plane):**
    ```bash
-   python3 ~/.claude/skills/chatgpt-consult/scripts/cdp_consult.py submit --rid <request_id> --prompt-file <prompt_file>   # --model defaults to "Pro Extended"
+   python3 ~/.claude/skills/open-claude-gpt/scripts/cdp_consult.py submit --rid <request_id> --prompt-file <prompt_file>   # --model defaults to "Pro"
    ```
    **Opens its OWN dedicated tab** (default — so concurrent consults never clobber each other), confirms the model, inserts the sentinel block via `execCommand` (no early submit), sends. Prints `{ok, userMsgs, model, modelConfirmed, conversation_id}`. **You MUST capture `conversation_id`** (the `/c/<id>`) and pass it to `wait --conversation <id>` — that pins the waiter to this exact tab so it returns THIS consult's answer and no other's. (Verified: 2 tabs each return their own answer independently.)
    - **Concurrency:** fire several consults at once — each gets its own tab + `conversation_id` + waiter; the waiter **auto-closes its tab** after retrieving (so tabs don't accumulate). Pass `--reuse-tab` only to navigate the single existing tab (no concurrency). If multiple tabs are open and a waiter isn't pinned with `--conversation`, it errors `ambiguous_target` on purpose — always pin.
-   - **Model:** `--model` defaults to **`Pro Extended`** (any Pro tier satisfies a `Pro*` target); navigate resets the model so submit re-selects it. Selection is **fully automated and two-menu aware** — the composer has separate model and reasoning-effort switchers, and the Pro tier lives in the model menu, so submit tries *each* switcher's menu until the target is actually selected, then confirms. **Fail-closed: if it cannot select the target it does NOT send** (`CGC_ERROR model_not_selectable`, exit 3) — the tier truly isn't offered by this account/project. Override `--model Medium`/etc., `--model skip` to keep the current model, or `--allow-model-mismatch` to send anyway. `composer_not_ready`/`no_page_target` → tab not on ChatGPT or login lapsed; tell the user.
+   - **Model:** `--model` defaults to **`Pro`** (any Pro tier satisfies a `Pro*` target); navigate resets the model so submit re-selects it. Selection is **fully automated and two-menu aware** — the composer has separate model and reasoning-effort switchers, and the Pro tier lives in the model menu, so submit tries *each* switcher's menu until the target is actually selected, then confirms. **Fail-closed: if it cannot select the target it does NOT send** (`CGC_ERROR model_not_selectable`, exit 3) — the tier truly isn't offered by this account/project. Override `--model Medium`/etc., `--model skip` to keep the current model, or `--allow-model-mismatch` to send anyway. `composer_not_ready`/`no_page_target` → tab not on ChatGPT or login lapsed; tell the user.
 3. **Wait + auto-retrieve (detached — this is the efficiency win):**
    ```bash
-   timeout 900 python3 ~/.claude/skills/chatgpt-consult/scripts/cdp_consult.py wait --rid <request_id> --conversation <conversation_id> \
+   timeout 900 python3 ~/.claude/skills/open-claude-gpt/scripts/cdp_consult.py wait --rid <request_id> --conversation <conversation_id> \
      --out /tmp/cgc_answer_<request_id>.txt --poll 20 --timeout 870
    ```
    **The outer `timeout 900` is REQUIRED** — a bare `run_in_background` waiter is unbounded and the goal-guard hook BLOCKS it (`an unbounded one … holds the session in pending-async state`). Outer `timeout 900` (the hook's ≤900s cap) makes it a bounded bg task; inner `--timeout 870` lets the waiter do its own rescue-grab and clean exit ~30s before the outer hard-kill. For a known-huge review, raise BOTH together (e.g. `timeout 1800 … --timeout 1770`).
@@ -141,13 +141,13 @@ The highest-value consults are a loop: get the answer → act locally → **repo
 
 ```bash
 # Round 1 — submit + wait. (submit records the active thread; it also prints this exact line.)
-timeout 900 python3 ~/.claude/skills/chatgpt-consult/scripts/cdp_consult.py wait --out /tmp/cgc_answer_<rid1>.txt --rid <rid1> --timeout 870
+timeout 900 python3 ~/.claude/skills/open-claude-gpt/scripts/cdp_consult.py wait --out /tmp/cgc_answer_<rid1>.txt --rid <rid1> --timeout 870
 # … read the answer, apply it locally, run the tests/checks …
 
 # Round 2 — ONE backgrounded command: renders + sends + WAITS for the answer, then exits (the
 # exit is the wake). --watch folds the wait in, so there is NO separate wait step to forget or
 # mis-arm. --conversation defaults to 'auto' (the active thread); --task is the only required field.
-timeout 900 python3 ~/.claude/skills/chatgpt-consult/scripts/cdp_consult.py followup \
+timeout 900 python3 ~/.claude/skills/open-claude-gpt/scripts/cdp_consult.py followup \
   --task "<local results + the next question>" \
   --title "<what's new>" \
   --watch --out /tmp/cgc_answer_<rid2>.txt --timeout 870 \
@@ -164,7 +164,7 @@ That's the whole round — ONE backgrounded `followup --watch` call. (Without `-
 
 ## Fixed configuration
 - **ChatGPT project (all consults go here):** `$CGC_PROJECT_URL (your ChatGPT project, or a plain new chat)`
-- **Model:** **Pro Extended** — `cdp_consult.py submit` confirms/sets it automatically (`--model` default `Pro Extended`; any Pro tier satisfies it); check `modelConfirmed` in its output.
+- **Model:** **Pro** — `cdp_consult.py submit` confirms/sets it automatically (`--model` default `Pro`; any Pro tier satisfies it); check `modelConfirmed` in its output.
 - **Fresh conversation inside the project per consult** (keeps `get_page_text` ≈ one Q+A; inherits project instructions).
 - Defaults: chunk target 32000 / hard 40000; wake plan from prep (`--expect-minutes` default 15 → first wake ~13 min, re-poll ~6 min; raise `--expect-minutes` for deep tasks to cut wake count); max ~8 chunks and max 3 consult rounds without user approval.
 
@@ -182,7 +182,7 @@ ChatGPT cannot read the local repo, and **the agent CANNOT auto-upload local fil
 
 **`deliver` is AGENT-DRIVEN — YOU choose the reference the task needs**, deliver just renders it grouped. Different tasks point at different things: another repo, `main`, a specific PR number, a compare range. Pass them explicitly:
 ```bash
-python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py deliver \
+python3 ~/.claude/skills/open-claude-gpt/scripts/consult.py deliver \
   [--repo owner/repo]   # a DIFFERENT repo than the local origin
   [--pr 123]            # specific PR  → /pull/123 + /pull/123/files
   [--ref main]          # branch/tag/SHA for /tree + /blob links (e.g. review current main)

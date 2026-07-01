@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # Created: 2026-06-11
 # Last reused or audited: 2026-06-15
-# Authority basis: chatgpt-consult skill v2 (CDP backend — external DevTools client).
+# Authority basis: open-claude-gpt skill v2 (CDP backend — external DevTools client).
 #   Adds `followup` (continue an existing conversation) so a consult is a multi-round
 #   thread, not a one-shot, and an automated Step-0 gate (_ensure_chrome) so submit/
 #   followup self-start the debug Chrome + check login with no LLM step. Answer
 #   detect/extract read via textContent + a DOM walk (NOT innerText, which collapses on
 #   a backgrounded tab — the cause of "1-char answer / waiter only returns on timeout").
 """
-Pure-CDP backend for the chatgpt-consult skill.
+Pure-CDP backend for the open-claude-gpt skill.
 
 WHY THIS EXISTS
 ---------------
@@ -73,7 +73,7 @@ except ImportError:
 #   CGC_PORT         remote-debugging port of the dedicated Chrome  (default 9333)
 #   CGC_STATE_DIR    scratch dir for state + answer files           (default /tmp/cgc)
 #   CGC_AUTO_MODEL   auto-pick the model tier before sending? 1/0    (default 1 = on)
-#   CGC_MODEL        which tier to pick when auto-model is on        (default "Pro Extended")
+#   CGC_MODEL        which tier to pick when auto-model is on        (default "Pro")
 #   CGC_PROJECT_URL  ChatGPT URL a fresh consult opens; set this to YOUR project
 #                    (…/g/g-p-<id>-<slug>/project) to keep consults in one project,
 #                    or leave default to open a plain new chat.     (default new chat)
@@ -84,7 +84,7 @@ CGC_STATE_DIR = os.environ.get("CGC_STATE_DIR", "/tmp/cgc")
 # touch the model picker — send on whatever the composer currently shows. This is
 # the same effect as `--model skip`, exposed as a global switch.
 CGC_AUTO_MODEL = os.environ.get("CGC_AUTO_MODEL", "1").strip().lower() not in ("0", "false", "no", "off", "")
-CGC_MODEL = os.environ.get("CGC_MODEL", "Pro Extended") if CGC_AUTO_MODEL else "skip"
+CGC_MODEL = os.environ.get("CGC_MODEL", "Pro") if CGC_AUTO_MODEL else "skip"
 CGC_PROJECT_URL = os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/")
 
 # ---- active-thread state (makes follow-up zero-bookkeeping) -----------------
@@ -523,7 +523,7 @@ def _model_confirm_js(target):
     # Pro-family aware: a 'Pro' target is satisfied by ANY Pro tier the switcher shows
     # ('Pro' or 'Pro Extended'), but NOT by Medium/Instant/High/Auto/GPT-effort. A
     # non-Pro target must match exactly. This is what keeps a consult off Medium while
-    # accepting the project's default top tier ('Pro Extended').
+    # accepting the project's default top tier ('Pro').
     t = json.dumps(target.lower())
     return ("(function(){var T=%s;return %s.some(function(b){"
             "var f=(b.innerText||'').trim().toLowerCase().split('\\n')[0];"
@@ -1007,7 +1007,7 @@ def main() -> int:
                     help="URL a fresh consult opens (default $CGC_PROJECT_URL, else a new chat). "
                          "Set CGC_PROJECT_URL to your own ChatGPT project to keep consults grouped.")
     su.add_argument("--model", default=CGC_MODEL,
-                    help="target model tier (default $CGC_MODEL or 'Pro Extended'). A 'Pro*' target is satisfied "
+                    help="target model tier (default $CGC_MODEL or 'Pro'). A 'Pro*' target is satisfied "
                          "by any Pro tier the switcher shows (Pro / Pro Extended) but never by "
                          "Medium/Instant/etc. Pass 'skip' to leave as-is.")
     su.add_argument("--reuse-tab", action="store_true",
@@ -1037,7 +1037,7 @@ def main() -> int:
                                           "(alternative to --task)")
     fu.add_argument("--rid", help="the new round's rid (auto-filled in one-shot mode from the rendered prompt)")
     fu.add_argument("--model", default=CGC_MODEL,
-                    help="tier to ENFORCE on the thread before sending (default $CGC_MODEL or 'Pro Extended'). A "
+                    help="tier to ENFORCE on the thread before sending (default $CGC_MODEL or 'Pro'). A "
                          "follow-up no longer blindly inherits a thread that silently downgraded to "
                          "Instant — it re-selects the target and fails closed if it can't. 'skip' = "
                          "leave as-is (old behavior).")

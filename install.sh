@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# chatgpt-consult installer.
-# Copies (or symlinks) the skill into ~/.claude/skills/chatgpt-consult, checks
+# open-claude-gpt installer.
+# Copies (or symlinks) the skill into ~/.claude/skills/open-claude-gpt, checks
 # dependencies, and runs the doctor. Idempotent — safe to re-run to upgrade.
 #
 #   ./install.sh            # copy the skill into ~/.claude/skills
@@ -10,7 +10,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
 SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
-NAME="chatgpt-consult"
+NAME="open-claude-gpt"
 MODE="copy"
 
 while [ $# -gt 0 ]; do
@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
 done
 
 DEST="$SKILLS_DIR/$NAME"
-echo "chatgpt-consult → $DEST  (mode: $MODE)"
+echo "open-claude-gpt → $DEST  (mode: $MODE)"
 
 # --- dependency preflight (non-fatal warnings; doctor re-checks in detail) ----
 command -v python3 >/dev/null || { echo "ERROR: python3 not found" >&2; exit 1; }
