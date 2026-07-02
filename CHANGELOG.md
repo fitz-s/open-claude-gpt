@@ -35,6 +35,16 @@ functional and fenced, but early — expect rough edges).
 - `uninstall.sh --purge` guards the Chrome-profile directory the same way it guards
   the scratch dir (won't `rm -rf` a path that doesn't look like a dedicated cgc dir).
 
+### Fixed
+- **Project-scoped conversations** (`/g/g-p-<pid>/c/<id>`) are now matched: `conversation_id()`
+  and the tab matcher previously recognized only a root `/c/<id>` path, so every consult run
+  inside a ChatGPT **project** failed to record/pin its thread. The id is now matched as a path
+  segment anywhere in the pathname (still pathname-only, so a `?x=/c/<id>` query spoof can't hit).
+- **Model auto-select reaching the Pro tier**: the menu-item click matched the first line
+  exactly, but ChatGPT labels the top effort tier `Pro Extended` (there is no bare `Pro` item),
+  so a `Pro` target could never click it and selection failed closed on a switcher sitting on
+  Medium. The click now uses the same Pro-family prefix rule as the confirm check.
+
 ### Renamed
 - Project is now **Open Claude GPT** (`open-claude-gpt`). The `cgc` CLI and `CGC_*`
   environment prefix are unchanged.
