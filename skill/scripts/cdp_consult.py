@@ -325,11 +325,12 @@ class CDP:
             if match:
                 # Match the URL PATH ONLY (via urlparse), never the query/hash — a tab whose URL
                 # merely contains the id in a query string or hash (e.g. ?ref=/c/<id> or #/c/<id>)
-                # must NOT count as the same conversation. The path must be exactly /c/<match>
-                # (or /c/<match>/... if ChatGPT ever appends a path suffix).
+                # must NOT count as the same conversation. /c/<match> may sit at the ROOT
+                # (/c/<id>) or inside a PROJECT (/g/g-p-<pid>/c/<id>), so match it as a path
+                # SEGMENT anywhere in the pathname — still pathname-only, so a query spoof can't hit.
                 def _is_conv_url(u):
                     path = urllib.parse.urlparse(u or "").path
-                    return path == f"/c/{match}" or path.startswith(f"/c/{match}/")
+                    return re.search(r"(?:^|/)c/" + re.escape(match) + r"(?:/|$)", path) is not None
                 hit = [t for t in pages if _is_conv_url(t.get("url"))]
                 if not hit:
                     raise SystemExit(f"CGC_ERROR conversation_not_found: no ChatGPT tab whose URL "
@@ -355,7 +356,10 @@ class CDP:
         Reads location.PATHNAME only — a /c/<id> that appears in the query string or hash of
         some other page must never be mistaken for the attached conversation."""
         path = self.eval("location.pathname") or ""
-        m = re.match(r"^/c/([0-9a-f-]+)(?:/|$)", path)
+        # /c/<id> can sit at the ROOT (/c/<id>) OR inside a PROJECT (/g/g-p-<pid>/c/<id>) —
+        # match it as a path SEGMENT anywhere in the PATHNAME (never the query/hash, so a
+        # spoofed ?x=/c/<id> can't be mistaken for the attached conversation).
+        m = re.search(r"(?:^|/)c/([0-9a-f-]+)(?:/|$)", path)
         return m.group(1) if m else ""
 
     def call(self, method, params=None, timeout=None):
