@@ -1,4 +1,4 @@
-# open-claude-gpt
+# chatgpt-consult
 
 A Claude Code skill that lets Claude Code consult a **visible, logged-in ChatGPT Pro** web session for deep, high-stakes second opinions — then return to local execution. ChatGPT plans/reviews; Claude Code executes and verifies. It is the Claude Code answer to the (Codex-only) [codex-chatgpt-control](https://github.com/adamallcock/codex-chatgpt-control) SDK, rebuilt around Claude Code's own tools.
 

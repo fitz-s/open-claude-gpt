@@ -2,12 +2,12 @@
 
 Use this ONLY when the dedicated debug-Chrome profile can't be set up (so the preferred CDP backend in SKILL.md → Pipeline A is unavailable). It drives the page through the Claude-in-Chrome MCP and pays all four platform taxes (see SKILL.md → "Hard platform facts"): page CSP, the `javascript_tool` privacy scanner, the 50000-char output cap (→ DOM windowing), and a full main-context reload per `ScheduleWakeup`. The CDP backend avoids all of them.
 
-`SKILL` below = `~/.claude/skills/open-claude-gpt` (write paths in full per command — shell vars don't persist between Bash calls).
+`SKILL` below = `~/.claude/skills/chatgpt-consult` (write paths in full per command — shell vars don't persist between Bash calls).
 
 ## 1. Prep
 ```bash
-python3 ~/.claude/skills/open-claude-gpt/scripts/consult.py prep \
-  --backend mcp --window-template ~/.claude/skills/open-claude-gpt/scripts/retrieval_window.js \
+python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py prep \
+  --backend mcp --window-template ~/.claude/skills/chatgpt-consult/scripts/retrieval_window.js \
   --task "<the question / what you want ChatGPT to plan or review>" \
   --refs-file "<optional /tmp/cgc/refs_*.md from `deliver`>" \
   --context-file "<optional /tmp/context.md you packed>"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # open-claude-gpt installer.
-# Copies (or symlinks) the skill into ~/.claude/skills/open-claude-gpt, checks
+# Copies (or symlinks) the skill into ~/.claude/skills/chatgpt-consult, checks
 # dependencies, and runs the doctor. Idempotent — safe to re-run to upgrade.
 #
 #   ./install.sh            # copy the skill into ~/.claude/skills
@@ -11,7 +11,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
 SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
-NAME="open-claude-gpt"
+NAME="chatgpt-consult"
 MODE="copy"
 FORCE=0
 
