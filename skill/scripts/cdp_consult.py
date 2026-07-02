@@ -690,13 +690,19 @@ def _open_cand_js(i):
 
 
 def _click_item_js(target):
-    # EXACT first-line match only — a loose `contains` would click a description/other
-    # item that merely mentions the word (e.g. anything containing 'pro'). Same Radix
-    # gesture as opening: a bare .click() can miss on the menuitem too.
+    # Match the menuitem's FIRST LINE, Pro-family aware — MUST mirror _model_confirm_js:
+    # a 'Pro' target is satisfied by any Pro tier the menu offers (ChatGPT's effort menu
+    # labels the top tier 'Pro Extended', there is no bare 'Pro' item), so an exact-only
+    # match could never CLICK 'Pro Extended' from a 'Pro' target even though confirm()
+    # accepts it — the two matchers would disagree and selection would fail-closed on a
+    # switcher sitting on Medium. A non-Pro target still needs an exact first-line match
+    # (never a loose contains, which would click a description item). Same Radix gesture as
+    # opening (a bare .click() misses). Verified live: Medium -> 'Pro' selects 'Pro Extended'.
     t = json.dumps(target.lower())
     return ("(function(){var T=%s;var ms=[].slice.call(document.querySelectorAll("
             "'[role=\"menuitem\"],[role=\"option\"],[role=\"menuitemradio\"]'));"
-            "var EL=ms.find(function(x){return (x.innerText||'').trim().toLowerCase().split('\\n')[0]===T;});"
+            "var EL=ms.find(function(x){var f=(x.innerText||'').trim().toLowerCase().split('\\n')[0];"
+            "return f===T||(T.indexOf('pro')===0&&f.indexOf('pro')===0);});"
             "if(EL){%s return true;}return false;})()" % (t, _GESTURE))
 
 
