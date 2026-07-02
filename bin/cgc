@@ -27,7 +27,7 @@ find_scripts() {
   local c candidates=()
   [ -n "${CGC_HOME:-}" ] && candidates+=("$CGC_HOME/scripts")
   candidates+=(
-    "$HOME/.claude/skills/open-claude-gpt/scripts"
+    "$HOME/.claude/skills/chatgpt-consult/scripts"
     "$(cd "$(dirname "$0")/.." && pwd)/skill/scripts"
   )
   for c in "${candidates[@]}"; do

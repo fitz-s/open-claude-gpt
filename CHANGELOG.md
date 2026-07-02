@@ -35,6 +35,9 @@ functional and fenced, but early — expect rough edges).
 - `uninstall.sh --purge` guards the Chrome-profile directory the same way it guards
   the scratch dir (won't `rm -rf` a path that doesn't look like a dedicated cgc dir).
 
+### Changed
+- The installable skill is now named **`chatgpt-consult`** (installs to `~/.claude/skills/chatgpt-consult`). The project/repo remains `open-claude-gpt`.
+
 ### Fixed
 - **Project-scoped conversations** (`/g/g-p-<pid>/c/<id>`) are now matched: `conversation_id()`
   and the tab matcher previously recognized only a root `/c/<id>` path, so every consult run

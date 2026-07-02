@@ -19,7 +19,7 @@ cd open-claude-gpt
 `install.sh`:
 
 1. checks `python3` + auto-installs `websocket-client` if missing,
-2. copies `skill/` into `~/.claude/skills/open-claude-gpt` (backing up any prior install to `.bak`),
+2. copies `skill/` into `~/.claude/skills/chatgpt-consult` (backing up any prior install to `.bak`),
 3. makes the scripts executable,
 4. runs `cgc doctor`.
 
@@ -65,7 +65,7 @@ works the moment the skill is installed — the agent knows when to use it.
 **Proactive (optional).** If you also want Claude to *consider offloading a consult
 at the start of every session* — the aggressive "background ultra-everything"
 default — add a `SessionStart` hook that injects the skill's activation note
-(`~/.claude/skills/open-claude-gpt/ACTIVATION.md`). The installer does **not** do
+(`~/.claude/skills/chatgpt-consult/ACTIVATION.md`). The installer does **not** do
 this for you, because it edits *your own* Claude settings; opt in yourself:
 
 ```bash
@@ -83,7 +83,7 @@ into context each session — edit it to tune how strongly Claude is nudged.
 cd open-claude-gpt && git pull && ./install.sh
 ```
 
-The prior install is moved to `~/.claude/skills/open-claude-gpt.bak` first.
+The prior install is moved to `~/.claude/skills/chatgpt-consult.bak` first.
 
 ## Uninstall
 
