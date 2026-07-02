@@ -496,23 +496,24 @@ def test_parity_matrix_size():
 
 # ============================================================================
 # 5. Pure-unit table test: /c/<id> conversation pathname matcher
-#    - conversation_id(): regex ^/c/([0-9a-f-]+)(?:/|$) applied to location.pathname
-#    - _is_conv_url(): urlparse(u).path == f"/c/{match}" or startswith f"/c/{match}/"
+#    - conversation_id(): regex (?:^|/)c/([0-9a-f-]+)(?:/|$) SEARCHED in location.pathname
+#    - _is_conv_url(): same segment regex over urlparse(u).path
+#    /c/<id> may sit at the ROOT (/c/<id>) or inside a PROJECT (/g/g-p-<pid>/c/<id>).
 #    Both operate on PATH ONLY — a spoofed query string (?x=/c/def) must never match.
 # ============================================================================
 
-_CONV_ID_RE = re.compile(r"^/c/([0-9a-f-]+)(?:/|$)")
+_CONV_ID_RE = re.compile(r"(?:^|/)c/([0-9a-f-]+)(?:/|$)")
 
 
 def _conversation_id_from_path(path):
-    m = _CONV_ID_RE.match(path)
+    m = _CONV_ID_RE.search(path)
     return m.group(1) if m else ""
 
 
 def _is_conv_url(url, match):
     import urllib.parse
     path = urllib.parse.urlparse(url or "").path
-    return path == f"/c/{match}" or path.startswith(f"/c/{match}/")
+    return re.search(r"(?:^|/)c/" + re.escape(match) + r"(?:/|$)", path) is not None
 
 
 CONV_PATH_CASES = [
@@ -520,10 +521,13 @@ CONV_PATH_CASES = [
     ("/c/abc", "abc"),
     ("/c/abc/", "abc"),
     ("/c/abc/anything", "abc"),
-    ("/c/abc?x=/c/def", ""),  # query string is part of `path` arg here only if caller passes it
-    # raw path (no query) forms — pathname never includes the query string in a real browser,
-    # so the spoof case is expressed via the full-URL _is_conv_url table below instead.
-    ("/g/g-p-deadbeef-project", ""),
+    # PROJECT-scoped conversation: id lives under /g/g-p-<pid>/c/<id> — must still resolve.
+    ("/g/g-p-deadbeef-claude-code/c/abc", "abc"),
+    ("/g/g-p-deadbeef-claude-code/c/abc/", "abc"),
+    # NOTE: a real location.pathname never contains a query string ('?...') — the query/hash
+    # spoof case (?x=/c/def) is exercised against FULL urls in the _is_conv_url table below,
+    # where urlparse strips the query before matching. So we don't feed a '?' path here.
+    ("/g/g-p-deadbeef-project", ""),   # project ROOT, no /c/ segment → no conversation
     ("/", ""),
 ]
 
@@ -540,6 +544,11 @@ IS_CONV_URL_CASES = [
     ("https://chatgpt.com/c/abc", "abc", True),
     ("https://chatgpt.com/c/abc/", "abc", True),
     ("https://chatgpt.com/c/abc/anything", "abc", True),
+    # PROJECT-scoped conversation URL — the id is a path segment under /g/g-p-<pid>/c/<id>.
+    ("https://chatgpt.com/g/g-p-deadbeef-claude-code/c/abc", "abc", True),
+    ("https://chatgpt.com/g/g-p-deadbeef-claude-code/c/abc/", "abc", True),
+    # a DIFFERENT project conversation must not match our id.
+    ("https://chatgpt.com/g/g-p-deadbeef-claude-code/c/xyz", "abc", False),
     # SPOOF CASE: query string mentions a DIFFERENT id — must match the PATH's abc, not def,
     # and must NOT be fooled into matching "def" when matching against match="def".
     ("https://chatgpt.com/c/abc?x=/c/def", "abc", True),
@@ -563,19 +572,18 @@ def test_conversation_id_method_matches_regex_used_in_source():
     not hardcoded, so a change to the production regex fails this test instead of silently
     diverging from the table above."""
     src = open(CDP_CONSULT_PY, encoding="utf-8").read()
-    m = re.search(r'm = re\.match\((r"[^"]+")', src)
+    m = re.search(r'm = re\.search\((r"(?:[^"\\]|\\.)*")\s*,\s*path\)', src)
     assert m, "conversation_id() regex not found in cdp_consult.py"
     prod_pattern = eval(m.group(1))  # noqa: S307 — trusted local source file, not external input
     assert prod_pattern == _CONV_ID_RE.pattern
 
 
 def test_is_conv_url_logic_matches_source():
-    """Cross-check: _is_conv_url's path-equality logic is extracted from the actual source
-    (the `path == f"/c/{match}" or path.startswith(f"/c/{match}/")` expression) so a change to
-    production logic is caught here rather than silently diverging from the table above."""
+    """Cross-check: _is_conv_url's segment-match logic is present in the actual source, so a
+    change to production logic is caught here rather than silently diverging from the table."""
     src = open(CDP_CONSULT_PY, encoding="utf-8").read()
-    assert 'path == f"/c/{match}" or path.startswith(f"/c/{match}/")' in src, (
-        "_is_conv_url's path-equality expression changed shape — update this test's mirrored "
+    assert r'return re.search(r"(?:^|/)c/" + re.escape(match) + r"(?:/|$)", path) is not None' in src, (
+        "_is_conv_url's segment-match expression changed shape — update this test's mirrored "
         "logic (_is_conv_url in this file) to match, after confirming the new behavior is intended."
     )
 
