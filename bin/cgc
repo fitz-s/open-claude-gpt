@@ -11,6 +11,8 @@
 #   cgc followup <args…>              continue a thread                    (cdp_consult.py followup)
 #   cgc wait    <args…>               poll until the answer is complete    (cdp_consult.py wait)
 #   cgc status  <args…>               one-shot progress JSON               (cdp_consult.py status)
+#   cgc set-project <url>|--clear     persist which ChatGPT project consults open (all users)
+#   cgc get-project                   print the stored project URL
 #   cgc config                        print the effective configuration
 #   cgc activation-hook               print an OPTIONAL SessionStart hook snippet
 #                                     (proactive offloading) — prints only, never edits settings
@@ -46,15 +48,31 @@ case "$cmd" in
   submit|followup|wait|status)
             # cdp_consult.py takes --port BEFORE the subcommand; pass through as-is.
             exec python3 "$S/cdp_consult.py" "$cmd" "$@" ;;
+  set-project)
+    # Persist which ChatGPT project a fresh consult opens, for ALL future consults, in the
+    # tool's own config file (~/.config/cgc/config) — no shell rc or settings.json edit needed.
+    # A real CGC_PROJECT_URL env var still overrides it. Pass a project URL, or --clear to unset.
+    url="${1:-}"
+    case "$url" in
+      "") echo "usage: cgc set-project <chatgpt-project-url>   e.g. https://chatgpt.com/g/g-p-<id>-<slug>/project" >&2
+          echo "       cgc set-project --clear   (open a plain new chat again)" >&2; exit 2 ;;
+      --clear) exec python3 "$S/cgc_config.py" set CGC_PROJECT_URL "https://chatgpt.com/" ;;
+      *) exec python3 "$S/cgc_config.py" set CGC_PROJECT_URL "$url" ;;
+    esac ;;
+  get-project)
+    exec python3 "$S/cgc_config.py" get CGC_PROJECT_URL ;;
   config)
-    echo "scripts     $S"
+    echo "scripts        $S"
+    echo "config file    $(python3 "$S/cgc_config.py" path)"
     echo "CGC_PORT        ${CGC_PORT:-9333}"
     echo "CGC_PROFILE     ${CGC_PROFILE:-$HOME/.cgc-chrome}"
     echo "CGC_STATE_DIR   ${CGC_STATE_DIR:-/tmp/cgc}"
     echo "CGC_AUTO_MODEL  ${CGC_AUTO_MODEL:-1}"
     echo "CGC_MODEL       ${CGC_MODEL:-Pro}"
-    echo "CGC_PROJECT_URL ${CGC_PROJECT_URL:-https://chatgpt.com/ (new chat)}"
+    echo "CGC_PROJECT_URL ${CGC_PROJECT_URL:-$(python3 "$S/cgc_config.py" get CGC_PROJECT_URL)}"
     echo "CGC_CHROME      ${CGC_CHROME:-<auto-detect>}"
+    echo "(stored in config file:)"
+    python3 "$S/cgc_config.py" show | sed 's/^/  /' || true
     ;;
   activation-hook)
     # Print a ready-to-paste SessionStart hook that injects this skill's ACTIVATION.md

@@ -20,6 +20,10 @@ functional and fenced, but early — expect rough edges).
   (`_sentinel_parse`, `_sentinel_js`, `retrieval_window.js`, `poll_js`) against a
   shared fixture corpus, so the parsers can't silently drift (Node runs it in CI).
 
+- **`cgc set-project <url>`** — persist which ChatGPT project consults open, in a tool-owned
+  config file (`~/.config/cgc/config`), so any user customizes it without editing a shell rc or
+  Claude's settings; a `CGC_PROJECT_URL` env var still overrides it (`cgc_config.py`).
+
 ### Hardened
 - Public-source provenance is fail-closed by default.
 - Remote debugging is loopback-bound and verified by the doctor; `cgc doctor --secure`

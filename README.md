@@ -127,7 +127,14 @@ Per-consult override: `--model "High"` or `--model skip`.
 
 ## Configuration
 
-Everything host- or preference-specific is read from the environment — the public skill ships **no hard-coded identity**. Copy `.env.example` to `.env` and set what you want:
+**Point consults at your ChatGPT project** — the one thing most people set — with no shell-rc or `settings.json` editing:
+
+```bash
+cgc set-project "https://chatgpt.com/g/g-p-<id>-<slug>/project"   # every consult opens here
+cgc set-project --clear                                           # back to a plain new chat
+```
+
+It persists in the tool's own config (`~/.config/cgc/config`); a `CGC_PROJECT_URL` env var still overrides it. Everything else host- or preference-specific is read from the environment — the public skill ships **no hard-coded identity**. Copy `.env.example` to `.env`, or set any of these:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
