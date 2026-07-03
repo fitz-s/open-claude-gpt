@@ -36,6 +36,15 @@ import sys
 import os
 import time
 
+# Load persisted CGC_* settings from the user's config file (env still wins) — see
+# cgc_config.py and `cgc set-project`.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from cgc_config import load_config as _cgc_load_config
+    _cgc_load_config()
+except Exception:
+    pass
+
 # Scratch dir for prompt/refs/answer files — overridable via env (see docs/CONFIGURATION.md).
 CGC_STATE_DIR = os.environ.get("CGC_STATE_DIR", "/tmp/cgc")
 

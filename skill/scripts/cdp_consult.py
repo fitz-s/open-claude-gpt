@@ -92,6 +92,16 @@ except ImportError:
 #   CGC_PROJECT_URL  ChatGPT URL a fresh consult opens; set this to YOUR project
 #                    (…/g/g-p-<id>-<slug>/project) to keep consults in one project,
 #                    or leave default to open a plain new chat.     (default new chat)
+# Load persisted CGC_* settings from the user's config file (env still wins) — see
+# cgc_config.py and `cgc set-project`. Makes the script's own dir importable first, so
+# this works however the script is launched.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from cgc_config import load_config as _cgc_load_config
+    _cgc_load_config()
+except Exception:
+    pass
+
 CGC_PORT = int(os.environ.get("CGC_PORT", "9333"))
 CGC_STATE_DIR = os.environ.get("CGC_STATE_DIR", "/tmp/cgc")
 # Auto model-selection is a toggle. ON (default): pick CGC_MODEL in the composer

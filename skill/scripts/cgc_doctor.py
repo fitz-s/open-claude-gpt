@@ -29,6 +29,16 @@ GREEN, YELLOW, RED, DIM, RESET = "\033[32m", "\033[33m", "\033[31m", "\033[2m", 
 if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
     GREEN = YELLOW = RED = DIM = RESET = ""
 
+# Load persisted CGC_* settings from the user's config file (env still wins) — see
+# cgc_config.py and `cgc set-project`, so the doctor reports the SAME effective config
+# the skill will actually use.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from cgc_config import load_config as _cgc_load_config
+    _cgc_load_config()
+except Exception:
+    pass
+
 PORT = int(os.environ.get("CGC_PORT", "9333"))
 PROFILE = os.environ.get("CGC_PROFILE", os.path.expanduser("~/.cgc-chrome"))
 STATE_DIR = os.environ.get("CGC_STATE_DIR", "/tmp/cgc")
