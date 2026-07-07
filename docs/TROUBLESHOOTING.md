@@ -88,6 +88,29 @@ answer finish? re-send the rest"`) if it looks truncated. The `.raw` sibling fil
 preserves exactly what was salvaged, in case the primary `--out` file gets
 overwritten by a later step.
 
+## `await` says `daemon_not_running`
+The egress daemon isn't up. Start it with `bin/cgc watch` (foreground) or
+`bin/cgc up` (Chrome + daemon, detached) — this is a one-time, user-started
+process, same as logging into the dedicated Chrome; the agent should never start
+it itself. Retry `cgc await` once `bin/cgc queue` shows the daemon up.
+
+## The daemon refused my job (`gate` error / GATE REFUSED)
+The daemon's egress gate re-checks every job before sending and refuses
+fail-closed. Common causes:
+- The referenced repo isn't gh-confirmed **public** — only public repos pass.
+- The delivery is a **gist link** — gists are refused by default because
+  visibility can't be cheaply proven the way a repo's can; set
+  `CGC_GATE_ALLOW_GIST=1` if you deliberately intend to send one.
+- A **secret-shaped string** was detected in the rendered prompt — remove it;
+  don't put `.env`/keys/tokens in `--task` or `--context-file`.
+
+## Consults hang forever in auto mode
+Under Claude Code's `auto` permission mode, the direct `submit`/`wait` path is
+blocked by the data-exfiltration classifier and the agent falls back to
+`enqueue`/`await`, which needs the egress daemon running to make progress. Check
+`bin/cgc queue` — if it shows the daemon **DOWN**, start it with `bin/cgc watch`
+(or `bin/cgc up`); nothing will complete until it's up.
+
 ## `gh` warnings in doctor
 `gh` is optional but recommended. Without it, `deliver` can't verify repo
 visibility or resolve PR associations. Install from https://cli.github.com and

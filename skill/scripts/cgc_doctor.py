@@ -360,6 +360,25 @@ def run(deep: bool, secure: bool = False) -> Report:
     r.ok("config", f"port={PORT} model={MODEL!r} profile={PROFILE}")
     r.ok("project", PROJECT_URL)
 
+    # 10. Egress daemon (user-started, like the debug Chrome). Required for the auto-mode-safe
+    # enqueue/await path; the direct submit/wait path still works without it, so this is a WARN.
+    try:
+        import cgc_spool
+        if cgc_spool.daemon_alive():
+            r.ok("daemon", f"egress daemon running (spool {cgc_spool.SPOOL_DIR})")
+        else:
+            r.warn("daemon", "egress daemon not running — REQUIRED for consults to run under "
+                   "Claude Code's auto mode (enqueue/await path); enqueued jobs will sit in the "
+                   "queue and never run",
+                   "start it with `cgc watch` (foreground) or `cgc up` (Chrome + daemon)")
+        try:
+            cgc_spool.ensure_dirs()
+        except Exception as e:
+            r.warn("daemon spool dir", f"{cgc_spool.SPOOL_DIR} not writable ({e})",
+                   "set CGC_STATE_DIR (or CGC_SPOOL_DIR) to a writable path")
+    except Exception as e:
+        r.warn("daemon", f"cgc_spool not importable ({e})", "re-run install.sh from the repo")
+
     return r
 
 
