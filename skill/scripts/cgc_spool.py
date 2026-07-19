@@ -133,8 +133,17 @@ _SUBDIRS = ("pending", "processing", "done", "status", "logs")
 
 
 def ensure_dirs():
+    """Create the spool private to this user. The PROMPTS are public by construction — the gate
+    enforces that. The ANSWERS are not: a consult's reply can quote private context, and follow-up
+    rounds carry local results outright. Leaving them at the umask's mercy under a world-traversable
+    /tmp made confidentiality a property of the host's configuration rather than of this tool."""
+    os.makedirs(SPOOL_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(SPOOL_DIR, 0o700)
+    except OSError:
+        pass
     for d in _SUBDIRS:
-        os.makedirs(os.path.join(SPOOL_DIR, d), exist_ok=True)
+        os.makedirs(os.path.join(SPOOL_DIR, d), mode=0o700, exist_ok=True)
 
 
 def _p(*parts):
@@ -491,10 +500,19 @@ def cmd_await(a) -> int:
         st = read_status(rid) or {}
         state = st.get("state")
         if state == "done":
-            try:
-                n = os.path.getsize(out)
-            except OSError:
-                n = 0
+            # `done` is the daemon's claim; the file is the evidence. They can disagree — the waiter
+            # writes the answer and the worker marks the status in two separate steps, so a failure
+            # between them leaves one without the other. Reporting success for a missing or empty
+            # file told the caller "answer ready (0 chars)" and returned 0, which is the worst
+            # possible outcome: a confident lie the caller has no reason to check.
+            n = os.path.getsize(out) if os.path.exists(out) else -1
+            if n <= 0:
+                sys.stderr.write(
+                    f"CGC_BROKEN {rid}: the daemon reports this consult done, but its answer file is "
+                    f"{'missing' if n < 0 else 'empty'} ({out}). The status and the artifact "
+                    f"disagree, so the answer was NOT delivered.\n")
+                _point_at_log(rid, out)
+                return 1
             sys.stderr.write(f"CGC_DONE {rid}: answer ready ({n} bytes). READ IT AT:\n  {out}\n")
             conv = st.get("conversation")
             if conv:

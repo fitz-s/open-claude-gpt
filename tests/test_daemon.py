@@ -72,7 +72,7 @@ def test_run_worker_refused_by_gate_returns_2_sets_error_status_never_calls_run(
 
     monkeypatch.setattr(daemon.spool, "validate_prompt", lambda text: (False, "nope"))
 
-    def _boom(cmd, timeout, rid=None):
+    def _boom(cmd, timeout, rid=None, stdin_text=None):
         raise AssertionError("_run must not be called when the gate refuses")
 
     monkeypatch.setattr(daemon, "_run", _boom)
@@ -96,7 +96,7 @@ def test_run_worker_submit_kind_success_sets_done_status_and_conversation(daemon
 
     calls = []
 
-    def _fake_run(cmd, timeout, rid=None):
+    def _fake_run(cmd, timeout, rid=None, stdin_text=None):
         calls.append(cmd)
         if len(calls) == 1:
             # submit call
@@ -211,7 +211,7 @@ def test_retrieve_job_sends_nothing_and_skips_the_gate(daemon, monkeypatch, tmp_
                         lambda t: called.append(t) or (True, "should not run"))
     seen = {}
 
-    def _fake_run(cmd, timeout, rid=None):
+    def _fake_run(cmd, timeout, rid=None, stdin_text=None):
         seen["cmd"] = cmd
         return 0, "", ""
 
@@ -233,7 +233,7 @@ def test_retrieve_job_sends_nothing_and_skips_the_gate(daemon, monkeypatch, tmp_
 def test_retrieve_job_carrying_a_prompt_is_refused(daemon, monkeypatch, tmp_path):
     """The gate is skipped only because a retrieve job structurally cannot carry content. Enforce
     that, or 'retrieve' becomes a way to send unvalidated text."""
-    def _boom(cmd, timeout, rid=None):
+    def _boom(cmd, timeout, rid=None, stdin_text=None):
         raise AssertionError("must not run anything")
 
     monkeypatch.setattr(daemon, "_run", _boom)
@@ -249,7 +249,7 @@ def test_retrieve_job_carrying_a_prompt_is_refused(daemon, monkeypatch, tmp_path
 
 
 def test_retrieve_job_without_a_conversation_is_refused(daemon, monkeypatch, tmp_path):
-    def _boom(cmd, timeout, rid=None):
+    def _boom(cmd, timeout, rid=None, stdin_text=None):
         raise AssertionError("must not run anything")
 
     monkeypatch.setattr(daemon, "_run", _boom)
@@ -261,3 +261,33 @@ def test_retrieve_job_without_a_conversation_is_refused(daemon, monkeypatch, tmp
                    "out": str(tmp_path / "a.txt")}, f)
 
     assert daemon.run_worker(path) == 2
+
+
+def test_the_gate_validated_bytes_are_what_get_sent(daemon, monkeypatch, tmp_path):
+    """The gate is the justification for this whole egress design, so it must cover the bytes that
+    actually leave. Passing the CDP child a PATHNAME let it reopen a file any same-user process
+    could rewrite after validation — the prompt that passed the public-repo and secret checks and
+    the prompt that reached ChatGPT were not provably the same object."""
+    calls = []
+
+    def _fake_run(cmd, timeout, rid=None, stdin_text=None):
+        calls.append((cmd, stdin_text))
+        return 0, json.dumps({"conversation_id": "c1"}), ""
+
+    monkeypatch.setattr(daemon, "_run", _fake_run)
+    monkeypatch.setattr(daemon.spool, "validate_prompt", lambda t: (True, "ok"))
+    rid = "REQ-20260707-120000-00b001"
+    pf = tmp_path / "prompt.md"
+    pf.write_text("VALIDATED BYTES https://github.com/acme/widgets", encoding="utf-8")
+    path = daemon.spool.processing_path(rid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"rid": rid, "kind": "submit", "prompt_file": str(pf),
+                   "out": str(tmp_path / "a.txt")}, f)
+
+    daemon.run_worker(path)
+    send_cmd, send_stdin = calls[0]          # the submit call, not the later wait
+    assert send_stdin == "VALIDATED BYTES https://github.com/acme/widgets"
+    assert send_cmd[send_cmd.index("--prompt-file") + 1] == "-", \
+        "the child must be handed bytes on stdin, never a path it can reopen"
+    assert str(pf) not in send_cmd, "the mutable prompt path must not reach the sender"
