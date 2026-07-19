@@ -435,19 +435,38 @@ class CDP:
 
 # Pick the assistant node that actually CONTAINS our BEGIN sentinel (by textContent), not blindly
 # the last node — a trailing empty/streaming assistant node would otherwise read as ~1 char.
+# ChatGPT's turn markup changed shape. Older builds tag each MESSAGE node
+# data-message-author-role="assistant"|"user"; the current build tags the TURN
+# data-turn="assistant"|"user" and leaves data-message-author-role on the user node only.
+# Selecting only the old attribute made querySelectorAll return ZERO assistant nodes, so the
+# sentinel could never be found and EVERY consult ran its full 25-minute budget before reporting
+# "no answer" with ac=0 — the tool looked alive and produced nothing, twice, before this was found.
+# Match either shape. This is the single fact about ChatGPT's DOM that the whole file rests on, so
+# it is named once here instead of being retyped inside six JS string literals where a future
+# rename would again have to be found six times.
+_SEL_A = '[data-message-author-role="assistant"],[data-turn="assistant"]'
+_SEL_U = '[data-message-author-role="user"],[data-turn="user"]'
+_SEL_ANY = '[data-message-author-role],[data-turn]'
+_JS_A, _JS_U, _JS_ANY = json.dumps(_SEL_A), json.dumps(_SEL_U), json.dumps(_SEL_ANY)
+
+# Whichever attribute this build uses, the role reads the same way.
+_ROLE_FN = ("function __cgcRole(el){return el.getAttribute('data-message-author-role')||"
+            "el.getAttribute('data-turn')||'';}")
+
 _NODE_FN = (
+    _ROLE_FN +
     "function __cgcNode(BG){"
-    "var all=document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+    "var all=document.querySelectorAll(" + _JS_A + ");"
     # 1) exact: any assistant node containing our (unique) BEGIN sentinel — global search.
     "for(var i=all.length-1;i>=0;i--){if((all[i].textContent||'').indexOf(BG)>=0)return all[i];}"
     # 2) fallback (no sentinel yet): the LARGEST assistant node of the CURRENT turn (after the
     #    last user message). NOT a[last] — that is often a 1-char trailing streaming placeholder,
     #    so the waiter saw len=1 for 25 min while the model was actually producing content in
     #    sibling nodes. NOT a global max either — that would read a PRIOR round's big answer.
-    "var nx=document.querySelectorAll('[data-message-author-role]');"
-    "var lu=-1;for(var j=0;j<nx.length;j++){if(nx[j].getAttribute('data-message-author-role')==='user')lu=j;}"
+    "var nx=document.querySelectorAll(" + _JS_ANY + ");"
+    "var lu=-1;for(var j=0;j<nx.length;j++){if(__cgcRole(nx[j])==='user')lu=j;}"
     "var best=null,bl=-1;"
-    "for(var k=lu+1;k<nx.length;k++){if(nx[k].getAttribute('data-message-author-role')==='assistant'){"
+    "for(var k=lu+1;k<nx.length;k++){if(__cgcRole(nx[k])==='assistant'){"
     "var L=(nx[k].textContent||'').length;if(L>bl){bl=L;best=nx[k];}}}"
     "return best;}"
 )
@@ -565,7 +584,7 @@ def _detect_js(rid: str) -> str:
     sentinel = _sentinel_js(rid, "__cgcText(node)")
     return (
         "(function(){" + _NODE_FN + _TEXT_FN +
-        "var a=document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+        "var a=document.querySelectorAll(" + _JS_A + ");"
         "var BG=" + begin + ",EN=" + end + ";"
         "var node=__cgcNode(BG);"
         "var rawT=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
@@ -587,7 +606,7 @@ def _user_rid_js() -> str:
     making a submit/wait rid mismatch structurally impossible."""
     # Exact rid shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) so a missing whitespace boundary in
     # concatenated text can't make the capture swallow trailing characters.
-    return ("(function(){var u=document.querySelectorAll('[data-message-author-role=\"user\"]');"
+    return ("(function(){var u=document.querySelectorAll(" + _JS_U + ");"
             "var n=u[u.length-1];var t=n?n.textContent:'';"
             "var m=t.match(/BEGIN_RESPONSE:(REQ-\\d{8}-\\d{6}-[0-9a-f]{6})/);return m?m[1]:'';})()")
 
@@ -638,7 +657,7 @@ def _extract_js(rid: str) -> str:
 # renders+commits the final node so textContent becomes readable — no foregrounding needed.
 _FORCE_RENDER_JS = ("(function(){try{var sc=document.querySelector('main')||document.scrollingElement;"
                     "if(sc)sc.scrollTop=sc.scrollHeight;"
-                    "var a=document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+                    "var a=document.querySelectorAll(" + _JS_A + ");"
                     "if(a.length)a[a.length-1].scrollIntoView(false);}catch(e){}return 1;})()")
 
 
@@ -709,7 +728,7 @@ def _open_cand_js(i):
 
 
 def _click_item_js(target):
-    # Match the menuitem's FIRST LINE, Pro-family aware — MUST mirror _model_confirm_js:
+    # Match the menuitem's FIRST LINE, Pro-family aware — MUST mirror _matches():
     # a 'Pro' target is satisfied by any Pro tier the menu offers (ChatGPT's effort menu
     # labels the top tier 'Pro Extended', there is no bare 'Pro' item), so an exact-only
     # match could never CLICK 'Pro Extended' from a 'Pro' target even though confirm()
@@ -725,28 +744,50 @@ def _click_item_js(target):
             "if(EL){%s return true;}return false;})()" % (t, _GESTURE))
 
 
-def _model_now_js():
-    """First-line label of the composer model switcher (or null)."""
-    return "(function(){var c=%s;return c.length?(c[0].innerText||'').trim().split('\\n')[0]:null;})()" % _CAND_JS
+def _cand_labels_js():
+    """Every switcher-ish button's first-line label, in DOM order. c[0] is the composer's own
+    model pill; later entries are the other switchers (ChatGPT splits model and reasoning effort)."""
+    return ("(function(){return %s.map(function(b){"
+            "return (b.innerText||'').trim().split('\\n')[0];});})()" % _CAND_JS)
 
 
-def _model_confirm_js(target):
-    # Pro-family aware: a 'Pro' target is satisfied by ANY Pro tier the switcher shows
-    # ('Pro' or 'Pro Extended'), but NOT by Medium/Instant/High/Auto/GPT-effort. A
-    # non-Pro target must match exactly. This is what keeps a consult off Medium while
-    # accepting the project's default top tier ('Pro').
-    t = json.dumps(target.lower())
-    return ("(function(){var T=%s;return %s.some(function(b){"
-            "var f=(b.innerText||'').trim().toLowerCase().split('\\n')[0];"
-            "return f===T||(T.indexOf('pro')===0&&f.indexOf('pro')===0);});})()" % (t, _CAND_JS))
+def _matches(label, target):
+    """Pro-family aware match, mirroring _click_item_js: a 'Pro' target is satisfied by any Pro tier
+    the switcher offers ('Pro' / 'Pro Extended'), since ChatGPT ships no bare 'Pro' item. Any other
+    target must match the first line exactly — never a loose contains, which would match a
+    description line."""
+    if not label:
+        return False
+    f = label.strip().lower()
+    t = (target or "").strip().lower()
+    return f == t or (t.startswith("pro") and f.startswith("pro"))
+
+
+def _model_verdict(labels, target):
+    """(confirmed, shown). `shown` is the label of the switcher that actually carries the target, so
+    the verdict and the reported model can no longer contradict each other.
+
+    Confirmation scans every switcher — correctly, because ChatGPT splits model and reasoning effort
+    across two menus and the Pro tier lives in whichever one this build puts it in. Reporting,
+    however, used to take labels[0] unconditionally, and labels[0] is NOT the model pill: the
+    composer's first switcher in DOM order is the MODE toggle (Chat / Agent / …). A correctly
+    pinned Pro consult therefore printed {"model": "Chat", "modelConfirmed": true} — a record that
+    contradicts itself, makes a healthy run look broken, and would disguise a genuinely wrong tier
+    exactly as well. Verified live: the project page shows ['Chat', 'Pro'], the conversation ['Pro']."""
+    labels = [x for x in (labels or []) if x]
+    for lab in labels:
+        if _matches(lab, target):
+            return True, lab
+    return False, (labels[0] if labels else None)
 
 
 def _select_model(c, target):
-    """Switch the composer to `target` by trying each switcher menu. Returns True if a
-    button now shows the target. Fully automated — no human step."""
-    if c.eval(_model_confirm_js(target)):
-        return True
-    for attempt in range(2):
+    """Switch the composer to `target` by trying each switcher menu. Returns (confirmed, shown).
+    Fully automated — no human step."""
+    ok, shown = _model_verdict(c.eval(_cand_labels_js()), target)
+    if ok:
+        return True, shown
+    for _ in range(2):
         n = c.eval(_cand_count_js()) or 0
         for i in range(min(int(n), 8)):
             opened = c.eval(_open_cand_js(i))
@@ -755,13 +796,14 @@ def _select_model(c, target):
             time.sleep(1.0)  # Radix menu renders async after the gesture
             if c.eval(_click_item_js(target)):
                 time.sleep(0.7)
-                if c.eval(_model_confirm_js(target)):
-                    return True
+                ok, shown = _model_verdict(c.eval(_cand_labels_js()), target)
+                if ok:
+                    return True, shown
             # wrong menu (target not in it) → close and try the next switcher
             c.key("Escape", "Escape", 27)
             time.sleep(0.25)
         time.sleep(0.4)
-    return c.eval(_model_confirm_js(target))
+    return _model_verdict(c.eval(_cand_labels_js()), target)
 
 
 # A real code-source URL: https:// on github.com / gist.github.com / raw.githubusercontent.com,
@@ -815,7 +857,7 @@ def cmd_submit(a) -> int:
         before_user_count = 0
         if a.reuse_tab:
             before_user_count = c.eval(
-                "document.querySelectorAll('[data-message-author-role=\"user\"]').length") or 0
+                "document.querySelectorAll(" + _JS_U + ").length") or 0
         # wait for composer to hydrate
         for _ in range(30):
             time.sleep(0.5)
@@ -833,8 +875,7 @@ def cmd_submit(a) -> int:
         model_now = None
         if a.model and a.model.lower() != "skip":
             target = a.model
-            model_confirmed = _select_model(c, target)
-            model_now = c.eval(_model_now_js())
+            model_confirmed, model_now = _select_model(c, target)
             if not model_confirmed and not a.allow_model_mismatch:
                 if not a.reuse_tab:
                     c.close_tab()  # don't orphan the dedicated tab we opened for this submit
@@ -873,7 +914,7 @@ def cmd_submit(a) -> int:
         n = 0
         for _ in range(10):
             time.sleep(0.5)
-            n = c.eval("document.querySelectorAll('[data-message-author-role=\"user\"]').length")
+            n = c.eval("document.querySelectorAll(" + _JS_U + ").length")
             if n and n > before_user_count:
                 break
         ok = bool(n and n > before_user_count)
@@ -1067,10 +1108,10 @@ def cmd_followup(a) -> int:
                 # itself then opens the picker and selects — this settle just gives it a live DOM
                 # to act on; the fail-closed guarantee is unchanged.)
                 _settle = time.time() + 8
-                while c.eval(_model_now_js()) is None and time.time() < _settle:
+                while not (c.eval(_cand_labels_js()) or []) and time.time() < _settle:
                     time.sleep(0.5)
-            if not _select_model(c, target) and not a.allow_model_mismatch:
-                model_now = c.eval(_model_now_js())
+            _fu_ok, model_now = _select_model(c, target)
+            if not _fu_ok and not a.allow_model_mismatch:
                 print(json.dumps({"ok": False, "followup": True, "conversation_id": conv,
                                   "rid": rid, "modelConfirmed": False, "model": model_now,
                                   "wanted": target}))
@@ -1082,7 +1123,7 @@ def cmd_followup(a) -> int:
                 return 2
         # Count user messages BEFORE sending so we can confirm a NEW one landed (the
         # thread already has >=1 user message, so an absolute >0 check would false-pass).
-        u_before = c.eval("document.querySelectorAll('[data-message-author-role=\"user\"]').length") or 0
+        u_before = c.eval("document.querySelectorAll(" + _JS_U + ").length") or 0
         # Insert via execCommand (typed newlines submit early). Model already gated above.
         c.call("Runtime.evaluate", {"expression":
             "(function(){var d=document.querySelector('div[role=\"textbox\"][contenteditable=\"true\"]')"
@@ -1100,7 +1141,7 @@ def cmd_followup(a) -> int:
         n = u_before
         for _ in range(10):
             time.sleep(0.5)
-            n = c.eval("document.querySelectorAll('[data-message-author-role=\"user\"]').length") or 0
+            n = c.eval("document.querySelectorAll(" + _JS_U + ").length") or 0
             if n > u_before:
                 break
         ok = bool(n > u_before)

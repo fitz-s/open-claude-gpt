@@ -72,7 +72,7 @@ def test_run_worker_refused_by_gate_returns_2_sets_error_status_never_calls_run(
 
     monkeypatch.setattr(daemon.spool, "validate_prompt", lambda text: (False, "nope"))
 
-    def _boom(cmd, timeout):
+    def _boom(cmd, timeout, rid=None):
         raise AssertionError("_run must not be called when the gate refuses")
 
     monkeypatch.setattr(daemon, "_run", _boom)
@@ -96,7 +96,7 @@ def test_run_worker_submit_kind_success_sets_done_status_and_conversation(daemon
 
     calls = []
 
-    def _fake_run(cmd, timeout):
+    def _fake_run(cmd, timeout, rid=None):
         calls.append(cmd)
         if len(calls) == 1:
             # submit call
@@ -133,3 +133,50 @@ def test_finish_from_wait_maps_exit_code_to_terminal_status(daemon, code, expect
     assert result == expected_return
     st = daemon.spool.read_status(rid)
     assert st["state"] == expected_state
+
+
+# ---- orphan requeue: a claimed job with no worker must not vanish ------------
+
+def _job(daemon, rid, age_s):
+    """Put a job in processing/ as if a previous daemon had claimed it `age_s` ago."""
+    import os
+    import time
+    path = daemon.spool.processing_path(rid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"rid": rid, "kind": "submit"}, f)
+    t = time.time() - age_s
+    os.utime(path, (t, t))
+    return path
+
+
+def test_requeue_orphans_recovers_a_job_stranded_by_a_daemon_restart(daemon):
+    """Workers are children of the daemon, and nothing ever re-scans processing/. So a crash or a
+    launchd restart used to lose the consult silently while `await` still reported it running."""
+    rid = "REQ-20260707-120000-0000a1"
+    _job(daemon, rid, age_s=daemon.spool.CONSULT_TIMEOUT_S + 600)
+    assert daemon._requeue_orphans() == 1
+    assert os.path.exists(daemon.spool.pending_path(rid))
+    assert not os.path.exists(daemon.spool.processing_path(rid))
+    assert daemon.spool.read_status(rid)["state"] == "queued"
+
+
+def test_requeue_orphans_leaves_a_job_that_could_still_have_a_live_worker(daemon):
+    """A worker's hard ceiling is CONSULT_TIMEOUT_S + 40, so anything younger may still be in
+    flight — requeuing it would send the same consult twice and bill the quota twice."""
+    rid = "REQ-20260707-120000-0000a2"
+    _job(daemon, rid, age_s=60)
+    assert daemon._requeue_orphans() == 0
+    assert os.path.exists(daemon.spool.processing_path(rid))
+
+
+def test_run_writes_the_child_transcript_to_the_job_log(daemon, tmp_path):
+    """The waiter's per-poll heartbeat is the only evidence of WHY a consult produced nothing; the
+    daemon used to capture it and throw it away, keeping a 240-char tail."""
+    rid = "REQ-20260707-120000-0000a3"
+    code, so, se = daemon._run([sys.executable, "-c",
+                                "import sys; print('OUT'); sys.stderr.write('CGC_WAIT alive: ac=0\\n')"],
+                               30, rid)
+    assert code == 0
+    log = open(daemon.spool.log_path(rid), encoding="utf-8").read()
+    assert "OUT" in log and "CGC_WAIT alive: ac=0" in log

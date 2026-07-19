@@ -628,7 +628,12 @@ def cmd_prep(a: argparse.Namespace) -> int:
         "var body=(bi>=0&&ei>bi)?L.slice(bi+1,ei).join('\\n').trim():'';"
         "return {done:(bi>=0&&ei>bi&&body.length>0),len:t.length};"
         "}"
-        "var a=document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+        # Either turn markup: older ChatGPT builds tag the message node
+        # data-message-author-role="assistant", the current build tags the turn
+        # data-turn="assistant". Matching only the old one selected nothing, so `done` could
+        # never fire. Mirrors _SEL_A in cdp_consult.py — the parsers must agree.
+        "var a=document.querySelectorAll('[data-message-author-role=\"assistant\"],"
+        "[data-turn=\"assistant\"]');"
         "var res={done:false,len:0};"
         "for(var k=a.length-1;k>=0;k--){"
         "var r=parse(a[k].textContent);"
@@ -654,19 +659,32 @@ def cmd_prep(a: argparse.Namespace) -> int:
     state = {
         "request_id": rid,
         "prompt_file": prompt_file,
-        "window_js_file": window_js_file,
-        "target_chars": a.target_chars,
-        "hard_chars": a.hard_chars,
-        "sentinel_begin": f"BEGIN_RESPONSE:{rid}",
-        "sentinel_end": end,
-        "poll_js": poll_js,
-        "preflight_js": preflight_js,
-        "expect_minutes": a.expect_minutes,
-        "first_wake_seconds": first_wake,
-        "repoll_seconds": repoll,
-        "max_polls": max_polls,
     }
+    # poll_js / preflight_js / the window script / the ScheduleWakeup wake plan exist ONLY for the
+    # MCP fallback (Backend B), which pastes them into javascript_tool and paces its own wakes. On
+    # the default CDP+daemon path nothing reads them — cdp_consult.py rebuilds the sentinels from
+    # the rid — so printing them dumped ~2.5k chars of dead JS straight into the agent's context on
+    # every single consult. The caller that needs them asks for them.
+    if a.backend == "mcp":
+        state.update({
+            "window_js_file": window_js_file,
+            "target_chars": a.target_chars,
+            "hard_chars": a.hard_chars,
+            "sentinel_begin": f"BEGIN_RESPONSE:{rid}",
+            "sentinel_end": end,
+            "poll_js": poll_js,
+            "preflight_js": preflight_js,
+            "expect_minutes": a.expect_minutes,
+            "first_wake_seconds": first_wake,
+            "repoll_seconds": repoll,
+            "max_polls": max_polls,
+        })
     print(json.dumps(state, ensure_ascii=False, indent=2))
+    if a.backend != "mcp" and prompt_file:
+        sys.stderr.write(
+            f"CGC_NEXT enqueue it (LOCAL write; the user's daemon validates + sends):\n"
+            f"  python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cgc_spool.py')} "
+            f"enqueue --rid {rid} --prompt-file {prompt_file}\n")
     return 0
 
 

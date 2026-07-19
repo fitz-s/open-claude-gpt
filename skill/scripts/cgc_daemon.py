@@ -59,16 +59,57 @@ def _tail(s, n=240):
     return s[-n:]
 
 
-def _run(cmd, timeout):
-    """Run a cdp_consult.py subcommand; return (exit, stdout, stderr). Never raises on non-zero."""
+def _tail_file(path, n=240):
+    """Last n chars of a file, without reading a 25-minute log into memory."""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           env=dict(os.environ))
-        return r.returncode, r.stdout, r.stderr
+        size = os.path.getsize(path)
+        with open(path, encoding="utf-8", errors="replace") as f:
+            f.seek(max(0, size - n * 4))
+            return f.read()[-n:].strip()
+    except OSError:
+        return ""
+
+
+def _run(cmd, timeout, rid=None):
+    """Run a cdp_consult.py subcommand; return (exit, stdout, stderr). Never raises on non-zero.
+
+    stderr streams LIVE into the job's log instead of being captured and discarded. Both halves of
+    that matter. It used to be captured and thrown away except for a 240-char tail folded into the
+    status message — so when a consult burned its whole 25-minute budget and produced nothing, the
+    waiter's per-poll heartbeat (`CGC_WAIT alive: gen/len/done/begin/end/ac`), which says exactly
+    which failure happened, was gone. And buffering it to write at exit would still leave the log
+    empty for the 25 minutes you actually want to watch it. stdout is still captured, because the
+    daemon parses submit's conversation id out of it."""
+    log = None
+    if rid:
+        try:
+            os.makedirs(os.path.dirname(spool.log_path(rid)), exist_ok=True)
+            log = open(spool.log_path(rid), "a", encoding="utf-8", buffering=1)
+            log.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')}  {cmd[2] if len(cmd) > 2 else '?'} "
+                      f"{rid} =====\n")
+        except OSError:
+            log = None
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=(log or subprocess.PIPE),
+                           text=True, timeout=timeout, env=dict(os.environ))
+        code, so, se = r.returncode, r.stdout, (r.stderr or "")
     except subprocess.TimeoutExpired as e:
-        return 124, "", f"subprocess timeout: {e}"
+        code, so, se = 124, "", f"subprocess timeout: {e}"
     except Exception as e:
-        return 1, "", f"subprocess error: {e}"
+        code, so, se = 1, "", f"subprocess error: {e}"
+    if log:
+        try:
+            if so:
+                log.write(so if so.endswith("\n") else so + "\n")
+            if se:
+                log.write(se if se.endswith("\n") else se + "\n")
+            log.write(f"----- exit={code} -----\n")
+            log.close()
+        except OSError:
+            pass  # logging must never break a consult
+        # stderr went to the file, so recover the tail the status message needs from there.
+        se = se or _tail_file(spool.log_path(rid))
+    return code, so, se
 
 
 def run_worker(processing_file: str) -> int:
@@ -107,7 +148,7 @@ def run_worker(processing_file: str) -> int:
                "--conversation", conv, "--prompt-file", job["prompt_file"],
                "--rid", rid, "--model", job.get("model", "Pro"),
                "--watch", "--out", out, "--poll", poll, "--timeout", str(timeout)]
-        code, so, se = _run(cmd, child_budget)
+        code, so, se = _run(cmd, child_budget, rid)
         return _finish_from_wait(rid, code, out, se, conv)
 
     # kind == submit: send, capture the conversation id, then wait.
@@ -115,7 +156,7 @@ def run_worker(processing_file: str) -> int:
            "--rid", rid, "--prompt-file", job["prompt_file"],
            "--project-url", job.get("project_url", "https://chatgpt.com/"),
            "--model", job.get("model", "Pro")]
-    code, so, se = _run(cmd, 240)
+    code, so, se = _run(cmd, 240, rid)
     conv = ""
     try:
         conv = (json.loads(so.strip().splitlines()[-1]) if so.strip() else {}).get("conversation_id", "") or ""
@@ -131,7 +172,7 @@ def run_worker(processing_file: str) -> int:
     spool.write_status(rid, "processing", out=out, conversation=conv, msg="sent; waiting for answer")
     wcmd = [sys.executable, _CDP, "wait", "--rid", rid, "--conversation", conv,
             "--out", out, "--poll", poll, "--timeout", str(timeout)]
-    wcode, wso, wse = _run(wcmd, child_budget)
+    wcode, wso, wse = _run(wcmd, child_budget, rid)
     return _finish_from_wait(rid, wcode, out, wse, conv)
 
 
@@ -156,10 +197,44 @@ def _finish_from_wait(rid, code, out, stderr, conv):
 
 # ---- the loop ---------------------------------------------------------------
 
+def _requeue_orphans() -> int:
+    """A job sitting in processing/ when the daemon starts has no worker. Workers are children of
+    the daemon process, so a crash or a launchd restart leaves the job claimed but unowned — and
+    nothing ever scans processing/ again, so the consult is lost silently while `await` keeps
+    reporting it as still running. Move those back to pending/.
+
+    Only jobs older than a full consult budget are touched. A worker's hard ceiling is
+    CONSULT_TIMEOUT_S + 40 (child_budget), so anything past CONSULT_TIMEOUT_S + 120 provably has no
+    live worker and cannot be double-sent — and a double send costs real ChatGPT quota."""
+    cutoff = time.time() - (spool.CONSULT_TIMEOUT_S + 120)
+    n = 0
+    try:
+        names = sorted(os.listdir(spool._p("processing")))
+    except OSError:
+        return 0
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        src = spool._p("processing", name)
+        rid = name[:-5]
+        try:
+            if os.path.getmtime(src) > cutoff:
+                continue
+            os.rename(src, spool.pending_path(rid))
+        except OSError:
+            continue
+        spool.write_status(rid, "queued", msg="requeued: no worker owned it after a daemon restart")
+        n += 1
+    if n:
+        sys.stderr.write(f"CGC_DAEMON requeued {n} orphaned job(s) from a previous run\n")
+    return n
+
+
 def run_loop(poll: float, concurrency: int, once: bool) -> int:
     spool.ensure_dirs()
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
+    _requeue_orphans()
     spool.heartbeat_write(os.getpid())
     sys.stderr.write(
         f"CGC_DAEMON up (pid {os.getpid()}) — spool {spool.SPOOL_DIR}, concurrency {concurrency}, "
