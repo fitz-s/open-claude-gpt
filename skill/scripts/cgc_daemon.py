@@ -218,16 +218,25 @@ def _finish_from_wait(rid, code, out, stderr, conv):
 
 # ---- the loop ---------------------------------------------------------------
 
-def _requeue_orphans() -> int:
-    """A job sitting in processing/ when the daemon starts has no worker. Workers are children of
-    the daemon process, so a crash or a launchd restart leaves the job claimed but unowned — and
-    nothing ever scans processing/ again, so the consult is lost silently while `await` keeps
-    reporting it as still running. Move those back to pending/.
+def _recover_orphans() -> int:
+    """Recover jobs left in processing/ with no worker running them.
 
-    Only jobs older than a full consult budget are touched. A worker's hard ceiling is
-    STUCK_AFTER_S + 40 (child_budget), so anything past STUCK_AFTER_S + 120 provably has no live
-    worker and cannot be double-sent — and a double send costs real ChatGPT quota."""
-    cutoff = time.time() - (spool.STUCK_AFTER_S + 120)
+    Workers are children of the daemon, so a crash or a launchd restart leaves the job claimed but
+    unowned, and nothing ever re-scans processing/ — the consult is lost silently while `await`
+    still reports it healthy.
+
+    Orphanhood is DETERMINED, not guessed. The dispatcher records the worker's pid, so the question
+    "is anyone working this?" is answered exactly by asking whether that pid is alive. The previous
+    age heuristic — requeue once the job outlives a worker's hard ceiling — had to wait longer than
+    any possible worker, which after the deadline became one number meant 62 minutes of a consult
+    sitting dead before anything noticed. A job with no recorded pid predates this and still falls
+    back to the age rule.
+
+    Recovery prefers RETRIEVE over re-sending. The waiter dying does not stop ChatGPT: the
+    conversation is usually still generating, so re-sending would open a second conversation, redo
+    the round and bill the quota twice. Only a job that never got far enough to have a conversation
+    is genuinely re-sent."""
+    age_cutoff = time.time() - (spool.STUCK_AFTER_S + 120)
     n = 0
     try:
         names = sorted(os.listdir(spool._p("processing")))
@@ -238,16 +247,34 @@ def _requeue_orphans() -> int:
             continue
         src = spool._p("processing", name)
         rid = name[:-5]
+        st = spool.read_status(rid) or {}
+        pid = st.get("worker_pid")
+        if pid is not None:
+            if spool._pid_alive(pid):
+                continue                      # genuinely being worked
+        elif os.path.getmtime(src) > age_cutoff:
+            continue                          # pre-pid job, not yet provably unowned
+        job = spool._read_json(src) or {}
+        conv = st.get("conversation") or job.get("conversation")
         try:
-            if os.path.getmtime(src) > cutoff:
-                continue
-            os.rename(src, spool.pending_path(rid))
-        except OSError:
+            if conv and conv != "auto":
+                # Its ChatGPT conversation outlived the waiter — attach and read, do not re-ask.
+                job = {"rid": rid, "kind": "retrieve", "conversation": conv,
+                       "out": job.get("out") or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt"),
+                       "poll": job.get("poll", spool.POLL_S), "timeout": job.get("timeout", spool.STUCK_AFTER_S)}
+                os.remove(src)
+                spool.enqueue_job(job)
+                spool.write_status(rid, "queued",
+                                   msg=f"worker died; re-attaching to {conv} to read its answer")
+            else:
+                os.rename(src, spool.pending_path(rid))
+                spool.write_status(rid, "queued",
+                                   msg="worker died before a conversation existed; re-sending")
+        except (OSError, ValueError):
             continue
-        spool.write_status(rid, "queued", msg="requeued: no worker owned it after a daemon restart")
         n += 1
     if n:
-        sys.stderr.write(f"CGC_DAEMON requeued {n} orphaned job(s) from a previous run\n")
+        sys.stderr.write(f"CGC_DAEMON recovered {n} orphaned job(s)\n")
     return n
 
 
@@ -271,7 +298,7 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
             # at 1620s.) This also covers a worker that died without writing a terminal status while
             # the daemon itself stayed up.
             if time.time() >= next_orphan_scan:
-                _requeue_orphans()
+                _recover_orphans()
                 next_orphan_scan = time.time() + 60
             # reap
             for rid in list(children):
@@ -288,7 +315,10 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
                 p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker", claimed],
                                      env=dict(os.environ))
                 children[rid] = p
-                sys.stderr.write(f"CGC_DAEMON dispatched {rid} ({len(children)}/{concurrency} busy)\n")
+                # Record who owns this job, so orphan detection is a fact rather than a timer.
+                spool.write_status(rid, "processing", worker_pid=p.pid)
+                sys.stderr.write(f"CGC_DAEMON dispatched {rid} pid={p.pid} "
+                                 f"({len(children)}/{concurrency} busy)\n")
             if once and not children and not spool.list_pending():
                 break
             time.sleep(poll)

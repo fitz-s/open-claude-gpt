@@ -62,14 +62,15 @@ releases until it stabilizes.
   This guard had no test coverage at all; it now has six.
 - **A daemon that died mid-consult left `await` looping forever.** The liveness check was gated on
   having seen the job picked up, so once a job reached `processing` the check switched off — every
-  later `await` then burned its whole 870s window and returned `5` ("still running, re-run me") for
-  a job nobody was working. Liveness is now checked in every state, and a daemon that stays gone
-  past `DAEMON_GRACE_S` ends the wait with an actionable exit 2.
+  later `await` then waited out its whole window on a job nobody was working. Liveness is now
+  checked in every state, and a daemon that stays gone past `DAEMON_GRACE_S` ends the wait as
+  broken — the one case where "still running" would be a lie, since nothing can ever finish it.
 - **Jobs stranded in `processing/` were lost silently.** Workers are children of the daemon and
   nothing ever re-scans `processing/`, so a crash or launchd restart orphaned the consult while
-  `await` kept reporting it healthy. The daemon now requeues them at startup — only those older
-  than a worker's hard ceiling (`CONSULT_TIMEOUT_S + 120`), so a still-live worker can never be
-  double-sent and billed twice.
+  `await` kept reporting it healthy. The daemon now rescans for them every 60s — requeuing only
+  those older than a worker's hard ceiling (`STUCK_AFTER_S + 120`), so a still-live worker can
+  never be double-sent and billed twice. (Scanning only at startup was not enough: a daemon that
+  restarts early in a job's life scans while that job is still ineligible and never looks again.)
 - **The launcher discarded Chrome's own error output** to `/dev/null`, so the one failure that
   actually kills a consult — the debug Chrome not coming up — was undiagnosable. Chrome's output now
   goes to `$CGC_STATE_DIR/chrome.log`, the failure path prints its tail and distinguishes "Chrome

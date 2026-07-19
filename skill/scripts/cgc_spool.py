@@ -245,7 +245,8 @@ def claim(pending_file: str):
         return None
 
 
-def write_status(rid, state, *, exit=None, out=None, msg=None, conversation=None):
+def write_status(rid, state, *, exit=None, out=None, msg=None, conversation=None,
+                 worker_pid=None):
     """Upsert status/<rid>.json. state in {queued,processing,done,blocker,no_answer,error}."""
     cur = _read_json(status_path(rid)) or {}
     cur.update({"rid": rid, "state": state, "ts": time.time()})
@@ -257,6 +258,8 @@ def write_status(rid, state, *, exit=None, out=None, msg=None, conversation=None
         cur["msg"] = msg
     if conversation is not None:
         cur["conversation"] = conversation
+    if worker_pid is not None:
+        cur["worker_pid"] = worker_pid
     _atomic_write(status_path(rid), cur)
     return cur
 
