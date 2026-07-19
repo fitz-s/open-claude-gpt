@@ -123,6 +123,28 @@ def run_worker(processing_file: str) -> int:
     poll = str(job.get("poll", 20))
     timeout = int(job.get("timeout", spool.CONSULT_TIMEOUT_S))  # enqueue always writes it
 
+    if kind == "retrieve":
+        # Attach to an existing conversation and read its answer. NOTHING is sent, so there is no
+        # payload for the gate to validate. That is enforced structurally rather than trusted: a
+        # retrieve job that carries a prompt is refused outright, so this branch can never become a
+        # way to send unvalidated content. It exists so that recovering a consult whose waiter died
+        # stays on the daemon path instead of forcing the agent onto the direct one.
+        if job.get("prompt_file"):
+            spool.finish_job(rid, state="error", exit=2, out=out,
+                             msg="refused: a retrieve job must carry no prompt (it sends nothing)")
+            return 2
+        conv = job.get("conversation") or ""
+        if not conv or conv == "auto":
+            spool.finish_job(rid, state="error", exit=2, out=out,
+                             msg="refused: retrieve needs an explicit conversation id")
+            return 2
+        spool.write_status(rid, "processing", out=out, conversation=conv,
+                           msg=f"attaching to {conv} to read its answer (nothing sent)")
+        rcmd = [sys.executable, _CDP, "wait", "--rid", rid, "--conversation", conv,
+                "--out", out, "--poll", poll, "--timeout", str(timeout)]
+        rcode, _rso, rse = _run(rcmd, timeout + 40, rid)
+        return _finish_from_wait(rid, rcode, out, rse, conv)
+
     # --- the gate: re-validate independently before ANY external send --------
     try:
         prompt = open(job["prompt_file"], encoding="utf-8").read()

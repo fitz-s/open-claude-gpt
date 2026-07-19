@@ -193,3 +193,66 @@ def test_requeue_orphans_is_rescanned_not_only_run_at_startup(daemon):
     body = src.split("while _running:", 1)
     assert len(body) == 2 and "_requeue_orphans()" in body[1], \
         "the orphan scan must sit INSIDE the loop, not only before it"
+
+
+# ---- kind=retrieve: recovery must stay on the daemon path --------------------
+
+def test_retrieve_job_sends_nothing_and_skips_the_gate(daemon, monkeypatch, tmp_path):
+    """Retrieval reads an existing conversation. There is no outbound payload, so there is nothing
+    for the gate to validate — and validate_prompt must not even be reached (it would need a prompt
+    file that a retrieve job deliberately does not have)."""
+    called = []
+    monkeypatch.setattr(daemon.spool, "validate_prompt",
+                        lambda t: called.append(t) or (True, "should not run"))
+    seen = {}
+
+    def _fake_run(cmd, timeout, rid=None):
+        seen["cmd"] = cmd
+        return 0, "", ""
+
+    monkeypatch.setattr(daemon, "_run", _fake_run)
+    rid = "REQ-20260707-120000-00re01"
+    out = str(tmp_path / "a.txt")
+    path = daemon.spool.processing_path(rid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"rid": rid, "kind": "retrieve", "conversation": "conv-123", "out": out}, f)
+
+    assert daemon.run_worker(path) == 0
+    assert called == [], "the gate must not run for a job that sends nothing"
+    assert "wait" in seen["cmd"], "retrieve must run wait, never submit/followup"
+    assert "submit" not in seen["cmd"] and "followup" not in seen["cmd"]
+    assert daemon.spool.read_status(rid)["state"] == "done"
+
+
+def test_retrieve_job_carrying_a_prompt_is_refused(daemon, monkeypatch, tmp_path):
+    """The gate is skipped only because a retrieve job structurally cannot carry content. Enforce
+    that, or 'retrieve' becomes a way to send unvalidated text."""
+    def _boom(cmd, timeout, rid=None):
+        raise AssertionError("must not run anything")
+
+    monkeypatch.setattr(daemon, "_run", _boom)
+    rid = "REQ-20260707-120000-00re02"
+    path = daemon.spool.processing_path(rid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"rid": rid, "kind": "retrieve", "conversation": "c1",
+                   "prompt_file": str(tmp_path / "p.md"), "out": str(tmp_path / "a.txt")}, f)
+
+    assert daemon.run_worker(path) == 2
+    assert "must carry no prompt" in daemon.spool.read_status(rid)["msg"]
+
+
+def test_retrieve_job_without_a_conversation_is_refused(daemon, monkeypatch, tmp_path):
+    def _boom(cmd, timeout, rid=None):
+        raise AssertionError("must not run anything")
+
+    monkeypatch.setattr(daemon, "_run", _boom)
+    rid = "REQ-20260707-120000-00re03"
+    path = daemon.spool.processing_path(rid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"rid": rid, "kind": "retrieve", "conversation": "auto",
+                   "out": str(tmp_path / "a.txt")}, f)
+
+    assert daemon.run_worker(path) == 2
