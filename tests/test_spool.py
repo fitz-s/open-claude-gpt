@@ -238,44 +238,43 @@ def test_cmd_await_blocker_state_exits_3(spool, tmp_path, monkeypatch):
     assert code == 3
 
 
-def test_cmd_await_no_answer_state_exits_4(spool, tmp_path, monkeypatch):
+def test_cmd_await_no_answer_and_error_both_exit_1(spool, tmp_path, monkeypatch):
+    """One outcome, not two. "the daemon finished and produced nothing" and "the daemon errored"
+    differ in cause but not in what the caller does next — read the log — so they are one code."""
     monkeypatch.setattr(spool, "daemon_alive", lambda: True)
-    rid = _rid()
-    out = tmp_path / "answer.txt"
-    spool.write_status(rid, "no_answer", exit=4, out=str(out))
-    code = spool.cmd_await(_await_args(rid, str(out)))
-    assert code == 4
+    for state in ("no_answer", "error"):
+        rid = _rid()
+        out = tmp_path / f"{state}.txt"
+        spool.write_status(rid, state, out=str(out))
+        assert spool.cmd_await(_await_args(rid, str(out))) == 1, state
 
 
-def test_cmd_await_error_state_exits_2(spool, tmp_path, monkeypatch):
-    monkeypatch.setattr(spool, "daemon_alive", lambda: True)
-    rid = _rid()
-    out = tmp_path / "answer.txt"
-    spool.write_status(rid, "error", exit=2, out=str(out))
-    code = spool.cmd_await(_await_args(rid, str(out)))
-    assert code == 2
-
-
-def test_cmd_await_window_elapsed_on_live_job_exits_5_not_4(spool, tmp_path, monkeypatch):
-    """The normal path for a GPT-5.6 Pro consult: the daemon is still reasoning when this await's
-    window runs out. That MUST be 5 (still running -> await again), never 4 (no usable answer),
-    because the two demand opposite actions."""
+def test_await_keeps_waiting_while_a_live_daemon_works_the_job(spool, tmp_path, monkeypatch):
+    """The normal path for a GPT-5.6 Pro consult: still reasoning. Waiting longer is the waiter's
+    job, so it must NOT return — this used to exit 5, turning every healthy round into something
+    the caller had to notice and manually retry."""
     monkeypatch.setattr(spool, "daemon_alive", lambda: True)
     rid = _rid()
     out = tmp_path / "answer.txt"
     spool.write_status(rid, "processing", out=str(out))
-    code = spool.cmd_await(_await_args(rid, str(out)))
-    assert code == 5
+    slept = []
+    monkeypatch.setattr(spool.time, "sleep", lambda n: slept.append(n))
+    # A deadline far out: it must still be looping (not returning) after many polls.
+    a = _await_args(rid, str(out), timeout=0.5, poll=0.01)
+    spool.cmd_await(a)
+    assert len(slept) > 1, "the waiter must keep polling a healthy in-flight consult"
 
 
-def test_cmd_await_window_elapsed_while_still_queued_exits_5(spool, tmp_path, monkeypatch):
-    """Queued behind another consult with a live daemon is also 'still running', not a failure."""
+def test_await_declares_stuck_not_slow_when_the_deadline_passes(spool, tmp_path, monkeypatch):
+    """Reaching STUCK_AFTER_S is not "the answer is late" — it is past any time the work explains,
+    so the message must send the caller to the log instead of inviting another wait."""
     monkeypatch.setattr(spool, "daemon_alive", lambda: True)
     rid = _rid()
     out = tmp_path / "answer.txt"
-    spool.write_status(rid, "queued", out=str(out))
-    code = spool.cmd_await(_await_args(rid, str(out)))
-    assert code == 5
+    spool.write_status(rid, "processing", out=str(out))
+    code = spool.cmd_await(_await_args(rid, str(out), timeout=0.05, poll=0.01))
+    assert code == 1
+
 
 
 _NO_CODE = ("# Prove it\nThis consult references no code — it is a self-contained question. "
@@ -308,11 +307,14 @@ def test_gate_still_refuses_prose_without_the_no_code_declaration(spool):
     assert not ok and "no public code link" in why
 
 
-def test_agent_can_cover_the_consult_timeout_in_slices(spool):
-    """The agent watches in AGENT_POLL_S slices because Claude Code kills its background tasks at
-    900s; two slices must still cover a full CONSULT_TIMEOUT_S consult."""
-    assert spool.AGENT_POLL_S <= 870, "must stay under the 900s background-task kill"
-    assert 2 * spool.AGENT_POLL_S >= spool.CONSULT_TIMEOUT_S
+def test_one_timeout_and_it_means_stuck_not_slow(spool):
+    """There is exactly ONE deadline. A GPT-5.6 Pro round reasons ~25 min, so any deadline at or
+    near that kills healthy consults; the deadline must sit far enough past the work that reaching
+    it means malfunction, not slowness. Regression guard against re-introducing a second clock."""
+    assert spool.STUCK_AFTER_S >= 3600
+    assert not hasattr(spool, "CONSULT_TIMEOUT_S"), "a per-consult budget is not a timeout"
+    assert not hasattr(spool, "AGENT_POLL_S"), "an observation window is not a timeout"
+
 
 
 # The fixture stubs _repo_is_public so no test can shell out to `gh`; the two tests that
@@ -389,14 +391,14 @@ def test_await_gives_up_when_daemon_dies_mid_processing(spool, tmp_path, monkeyp
     monkeypatch.setattr(spool, "daemon_alive", lambda: False)
     monkeypatch.setattr(spool, "DAEMON_GRACE_S", 0)
     code = spool.cmd_await(_await_args(rid, str(tmp_path / "a.txt"), timeout=3))
-    assert code == 2
+    assert code == 1
 
 
-def test_await_still_returns_5_while_a_live_daemon_works_the_job(spool, tmp_path, monkeypatch):
-    """The complement: a healthy in-flight consult must still read as 'still running', never as a
-    failure — that distinction is the whole reason exit 5 exists."""
+def test_await_reports_a_dead_daemon_as_broken_not_as_still_running(spool, tmp_path, monkeypatch):
+    """A daemon that died mid-consult is the one case where "still running" would be a lie: nothing
+    is working the job, so waiting can never end. That must surface as broken."""
     rid = _rid("aa0002")
     spool.write_status(rid, "processing", out=str(tmp_path / "b.txt"))
-    monkeypatch.setattr(spool, "daemon_alive", lambda: True)
-    code = spool.cmd_await(_await_args(rid, str(tmp_path / "b.txt"), timeout=0.2))
-    assert code == 5
+    monkeypatch.setattr(spool, "daemon_alive", lambda: False)
+    monkeypatch.setattr(spool, "DAEMON_GRACE_S", 0)
+    assert spool.cmd_await(_await_args(rid, str(tmp_path / "b.txt"), timeout=3)) == 1
