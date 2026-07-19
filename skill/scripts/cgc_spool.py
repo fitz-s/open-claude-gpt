@@ -34,9 +34,10 @@ Agent-facing CLI (dispatched by bin/cgc; both are LOCAL-ONLY, never touch the ne
            -> writes pending/<rid>.json, prints {rid,out,queued,daemon_up}. Local write only.
   await    --rid R --out F [--timeout T] [--poll N]
            -> polls status/<rid>.json + the answer file until the daemon finishes. Local read
-              only — no CDP. Exit codes MIRROR cdp_consult.py wait:
-                0 done (answer at --out)   3 blocker (login/captcha/rate/model)
+              only — no CDP. Exit codes:
+                0 done (answer at --out)   3 blocker (login/captcha/rate/model/safeguard)
                 4 no usable answer         2 usage/setup error (incl. daemon not running)
+                5 still running — re-run await (see CONSULT_TIMEOUT_S).
 """
 from __future__ import annotations
 
@@ -66,6 +67,15 @@ SPOOL_DIR = os.environ.get("CGC_SPOOL_DIR", os.path.join(CGC_STATE_DIR, "spool")
 
 # A consult with no fresh daemon heartbeat within this many seconds is treated as "daemon down".
 HEARTBEAT_STALE_S = 45
+
+# How long a consult takes: a GPT-5.6 Pro round reasons ~25 min. One number, used everywhere.
+CONSULT_TIMEOUT_S = 1500
+
+# Claude Code kills any background task the AGENT launches at 900s, so the agent cannot hold a
+# 25-minute wait in one call. It watches in AGENT_POLL_S slices under a `timeout 899` wrapper and
+# re-runs; await exits 5 (still running) rather than 4 (finished, nothing produced) so a healthy
+# consult is never mistaken for a dead one. Nothing else in the system uses this number.
+AGENT_POLL_S = 870
 
 # rid shape must match cdp_consult.py exactly.
 _RID_RE = re.compile(r"^REQ-\d{8}-\d{6}-[0-9a-f]{6}$")
@@ -263,9 +273,12 @@ def _repo_is_public(slug: str) -> tuple:
 def validate_prompt(prompt_text: str) -> tuple:
     """The egress gate. Returns (ok: bool, reason: str). ok means: it is safe to send this prompt to
     the external ChatGPT session. Rules, all fail-closed:
-      1. Must contain at least one real public-code link (github/gist/raw) — a prompt with no code
-         link is either malformed or is trying to send prose-only content; refuse (a legitimate
-         follow-up carries the marker below instead).
+      1. Must contain at least one real public-code link (github/gist/raw), UNLESS it is a follow-up
+         (the thread already holds the code) or a declared no-code consult — `prep --no-code`, for a
+         maths/research/writing question, renders "references no code". Rules 2-4 still apply to
+         both. Note what this rule is and isn't: it stops a *code* consult from going out as blind
+         prose, which is a quality guard; the security guarantees are rules 2-4 (nothing private,
+         nothing secret), and they are untouched by the exemption.
       2. Every github/raw repo slug in the prompt must be a gh-confirmed PUBLIC repo. Any private /
          unknown / unverifiable repo -> refuse. This is the independent re-check that makes the
          daemon a real gate rather than a blind relay of whatever the agent enqueued.
@@ -284,7 +297,7 @@ def validate_prompt(prompt_text: str) -> tuple:
             return False, f"refused: prompt contains what looks like a {label} — will not send it to an external service"
 
     links = _CODE_URL_RE.findall(text)
-    if not links and not is_followup:
+    if not links and not is_followup and "references no code" not in low:
         return False, "refused: no public code link (github/gist/raw URL) in the prompt — nothing safe to send"
 
     # 3. gists
@@ -324,10 +337,12 @@ def cmd_enqueue(a) -> int:
         if rx.search(prompt):
             sys.stderr.write(f"CGC_ERROR gate_secret: prompt looks like it contains a {label} — NOT enqueuing.\n")
             return 2
-    if not _CODE_URL_RE.search(prompt) and not is_followup:
+    if not _CODE_URL_RE.search(prompt) and not is_followup and "references no code" not in low:
         sys.stderr.write(
             "CGC_ERROR no_code_source: prompt has no public code link (github/gist URL) — the daemon "
-            "would refuse it. Deliver a link first (consult.py deliver → prep). NOT enqueuing.\n")
+            "would refuse it. Deliver a link first (consult.py deliver → prep). If the question has "
+            "no code subject at all (maths/research/writing), render it with `prep --no-code`. "
+            "NOT enqueuing.\n")
         return 2
 
     out = a.out or os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
@@ -352,18 +367,21 @@ def cmd_enqueue(a) -> int:
     print(json.dumps({"queued": True, "rid": a.rid, "out": os.path.abspath(out), "daemon_up": up}))
     if not up:
         sys.stderr.write(
-            "CGC_WARN daemon_down: the consult daemon is not running, so this job will sit in the "
-            "queue until it starts. Ask the user to start it once (like the debug Chrome):\n"
-            "  cgc watch     (foreground)   OR   cgc up   (starts Chrome + the daemon)\n"
-            "The agent should NOT start the daemon itself — it is user-owned setup.\n")
+            "CGC_WARN daemon_down: the consult daemon is not running, so this job sits queued until "
+            "it is. Relay ONE line to the user:\n"
+            "  cgc install-daemon    # installs it via launchd: starts at login, respawns if it dies\n"
+            "The agent does not start it — after that install, nobody has to.\n")
     else:
         sys.stderr.write(
             "CGC_QUEUED. The user's daemon will validate (public-repo re-check) + send it. Now wait "
             "for the answer with a LOCAL file poll (run_in_background:true) — copy verbatim:\n"
             f"  timeout 899 python3 {os.path.abspath(__file__)} await --rid {a.rid} "
-            f"--out {os.path.abspath(out)} --poll {a.poll} --timeout {a.timeout}\n"
+            f"--out {os.path.abspath(out)} --poll {a.poll} --timeout {AGENT_POLL_S}\n"
             "MANDATORY: keep the `timeout 899` prefix. `await` only reads local files — it never "
-            "touches the network, so it is never blocked by the auto-mode classifier.\n")
+            "touches the network, so it is never blocked by the auto-mode classifier.\n"
+            f"This consult gets {a.timeout // 60} min; your await watches {AGENT_POLL_S}s at a time "
+            "(Claude Code kills longer background tasks), so exit 5 = still running is expected — "
+            "just run the same line again.\n")
     return 0
 
 
@@ -393,8 +411,9 @@ def cmd_await(a) -> int:
             if time.time() > (deadline - a.timeout) + 60:
                 sys.stderr.write(
                     "CGC_ERROR daemon_not_running: the job was never picked up and no live consult "
-                    "daemon was found. Ask the user to start it once: `cgc watch` (or `cgc up`). "
-                    "The job stays queued and will run once the daemon is up.\n")
+                    "daemon was found. Relay ONE line to the user — `cgc install-daemon` (installs "
+                    "it as a launchd agent so it starts at login and never needs starting again). "
+                    "The job stays queued and runs as soon as it is up.\n")
                 return 2
         if state == "done":
             try:
@@ -417,11 +436,13 @@ def cmd_await(a) -> int:
             sys.stderr.write(f"CGC_ERROR gate_or_send_error: {_m}\n")
             return 2
         time.sleep(a.poll)
+    _last = (read_status(rid) or {}).get("state") or "none"
     sys.stderr.write(
-        f"CGC_ERROR await_timeout: no terminal status for {rid} within {a.timeout}s "
-        f"(last state {read_status(rid).get('state') if read_status(rid) else 'none'}). The consult "
-        f"may still be running in the daemon — re-run `await` to keep watching, or check `cgc watch` logs.\n")
-    return 4
+        f"CGC_STILL_RUNNING {rid}: still {_last} after {a.timeout}s — not a failure. The daemon is "
+        f"working; the answer will land at {out}. Keep watching:\n"
+        f"  timeout 899 python3 {os.path.abspath(__file__)} await --rid {rid} "
+        f"--out {out} --poll {a.poll} --timeout {a.timeout}\n")
+    return 5
 
 
 def _print_followup_recipe(rid, st):
@@ -434,7 +455,8 @@ def _print_followup_recipe(rid, st):
         "  python3 consult.py prep --followup --task \"<local results + next question>\" --title \"<what's new>\"\n"
         "  # 2. enqueue it (uses this thread), then await:\n"
         f"  python3 cgc_spool.py enqueue --rid <r2> --kind followup --conversation {conv} --prompt-file <rendered>\n"
-        f"  timeout 899 python3 cgc_spool.py await --rid <r2> --out {os.path.join(CGC_STATE_DIR,'answer_<r2>.txt')} --timeout 870\n")
+        f"  timeout 899 python3 cgc_spool.py await --rid <r2> --out {os.path.join(CGC_STATE_DIR,'answer_<r2>.txt')} --timeout 870\n"
+        "  # await exits 5 = still running (a Pro consult routinely outlasts one await) -> just await again.\n")
 
 
 # ---- CLI: status (human) ----------------------------------------------------
@@ -468,14 +490,20 @@ def main() -> int:
     e.add_argument("--model", default=os.environ.get("CGC_MODEL", "Pro"))
     e.add_argument("--out", help="answer file (default $CGC_STATE_DIR/answer_<rid>.txt)")
     e.add_argument("--poll", type=int, default=20)
-    e.add_argument("--timeout", type=int, default=870)
+    e.add_argument("--timeout", type=int, default=CONSULT_TIMEOUT_S,
+                   help=f"seconds to allow this consult (default {CONSULT_TIMEOUT_S} = "
+                        f"{CONSULT_TIMEOUT_S // 60} min, how long a GPT-5.6 Pro round reasons).")
     e.set_defaults(fn=cmd_enqueue)
 
     w = sub.add_parser("await", help="poll the local answer/status for a queued job (LOCAL read only)")
     w.add_argument("--rid", required=True)
     w.add_argument("--out", required=True)
     w.add_argument("--poll", type=int, default=20)
-    w.add_argument("--timeout", type=int, default=870)
+    w.add_argument("--timeout", type=int, default=CONSULT_TIMEOUT_S,
+                   help=f"seconds to wait for the answer (default {CONSULT_TIMEOUT_S} = "
+                        f"{CONSULT_TIMEOUT_S // 60} min). The agent must pass {AGENT_POLL_S} "
+                        "instead — Claude Code kills its background tasks at 900s — and re-run "
+                        "await on exit 5 (still running).")
     w.set_defaults(fn=cmd_await)
 
     s = sub.add_parser("status", help="print daemon liveness + spool contents")

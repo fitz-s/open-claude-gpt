@@ -80,7 +80,7 @@ def run_worker(processing_file: str) -> int:
     out = job.get("out") or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt")
     kind = job.get("kind", "submit")
     poll = str(job.get("poll", 20))
-    timeout = int(job.get("timeout", 870))
+    timeout = int(job.get("timeout", spool.CONSULT_TIMEOUT_S))  # enqueue always writes it
 
     # --- the gate: re-validate independently before ANY external send --------
     try:

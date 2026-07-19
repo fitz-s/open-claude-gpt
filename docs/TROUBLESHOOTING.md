@@ -64,10 +64,19 @@ for very long consults (the bound is a safety cap, not the expected duration).
 - **`0`** — the wrapped answer was retrieved (clean `BEGIN_RESPONSE:<rid>` /
   `END_RESPONSE:<rid>` extraction), **or** a best-effort salvage at timeout (see
   below). Both cases write the answer to `--out`.
+- **`5`** (`cgc await` only) — **still running; not an error.** This await's local
+  window (default 870s) elapsed while the daemon is still working the job. A
+  GPT-5.6 Pro consult reasons for ~25 min, and the agent's await is capped at
+  ~900s by the background-task guard, so a normal consult *will* hit this once —
+  just run the same `await` again. Contrast with `4`: there the consult finished
+  and produced nothing; here it is alive and on track.
 - **`4`** — genuine no-answer timeout: nothing usable was present when the waiter
   gave up.
-- **`3`** — a blocker was detected (login, CAPTCHA, or rate-limit).
-- **`2`** — usage error (bad flags/arguments).
+- **`3`** — a blocker was detected (login, CAPTCHA, rate-limit, an unselectable
+  model, or a GPT-5.6 safeguard refusal — its synchronous cyber/bio classifier
+  can intervene on legitimate dual-use work such as vulnerability or security
+  review).
+- **`2`** — usage error (bad flags/arguments), or setup (e.g. `daemon_not_running`).
 
 ## `sentinel_missing` / `CGC_UNWRAPPED` / `.raw`
 If the model never emits a clean `BEGIN_RESPONSE:<rid>` / `END_RESPONSE:<rid>`
@@ -89,10 +98,15 @@ preserves exactly what was salvaged, in case the primary `--out` file gets
 overwritten by a later step.
 
 ## `await` says `daemon_not_running`
-The egress daemon isn't up. Start it with `bin/cgc watch` (foreground) or
-`bin/cgc up` (Chrome + daemon, detached) — this is a one-time, user-started
-process, same as logging into the dedicated Chrome; the agent should never start
-it itself. Retry `cgc await` once `bin/cgc queue` shows the daemon up.
+The egress daemon isn't up. Install it permanently — once, on this machine:
+
+    cgc install-daemon
+
+That registers it as a launchd agent (`RunAtLoad` + `KeepAlive`), so it starts at
+login and respawns if it ever dies. After this, neither you nor the agent has to
+start or check it again, and the agent never starts it itself. `cgc uninstall-daemon`
+reverses it. For a one-off or to watch it work, `cgc watch` still runs it in the
+foreground.
 
 ## The daemon refused my job (`gate` error / GATE REFUSED)
 The daemon's egress gate re-checks every job before sending and refuses
@@ -108,8 +122,8 @@ fail-closed. Common causes:
 Under Claude Code's `auto` permission mode, the direct `submit`/`wait` path is
 blocked by the data-exfiltration classifier and the agent falls back to
 `enqueue`/`await`, which needs the egress daemon running to make progress. Check
-`bin/cgc queue` — if it shows the daemon **DOWN**, start it with `bin/cgc watch`
-(or `bin/cgc up`); nothing will complete until it's up.
+`bin/cgc queue` — if it shows the daemon **DOWN**, run `cgc install-daemon` once;
+nothing will complete until it's up, and after that install it always is.
 
 ## `gh` warnings in doctor
 `gh` is optional but recommended. Without it, `deliver` can't verify repo

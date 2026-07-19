@@ -160,8 +160,11 @@ agent ─▶ cgc await ◀──────────┘                     
 
 `cgc enqueue` and `cgc await` are pure local file I/O — they never open a socket to
 an external host, so the classifier has nothing to flag. The only process that
-talks to `chatgpt.com` is **`cgc watch`**, a daemon the *user* starts once, exactly
-like they log into the dedicated Chrome once: it is never started by the agent,
+talks to `chatgpt.com` is the daemon, which lives in the *user's* login session —
+installed once via `cgc install-daemon` (a launchd agent that starts at login and
+respawns if it dies), exactly as they log into the dedicated Chrome once. The
+install is a deliberate, explicit act by the user; the agent cannot perform it and
+never starts the daemon,
 and its Bash invocation happens outside any agent turn, so it is simply not subject
 to the agent-call classifier at all.
 

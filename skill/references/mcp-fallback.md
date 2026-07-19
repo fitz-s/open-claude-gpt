@@ -27,7 +27,7 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py prep \
 
 ## 4. Monitor (ScheduleWakeup poll-wake)
 - **Cost model:** each wake = one full main-context reload (a `ScheduleWakeup` sleep >5 min misses the prompt cache), so cost ≈ `wake_count × context_size`. Waking early on an unfinished answer burns a reload; being late is free. Bias the schedule **long**; target ≤4 wakes.
-- Use the wake plan from prep: `first_wake_seconds` (≈85% of expected latency) then `repoll_seconds`. For a known-deep task pass `--expect-minutes 25`+ to prep so the first wake lands near completion (the biggest token lever). Let the wake chain run; don't poll early.
+- Use the wake plan from prep: `first_wake_seconds` (≈85% of expected latency) then `repoll_seconds`. `--expect-minutes` now defaults to **25** (GPT-5.6 Pro reasons that long), so the first wake already lands near completion — the biggest token lever. Raise it further only for a genuinely huge review. Let the wake chain run; don't poll early.
 - Each wake: run `poll_js` verbatim via `javascript_tool` (returns `{generating,done,blocker,assistantCount,len}` — metadata only). `done` is line-anchored (standalone `BEGIN_RESPONSE:<id>` before standalone `END_RESPONSE:<id>`, not generating). The first 1–2 polls may show `len:0`/`done:false` while the node hydrates — keep polling, never resubmit.
   - `blocker` non-null (login/captcha/rate_limit) → stop, tell the user.
   - **Settled-without-sentinel:** `generating:false` AND `len>0` AND `done:false` AND `len` unchanged from the prior wake → it finished without `END_RESPONSE:<id>`. Read the last assistant message via `get_page_text`: real just-unwrapped answer → use it; junk/partial → re-submit. (Mirror of CDP exit 5.)

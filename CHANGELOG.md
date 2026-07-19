@@ -10,6 +10,14 @@ First public release. Experimental pre-release (the CDP/browser-automation path 
 functional and fenced, but early — expect rough edges).
 
 ### Added
+- **`prep --no-code`** for consults with no code subject — a maths proof, a research or writing
+  question, a self-contained analysis. These were previously impossible: `prep` refused without a
+  `--refs-file` ("there is NO override") and the daemon's gate refused a prompt with no code link,
+  so the only route was gisting the question, which the gate also refuses by default. The flag
+  renders an explicit "references no code" declaration that both the model and the gate read. It is
+  scoped to that one rule: secrets are still refused, and any repo such a prompt does cite must
+  still be gh-confirmed public — the security guarantees are unchanged, only the quality rule
+  (don't send a *code* consult as blind prose) now correctly does not apply to non-code questions.
 - Claude Code skill and `cgc` CLI for sending public-GitHub-linked consults to a
   logged-in ChatGPT web session; dedicated Chrome profile launch, doctor checks,
   model selection, background waiting, follow-up threads, and public-source delivery.
@@ -56,6 +64,34 @@ functional and fenced, but early — expect rough edges).
 
 ### Changed
 - The installable skill is now named **`chatgpt-consult`** (installs to `~/.claude/skills/chatgpt-consult`). The project/repo remains `open-claude-gpt`.
+- **`cgc install-daemon` / `uninstall-daemon` — the daemon is now permanent, so a consult never
+  stalls waiting for a human.** Previously the egress daemon had to be started by hand (`cgc watch`),
+  which meant an agent could prep and enqueue a consult only to discover nothing would send, then
+  interrupt the user mid-task. `install-daemon` registers it as a launchd agent (`RunAtLoad` +
+  `KeepAlive`): up at login, respawned if it dies, and it opens the debug Chrome itself. Run once,
+  never again. The daemon still runs in the user's own session and is still never started by the
+  agent — the security model is unchanged, only the number of times a human is needed (now: once).
+  The generated plist bakes the installing shell's `PATH`, without which a LaunchAgent's minimal
+  `PATH` would break the gate's `gh` repo-visibility check.
+- **The agent no longer preflights the daemon.** SKILL.md/ACTIVATION.md now explicitly forbid running
+  `cgc queue`/`doctor` "to make sure" before a consult: it spends tokens every round to learn
+  something it wouldn't act on, and `enqueue`/`await` already fail in one actionable line (exit 2).
+- **Timing defaults resized to 25 minutes throughout — that is simply how long a GPT-5.6 Pro round
+  reasons.** The daemon's per-job budget (`cgc enqueue --timeout`), `cdp_consult.py wait`, and
+  `followup --watch` all default to **1500s / 25 min**, and `prep --expect-minutes` defaults to **25**.
+  The one number that is *not* 25 min is the agent's own `cgc await` window (**870s**): Claude Code's
+  background-task guard blocks any bounded task capped over 900s, so the agent must watch in chunks —
+  its *effective* wait is still the full 25 min, via exit 5 + re-await. That slice size is now the
+  named `AGENT_POLL_S`, distinct from the single `CONSULT_TIMEOUT_S` every real timeout uses — one
+  magic number no longer stands in for two unrelated things. The skill documents that a consult is a slow, proof-shaped,
+  multi-angle round — so the question and the prompt must be precise, and it should only be spent on
+  the hardest open-ended work.
+- **New `cgc await` exit code `5` = still running** (was: conflated into `4`). `4` had meant both "the
+  daemon finished and produced nothing" and "my local window elapsed while the consult is healthy" —
+  opposite situations demanding opposite actions. At the old 870s-everywhere defaults the second case
+  was rare; at a 25-minute budget it is the *normal* path, so every consult would have looked like a
+  no-answer failure at 14.5 min. `5` now means "re-run the same await"; `4` keeps its true meaning.
+- **Prompt guidance retargeted to the GPT-5.6 family** (`gpt-5.6`→sol / terra / luna, GA 2026-07-09; the `Pro Extended` ChatGPT tier now runs sol-class). `references/gpt-5.6-prompting-principles.md` replaces the 5.5 file, grounded in OpenAI's "Using GPT-5.6" guide (which states 5.5 prompting carries forward) and enriched with the 5.6 deltas that matter here: shorter-prompts-measurably-win, avoid blanket "be concise" (5.6 may truncate the artifact — use prioritization), the tier-is-the-mode / "prompt the task not the mode" rule, and safeguard behavior. Plus a retrieval-budget stopping rule, the persona-vs-personality split, and an explicit "no preamble — sentinel-wrapped answer only" note. The outcome-first `PROMPT_TEMPLATE` is unchanged; model selection targets the switcher *label*, so it survived the 5.5→5.6 swap untouched. SKILL.md now notes a GPT-5.6 safeguard refusal as a possible `blocker` and its mid-stream classifier pauses as a non-stall for the waiter.
 
 ### Fixed
 - **Project-scoped conversations** (`/g/g-p-<pid>/c/<id>`) are now matched: `conversation_id()`

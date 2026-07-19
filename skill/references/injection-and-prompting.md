@@ -1,10 +1,10 @@
 <!-- Source: ChatGPT Pro consult REQ-20260612-082838, 2026-06-12. -->
 
-> **AUTHORITY (read first).** This doc predates `consult.py`'s `deliver` (which now automates scenario detection + ref selection) and the adoption of the official GPT-5.5 prompting guide. So:
+> **AUTHORITY (read first).** This doc predates `consult.py`'s `deliver` (which now automates scenario detection + ref selection) and the adoption of the official GPT-5.6 prompting guide. So:
 > - The live `PROMPT_TEMPLATE` in `scripts/consult.py` is the **authoritative prompt** — it overrides anything here.
 > - **Live, still-useful value:** §2 (URL-type catalog) and §9 (high-signal file selection). Use these.
 > - **Superseded / historical:** §1 "Core Contract", §3 "Deliver-Step Decision Procedure", §10 "Master Template", §12 "Implementation Checklist" — these describe the manual, pre-`deliver` workflow and a second prompt skeleton that no longer matches the tooling. Don't compose prompts from them.
-> - **§4 scenario templates** are GPT-5.5-era *legacy* (process-heavy, ALWAYS/NEVER, heading-per-finding). Mine them only as raw material for an `--output-file` contract; the live template owns the actual prompt structure.
+> - **§4 scenario templates** are pre-outcome-first *legacy* (process-heavy, ALWAYS/NEVER, heading-per-finding). Mine them only as raw material for an `--output-file` contract; the live template owns the actual prompt structure.
 
 chatgpt-consult Information-Injection and Prompting Layer
 

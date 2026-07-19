@@ -254,3 +254,62 @@ def test_cmd_await_error_state_exits_2(spool, tmp_path, monkeypatch):
     spool.write_status(rid, "error", exit=2, out=str(out))
     code = spool.cmd_await(_await_args(rid, str(out)))
     assert code == 2
+
+
+def test_cmd_await_window_elapsed_on_live_job_exits_5_not_4(spool, tmp_path, monkeypatch):
+    """The normal path for a GPT-5.6 Pro consult: the daemon is still reasoning when this await's
+    window runs out. That MUST be 5 (still running -> await again), never 4 (no usable answer),
+    because the two demand opposite actions."""
+    monkeypatch.setattr(spool, "daemon_alive", lambda: True)
+    rid = _rid()
+    out = tmp_path / "answer.txt"
+    spool.write_status(rid, "processing", out=str(out))
+    code = spool.cmd_await(_await_args(rid, str(out)))
+    assert code == 5
+
+
+def test_cmd_await_window_elapsed_while_still_queued_exits_5(spool, tmp_path, monkeypatch):
+    """Queued behind another consult with a live daemon is also 'still running', not a failure."""
+    monkeypatch.setattr(spool, "daemon_alive", lambda: True)
+    rid = _rid()
+    out = tmp_path / "answer.txt"
+    spool.write_status(rid, "queued", out=str(out))
+    code = spool.cmd_await(_await_args(rid, str(out)))
+    assert code == 5
+
+
+_NO_CODE = ("# Prove it\nThis consult references no code — it is a self-contained question. "
+            "Reason from first principles.\nProve the supermartingale maximal inequality.\n")
+
+
+def test_gate_allows_declared_no_code_consult(spool, monkeypatch):
+    """`prep --no-code` (maths/research/writing) has no repo to link, so rule 1 must not refuse it."""
+    monkeypatch.setattr(spool, "_repo_is_public", lambda slug: (True, "public"))
+    ok, why = spool.validate_prompt(_NO_CODE)
+    assert ok, why
+
+
+def test_gate_still_refuses_secrets_in_a_no_code_consult(spool):
+    """The no-code exemption is scoped to rule 1 only — secrets are refused on every path."""
+    ok, why = spool.validate_prompt(_NO_CODE + "\nAKIAABCDEFGHIJKLMNOP\n")
+    assert not ok and "key" in why.lower()
+
+
+def test_gate_still_refuses_private_repo_in_a_no_code_consult(spool, monkeypatch):
+    """Nor does it exempt a private repo that the prompt happens to cite."""
+    monkeypatch.setattr(spool, "_repo_is_public", lambda slug: (False, "private"))
+    ok, why = spool.validate_prompt(_NO_CODE + "\nhttps://github.com/acme/secret\n")
+    assert not ok and "not confirmed PUBLIC" in why
+
+
+def test_gate_still_refuses_prose_without_the_no_code_declaration(spool):
+    """A code consult that shipped prose instead of a link must still be refused."""
+    ok, why = spool.validate_prompt("Please review the design of my repository, it is a big refactor.")
+    assert not ok and "no public code link" in why
+
+
+def test_agent_can_cover_the_consult_timeout_in_slices(spool):
+    """The agent watches in AGENT_POLL_S slices because Claude Code kills its background tasks at
+    900s; two slices must still cover a full CONSULT_TIMEOUT_S consult."""
+    assert spool.AGENT_POLL_S <= 870, "must stay under the 900s background-task kill"
+    assert 2 * spool.AGENT_POLL_S >= spool.CONSULT_TIMEOUT_S
