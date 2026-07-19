@@ -6,6 +6,41 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Changed
+- **One deadline replaces three timeouts, and two of the three were never timeouts.**
+  `CONSULT_TIMEOUT_S = 1500` was an *expectation* — how long a GPT-5.6 Pro round reasons.
+  `AGENT_POLL_S = 870` was an *observation interval*, sized to a believed 900s cap on background
+  tasks the agent launches. Neither answers the question a deadline answers: past what point is
+  waiting no longer explained by the work? That is one number, `STUCK_AFTER_S = 3600`, and reaching
+  it means something is broken, so the response is to read the job log rather than wait again. The
+  `timeout 899` wrapper, the 870/899 pairing, and the four-layer nesting (wrapper → agent window →
+  daemon budget → child budget) are all gone.
+- **The 900s background-task cap does not exist — measured, not assumed.** It was asserted in a
+  dozen places in this repo with no evidence, and the entire slicing apparatus existed to satisfy
+  it. An unbounded background waiter is accepted, and an unbounded 1000-second task ran to
+  completion (`SURVIVED_1000s`, start/end markers 1000s apart). The wrapper only ever truncated
+  healthy consults.
+- **Waiter exit codes collapse from five to three**, because three things are actionable: `0` the
+  answer is on disk and its path is printed, `3` a human must act in the ChatGPT window, `1` broken
+  and the job-log path is printed. Exit `5` "still running" is gone — a consult routinely outlasts
+  any particular observation, and making that an exit code turned every healthy 25-minute round
+  into a failure the caller had to notice and manually retry. Waiting longer is the waiter's job.
+  Exit `4` "no usable answer" and exit `2` "error" merge: they differ in cause but not in what the
+  caller does next. `cdp_consult.py wait` keeps the finer set internally so the *cause* still
+  reaches the log — cause is worth keeping where it aids diagnosis, not where it forces the caller
+  to branch on a difference it cannot act on.
+- **Success hands back a path, not a lecture.** `enqueue` and `await` printed multi-line guidance
+  blocks on every invocation; they now print the one command or file that matters.
+
+### Added
+- **`enqueue --kind retrieve`** — attach to an EXISTING conversation and read its answer. A
+  consult's ChatGPT conversation outlives its waiter whenever the daemon restarts, crashes, or the
+  user closes Chrome, and the spool had no operation for that: `submit` opens a new conversation
+  and `followup` sends another message. The only recovery left was a direct agent-side wait — the
+  path auto mode blocks by design. The recovery path must not be the forbidden path. retrieve sends
+  nothing, so there is no payload for the gate to validate; that is enforced structurally rather
+  than trusted, since the job carries no prompt and the daemon refuses one that does.
+
 ### Fixed
 - **Answer detection had gone blind against ChatGPT's current DOM — every consult on that build ran
   its full 25-minute budget and returned nothing.** All four parsers selected assistant turns with

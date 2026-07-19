@@ -19,7 +19,7 @@ A GPT-5.6 Pro round reasons for ~25 min: it works the problem from several angle
 - **Only send work worth that.** Never a question you could answer locally in a minute.
 - **Be precise — the question above all.** Depth amplifies whatever you aim it at, so a vague `--task` buys 25 minutes of well-argued irrelevance and you find out only when it lands. Name the decision, the bar for "good", and the sub-questions (see "Steer the round"), and keep the prompt lean — on 5.6 padding buys extra exploration, and "be brief" makes it substitute a shorter artifact. Full law: **[references/gpt-5.6-prompting-principles.md](references/gpt-5.6-prompting-principles.md)**.
 
-Then fire it and go work on something else — the path is detached and wakes you. `await` exiting **5 = still running** is normal; just await again.
+Then fire it and go work on something else — the path is detached and wakes you. `await` waits as long as the consult takes; it returns only when there is something to act on.
 
 ## Quickstart — the daemon path (default; auto-mode-safe), top to bottom
 Prereqs (once per machine): `pip install websocket-client`; `gh auth status` OK; Google Chrome installed (the launcher uses the macOS path). Run each line as its own step and write paths in full — shell variables don't persist between separate Bash calls.
@@ -45,17 +45,17 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py prep --refs-file <re
 python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py enqueue --rid <request_id> --prompt-file <prompt_file>
 
 # 4. Await DETACHED — dispatch with run_in_background:true, then go do other work; it wakes you on done.
-#    `await` is a LOCAL file poll (no network), so the classifier never blocks it. The `timeout 899`
-#    prefix is still MANDATORY (goal-guard). NEVER `nohup … & disown` — an untracked process never wakes you.
-#    Exit 5 = still running (the ~25-min consult outlives one 870s await) -> re-run this SAME line.
-timeout 899 python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <request_id> --out /tmp/cgc/answer_<request_id>.txt --timeout 870
+#    `await` is a LOCAL file poll (no network), so the classifier never blocks it. It waits as long
+#    as the consult takes — no wrapper, no slicing, no re-running. NEVER `nohup … & disown`: an
+#    untracked process never wakes you.
+python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <request_id> --out /tmp/cgc/answer_<request_id>.txt
 
 # 5. On wake: read the answer, then verify locally.
 #    Read /tmp/cgc/answer_<request_id>.txt    (enqueue's default --out; it also prints the exact await line)
 #    To continue the thread, prep --followup then enqueue --kind followup --conversation auto (NOT a new
 #    plain prep+enqueue, which opens a NEW conversation). See "Follow-up rounds".
 ```
-Error → cause: `await` exits **5** = **still running — NOT an error**; this await's 870s window elapsed while the daemon is still reasoning (the normal path for a ~25-min Pro consult) → just re-run the same await line. **3** = blocker (login/captcha/rate-limit/model, or a **GPT-5.6 safeguard refusal** — its synchronous cyber/bio classifier occasionally intervenes on legitimate dual-use work like vuln/security review; user checks the ChatGPT window, then re-enqueue); **4** = no usable answer (the daemon finished and found nothing — a real failure, unlike 5); **2** = setup error, usually `daemon_not_running` → relay `cgc install-daemon` to the user. `enqueue` refuses locally (exit 2) on a missing code link or a detected secret. The daemon's own `GATE REFUSED` (seen via `cgc queue` / its log) = the repo isn't gh-confirmed public, a gist link (`CGC_GATE_ALLOW_GIST=1` to allow), or a secret — read its FIRST WORD: `refused:` is a verdict (fix the input; re-enqueueing cannot help), `unverified:` means the check itself failed (`gh` timed out) and nothing is known, so re-enqueue to retry. **On any failure, `await` prints `CGC_LOG <path>` — that file is the full send+wait transcript for the job, and it streams live. Read it before guessing.** Its heartbeat line is the diagnosis: `ac=0` for the whole run = ChatGPT never produced an assistant turn (nothing was sent, or the page changed shape); `begin=true end=false` = the answer is being written right now. Full detail in **Pipeline A** below; the DIRECT submit/wait fallback (interactive mode only — blocked by the classifier in auto mode) and the no-debug-profile path are in **[references/mcp-fallback.md](references/mcp-fallback.md)** and **Pipeline A**.
+Error → cause: `await` returns exactly three things, because exactly three are actionable. **`0`** = the answer is on disk and its path is printed — go read it. **`3`** = a human must act in the ChatGPT window (login/captcha/rate-limit/model, or a **GPT-5.6 safeguard refusal** — its synchronous cyber/bio classifier occasionally intervenes on legitimate dual-use work like vuln/security review); the user acts, then re-enqueue. **`1`** = broken, and the job-log path is printed. "Still running" is not a return value: a consult routinely takes ~25 minutes and `await` simply keeps waiting. It gives up only after **60 minutes**, which is far past anything the work explains — so that is a malfunction, not a slow answer, and re-running the wait cannot fix it. `enqueue` refuses locally (exit 2) on a missing code link or a detected secret. The daemon's own `GATE REFUSED` (via `cgc queue` / its log) = the repo isn't gh-confirmed public, a gist link (`CGC_GATE_ALLOW_GIST=1` to allow), or a secret — read its FIRST WORD: `refused:` is a verdict (fix the input; re-enqueueing cannot help), `unverified:` means the check itself failed (`gh` timed out) and nothing is known, so re-enqueue to retry. **On any failure `await` prints `CGC_LOG <path>` — the full send+wait transcript, streamed live. Read it before guessing.** Its heartbeat is the diagnosis: `ac=0` throughout = ChatGPT never produced an assistant turn (nothing was sent, or the page changed shape); `begin=true end=false` = the answer is being written right now. Full detail in **Pipeline A**; the DIRECT submit/wait fallback (interactive mode only) and the no-debug-profile path are in **[references/mcp-fallback.md](references/mcp-fallback.md)**.
 
 ## Roles (keep distinct)
 - **ChatGPT = external advisor.** Gives plans / reviews / risk analysis — treat its output as advisory input.
@@ -151,14 +151,12 @@ Fall back to Backend B (MCP) only if the user declines the dedicated-profile set
    - **Model:** `--model` defaults to **`Pro`** (any Pro tier satisfies a `Pro*` target); navigate resets the model so submit re-selects it. Selection is **fully automated and two-menu aware** — the composer has separate model and reasoning-effort switchers, and the Pro tier lives in the model menu, so submit tries *each* switcher's menu until the target is actually selected, then confirms. **Fail-closed: if it cannot select the target it does NOT send** (`CGC_ERROR model_not_selectable`, exit 3) — the tier truly isn't offered by this account/project. Override `--model Medium`/etc., `--model skip` to keep the current model, or `--allow-model-mismatch` to send anyway. `composer_not_ready`/`no_page_target` → tab not on ChatGPT or login lapsed; tell the user.
 3. **Wait + auto-retrieve (detached — this is the efficiency win):**
    ```bash
-   timeout 899 python3 ~/.claude/skills/chatgpt-consult/scripts/cdp_consult.py wait --rid <request_id> --conversation <conversation_id> \
-     --out /tmp/cgc_answer_<request_id>.txt --poll 20 --timeout 870
+   python3 ~/.claude/skills/chatgpt-consult/scripts/cdp_consult.py wait --rid <request_id> --conversation <conversation_id> \
+     --out /tmp/cgc_answer_<request_id>.txt
    ```
-   **The outer `timeout 899` is REQUIRED** — a bare `run_in_background` waiter is unbounded and the goal-guard hook BLOCKS it (`an unbounded one … holds the session in pending-async state`), and a background-task guard blocks any bounded task whose cap exceeds 900s. Outer `timeout 899` (≤900s, under that cap) makes it a bounded bg task; inner `--timeout 870` (~15 minutes, ~29s under the outer bound) lets the waiter do its own rescue-grab and clean exit before the outer hard-kill. **Keep that 870/899 pair together** — the margin is what makes the salvage grab run at all.
-
-   **Why you pass 870 when the timeout is 25 min.** Claude Code kills any background task YOU launch at 900s, so you can't hold a 25-minute wait in one call — you watch 870s at a time and re-run. On the daemon path that's free (the daemon holds the consult; `await` exits 5 = still running, you await again). On this DIRECT path nothing holds it, so re-run `wait` — it re-attaches via `--conversation` — instead of trusting a mid-stream salvage.
+   **No wrapper, and do not slice the wait.** Earlier versions of this file required `timeout 899` around every waiter and `--timeout 870` inside it, on the belief that an unbounded background task is blocked and a bounded one is killed at 900s. **Both were measured false:** an unbounded background waiter is accepted, and an unbounded 1000s task ran to completion. The wrapper only ever truncated healthy consults. Let the waiter wait.
    **Pin with `--conversation <conversation_id>` (from submit) AND pass the real `--rid`.** The conversation id selects the exact tab; the rid is then *verified* against that tab's `BEGIN_RESPONSE:<rid>` echo — mismatch → it errors `rid_mismatch` instead of returning the wrong request's answer. (`--rid auto` reads the rid off the pinned tab if you didn't keep it, but prefer passing both.) Without a conversation pin, multiple open tabs → `ambiguous_target` by design. This combination (own conversation + verified rid) makes cross-request collision impossible.
-   Dispatch this with **`run_in_background: true`** AND the outer `timeout 899` wrapper above (bounded, or the goal-guard hook blocks it). It polls the DOM every 20 s *with no agent context loaded*, and on completion writes the full answer (sentinels stripped, references intact, no 50k cap) and exits. Its exit re-invokes you = the wake. Do NOT `ScheduleWakeup` and do NOT poll yourself. Inner `--timeout` defaults to `1500` (25 min, the real consult length) — here passed as `870` because only the agent is guard-bound, leaving the outer `timeout 899` ~29s of margin. **Consequence on this direct path: a ~25-min consult outlives one wait.** If it returns at ~14.5 min, prefer re-running the same `wait` (it re-attaches via `--conversation`) over trusting a mid-stream salvage (`CGC_UNWRAPPED` — check it isn't cut off). The daemon path has no such split. Also: `--settle-seconds 300`, `--min-unwrapped 1500`. **Exit codes:** `0` = wrapped answer retrieved, OR a best-effort salvage at timeout (no wrapper but a substantial answer present → written to `--out` plus a sibling `<out>.raw`, logged `CGC_UNWRAPPED` — verify it isn't cut off before trusting it) · `4` = genuine no-answer timeout (nothing usable present) · `3` = blocker (login/captcha/rate-limit) · `2` = usage. See "sentinel_missing / CGC_UNWRAPPED / .raw" in [docs/TROUBLESHOOTING.md](../docs/TROUBLESHOOTING.md).
+   Dispatch this with **`run_in_background: true`**. It polls the DOM every 20 s *with no agent context loaded*, and on completion writes the full answer (sentinels stripped, references intact, no 50k cap) and exits. Its exit re-invokes you = the wake. Do NOT `ScheduleWakeup` and do NOT poll yourself. `--timeout` defaults to `3600` — that is not a budget for the consult but the point past which the job is stuck rather than slow. Also: `--settle-seconds 300`, `--min-unwrapped 1500`. **Exit codes:** `0` = wrapped answer retrieved, OR a best-effort salvage at timeout (no wrapper but a substantial answer present → written to `--out` plus a sibling `<out>.raw`, logged `CGC_UNWRAPPED` — verify it isn't cut off before trusting it) · `4` = genuine no-answer timeout (nothing usable present) · `3` = blocker (login/captcha/rate-limit) · `2` = usage. See "sentinel_missing / CGC_UNWRAPPED / .raw" in [docs/TROUBLESHOOTING.md](../docs/TROUBLESHOOTING.md).
    - **`done` is SENTINEL-driven** — it fires when `END_RESPONSE:<rid>` appears after `BEGIN_RESPONSE:<rid>` in the answer node's text (read via `textContent`, so a backgrounded tab can't collapse it; not gated on the stop-button, which the ChatGPT UI can keep showing). A Thinking model streams short reasoning-summary stubs for a long time BEFORE the real answer — that is NOT the answer; the waiter keeps polling.
    - **Be patient — ~25 min is the NORMAL duration for a GPT-5.6 Pro consult (a huge 150-file PR review, longer), and ChatGPT may show `gen=False` with the answer not yet streamed.** The heartbeat `len` now tracks the LARGEST message of the CURRENT turn (not a trailing 1-char placeholder, the old "stuck at len=1" misread), so a growing or non-trivial `len`, or `gen=True`, means the model is alive — **do not kill the waiter.** (GPT-5.6 also pauses generation for several seconds mid-stream while its safeguard classifiers review output — another reason a brief stall is not a stall.) It keeps polling and returns when the answer lands; let it run to `--timeout` (raise it for very large reviews).
    - **If the model skips the wrapper** (it sometimes does on short follow-ups), the waiter takes the whole last message as the answer once it's ≥ `--min-unwrapped` chars (logs `CGC_UNWRAPPED` — **verify it isn't cut off** before trusting it). A small stable message is treated as a streaming stub, not a stall, so the waiter keeps waiting rather than quitting. At timeout it makes one last rescue grab of any substantial message present.
@@ -176,7 +174,7 @@ The highest-value consults are a loop: get the answer → act locally → **repo
 python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py prep --followup --task "<local results + next question>" --title "<what's new>"
 # … enqueue it against the active thread, then await (LOCAL, detached):
 python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py enqueue --rid <r2> --kind followup --conversation auto --prompt-file <rendered_prompt_file>
-timeout 899 python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <r2> --out /tmp/cgc/answer_<r2>.txt --timeout 870
+python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <r2> --out /tmp/cgc/answer_<r2>.txt
 ```
 `--conversation auto` continues the active thread; on done `await` prints this exact recipe again (`CGC_NEXT`). The interactive-mode direct form follows.
 
@@ -184,16 +182,16 @@ timeout 899 python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await 
 
 ```bash
 # Round 1 — submit + wait. (submit records the active thread; it also prints this exact line.)
-timeout 899 python3 ~/.claude/skills/chatgpt-consult/scripts/cdp_consult.py wait --out /tmp/cgc_answer_<rid1>.txt --rid <rid1> --timeout 870
+python3 ~/.claude/skills/chatgpt-consult/scripts/cdp_consult.py wait --out /tmp/cgc_answer_<rid1>.txt --rid <rid1>
 # … read the answer, apply it locally, run the tests/checks …
 
 # Round 2 — ONE backgrounded command: renders + sends + WAITS for the answer, then exits (the
 # exit is the wake). --watch folds the wait in, so there is NO separate wait step to forget or
 # mis-arm. --conversation defaults to 'auto' (the active thread); --task is the only required field.
-timeout 899 python3 ~/.claude/skills/chatgpt-consult/scripts/cdp_consult.py followup \
+python3 ~/.claude/skills/chatgpt-consult/scripts/cdp_consult.py followup \
   --task "<local results + the next question>" \
   --title "<what's new>" \
-  --watch --out /tmp/cgc_answer_<rid2>.txt --timeout 870 \
+  --watch --out /tmp/cgc_answer_<rid2>.txt \
   --context-file /tmp/cgc_localresults.md   # optional: what you ran, results, where reality diverged
 #   → dispatch with run_in_background:true. On wake, Read /tmp/cgc_answer_<rid2>.txt.
 ```
@@ -209,7 +207,7 @@ That's the whole round — ONE backgrounded `followup --watch` call. (Without `-
 - **ChatGPT project (all consults go here):** `$CGC_PROJECT_URL (your ChatGPT project, or a plain new chat)`
 - **Model:** **Pro** (the `Pro`/`Pro Extended` switcher tier, which post-GA runs the **GPT-5.6** family, Sol-class) — `cdp_consult.py submit` confirms/sets it automatically (`--model` default `Pro`; any Pro tier satisfies it); check `modelConfirmed` in its output. Selection targets the switcher *label*, so it's robust to the underlying 5.x model version; if a 5.6 web build renames the tier, set `CGC_MODEL`.
 - **Fresh conversation inside the project per consult** (keeps `get_page_text` ≈ one Q+A; inherits project instructions).
-- **Timeouts: 25 minutes, everywhere** (`enqueue`/`await`/`wait`/`followup --timeout`, `prep --expect-minutes`) — that's how long a GPT-5.6 Pro round reasons. The one exception isn't a timeout: Claude Code kills your background tasks at 900s, so your `await` line passes `--timeout 870` under `timeout 899` and you re-run it on exit **5 = still running**.
+- **One deadline: 60 minutes** (`STUCK_AFTER_S`, the default `--timeout` on `enqueue`/`await`/`wait`/`followup`). A GPT-5.6 Pro round reasons ~25 min — that is how long the work TAKES, an expectation, and nothing is killed for reaching it. 60 min is the separate question of when waiting stops being explained by the work; past it the job is broken, so read its log instead of waiting again. There is no second clock: no wrapper, no slicing, no "still running" return.
 - Other defaults: chunk target 32000 / hard 40000; wake plan from prep (`--expect-minutes` 25 → first wake ~21 min, then re-poll); max ~8 chunks and max 3 consult rounds without user approval.
 
 ## Safety boundary

@@ -130,24 +130,29 @@ Because those lines are fenced, the parser ignores them and completion does not
 fire. Removing or reformatting the sentinel block (so it's no longer an
 unfenced standalone line) breaks answer retrieval.
 
-### Timeouts
+### The deadline
 
-**Every timeout is 25 minutes** (`1500s`), because that is how long a GPT-5.6 Pro
-round reasons. `cgc enqueue --timeout`, `cgc await --timeout`, `cdp_consult.py
-wait`, `followup --watch`, and `prep --expect-minutes` all default to it. Raise it
-only for a genuinely huge review.
+**There is one deadline, and it is 60 minutes** (`STUCK_AFTER_S = 3600`, the default
+`--timeout` on `cgc enqueue`, `cgc await`, `cdp_consult.py wait`, and `followup
+--watch`).
 
-One exception, and it is not a timeout: **Claude Code kills any background task the
-agent launches at 900s.** So the agent cannot hold a 25-minute wait in one call — it
-passes `--timeout 870` under a `timeout 899` wrapper and re-runs. When that slice
-ends on a live job, `await` exits **`5` = still running** (not `4`, which means the
-consult finished and produced nothing), and the agent simply runs the same line
-again. Its effective wait is still the full 25 minutes.
+It is not a budget for the consult. A GPT-5.6 Pro round reasons for about 25 minutes;
+that is how long the work *takes* — an expectation, not a deadline — and nothing is
+killed for reaching it. The deadline answers a different question: past what point is
+waiting no longer explained by the work? Beyond an hour the answer is not late,
+something is broken, and the right response is to read
+`$CGC_SPOOL_DIR/logs/<rid>.log` rather than wait again.
 
-On the **direct** path (the interactive-mode fallback) there is no daemon holding
-the consult, so an agent-run `wait` also ends at ~14.5 min. Re-run it — it
-re-attaches via `--conversation` — rather than trusting a mid-stream salvage. The
-daemon path has no such split, which is one more reason to prefer it.
+Earlier versions carried three numbers — a 1500s per-consult budget, an 870s agent
+window, and a `timeout 899` wrapper — because two of them were mis-named. The 1500s was
+the expectation above; the 870s existed only to stay under a believed 900s cap on
+background tasks the agent launches. **That cap was measured and does not exist:** an
+unbounded background waiter is accepted, and an unbounded 1000-second task ran to
+completion. The wrapper only ever truncated healthy consults, so it is gone. Waiters
+wait.
+
+`prep --expect-minutes` (default 25) is unrelated to any of this — it only paces the
+MCP fallback's wake plan.
 
 ### 3. Reference material
 
