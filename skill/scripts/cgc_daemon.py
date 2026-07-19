@@ -30,6 +30,7 @@ Flags:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -70,7 +71,7 @@ def _tail_file(path, n=240):
         return ""
 
 
-def _run(cmd, timeout, rid=None):
+def _run(cmd, timeout, rid=None, stdin_text=None):
     """Run a cdp_consult.py subcommand; return (exit, stdout, stderr). Never raises on non-zero.
 
     stderr streams LIVE into the job's log instead of being captured and discarded. Both halves of
@@ -90,7 +91,8 @@ def _run(cmd, timeout, rid=None):
         except OSError:
             log = None
     try:
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=(log or subprocess.PIPE),
+        r = subprocess.run(cmd, input=stdin_text, stdout=subprocess.PIPE,
+                           stderr=(log or subprocess.PIPE),
                            text=True, timeout=timeout, env=dict(os.environ))
         code, so, se = r.returncode, r.stdout, (r.stderr or "")
     except subprocess.TimeoutExpired as e:
@@ -151,7 +153,7 @@ def run_worker(processing_file: str) -> int:
     except OSError as e:
         spool.finish_job(rid, state="error", exit=2, out=out, msg=f"prompt unreadable: {e}")
         return 2
-    ok, reason = spool.validate_prompt(prompt)
+    ok, reason = spool.validate_prompt(prompt)  # `prompt` is now the ONLY copy that matters
     if not ok:
         sys.stderr.write(f"CGC_DAEMON GATE REFUSED {rid}: {reason}\n")
         spool.finish_job(rid, state="error", exit=2, out=out, msg=reason)
@@ -165,19 +167,26 @@ def run_worker(processing_file: str) -> int:
 
     if kind == "followup":
         conv = job.get("conversation") or "auto"
+        # Same rule as submit: the validated bytes go over stdin, never a reopenable path.
         cmd = [sys.executable, _CDP, "followup",
-               "--conversation", conv, "--prompt-file", job["prompt_file"],
+               "--conversation", conv, "--prompt-file", "-",
                "--rid", rid, "--model", job.get("model", "Pro"),
                "--watch", "--out", out, "--poll", poll, "--timeout", str(timeout)]
-        code, so, se = _run(cmd, child_budget, rid)
+        code, so, se = _run(cmd, child_budget, rid, stdin_text=prompt)
         return _finish_from_wait(rid, code, out, se, conv)
 
     # kind == submit: send, capture the conversation id, then wait.
+    # Hand the CDP child the VALIDATED BYTES over stdin, not the pathname. Passing the path let the
+    # child reopen a file any same-user process could have rewritten after validation, so what got
+    # sent to ChatGPT need not be what passed the public-repo and secret checks. The gate is the
+    # justification for this whole egress design; it has to cover the bytes that actually leave.
+    _sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     cmd = [sys.executable, _CDP, "submit",
-           "--rid", rid, "--prompt-file", job["prompt_file"],
+           "--rid", rid, "--prompt-file", "-",
            "--project-url", job.get("project_url", "https://chatgpt.com/"),
            "--model", job.get("model", "Pro")]
-    code, so, se = _run(cmd, 240, rid)
+    code, so, se = _run(cmd, 240, rid, stdin_text=prompt)
+    spool.write_status(rid, "processing", msg=f"{reason}; sent sha256={_sha[:16]}")
     conv = ""
     try:
         conv = (json.loads(so.strip().splitlines()[-1]) if so.strip() else {}).get("conversation_id", "") or ""

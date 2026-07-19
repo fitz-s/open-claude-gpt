@@ -816,8 +816,22 @@ _CODE_URL_RE = re.compile(
     re.IGNORECASE)
 
 
+def _read_prompt(path):
+    """Read the prompt to send. `-` means stdin, which is how the daemon hands over the EXACT bytes
+    its egress gate validated.
+
+    Reopening the path here would reintroduce a TOCTOU hole in that gate: the daemon reads the file
+    to validate it, and any same-user process could rewrite the file before this process opened it,
+    so the bytes sent to ChatGPT need not be the bytes that passed the public-repo and secret checks.
+    The gate is the whole justification for this tool's egress design, so it must cover the bytes
+    that actually leave, not a filename that once contained them."""
+    if path == "-":
+        return sys.stdin.read()
+    return open(path, encoding="utf-8").read()
+
+
 def cmd_submit(a) -> int:
-    prompt = open(a.prompt_file, encoding="utf-8").read()
+    prompt = _read_prompt(a.prompt_file)
     # Backstop (prep already hard-blocks at render): refuse to send a prompt with no actual CODE LINK.
     # A prose Context section is NOT the code — ChatGPT can't read the repo from a description and
     # answers blind ("no file access / can't cite file:line"). Require a github/gist link unless it's a
@@ -1000,7 +1014,7 @@ def _extract_rid_from_prompt_file(prompt_file: str) -> str:
     hard failure BEFORE sending, since the caller has no way to know which round the prompt actually
     belongs to and a wrong guess would let `wait --rid auto` watch a stale round."""
     try:
-        text = open(prompt_file, encoding="utf-8").read()
+        text = _read_prompt(prompt_file)
     except OSError as e:
         raise SystemExit(f"CGC_ERROR prompt_file_unreadable: {prompt_file}: {e}")
     rids = sorted(set(m.group(1) for m in _PROMPT_FILE_RID_RE.finditer(text)))
@@ -1048,7 +1062,7 @@ def cmd_followup(a) -> int:
     else:
         prompt_file, rid = _render_followup(a)
         sys.stderr.write(f"CGC_FOLLOWUP rendered {prompt_file} (rid {rid})\n")
-    prompt = open(prompt_file, encoding="utf-8").read()
+    prompt = _read_prompt(prompt_file)
     # A consult is a THREAD: the conversation persists server-side at /c/<id> even after
     # its tab is closed (default), so follow-up must NOT depend on round-1 having kept the
     # tab. Attach to a live tab if one exists; otherwise RE-OPEN the conversation by URL.
@@ -1421,7 +1435,9 @@ def main() -> int:
 
     su = sub.add_parser("submit")
     su.add_argument("--rid", required=True)
-    su.add_argument("--prompt-file", required=True)
+    su.add_argument("--prompt-file", required=True,
+                    help="rendered prompt; '-' reads it from stdin, which is how the daemon passes "
+                         "the exact bytes its gate validated (see _read_prompt)")
     su.add_argument("--project-url", default=CGC_PROJECT_URL,
                     help="URL a fresh consult opens (default $CGC_PROJECT_URL, else a new chat). "
                          "Set CGC_PROJECT_URL to your own ChatGPT project to keep consults grouped.")
