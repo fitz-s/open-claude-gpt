@@ -5,8 +5,12 @@
 #
 #   cgc doctor  [--deep] [--json]     health check / preflight
 #   cgc launch  [--gate]              start the dedicated debug Chrome, probe login
-#   cgc watch   [--once]              run the USER-OWNED egress daemon (send + validating gate)
-#   cgc up                            start the debug Chrome AND the daemon (detached) — full setup
+#   cgc install-daemon                install the egress daemon as a launchd agent — RUN THIS ONCE.
+#                                     Starts at login, restarts if it dies, so neither you nor the
+#                                     agent ever has to start or check it again.
+#   cgc uninstall-daemon              remove that launchd agent and stop the daemon
+#   cgc watch   [--once]              run the egress daemon in the FOREGROUND (debugging / one-off)
+#   cgc up                            start the debug Chrome AND the daemon (detached) — ad-hoc setup
 #   cgc deliver <args…>               resolve GitHub links for a consult   (consult.py deliver)
 #   cgc prep    <args…>               render the consult prompt            (consult.py prep)
 #   cgc enqueue <args…>               queue a job for the daemon (LOCAL write) (cgc_spool.py enqueue)
@@ -56,6 +60,58 @@ case "$cmd" in
   launch)   [ "${1:-}" = "--gate" ] && { shift; exec env CGC_GATE=1 bash "$S/cdp_launch.sh" "$@"; }
             exec bash "$S/cdp_launch.sh" "$@" ;;
   watch)    exec python3 "$S/cgc_daemon.py" "$@" ;;
+  install-daemon)
+    # Make the daemon permanent. Everything else in this tool is designed so a consult "just works";
+    # the one remaining human step was starting the daemon, which stalled the agent mid-task and made
+    # it burn tokens checking. launchd removes it: RunAtLoad + KeepAlive means the daemon is up at
+    # login and respawns if it crashes. The daemon still runs as YOU (your login session, your gate,
+    # your ChatGPT profile) — the agent never starts it, it just finds it already there.
+    case "$(uname -s)" in
+      Darwin) ;;
+      *) echo "cgc install-daemon: macOS/launchd only. On Linux, run the equivalent systemd --user" >&2
+         echo "  unit for: $(command -v python3) $S/cgc_daemon.py" >&2; exit 2 ;;
+    esac
+    label="com.open-claude-gpt.daemon"
+    plist="$HOME/Library/LaunchAgents/$label.plist"
+    log="${CGC_STATE_DIR:-/tmp/cgc}/daemon.log"
+    mkdir -p "$HOME/Library/LaunchAgents" "$(dirname "$log")"
+    # Generate the plist with plistlib rather than hand-rolled XML (escaping is not our problem to
+    # get wrong). Bake the CURRENT PATH: a LaunchAgent otherwise gets a minimal one and the gate's
+    # `gh` repo-visibility check — the thing that keeps private code from being sent — would fail.
+    python3 - "$plist" "$label" "$(command -v python3)" "$S/cgc_daemon.py" "$log" "$PATH" <<'PYEOF'
+import os, plistlib, sys
+plist_path, label, py, script, log, path = sys.argv[1:7]
+env = {"PATH": path}
+env.update({k: v for k, v in os.environ.items() if k.startswith("CGC_")})
+with open(plist_path, "wb") as f:
+    plistlib.dump({
+        "Label": label,
+        "ProgramArguments": [py, script],
+        "RunAtLoad": True,        # up as soon as you log in
+        "KeepAlive": True,        # respawn if it ever dies
+        "StandardOutPath": log,
+        "StandardErrorPath": log,
+        "EnvironmentVariables": env,
+        "ProcessType": "Background",
+    }, f)
+print(f"cgc: wrote {plist_path}")
+PYEOF
+    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl load -w "$plist"
+    sleep 1
+    python3 "$S/cgc_spool.py" status
+    echo
+    echo "The daemon is now permanent — it starts at login and respawns if it dies."
+    echo "Remaining one-time step (only if you have not done it): log into ChatGPT Pro in the"
+    echo "debug Chrome — run 'cgc launch', log in, done. The daemon opens Chrome itself after that."
+    ;;
+  uninstall-daemon)
+    label="com.open-claude-gpt.daemon"
+    plist="$HOME/Library/LaunchAgents/$label.plist"
+    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || launchctl unload -w "$plist" 2>/dev/null || true
+    rm -f "$plist"
+    echo "cgc: removed $plist and stopped the daemon."
+    ;;
   up)
     # Full setup in one command (USER-run, not the agent): ensure the debug Chrome is up, then
     # start the egress daemon DETACHED so it keeps running after this shell exits. The agent must

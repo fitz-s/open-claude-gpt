@@ -130,15 +130,24 @@ Because those lines are fenced, the parser ignores them and completion does not
 fire. Removing or reformatting the sentinel block (so it's no longer an
 unfenced standalone line) breaks answer retrieval.
 
-### Waiter timeouts are a knob, not a fixed limit
+### Timeouts
 
-The waiter runs as `timeout 899 … wait … --timeout 870` — an outer `timeout 899`
-(bounded so the background-task guard doesn't block it; keep it ≤900) and an inner
-`--timeout 870` (~15 minutes, ~29s under the outer bound so a timeout-rescue grab
-still has time to complete and exit cleanly). That ~15-minute inner cap is not a
-hard ceiling on consult length — raise **both** numbers together for a large
-review (e.g. a big multi-hundred-file PR), keeping the outer at or under 900
-because of the background-task guard.
+**Every timeout is 25 minutes** (`1500s`), because that is how long a GPT-5.6 Pro
+round reasons. `cgc enqueue --timeout`, `cgc await --timeout`, `cdp_consult.py
+wait`, `followup --watch`, and `prep --expect-minutes` all default to it. Raise it
+only for a genuinely huge review.
+
+One exception, and it is not a timeout: **Claude Code kills any background task the
+agent launches at 900s.** So the agent cannot hold a 25-minute wait in one call — it
+passes `--timeout 870` under a `timeout 899` wrapper and re-runs. When that slice
+ends on a live job, `await` exits **`5` = still running** (not `4`, which means the
+consult finished and produced nothing), and the agent simply runs the same line
+again. Its effective wait is still the full 25 minutes.
+
+On the **direct** path (the interactive-mode fallback) there is no daemon holding
+the consult, so an agent-run `wait` also ends at ~14.5 min. Re-run it — it
+re-attaches via `--conversation` — rather than trusting a mid-stream salvage. The
+daemon path has no such split, which is one more reason to prefer it.
 
 ### 3. Reference material
 
@@ -146,7 +155,7 @@ Deeper prompt/injection guidance the templates are derived from lives in
 [`skill/references/`](../skill/references/):
 
 - `injection-and-prompting.md` — the URL catalog (every GitHub injection method, when to use it, failure modes) and file-selection rules.
-- `gpt-5.5-prompting-principles.md` — prompting principles for the current model.
+- `gpt-5.6-prompting-principles.md` — prompting principles for the current model (GPT-5.6 family).
 - `deep-review-output.md` — the review output contract.
 - `mcp-fallback.md` — the zero-setup MCP path (see below).
 
@@ -167,8 +176,9 @@ consults working there, the actual send is done by a daemon the *user* starts,
 not the agent:
 
 ```bash
-bin/cgc watch      # run the daemon in the foreground (Ctrl-C to stop)
-bin/cgc up         # start the dedicated Chrome AND the daemon, detached
+bin/cgc install-daemon    # ONCE: launchd agent — starts at login, respawns if it dies
+bin/cgc uninstall-daemon  # reverse it
+bin/cgc watch             # foreground, for debugging or a one-off
 ```
 
 With the daemon running, the agent's side of a consult is two local-only calls:

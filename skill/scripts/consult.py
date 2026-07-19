@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Created: 2026-06-10
 # Last reused or audited: 2026-07-01
-# Authority basis: open-claude-gpt skill v2 — prep renders the GPT-5.5 outcome-first
+# Authority basis: open-claude-gpt skill v2 — prep renders the GPT-5.6 outcome-first
 #   PROMPT_TEMPLATE (title + steerable role + end-to-end depth mandate) and, with
 #   --followup, the FOLLOWUP_TEMPLATE for a continuing thread; deliver builds
 #   purpose-grouped GitHub refs. Used by both the CDP backend (primary) and the MCP
@@ -525,7 +525,7 @@ def cmd_prep(a: argparse.Namespace) -> int:
         # of ABSTRACTED PROSE is NOT the code — ChatGPT can't read the repo from a description and
         # answers BLIND ("no file access, can't cite file:line"). So --refs-file is REQUIRED for a
         # non-followup consult; --context-file is only a supplement. This is THE recurring failure.
-        if not a.followup and not refs:
+        if not a.followup and not refs and not a.no_code:
             raise SystemExit(
                 "CGC_ERROR no_code_source: no actual code link attached (no --refs-file)."
                 + (" A --context-file was given, but ABSTRACTED PROSE IS NOT THE CODE — ChatGPT can't "
@@ -547,7 +547,13 @@ def cmd_prep(a: argparse.Namespace) -> int:
         # The source-handling instruction lives WITH the sources, so when no refs are
         # attached the prompt makes no dangling reference to a source section.
         refs_block = ""
-        if refs:
+        if a.no_code and not refs:
+            # Declares the consult carries no code, for the model AND for the daemon's gate, which
+            # keys its rule-1 exemption off this sentence (see cgc_spool.validate_prompt).
+            refs_block = ("\n# Source\n"
+                          "This consult references no code — it is a self-contained question. "
+                          "Reason from first principles and name any public sources you rely on.\n")
+        elif refs:
             if a.followup:
                 refs_block = (
                     "\n# New or changed source since the last round\n"
@@ -684,6 +690,13 @@ def main() -> int:
                          "thread; pair with `cdp_consult.py followup --conversation <id>`). Use "
                          "--context-file for the local results you're feeding back, --refs-file for "
                          "any new/changed source. Skips role/criteria/output (set in round 1).")
+    pp.add_argument("--no-code", action="store_true",
+                    help="this consult is not about code, so no --refs-file is required: a maths "
+                         "proof, a research or writing question, a self-contained analysis. ONLY "
+                         "for questions with no code subject at all — anything about a repo, a "
+                         "diff, or a design in code MUST still ship the link (that rule exists "
+                         "because prose about code gets a blind answer, and --no-code is not an "
+                         "escape from it).")
     pp.add_argument("--context-file", help="optional context markdown to embed inline (on --followup, "
                                            "this is the local-results bundle fed back to the thread)")
     pp.add_argument("--refs-file", help="optional refs markdown (from `deliver`) — GitHub/PR "
@@ -697,9 +710,10 @@ def main() -> int:
                          "don't conflict). Keeps only a short universal close. No effect without --output-file.")
     pp.add_argument("--target-chars", type=int, default=32000)
     pp.add_argument("--hard-chars", type=int, default=40000)
-    pp.add_argument("--expect-minutes", type=int, default=15,
-                    help="expected Pro latency; first wake lands at ~85%% of it. "
-                         "Set higher (e.g. 25) for deep tasks to cut wake count.")
+    pp.add_argument("--expect-minutes", type=int, default=25,
+                    help="expected Pro latency; first wake lands at ~85%% of it. Default 25 — a "
+                         "GPT-5.6 Pro consult reasons for a long time (multi-angle, proof-style). "
+                         "Raise it further (40+) for a genuinely huge review to cut wake count.")
     pp.set_defaults(fn=cmd_prep)
 
     pd = sub.add_parser("deliver", help="build purpose-grouped GitHub refs for ChatGPT to browse "

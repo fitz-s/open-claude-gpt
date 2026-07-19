@@ -130,6 +130,11 @@ STATE_PATH = os.path.join(CGC_STATE_DIR, "active.json")
 
 STATE_LOCK_PATH = STATE_PATH + ".lock"
 
+# How long a consult takes: a GPT-5.6 Pro round reasons ~25 min. Same number as
+# cgc_spool.CONSULT_TIMEOUT_S; the agent overrides it to 870 because Claude Code kills its
+# background tasks at 900s (see cgc_spool.AGENT_POLL_S).
+CONSULT_TIMEOUT_S = 1500
+
 
 @contextlib.contextmanager
 def _state_lock():
@@ -903,11 +908,11 @@ def cmd_submit(a) -> int:
         print(json.dumps({"ok": ok, "userMsgs": n, "model": model_now,
                           "modelConfirmed": model_confirmed, "conversation_id": conv}))
         out = os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
-        # Hand the agent the EXACT bounded waiter to run (run_in_background:true). The
-        # `timeout 899` outer prefix is REQUIRED (must be <=900 — the goal-guard denies an
-        # over-cap/un-prefixed bg waiter) and clears the inner --timeout 870 by ~29s so the
-        # salvage grab runs before the hard kill. The nohup escape it suggests makes an
-        # UNTRACKED process that never wakes you.
+        # Hand the agent the EXACT bounded waiter to run (run_in_background:true). `timeout 899` is
+        # REQUIRED (the goal-guard denies an unbounded/over-cap bg waiter) and clears the inner
+        # --timeout 870 by ~29s so the salvage grab runs first. nohup makes an UNTRACKED process
+        # that never wakes you. On this DIRECT path a 25-min consult outlives one agent wait — re-run
+        # `wait` (it re-attaches via --conversation) instead of trusting a mid-stream salvage.
         sys.stderr.write(
             "CGC_SUBMITTED. Now run the detached waiter (run_in_background:true) — copy verbatim:\n"
             f"  timeout 899 python3 {os.path.abspath(__file__)} wait --rid {a.rid} "
@@ -1426,9 +1431,10 @@ def main() -> int:
                          "(one-shot send+wait; the exit is the wake). REQUIRES --out.")
     fu.add_argument("--out", help="answer file for --watch mode")
     fu.add_argument("--poll", type=int, default=20, help="(--watch) seconds between DOM checks")
-    fu.add_argument("--timeout", type=int, default=870, help="(--watch) give up after N seconds "
-                    "(default 870 — clears the mandatory outer `timeout 899` wrapper by ~29s so "
-                    "the salvage grab runs before the hard kill)")
+    fu.add_argument("--timeout", type=int, default=CONSULT_TIMEOUT_S,
+                    help="(--watch) seconds to wait for the answer (default 1500 = 25 min, how long "
+                         "a GPT-5.6 Pro round reasons). The agent must pass 870 — Claude Code kills "
+                         "its background tasks at 900s.")
     fu.add_argument("--settle-seconds", type=int, default=300, help="(--watch) unwrapped-answer settle window")
     fu.add_argument("--min-unwrapped", type=int, default=1500, help="(--watch) min chars to accept an unwrapped answer")
     fu.add_argument("--keep-tab", action="store_true", help="(--watch) keep the tab after retrieving")
@@ -1442,9 +1448,10 @@ def main() -> int:
                         "if the tab was closed.")
     w.add_argument("--out", required=True)
     w.add_argument("--poll", type=int, default=20, help="seconds between DOM checks")
-    w.add_argument("--timeout", type=int, default=870, help="give up after N seconds (default 870s "
-                   "≈ 15 min — clears the mandatory outer `timeout 899` wrapper by ~29s so the "
-                   "salvage grab runs before the hard kill)")
+    w.add_argument("--timeout", type=int, default=CONSULT_TIMEOUT_S,
+                   help="seconds to wait for the answer (default 1500 = 25 min, how long a GPT-5.6 "
+                        "Pro round reasons). The agent must pass 870 — Claude Code kills its "
+                        "background tasks at 900s.")
     w.add_argument("--keep-tab", action="store_true",
                    help="do not close the consult's tab after retrieving (default: close it, so "
                         "concurrent consults' tabs don't accumulate)")
