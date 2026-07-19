@@ -135,64 +135,69 @@ def test_finish_from_wait_maps_exit_code_to_terminal_status(daemon, code, expect
     assert st["state"] == expected_state
 
 
-# ---- orphan requeue: a claimed job with no worker must not vanish ------------
+# ---- orphan recovery: a claimed job with no worker must not vanish ----
 
-def _job(daemon, rid, age_s):
+def _job(daemon, rid, age_s, **extra):
     """Put a job in processing/ as if a previous daemon had claimed it `age_s` ago."""
     import os
     import time
     path = daemon.spool.processing_path(rid)
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    body = {"rid": rid, "kind": "submit", "out": f"/tmp/{rid}.txt"}
+    body.update(extra)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"rid": rid, "kind": "submit"}, f)
-    t = time.time() - age_s
-    os.utime(path, (t, t))
+        json.dump(body, f)
+    ts = time.time() - age_s
+    os.utime(path, (ts, ts))
     return path
 
 
-def test_requeue_orphans_recovers_a_job_stranded_by_a_daemon_restart(daemon):
-    """Workers are children of the daemon, and nothing ever re-scans processing/. So a crash or a
-    launchd restart used to lose the consult silently while `await` still reported it running."""
+def test_a_dead_worker_is_detected_immediately_not_after_an_hour(daemon):
+    """Orphanhood is a fact, not a timer. The dispatcher records the worker pid, so a dead worker is
+    known at once — the old age rule had to outwait any possible worker, which once the deadline
+    became a single 60-minute number meant a consult sat dead for 62 minutes before anything looked."""
     rid = "REQ-20260707-120000-0000a1"
-    _job(daemon, rid, age_s=daemon.spool.STUCK_AFTER_S + 600)
-    assert daemon._requeue_orphans() == 1
-    assert os.path.exists(daemon.spool.pending_path(rid))
+    _job(daemon, rid, age_s=5)                       # young: the age rule would have skipped it
+    daemon.spool.write_status(rid, "processing", worker_pid=2 ** 22)  # certainly not running
+    assert daemon._recover_orphans() == 1
     assert not os.path.exists(daemon.spool.processing_path(rid))
-    assert daemon.spool.read_status(rid)["state"] == "queued"
 
 
-def test_requeue_orphans_leaves_a_job_that_could_still_have_a_live_worker(daemon):
-    """A worker's hard ceiling is STUCK_AFTER_S + 40, so anything younger may still be in
-    flight — requeuing it would send the same consult twice and bill the quota twice."""
+def test_a_live_worker_is_never_touched(daemon):
+    """The guarantee that matters: never recover a job someone is still working, or the same consult
+    is sent twice and the quota billed twice."""
     rid = "REQ-20260707-120000-0000a2"
-    _job(daemon, rid, age_s=60)
-    assert daemon._requeue_orphans() == 0
+    _job(daemon, rid, age_s=daemon.spool.STUCK_AFTER_S + 9999)  # ancient — age rule would requeue
+    daemon.spool.write_status(rid, "processing", worker_pid=os.getpid())  # but its worker is alive
+    assert daemon._recover_orphans() == 0
     assert os.path.exists(daemon.spool.processing_path(rid))
 
 
-def test_run_writes_the_child_transcript_to_the_job_log(daemon, tmp_path):
-    """The waiter's per-poll heartbeat is the only evidence of WHY a consult produced nothing; the
-    daemon used to capture it and throw it away, keeping a 240-char tail."""
+def test_orphan_with_a_live_conversation_is_retrieved_not_resent(daemon):
+    """The waiter dying does not stop ChatGPT. Re-sending would open a SECOND conversation, redo the
+    round and bill it twice; attaching reads the answer that is already being written."""
     rid = "REQ-20260707-120000-0000a3"
-    code, so, se = daemon._run([sys.executable, "-c",
-                                "import sys; print('OUT'); sys.stderr.write('CGC_WAIT alive: ac=0\\n')"],
-                               30, rid)
-    assert code == 0
-    log = open(daemon.spool.log_path(rid), encoding="utf-8").read()
-    assert "OUT" in log and "CGC_WAIT alive: ac=0" in log
+    _job(daemon, rid, age_s=5)
+    daemon.spool.write_status(rid, "processing", worker_pid=2 ** 22, conversation="conv-abc")
+    assert daemon._recover_orphans() == 1
+    queued = daemon.spool._read_json(daemon.spool.pending_path(rid))
+    assert queued["kind"] == "retrieve" and queued["conversation"] == "conv-abc"
 
 
-def test_requeue_orphans_is_rescanned_not_only_run_at_startup(daemon):
-    """A job becomes eligible only once it outlives a worker's ceiling, so a daemon that restarts
-    EARLY in that job's life scans while it is still ineligible. If that were the only scan the
-    consult would sit in processing/ forever — observed live: a restart 415s into a job whose
-    window opens at 1620s."""
-    import inspect
-    src = inspect.getsource(daemon.run_loop)
-    assert "_requeue_orphans()" in src, "the loop must rescan for orphans"
-    body = src.split("while _running:", 1)
-    assert len(body) == 2 and "_requeue_orphans()" in body[1], \
-        "the orphan scan must sit INSIDE the loop, not only before it"
+def test_orphan_without_a_conversation_is_resent(daemon):
+    """Nothing to attach to — it never got that far — so re-sending is the only recovery."""
+    rid = "REQ-20260707-120000-0000a4"
+    _job(daemon, rid, age_s=5)
+    daemon.spool.write_status(rid, "processing", worker_pid=2 ** 22)
+    assert daemon._recover_orphans() == 1
+    assert daemon.spool._read_json(daemon.spool.pending_path(rid))["kind"] == "submit"
+
+
+def test_a_pre_pid_job_still_falls_back_to_the_age_rule(daemon):
+    """Jobs claimed by an older daemon carry no pid; they must still be recoverable."""
+    rid = "REQ-20260707-120000-0000a5"
+    _job(daemon, rid, age_s=daemon.spool.STUCK_AFTER_S + 600)
+    assert daemon._recover_orphans() == 1
 
 
 # ---- kind=retrieve: recovery must stay on the daemon path --------------------
