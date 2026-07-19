@@ -85,22 +85,26 @@ consult actually completed (`bin/cgc status --rid <RID>`). Increase `--timeout`
 for very long consults (the bound is a safety cap, not the expected duration).
 
 ## Waiter exit codes
-- **`0`** — the wrapped answer was retrieved (clean `BEGIN_RESPONSE:<rid>` /
-  `END_RESPONSE:<rid>` extraction), **or** a best-effort salvage at timeout (see
-  below). Both cases write the answer to `--out`.
-- **`5`** (`cgc await` only) — **still running; not an error.** This await's local
-  window (default 870s) elapsed while the daemon is still working the job. A
-  GPT-5.6 Pro consult reasons for ~25 min, and the agent's await is capped at
-  ~900s by the background-task guard, so a normal consult *will* hit this once —
-  just run the same `await` again. Contrast with `4`: there the consult finished
-  and produced nothing; here it is alive and on track.
-- **`4`** — genuine no-answer timeout: nothing usable was present when the waiter
-  gave up.
-- **`3`** — a blocker was detected (login, CAPTCHA, rate-limit, an unselectable
-  model, or a GPT-5.6 safeguard refusal — its synchronous cyber/bio classifier
-  can intervene on legitimate dual-use work such as vulnerability or security
-  review).
-- **`2`** — usage error (bad flags/arguments), or setup (e.g. `daemon_not_running`).
+
+`cgc await` returns three things, because three things are actionable:
+
+| code | means | what to do |
+| --- | --- | --- |
+| `0` | the answer is on disk | its path is printed — read it |
+| `3` | a human must act in the ChatGPT window | login / captcha / rate limit / a GPT-5.6 safeguard refusal, then re-enqueue |
+| `1` | broken | the job-log path is printed — read it |
+
+There is deliberately no "still running" code. A consult routinely takes ~25 minutes
+and `await` simply keeps waiting; an earlier version returned `5` for this, which made
+every healthy round look like a failure that had to be manually retried. `await` stops
+without an answer only after 60 minutes, and that is a malfunction rather than a slow
+answer — waiting again cannot fix it.
+
+`cdp_consult.py wait` (the daemon's own child, and the direct-path fallback) keeps a
+finer-grained set — `0` retrieved, `3` blocker, `4` genuine no-answer, `2` usage — so
+the *cause* survives in the log even though the agent-facing contract collapses `4`
+and `2` into `1`. Cause is worth keeping where it aids diagnosis, not where it forces
+the caller to branch on a difference it cannot act on.
 
 ## `sentinel_missing` / `CGC_UNWRAPPED` / `.raw`
 If the model never emits a clean `BEGIN_RESPONSE:<rid>` / `END_RESPONSE:<rid>`
