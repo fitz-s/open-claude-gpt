@@ -180,3 +180,16 @@ def test_run_writes_the_child_transcript_to_the_job_log(daemon, tmp_path):
     assert code == 0
     log = open(daemon.spool.log_path(rid), encoding="utf-8").read()
     assert "OUT" in log and "CGC_WAIT alive: ac=0" in log
+
+
+def test_requeue_orphans_is_rescanned_not_only_run_at_startup(daemon):
+    """A job becomes eligible only once it outlives a worker's ceiling, so a daemon that restarts
+    EARLY in that job's life scans while it is still ineligible. If that were the only scan the
+    consult would sit in processing/ forever — observed live: a restart 415s into a job whose
+    window opens at 1620s."""
+    import inspect
+    src = inspect.getsource(daemon.run_loop)
+    assert "_requeue_orphans()" in src, "the loop must rescan for orphans"
+    body = src.split("while _running:", 1)
+    assert len(body) == 2 and "_requeue_orphans()" in body[1], \
+        "the orphan scan must sit INSIDE the loop, not only before it"

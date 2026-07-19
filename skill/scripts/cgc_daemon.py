@@ -234,15 +234,24 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
     spool.ensure_dirs()
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    _requeue_orphans()
     spool.heartbeat_write(os.getpid())
     sys.stderr.write(
         f"CGC_DAEMON up (pid {os.getpid()}) — spool {spool.SPOOL_DIR}, concurrency {concurrency}, "
         f"poll {poll}s. This is the user-owned egress gate; the agent only reads/writes local files.\n")
     children = {}  # rid -> Popen
+    next_orphan_scan = 0.0
     try:
         while _running:
             spool.heartbeat_write(os.getpid())
+            # Rescan periodically, not only at startup. A job becomes requeue-eligible only once it
+            # is older than a worker's hard ceiling, so a daemon that restarts EARLY in a job's life
+            # scans while that job is still ineligible and then never looks again — the consult sits
+            # in processing/ forever. (Observed: daemon restarted 415s into a job whose window opens
+            # at 1620s.) This also covers a worker that died without writing a terminal status while
+            # the daemon itself stayed up.
+            if time.time() >= next_orphan_scan:
+                _requeue_orphans()
+                next_orphan_scan = time.time() + 60
             # reap
             for rid in list(children):
                 if children[rid].poll() is not None:
