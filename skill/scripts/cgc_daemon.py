@@ -121,7 +121,7 @@ def run_worker(processing_file: str) -> int:
     out = job.get("out") or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt")
     kind = job.get("kind", "submit")
     poll = str(job.get("poll", 20))
-    timeout = int(job.get("timeout", spool.CONSULT_TIMEOUT_S))  # enqueue always writes it
+    timeout = int(job.get("timeout", spool.STUCK_AFTER_S))  # enqueue always writes it
 
     if kind == "retrieve":
         # Attach to an existing conversation and read its answer. NOTHING is sent, so there is no
@@ -159,9 +159,8 @@ def run_worker(processing_file: str) -> int:
     sys.stderr.write(f"CGC_DAEMON gate ok {rid}: {reason}\n")
     spool.write_status(rid, "processing", out=out, msg=reason)
 
-    # subprocess wall-clock budget: mirror the old `timeout 899` outer wrapper (inner --timeout
-    # clears it by ~29s so the salvage grab runs) — here the daemon is the supervisor, so give the
-    # child timeout+40 and let cdp_consult's own --timeout do the graceful salvage.
+    # The daemon is the supervisor, so give the child a slightly wider wall-clock budget than its
+    # own --timeout and let cdp_consult's timeout do the graceful salvage first.
     child_budget = timeout + 40
 
     if kind == "followup":
@@ -226,9 +225,9 @@ def _requeue_orphans() -> int:
     reporting it as still running. Move those back to pending/.
 
     Only jobs older than a full consult budget are touched. A worker's hard ceiling is
-    CONSULT_TIMEOUT_S + 40 (child_budget), so anything past CONSULT_TIMEOUT_S + 120 provably has no
-    live worker and cannot be double-sent — and a double send costs real ChatGPT quota."""
-    cutoff = time.time() - (spool.CONSULT_TIMEOUT_S + 120)
+    STUCK_AFTER_S + 40 (child_budget), so anything past STUCK_AFTER_S + 120 provably has no live
+    worker and cannot be double-sent — and a double send costs real ChatGPT quota."""
+    cutoff = time.time() - (spool.STUCK_AFTER_S + 120)
     n = 0
     try:
         names = sorted(os.listdir(spool._p("processing")))

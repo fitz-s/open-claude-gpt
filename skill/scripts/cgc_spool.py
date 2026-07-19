@@ -36,13 +36,14 @@ Agent-facing CLI (dispatched by bin/cgc; both are LOCAL-ONLY, never touch the ne
            -> read an EXISTING conversation's answer; sends nothing, carries no prompt. Recovers a
               consult whose waiter died (daemon restart, closed Chrome) WITHOUT leaving the daemon
               path — otherwise the only recovery is a direct agent-side wait, which auto mode blocks
-              and which the agent can hold for only AGENT_POLL_S at a time.
+              and which the agent cannot hold for a whole round.
   await    --rid R --out F [--timeout T] [--poll N]
-           -> polls status/<rid>.json + the answer file until the daemon finishes. Local read
-              only — no CDP. Exit codes:
-                0 done (answer at --out)   3 blocker (login/captcha/rate/model/safeguard)
-                4 no usable answer         2 usage/setup error (incl. daemon not running)
-                5 still running — re-run await (see CONSULT_TIMEOUT_S).
+           -> polls status/<rid>.json until there is something to act on. Local read only — no CDP.
+              Three outcomes, because three things are actionable:
+                0 the answer is on disk, path printed
+                3 a human must act in the ChatGPT window (login/captcha/rate limit/safeguard)
+                1 broken, job-log path printed (includes: nothing after STUCK_AFTER_S)
+              It does NOT exit merely because the consult is still running — waiting is its job.
 """
 from __future__ import annotations
 
@@ -77,14 +78,21 @@ HEARTBEAT_STALE_S = 45
 # seconds, so this only has to outlast a restart, not a repair.
 DAEMON_GRACE_S = 60
 
-# How long a consult takes: a GPT-5.6 Pro round reasons ~25 min. One number, used everywhere.
-CONSULT_TIMEOUT_S = 1500
+# THE timeout — the only deadline in this system.
+#
+# A GPT-5.6 Pro round reasons ~25 minutes. That is how long the work TAKES; it is an expectation,
+# not a deadline, and nothing may be killed for reaching it. A deadline answers a different
+# question: past what point is waiting no longer explained by the work? An hour. Beyond that the
+# answer is not late — something is broken — and the right response is to read the job log, not to
+# keep waiting.
+#
+# Everything that used to be a second or third "timeout" was one of these two things wearing the
+# wrong name: a 1500s per-consult budget (an expectation) and an 870s agent window (an observation
+# interval). Both killed healthy consults for the crime of taking as long as they take.
+STUCK_AFTER_S = 3600
 
-# Claude Code kills any background task the AGENT launches at 900s, so the agent cannot hold a
-# 25-minute wait in one call. It watches in AGENT_POLL_S slices under a `timeout 899` wrapper and
-# re-runs; await exits 5 (still running) rather than 4 (finished, nothing produced) so a healthy
-# consult is never mistaken for a dead one. Nothing else in the system uses this number.
-AGENT_POLL_S = 870
+# How often to look. An interval, not a deadline.
+POLL_S = 20
 
 # rid shape must match cdp_consult.py exactly.
 _RID_RE = re.compile(r"^REQ-\d{8}-\d{6}-[0-9a-f]{6}$")
@@ -391,10 +399,9 @@ def cmd_enqueue(a) -> int:
         print(json.dumps({"queued": True, "rid": a.rid, "out": os.path.abspath(out),
                           "kind": "retrieve", "daemon_up": daemon_alive()}))
         sys.stderr.write(
-            f"CGC_QUEUED retrieve. The daemon will attach to conversation {a.conversation} and read "
-            f"its answer — nothing is sent. Await it exactly like any consult:\n"
-            f"  timeout 899 python3 {os.path.abspath(__file__)} await --rid {a.rid} "
-            f"--out {os.path.abspath(out)} --poll {a.poll} --timeout {AGENT_POLL_S}\n")
+            f"CGC_QUEUED retrieve {a.rid} (attaches to {a.conversation}; sends nothing). Await it:\n"
+            f"  python3 {os.path.abspath(__file__)} await --rid {a.rid} "
+            f"--out {os.path.abspath(out)}\n")
         return 0
     if not a.prompt_file:
         sys.stderr.write("CGC_ERROR need_prompt_file: --prompt-file is required "
@@ -445,31 +452,35 @@ def cmd_enqueue(a) -> int:
     print(json.dumps({"queued": True, "rid": a.rid, "out": os.path.abspath(out), "daemon_up": up}))
     if not up:
         sys.stderr.write(
-            "CGC_WARN daemon_down: the consult daemon is not running, so this job sits queued until "
-            "it is. Relay ONE line to the user:\n"
-            "  cgc install-daemon    # installs it via launchd: starts at login, respawns if it dies\n"
-            "The agent does not start it — after that install, nobody has to.\n")
+            "CGC_WARN daemon_down: this job sits queued until the daemon runs. Relay ONE line:\n"
+            "  cgc install-daemon    # launchd: starts at login, respawns if it dies\n")
     else:
         sys.stderr.write(
-            "CGC_QUEUED. The user's daemon will validate (public-repo re-check) + send it. Now wait "
-            "for the answer with a LOCAL file poll (run_in_background:true) — copy verbatim:\n"
-            f"  timeout 899 python3 {os.path.abspath(__file__)} await --rid {a.rid} "
-            f"--out {os.path.abspath(out)} --poll {a.poll} --timeout {AGENT_POLL_S}\n"
-            "MANDATORY: keep the `timeout 899` prefix. `await` only reads local files — it never "
-            "touches the network, so it is never blocked by the auto-mode classifier.\n"
-            f"This consult gets {a.timeout // 60} min; your await watches {AGENT_POLL_S}s at a time "
-            "(Claude Code kills longer background tasks), so exit 5 = still running is expected — "
-            "just run the same line again.\n")
+            f"CGC_QUEUED {a.rid}. Await it (LOCAL file poll, run_in_background:true):\n"
+            f"  python3 {os.path.abspath(__file__)} await --rid {a.rid} "
+            f"--out {os.path.abspath(out)}\n")
     return 0
 
 
 # ---- CLI: await -------------------------------------------------------------
 
 def cmd_await(a) -> int:
-    """Pure LOCAL wait: poll status/<rid>.json + the answer file until the daemon reaches a terminal
-    state or we time out. No CDP, no network — this is the whole point (the classifier never sees an
-    external send here). Exit codes mirror cdp_consult.py wait."""
-    deadline = time.time() + a.timeout
+    """Wait for the answer. Pure LOCAL polling of status/<rid>.json — no CDP, no network, which is
+    what keeps it invisible to the auto-mode classifier.
+
+    It exits on exactly three things, because exactly three things are worth acting on:
+
+        0  the answer is on disk    -> the path is printed; go read it
+        3  a human must act in the ChatGPT window (login / captcha / rate limit / safeguard refusal)
+        1  broken                   -> the job log path is printed; go look
+
+    "Still running" is NOT among them. A consult routinely outlasts any particular observation, and
+    making that an exit code turned every healthy 25-minute round into a failure the caller had to
+    notice and manually retry. Waiting longer is the waiter's job, so the waiter just keeps waiting.
+    The only reason it ever stops without an answer is STUCK_AFTER_S — and reaching that does not
+    mean the answer is late, it means something is wrong and waiting more cannot fix it."""
+    start = time.time()
+    deadline = start + a.timeout
     rid = a.rid
     out = os.path.abspath(a.out)
     down_since = None
@@ -478,81 +489,67 @@ def cmd_await(a) -> int:
         state = st.get("state")
         if state == "done":
             try:
-                ans = open(out, encoding="utf-8").read()
+                n = os.path.getsize(out)
             except OSError:
-                ans = ""
-            sys.stderr.write(f"CGC_DONE answer ready ({len(ans)} chars) at {out}\n")
-            _print_followup_recipe(rid, st)
+                n = 0
+            sys.stderr.write(f"CGC_DONE {rid}: answer ready ({n} bytes). READ IT AT:\n  {out}\n")
+            conv = st.get("conversation")
+            if conv:
+                sys.stderr.write(f"To continue this thread: prep --followup, then "
+                                 f"enqueue --kind followup --conversation {conv}\n")
             return 0
         if state == "blocker":
-            sys.stderr.write(f"CGC_BLOCKER {st.get('msg') or 'login/captcha/rate-limit'} — the user "
-                             f"may need to act in the ChatGPT window, then re-enqueue.\n")
+            sys.stderr.write(
+                f"CGC_BLOCKER {rid}: {st.get('msg') or 'login/captcha/rate-limit'}\n"
+                f"A human must act in the ChatGPT window, then this job can be re-enqueued.\n")
             return 3
-        if state == "no_answer":
-            sys.stderr.write(f"CGC_ERROR timeout_no_answer: {st.get('msg') or 'no usable answer'} "
-                             f"(raw may be at {out}.raw)\n")
-            _point_at_log(rid)
-            return 4
-        if state == "error":
-            _m = st.get("msg") or "the daemon refused or failed this job"
-            sys.stderr.write(f"CGC_ERROR gate_or_send_error: {_m}\n")
-            _point_at_log(rid)
-            return 2
+        if state in ("no_answer", "error"):
+            # One outcome, not two. Both mean the machinery did not deliver an answer and the next
+            # step is identical: read the log. Splitting them made the caller branch on a difference
+            # it could not act on differently.
+            sys.stderr.write(f"CGC_BROKEN {rid}: {st.get('msg') or 'the daemon could not deliver an answer'}\n")
+            _point_at_log(rid, out)
+            return 1
         # Non-terminal (queued/processing): the job only advances while a daemon is alive to advance
         # it, so liveness is checked in EVERY state. Checking it only before pickup left a hole with
-        # no exit — a daemon that died mid-consult left every later await burning its full window and
-        # returning 5 ("still running, re-run me"), an unbounded loop over a job nobody was working.
+        # no exit — a daemon that died mid-consult left the waiter waiting on a job nobody was working.
         if daemon_alive():
             down_since = None
         else:
             if down_since is None:
                 down_since = time.time()
-                sys.stderr.write("CGC_WAIT no live daemon; polling briefly in case it is restarting…\n")
+                sys.stderr.write("CGC_WAIT no live daemon; holding briefly in case it is restarting…\n")
             elif time.time() - down_since > DAEMON_GRACE_S:
                 if state == "processing":
                     sys.stderr.write(
-                        f"CGC_ERROR daemon_died_mid_consult: {rid} was being sent when the daemon "
-                        f"stopped, so nothing is working it now and awaiting again would never "
-                        f"return. launchd normally respawns it; if this persists tell the user to "
+                        f"CGC_BROKEN {rid}: the daemon stopped while this consult was in flight, so "
+                        f"nothing is working it. launchd normally respawns it; if this persists, "
                         f"check `cgc queue` and the daemon log.\n")
                 else:
                     sys.stderr.write(
-                        "CGC_ERROR daemon_not_running: the job was never picked up and no live "
-                        "consult daemon was found. Relay ONE line to the user — `cgc install-daemon` "
-                        "(installs it as a launchd agent so it starts at login and never needs "
-                        "starting again). The job stays queued and runs as soon as it is up.\n")
-                _point_at_log(rid)
-                return 2
+                        f"CGC_BROKEN {rid}: never picked up and no live daemon. Relay ONE line to "
+                        f"the user — `cgc install-daemon` (launchd agent: starts at login, respawns "
+                        f"if it dies). The job stays queued and runs as soon as it is up.\n")
+                _point_at_log(rid, out)
+                return 1
         time.sleep(a.poll)
-    _last = (read_status(rid) or {}).get("state") or "none"
     sys.stderr.write(
-        f"CGC_STILL_RUNNING {rid}: still {_last} after {a.timeout}s — not a failure. The daemon is "
-        f"working; the answer will land at {out}. Keep watching:\n"
-        f"  timeout 899 python3 {os.path.abspath(__file__)} await --rid {rid} "
-        f"--out {out} --poll {a.poll} --timeout {a.timeout}\n")
-    return 5
+        f"CGC_BROKEN {rid}: no answer after {int(time.time()-start)//60} minutes. That is past any "
+        f"time the work itself explains — a GPT-5.6 Pro round reasons ~25 min — so treat this as a "
+        f"malfunction, not a slow answer, and do NOT simply wait again. Read the log below: an "
+        f"`ac=0` heartbeat throughout means ChatGPT never produced an assistant turn.\n")
+    _point_at_log(rid, out)
+    return 1
 
 
-def _point_at_log(rid):
-    """Name the evidence file on any failure. Costs one line; without it the agent's only options
-    are to guess or to ask the user to go dig."""
+def _point_at_log(rid, out=None):
+    """Name the evidence on any failure. Costs one line; without it the caller can only guess or
+    ask a human to go dig."""
     lp = log_path(rid)
     if os.path.exists(lp):
-        sys.stderr.write(f"CGC_LOG full transcript of this job's send+wait: {lp}\n")
-
-
-def _print_followup_recipe(rid, st):
-    conv = (st or {}).get("conversation") or "auto"
-    sys.stderr.write(
-        "CGC_NEXT to CONTINUE this consult as a thread (feed local results back / next round), "
-        "enqueue a FOLLOW-UP job (do NOT start a new prep+submit — that loses ChatGPT's context). "
-        "One backgrounded command each way; its exit is the wake:\n"
-        "  # 1. render the follow-up prompt locally:\n"
-        "  python3 consult.py prep --followup --task \"<local results + next question>\" --title \"<what's new>\"\n"
-        "  # 2. enqueue it (uses this thread), then await:\n"
-        f"  python3 cgc_spool.py enqueue --rid <r2> --kind followup --conversation {conv} --prompt-file <rendered>\n"
-        f"  timeout 899 python3 cgc_spool.py await --rid <r2> --out {os.path.join(CGC_STATE_DIR,'answer_<r2>.txt')} --timeout 870\n"
-        "  # await exits 5 = still running (a Pro consult routinely outlasts one await) -> just await again.\n")
+        sys.stderr.write(f"CGC_LOG send+wait transcript: {lp}\n")
+    if out and os.path.exists(out + ".raw"):
+        sys.stderr.write(f"CGC_RAW partial text salvaged: {out}.raw\n")
 
 
 # ---- CLI: status (human) ----------------------------------------------------
@@ -587,21 +584,21 @@ def main() -> int:
     e.add_argument("--conversation", default="auto", help="(followup) /c/<id> or 'auto'")
     e.add_argument("--model", default=os.environ.get("CGC_MODEL", "Pro"))
     e.add_argument("--out", help="answer file (default $CGC_STATE_DIR/answer_<rid>.txt)")
-    e.add_argument("--poll", type=int, default=20)
-    e.add_argument("--timeout", type=int, default=CONSULT_TIMEOUT_S,
-                   help=f"seconds to allow this consult (default {CONSULT_TIMEOUT_S} = "
-                        f"{CONSULT_TIMEOUT_S // 60} min, how long a GPT-5.6 Pro round reasons).")
+    e.add_argument("--poll", type=int, default=POLL_S)
+    e.add_argument("--timeout", type=int, default=STUCK_AFTER_S,
+                   help=f"seconds before this consult is considered STUCK, not slow (default "
+                        f"{STUCK_AFTER_S} = {STUCK_AFTER_S // 60} min). A round reasons ~25 min; "
+                        f"this is the point past which waiting stops being an explanation.")
     e.set_defaults(fn=cmd_enqueue)
 
     w = sub.add_parser("await", help="poll the local answer/status for a queued job (LOCAL read only)")
     w.add_argument("--rid", required=True)
     w.add_argument("--out", required=True)
-    w.add_argument("--poll", type=int, default=20)
-    w.add_argument("--timeout", type=int, default=CONSULT_TIMEOUT_S,
-                   help=f"seconds to wait for the answer (default {CONSULT_TIMEOUT_S} = "
-                        f"{CONSULT_TIMEOUT_S // 60} min). The agent must pass {AGENT_POLL_S} "
-                        "instead — Claude Code kills its background tasks at 900s — and re-run "
-                        "await on exit 5 (still running).")
+    w.add_argument("--poll", type=int, default=POLL_S)
+    w.add_argument("--timeout", type=int, default=STUCK_AFTER_S,
+                   help=f"seconds before declaring the job STUCK (default {STUCK_AFTER_S} = "
+                        f"{STUCK_AFTER_S // 60} min). Not a budget for the consult — reaching it "
+                        f"means something is broken, so read the log rather than waiting again.")
     w.set_defaults(fn=cmd_await)
 
     s = sub.add_parser("status", help="print daemon liveness + spool contents")

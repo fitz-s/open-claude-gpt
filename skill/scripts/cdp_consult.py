@@ -131,9 +131,10 @@ STATE_PATH = os.path.join(CGC_STATE_DIR, "active.json")
 STATE_LOCK_PATH = STATE_PATH + ".lock"
 
 # How long a consult takes: a GPT-5.6 Pro round reasons ~25 min. Same number as
-# cgc_spool.CONSULT_TIMEOUT_S; the agent overrides it to 870 because Claude Code kills its
-# background tasks at 900s (see cgc_spool.AGENT_POLL_S).
-CONSULT_TIMEOUT_S = 1500
+# cgc_spool.STUCK_AFTER_S. This is NOT a budget for the consult — a GPT-5.6 Pro round reasons
+# ~25 min and must never be killed for it. It is the point past which waiting is no longer
+# explained by the work, so the job is stuck and the log is what to read next.
+STUCK_AFTER_S = 3600
 
 
 @contextlib.contextmanager
@@ -1472,7 +1473,7 @@ def main() -> int:
                          "(one-shot send+wait; the exit is the wake). REQUIRES --out.")
     fu.add_argument("--out", help="answer file for --watch mode")
     fu.add_argument("--poll", type=int, default=20, help="(--watch) seconds between DOM checks")
-    fu.add_argument("--timeout", type=int, default=CONSULT_TIMEOUT_S,
+    fu.add_argument("--timeout", type=int, default=STUCK_AFTER_S,
                     help="(--watch) seconds to wait for the answer (default 1500 = 25 min, how long "
                          "a GPT-5.6 Pro round reasons). The agent must pass 870 — Claude Code kills "
                          "its background tasks at 900s.")
@@ -1489,7 +1490,7 @@ def main() -> int:
                         "if the tab was closed.")
     w.add_argument("--out", required=True)
     w.add_argument("--poll", type=int, default=20, help="seconds between DOM checks")
-    w.add_argument("--timeout", type=int, default=CONSULT_TIMEOUT_S,
+    w.add_argument("--timeout", type=int, default=STUCK_AFTER_S,
                    help="seconds to wait for the answer (default 1500 = 25 min, how long a GPT-5.6 "
                         "Pro round reasons). The agent must pass 870 — Claude Code kills its "
                         "background tasks at 900s.")

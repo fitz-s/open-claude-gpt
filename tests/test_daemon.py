@@ -154,7 +154,7 @@ def test_requeue_orphans_recovers_a_job_stranded_by_a_daemon_restart(daemon):
     """Workers are children of the daemon, and nothing ever re-scans processing/. So a crash or a
     launchd restart used to lose the consult silently while `await` still reported it running."""
     rid = "REQ-20260707-120000-0000a1"
-    _job(daemon, rid, age_s=daemon.spool.CONSULT_TIMEOUT_S + 600)
+    _job(daemon, rid, age_s=daemon.spool.STUCK_AFTER_S + 600)
     assert daemon._requeue_orphans() == 1
     assert os.path.exists(daemon.spool.pending_path(rid))
     assert not os.path.exists(daemon.spool.processing_path(rid))
@@ -162,7 +162,7 @@ def test_requeue_orphans_recovers_a_job_stranded_by_a_daemon_restart(daemon):
 
 
 def test_requeue_orphans_leaves_a_job_that_could_still_have_a_live_worker(daemon):
-    """A worker's hard ceiling is CONSULT_TIMEOUT_S + 40, so anything younger may still be in
+    """A worker's hard ceiling is STUCK_AFTER_S + 40, so anything younger may still be in
     flight — requeuing it would send the same consult twice and bill the quota twice."""
     rid = "REQ-20260707-120000-0000a2"
     _job(daemon, rid, age_s=60)
