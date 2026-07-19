@@ -32,6 +32,11 @@ Agent-facing CLI (dispatched by bin/cgc; both are LOCAL-ONLY, never touch the ne
   enqueue  --rid R --prompt-file F [--kind submit|followup] [--project-url U]
            [--conversation C] [--model M] [--out O] [--poll N] [--timeout N]
            -> writes pending/<rid>.json, prints {rid,out,queued,daemon_up}. Local write only.
+  enqueue  --rid R --kind retrieve --conversation C [--out O]
+           -> read an EXISTING conversation's answer; sends nothing, carries no prompt. Recovers a
+              consult whose waiter died (daemon restart, closed Chrome) WITHOUT leaving the daemon
+              path — otherwise the only recovery is a direct agent-side wait, which auto mode blocks
+              and which the agent can hold for only AGENT_POLL_S at a time.
   await    --rid R --out F [--timeout T] [--poll N]
            -> polls status/<rid>.json + the answer file until the daemon finishes. Local read
               only — no CDP. Exit codes:
@@ -363,6 +368,38 @@ def validate_prompt(prompt_text: str) -> tuple:
 # ---- CLI: enqueue -----------------------------------------------------------
 
 def cmd_enqueue(a) -> int:
+    if a.kind == "retrieve":
+        # Retrieval attaches to a conversation that already exists and reads its answer. It sends
+        # NOTHING, so there is no payload for the egress gate to validate — and that is guaranteed
+        # structurally, not by trust: a retrieve job carries no prompt at all, and the daemon
+        # refuses one that somehow does. This exists so recovering a consult whose waiter died
+        # (daemon restart, closed Chrome) stays on the daemon path. Without it the only recovery was
+        # a DIRECT agent-side wait, which auto mode blocks by design and which the agent can only
+        # hold for 870s at a time — the recovery path must not be the forbidden path.
+        if not a.conversation or a.conversation == "auto":
+            sys.stderr.write("CGC_ERROR need_conversation: --kind retrieve requires an explicit "
+                             "--conversation <id> (there is no active thread to infer).\n")
+            return 2
+        out = a.out or os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
+        try:
+            enqueue_job({"rid": a.rid, "kind": "retrieve", "conversation": a.conversation,
+                         "out": os.path.abspath(out), "poll": a.poll, "timeout": a.timeout})
+        except ValueError as e:
+            sys.stderr.write(f"CGC_ERROR bad_job: {e}\n")
+            return 2
+        write_status(a.rid, "queued", out=os.path.abspath(out))
+        print(json.dumps({"queued": True, "rid": a.rid, "out": os.path.abspath(out),
+                          "kind": "retrieve", "daemon_up": daemon_alive()}))
+        sys.stderr.write(
+            f"CGC_QUEUED retrieve. The daemon will attach to conversation {a.conversation} and read "
+            f"its answer — nothing is sent. Await it exactly like any consult:\n"
+            f"  timeout 899 python3 {os.path.abspath(__file__)} await --rid {a.rid} "
+            f"--out {os.path.abspath(out)} --poll {a.poll} --timeout {AGENT_POLL_S}\n")
+        return 0
+    if not a.prompt_file:
+        sys.stderr.write("CGC_ERROR need_prompt_file: --prompt-file is required "
+                         "(only --kind retrieve may omit it).\n")
+        return 2
     if not os.path.exists(a.prompt_file):
         sys.stderr.write(f"CGC_ERROR prompt_file_missing: {a.prompt_file}\n")
         return 2
@@ -542,8 +579,10 @@ def main() -> int:
 
     e = sub.add_parser("enqueue", help="write a consult job into the local spool (LOCAL write only)")
     e.add_argument("--rid", required=True)
-    e.add_argument("--prompt-file", required=True)
-    e.add_argument("--kind", choices=("submit", "followup"), default="submit")
+    e.add_argument("--prompt-file", help="rendered prompt (required except for --kind retrieve)")
+    e.add_argument("--kind", choices=("submit", "followup", "retrieve"), default="submit",
+                   help="submit=new consult, followup=continue a thread, retrieve=read an existing "
+                        "conversation's answer without sending anything")
     e.add_argument("--project-url", default=os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/"))
     e.add_argument("--conversation", default="auto", help="(followup) /c/<id> or 'auto'")
     e.add_argument("--model", default=os.environ.get("CGC_MODEL", "Pro"))
