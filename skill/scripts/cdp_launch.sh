@@ -102,6 +102,12 @@ fi
 
 # Not up → start it (this is the no-LLM auto-start the gate guarantees).
 mkdir -p "$PROFILE"
+# Chrome's own stderr goes to a log, NOT to /dev/null. When Chrome fails to start, that output is
+# the only thing that says why — and this launcher failing is exactly what silently kills a consult
+# (the daemon reports "did not expose port" and the real reason is gone). It is also why the
+# failure path below prints the tail: an unreadable failure costs a whole 25-minute round.
+CHROME_LOG="${CGC_STATE_DIR:-/tmp/cgc}/chrome.log"
+mkdir -p "$(dirname "$CHROME_LOG")"
 # allow-origins scoped to loopback (NOT '*') — the CDP client connects from this origin.
 # debugging-address pinned to loopback so the port is never reachable off-host.
 "$CHROME" \
@@ -110,15 +116,26 @@ mkdir -p "$PROFILE"
   --remote-allow-origins="http://127.0.0.1:$PORT" \
   --user-data-dir="$PROFILE" \
   --no-first-run --no-default-browser-check \
-  "$PROJECT_URL" >/dev/null 2>&1 &
+  "$PROJECT_URL" >>"$CHROME_LOG" 2>&1 &
+CHROME_PID=$!
 
-for _ in $(seq 1 20); do
+# A warm profile on an idle Mac exposes the port in ~2s, but this also runs from a launchd agent
+# whose I/O is deprioritized, so allow 40s before calling it dead. Waiting is free; a false
+# negative here throws away the consult.
+for _ in $(seq 1 80); do
   sleep 0.5
   if curl -s -m 2 "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1; then
     [ "$GATE" = "1" ] || echo "CGC_OK debug Chrome up on port $PORT (profile $PROFILE)."
     sleep 1
     finish "$(probe_login)"
   fi
+  kill -0 "$CHROME_PID" 2>/dev/null || break   # Chrome exited outright — stop waiting on a corpse
 done
-echo "CGC_ERROR debug Chrome did not expose port $PORT" >&2
+echo "CGC_ERROR debug Chrome did not expose port $PORT (profile $PROFILE)" >&2
+if kill -0 "$CHROME_PID" 2>/dev/null; then
+  echo "  Chrome is still running but never opened the port — is another Chrome already using $PROFILE?" >&2
+else
+  echo "  Chrome exited without opening the port. Its last output ($CHROME_LOG):" >&2
+  tail -5 "$CHROME_LOG" 2>/dev/null | sed 's/^/    /' >&2
+fi
 exit 1

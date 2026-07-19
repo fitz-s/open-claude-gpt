@@ -74,7 +74,11 @@
   }
 
   function extractAnswer() {
-    var nodes = document.querySelectorAll('[data-message-author-role="assistant"]');
+    // Either turn markup: older ChatGPT builds tag the message node
+    // data-message-author-role="assistant", the current build tags the turn
+    // data-turn="assistant". Mirrors _SEL_A in cdp_consult.py — all four parsers must agree.
+    var nodes = document.querySelectorAll(
+      '[data-message-author-role="assistant"],[data-turn="assistant"]');
     for (var k = nodes.length - 1; k >= 0; k--) {
       var t = cgcText(nodes[k]).replace(/\r\n/g, "\n");
       var lines = t.split("\n");

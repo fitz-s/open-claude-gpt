@@ -68,6 +68,10 @@ SPOOL_DIR = os.environ.get("CGC_SPOOL_DIR", os.path.join(CGC_STATE_DIR, "spool")
 # A consult with no fresh daemon heartbeat within this many seconds is treated as "daemon down".
 HEARTBEAT_STALE_S = 45
 
+# How long `await` tolerates a missing daemon before giving up. launchd (KeepAlive) respawns it in
+# seconds, so this only has to outlast a restart, not a repair.
+DAEMON_GRACE_S = 60
+
 # How long a consult takes: a GPT-5.6 Pro round reasons ~25 min. One number, used everywhere.
 CONSULT_TIMEOUT_S = 1500
 
@@ -112,7 +116,7 @@ _SECRET_RES = [
 
 # ---- paths / dirs -----------------------------------------------------------
 
-_SUBDIRS = ("pending", "processing", "done", "status")
+_SUBDIRS = ("pending", "processing", "done", "status", "logs")
 
 
 def ensure_dirs():
@@ -138,6 +142,13 @@ def done_path(rid):
 
 def status_path(rid):
     return _p("status", rid + ".json")
+
+
+def log_path(rid):
+    """Everything the daemon's worker saw while running this job. A failed consult used to leave
+    only a 240-char tail inside a status file, which is not enough to tell a login lapse from a
+    silent send from a model that never answered — so a failure must name where its own evidence is."""
+    return _p("logs", rid + ".log")
 
 
 DAEMON_PATH = _p("daemon.json")
@@ -254,20 +265,45 @@ def finish_job(rid, *, state, exit, out=None, msg=None, conversation=None):
 
 # ---- the validating gate (security core) ------------------------------------
 
+# `gh` normally answers in well under a second, but it reads its token from the OS keyring, and a
+# background/launchd daemon's keyring access can block far longer than an interactive shell's. One
+# attempt at 20s cost a real consult its whole 25-minute budget, so: a wider window, and one retry.
+_GH_TIMEOUT_S = 25
+_GH_ATTEMPTS = 2
+
+
 def _repo_is_public(slug: str) -> tuple:
-    """Ask gh whether owner/repo is public. Returns (public: bool, detail: str). Fail-closed:
-    gh missing / unauthenticated / errored / anything but 'public' -> (False, why)."""
-    try:
-        r = subprocess.run(["gh", "api", f"repos/{slug}", "--jq", ".visibility"],
-                           capture_output=True, text=True, timeout=20)
-    except FileNotFoundError:
-        return False, "gh not installed"
-    except Exception as e:
-        return False, f"gh error: {e}"
-    if r.returncode != 0:
-        return False, f"gh api repos/{slug} failed: {(r.stderr or '').strip()[:120]}"
-    vis = (r.stdout or "").strip()
-    return (vis == "public"), (f"visibility={vis or 'unknown'}")
+    """Ask gh whether owner/repo is public. Returns (public: bool, detail: str).
+
+    Fail-closed on every path — but the detail DISTINGUISHES the two failures, because they demand
+    opposite actions from the caller. "gh says this repo is not public" is terminal: it will never
+    be sendable, stop. "gh could not be asked" (missing, timed out, errored) proves NOTHING about
+    the repo: the check failed, not the repo, and retrying is correct. Only the latter's detail
+    starts with `unverified:`; validate_prompt turns that marker into a retryable refusal instead of
+    a security verdict the repo never earned."""
+    last = "unverified: gh never answered"
+    for _ in range(_GH_ATTEMPTS):
+        try:
+            r = subprocess.run(["gh", "api", f"repos/{slug}", "--jq", ".visibility"],
+                               capture_output=True, text=True, timeout=_GH_TIMEOUT_S)
+        except FileNotFoundError:
+            return False, "unverified: gh not installed"
+        except subprocess.TimeoutExpired:
+            last = f"unverified: gh timed out after {_GH_TIMEOUT_S}s"
+            continue
+        except Exception as e:
+            last = f"unverified: gh error: {e}"
+            continue
+        if r.returncode != 0:
+            err = (r.stderr or "").strip()
+            # 404 IS an answer: this token cannot see the repo, so it is private or absent. Terminal.
+            if "404" in err or "Not Found" in err:
+                return False, "visibility=invisible to your gh token (404 — private or nonexistent)"
+            last = f"unverified: gh api repos/{slug} failed: {err[:120]}"
+            continue
+        vis = (r.stdout or "").strip()
+        return (vis == "public"), f"visibility={vis or 'unknown'}"
+    return False, last
 
 
 def validate_prompt(prompt_text: str) -> tuple:
@@ -314,6 +350,11 @@ def validate_prompt(prompt_text: str) -> tuple:
     for slug in sorted(slugs):
         ok, detail = _repo_is_public(slug)
         if not ok:
+            if detail.startswith("unverified:"):
+                return False, (f"unverified: could not check whether repo {slug} is public "
+                               f"({detail.split(':', 1)[1].strip()}). This is NOT a finding that the "
+                               f"repo is private — the check itself failed, so nothing was sent. "
+                               f"Re-enqueue to retry.")
             return False, f"refused: repo {slug} is not confirmed PUBLIC ({detail}) — will not send its link to an external service"
 
     return True, f"ok: {len(slugs)} public repo(s), no secrets detected"
@@ -394,27 +435,10 @@ def cmd_await(a) -> int:
     deadline = time.time() + a.timeout
     rid = a.rid
     out = os.path.abspath(a.out)
-    saw_pickup = False
-    warned_daemon = False
+    down_since = None
     while time.time() < deadline:
         st = read_status(rid) or {}
         state = st.get("state")
-        if state in ("processing", "done", "blocker", "no_answer", "error"):
-            saw_pickup = True
-        # daemon-liveness guard: if it never picked the job up AND there is no live daemon, fail fast
-        # with actionable guidance instead of burning the whole timeout on a queue nothing drains.
-        if not saw_pickup and not daemon_alive():
-            if not warned_daemon:
-                warned_daemon = True
-                sys.stderr.write("CGC_WAIT daemon not running yet; will keep polling briefly…\n")
-            # give a short grace (a just-enqueued job + a daemon starting up), then give up.
-            if time.time() > (deadline - a.timeout) + 60:
-                sys.stderr.write(
-                    "CGC_ERROR daemon_not_running: the job was never picked up and no live consult "
-                    "daemon was found. Relay ONE line to the user — `cgc install-daemon` (installs "
-                    "it as a launchd agent so it starts at login and never needs starting again). "
-                    "The job stays queued and runs as soon as it is up.\n")
-                return 2
         if state == "done":
             try:
                 ans = open(out, encoding="utf-8").read()
@@ -430,11 +454,38 @@ def cmd_await(a) -> int:
         if state == "no_answer":
             sys.stderr.write(f"CGC_ERROR timeout_no_answer: {st.get('msg') or 'no usable answer'} "
                              f"(raw may be at {out}.raw)\n")
+            _point_at_log(rid)
             return 4
         if state == "error":
             _m = st.get("msg") or "the daemon refused or failed this job"
             sys.stderr.write(f"CGC_ERROR gate_or_send_error: {_m}\n")
+            _point_at_log(rid)
             return 2
+        # Non-terminal (queued/processing): the job only advances while a daemon is alive to advance
+        # it, so liveness is checked in EVERY state. Checking it only before pickup left a hole with
+        # no exit — a daemon that died mid-consult left every later await burning its full window and
+        # returning 5 ("still running, re-run me"), an unbounded loop over a job nobody was working.
+        if daemon_alive():
+            down_since = None
+        else:
+            if down_since is None:
+                down_since = time.time()
+                sys.stderr.write("CGC_WAIT no live daemon; polling briefly in case it is restarting…\n")
+            elif time.time() - down_since > DAEMON_GRACE_S:
+                if state == "processing":
+                    sys.stderr.write(
+                        f"CGC_ERROR daemon_died_mid_consult: {rid} was being sent when the daemon "
+                        f"stopped, so nothing is working it now and awaiting again would never "
+                        f"return. launchd normally respawns it; if this persists tell the user to "
+                        f"check `cgc queue` and the daemon log.\n")
+                else:
+                    sys.stderr.write(
+                        "CGC_ERROR daemon_not_running: the job was never picked up and no live "
+                        "consult daemon was found. Relay ONE line to the user — `cgc install-daemon` "
+                        "(installs it as a launchd agent so it starts at login and never needs "
+                        "starting again). The job stays queued and runs as soon as it is up.\n")
+                _point_at_log(rid)
+                return 2
         time.sleep(a.poll)
     _last = (read_status(rid) or {}).get("state") or "none"
     sys.stderr.write(
@@ -443,6 +494,14 @@ def cmd_await(a) -> int:
         f"  timeout 899 python3 {os.path.abspath(__file__)} await --rid {rid} "
         f"--out {out} --poll {a.poll} --timeout {a.timeout}\n")
     return 5
+
+
+def _point_at_log(rid):
+    """Name the evidence file on any failure. Costs one line; without it the agent's only options
+    are to guess or to ask the user to go dig."""
+    lp = log_path(rid)
+    if os.path.exists(lp):
+        sys.stderr.write(f"CGC_LOG full transcript of this job's send+wait: {lp}\n")
 
 
 def _print_followup_recipe(rid, st):

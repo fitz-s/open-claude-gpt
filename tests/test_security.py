@@ -45,3 +45,51 @@ if __name__ == "__main__":
     test_routable_addresses_classified_false()
     test_empty_and_whitespace_not_loopback()
     print("OK")
+
+
+# ---- the model guard: verdict and reported model must never contradict ----
+#
+# Regression: submit printed {"model": "Chat", "modelConfirmed": true} for a --model Pro consult.
+# Confirmation scanned every switcher (right — ChatGPT splits model and reasoning effort across two
+# menus), but the REPORTED model was always labels[0], and labels[0] is the composer's MODE toggle
+# (Chat / Agent / …), not the model pill. Verified live: the project page shows ['Chat', 'Pro'].
+# So a correctly pinned Pro run recorded itself as running on "Chat".
+
+import importlib.util as _ilu
+import os as _os
+
+_CDP_PATH = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                          "skill", "scripts", "cdp_consult.py")
+_spec = _ilu.spec_from_file_location("cdp_consult", _CDP_PATH)
+_CDP = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_CDP)
+
+
+def test_mode_toggle_first_does_not_become_the_reported_model():
+    """The exact live layout: mode toggle 'Chat' sorts before the 'Pro' tier switcher."""
+    ok, shown = _CDP._model_verdict(["Chat", "Pro"], "Pro")
+    assert ok is True
+    assert shown == "Pro", "must report the switcher that carries the tier, not the mode toggle"
+
+
+def test_two_menu_pro_extended_confirms():
+    ok, shown = _CDP._model_verdict(["GPT-5.6", "Pro Extended"], "Pro")
+    assert ok is True and shown == "Pro Extended"
+
+
+def test_no_pro_switcher_anywhere_fails_closed():
+    """The guard that actually matters: nothing offers a Pro tier, so do not send."""
+    ok, shown = _CDP._model_verdict(["Chat", "Medium"], "Pro")
+    assert ok is False and shown == "Chat"
+
+
+def test_non_pro_target_requires_an_exact_first_line_match():
+    """Only a Pro target gets family matching, so 'High' never satisfies 'Extra High'."""
+    assert _CDP._model_verdict(["High"], "High")[0] is True
+    assert _CDP._model_verdict(["Extra High"], "High")[0] is False
+    assert _CDP._model_verdict(["Medium"], "High")[0] is False
+
+
+def test_no_switchers_at_all_is_not_a_confirmation():
+    ok, shown = _CDP._model_verdict([], "Pro")
+    assert ok is False and shown is None

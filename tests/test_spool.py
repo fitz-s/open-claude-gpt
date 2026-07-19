@@ -313,3 +313,90 @@ def test_agent_can_cover_the_consult_timeout_in_slices(spool):
     900s; two slices must still cover a full CONSULT_TIMEOUT_S consult."""
     assert spool.AGENT_POLL_S <= 870, "must stay under the 900s background-task kill"
     assert 2 * spool.AGENT_POLL_S >= spool.CONSULT_TIMEOUT_S
+
+
+# The fixture stubs _repo_is_public so no test can shell out to `gh`; the two tests that
+# exercise the real implementation restore it explicitly from a pristine module load.
+_REAL_REPO_IS_PUBLIC = _load()._repo_is_public
+
+
+# ---- gate: "could not verify" is not the same finding as "not public" --------
+
+def test_gate_unverified_gh_is_not_reported_as_a_private_repo(spool, monkeypatch):
+    """A gh that times out proves nothing about the repo. Reporting that as 'not confirmed PUBLIC'
+    reads as a security verdict the repo never earned, and tells the caller to give up on a job a
+    retry would have sent. Both refuse — only the reason differs, and the reason drives the action."""
+    monkeypatch.setattr(spool, "_repo_is_public",
+                        lambda slug: (False, "unverified: gh timed out after 25s"))
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets")
+    assert ok is False
+    assert why.startswith("unverified:")
+    assert "not confirmed PUBLIC" not in why
+    assert "re-enqueue" in why.lower()
+
+
+def test_gate_confirmed_nonpublic_still_reads_as_a_refusal(spool, monkeypatch):
+    """The terminal case must keep its old wording — it is a real security verdict."""
+    monkeypatch.setattr(spool, "_repo_is_public", lambda slug: (False, "visibility=private"))
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets")
+    assert ok is False and why.startswith("refused:") and "not confirmed PUBLIC" in why
+
+
+def test_repo_is_public_retries_then_reports_unverified_on_timeout(spool, monkeypatch):
+    """gh reads its token from the OS keyring, which can block far longer in a launchd daemon than
+    in a shell. One 20s attempt cost a real consult its whole budget, so: retry, then say so."""
+    calls = []
+
+    def _timeout(*args, **kw):
+        calls.append(1)
+        raise __import__("subprocess").TimeoutExpired(cmd="gh", timeout=25)
+
+    monkeypatch.setattr(spool, "_repo_is_public", _REAL_REPO_IS_PUBLIC)
+    monkeypatch.setattr(spool.subprocess, "run", _timeout)
+    ok, detail = spool._repo_is_public("acme/widgets")
+    assert ok is False
+    assert len(calls) == spool._GH_ATTEMPTS
+    assert detail.startswith("unverified:") and "timed out" in detail
+
+
+def test_repo_is_public_404_is_terminal_not_retried(spool, monkeypatch):
+    """A 404 IS gh's answer (this token cannot see the repo) — retrying can only waste the budget."""
+    calls = []
+
+    class _R:
+        returncode = 1
+        stdout = ""
+        stderr = "gh: Not Found (HTTP 404)"
+
+    def _run(*args, **kw):
+        calls.append(1)
+        return _R()
+
+    monkeypatch.setattr(spool, "_repo_is_public", _REAL_REPO_IS_PUBLIC)
+    monkeypatch.setattr(spool.subprocess, "run", _run)
+    ok, detail = spool._repo_is_public("acme/ghost")
+    assert ok is False and len(calls) == 1 and not detail.startswith("unverified:")
+
+
+# ---- await: a daemon that dies mid-consult must terminate the wait -----------
+
+def test_await_gives_up_when_daemon_dies_mid_processing(spool, tmp_path, monkeypatch):
+    """The liveness guard used to switch OFF once the job reached `processing`. A daemon that died
+    after pickup therefore left every later await burning its full window and returning 5 = 'still
+    running, re-run me' — an unbounded loop over a job nobody was working."""
+    rid = _rid("aa0001")
+    spool.write_status(rid, "processing", out=str(tmp_path / "a.txt"))
+    monkeypatch.setattr(spool, "daemon_alive", lambda: False)
+    monkeypatch.setattr(spool, "DAEMON_GRACE_S", 0)
+    code = spool.cmd_await(_await_args(rid, str(tmp_path / "a.txt"), timeout=3))
+    assert code == 2
+
+
+def test_await_still_returns_5_while_a_live_daemon_works_the_job(spool, tmp_path, monkeypatch):
+    """The complement: a healthy in-flight consult must still read as 'still running', never as a
+    failure — that distinction is the whole reason exit 5 exists."""
+    rid = _rid("aa0002")
+    spool.write_status(rid, "processing", out=str(tmp_path / "b.txt"))
+    monkeypatch.setattr(spool, "daemon_alive", lambda: True)
+    code = spool.cmd_await(_await_args(rid, str(tmp_path / "b.txt"), timeout=0.2))
+    assert code == 5

@@ -20,11 +20,35 @@ export CGC_CHROME="/path/to/your/chrome"
 ## `CGC_ERROR chrome_unavailable` / debug Chrome not on the port
 The dedicated Chrome isn't running (or another process holds the port).
 ```bash
-bin/cgc launch          # start it
-lsof -i :9333           # check what's on the port; change CGC_PORT if taken
+bin/cgc launch                    # start it
+lsof -i :9333                     # check what's on the port; change CGC_PORT if taken
+tail -20 /tmp/cgc/chrome.log      # what Chrome itself said when it failed to start
 ```
 If you already have a Chrome running on your default profile, that's fine — this
-uses a separate profile and port and won't collide.
+uses a separate profile and port and won't collide. But **only one Chrome may hold
+`CGC_PROFILE` at a time**: if a previous debug Chrome is still alive, a second one
+exits immediately instead of opening the port, and the launcher says so.
+
+The launcher waits 40s for the port. That is generous on purpose — it also runs
+from the launchd daemon, whose I/O launchd deprioritizes, and a false "Chrome
+didn't start" throws away a whole 25-minute consult.
+
+## A consult finished but produced nothing — where is the evidence?
+Every job the daemon runs writes a full transcript of its send + wait to
+
+    $CGC_SPOOL_DIR/logs/<rid>.log        # default /tmp/cgc/spool/logs/<rid>.log
+
+`await` names that path on any failure. It streams **live**, so you can watch a
+consult while it runs — the waiter's per-poll heartbeat is the line to read:
+
+    CGC_WAIT alive: gen=… len=… done=… begin=… end=… ac=…
+
+- `ac=0` for the whole run — ChatGPT never produced an assistant turn at all. The
+  prompt was inserted but the send didn't take, or the session was rejected. Look
+  at the debug Chrome window.
+- `begin=true end=false` — the model is writing the answer right now; wait.
+- `len` growing, `gen=true` — alive, still reasoning. GPT-5.6 also pauses for
+  several seconds mid-stream while its safeguard classifiers review output.
 
 ## `CGC_LOGIN needed` / `CGC_ERROR login_needed`
 You're logged out in the dedicated profile. Run `bin/cgc launch`, log into ChatGPT
@@ -110,7 +134,17 @@ foreground.
 
 ## The daemon refused my job (`gate` error / GATE REFUSED)
 The daemon's egress gate re-checks every job before sending and refuses
-fail-closed. Common causes:
+fail-closed. Read the first word of the reason — it tells you which of two very
+different things happened:
+
+- **`refused: …`** — a verdict. The gate checked and the answer was no. Fix the
+  input; re-enqueueing the same job cannot help.
+- **`unverified: …`** — the *check* failed, not the input. `gh` timed out or
+  couldn't run, so nothing is known about the repo and nothing was sent. Re-enqueue
+  to retry. (`gh` reads its token from the OS keyring, which can block much longer
+  under the launchd daemon than in your shell; the gate already retries once.)
+
+Common `refused:` causes:
 - The referenced repo isn't gh-confirmed **public** — only public repos pass.
 - The delivery is a **gist link** — gists are refused by default because
   visibility can't be cheaply proven the way a repo's can; set

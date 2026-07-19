@@ -252,9 +252,15 @@ def _poll_js_parse_source():
             f.write("https://github.com/acme/widgets/tree/deadbeef\n")
         state_dir = os.path.join(td, "state")
         env = {**os.environ, "CGC_STATE_DIR": state_dir}
+        # --backend mcp: poll_js is an MCP-fallback artifact, and only that backend prints it
+        # (the CDP path never reads it, so emitting it there was dead weight in the agent's
+        # context). The STRING is built by the same cmd_prep code path either way, which is
+        # what this parity harness needs.
+        window_template = os.path.join(os.path.dirname(CONSULT_PY), "retrieval_window.js")
         r = subprocess.run(
             [sys.executable, CONSULT_PY, "prep", "--title", "x", "--task", "y",
-             "--refs-file", refs_file],
+             "--refs-file", refs_file, "--backend", "mcp",
+             "--window-template", window_template],
             capture_output=True, text=True, env=env, timeout=30)
         assert r.returncode == 0, f"consult.py prep failed: {r.stderr}"
         state = json.loads(r.stdout)

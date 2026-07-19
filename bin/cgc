@@ -92,7 +92,10 @@ with open(plist_path, "wb") as f:
         "StandardOutPath": log,
         "StandardErrorPath": log,
         "EnvironmentVariables": env,
-        "ProcessType": "Background",
+        # No "ProcessType": "Background". That key tells launchd the job is not involved in user
+        # interaction, so it gets throttled scheduling and I/O — but this daemon's entire job is to
+        # launch and drive a GUI Chrome in the user's Aqua session. Omitting it leaves the default
+        # ("Standard"), which is what a browser-driving agent actually is.
     }, f)
 print(f"cgc: wrote {plist_path}")
 PYEOF

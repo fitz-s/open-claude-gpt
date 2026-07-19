@@ -4,6 +4,68 @@ All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-based
 releases until it stabilizes.
 
+## [Unreleased]
+
+### Fixed
+- **Answer detection had gone blind against ChatGPT's current DOM — every consult on that build ran
+  its full 25-minute budget and returned nothing.** All four parsers selected assistant turns with
+  `[data-message-author-role="assistant"]`; the live build marks the turn `data-turn="assistant"`
+  and leaves `data-message-author-role` on the *user* node only, so `querySelectorAll` returned
+  **zero** assistant nodes, the sentinel could never be found, and `wait` timed out reporting
+  `ac=0`. Confirmed live against a running conversation: old selector `ac=0`, new selector `ac=1`
+  with `len=926` on the same streaming answer. All four implementations now match either shape, and
+  the selector is named ONCE (`_SEL_A`/`_SEL_U`/`_SEL_ANY` in `cdp_consult.py`) instead of being
+  retyped in six JS string literals where the next rename would again have to be found six times.
+- **`submit` reported a model it was not running on.** It printed `{"model": "Chat",
+  "modelConfirmed": true}` for a `--model Pro` consult. Confirmation scans every switcher — which is
+  right, since ChatGPT splits model and reasoning effort across two menus — but the *reported* model
+  was always `labels[0]`, and `labels[0]` is the composer's **mode** toggle (Chat / Agent / …), not
+  the model pill. So a correctly pinned Pro run recorded itself as running on "Chat": a record that
+  contradicts itself in one JSON object, makes a healthy run look broken, and would disguise a
+  genuinely wrong tier just as well. `_model_verdict` now reports the switcher that actually carries
+  the tier. Verified live: the project page shows `['Chat', 'Pro']`, the conversation `['Pro']`.
+  This guard had no test coverage at all; it now has six.
+- **A daemon that died mid-consult left `await` looping forever.** The liveness check was gated on
+  having seen the job picked up, so once a job reached `processing` the check switched off — every
+  later `await` then burned its whole 870s window and returned `5` ("still running, re-run me") for
+  a job nobody was working. Liveness is now checked in every state, and a daemon that stays gone
+  past `DAEMON_GRACE_S` ends the wait with an actionable exit 2.
+- **Jobs stranded in `processing/` were lost silently.** Workers are children of the daemon and
+  nothing ever re-scans `processing/`, so a crash or launchd restart orphaned the consult while
+  `await` kept reporting it healthy. The daemon now requeues them at startup — only those older
+  than a worker's hard ceiling (`CONSULT_TIMEOUT_S + 120`), so a still-live worker can never be
+  double-sent and billed twice.
+- **The launcher discarded Chrome's own error output** to `/dev/null`, so the one failure that
+  actually kills a consult — the debug Chrome not coming up — was undiagnosable. Chrome's output now
+  goes to `$CGC_STATE_DIR/chrome.log`, the failure path prints its tail and distinguishes "Chrome
+  exited" from "Chrome is up but never opened the port" (a second Chrome holding the same profile).
+  The readiness wait went from 10s to 40s: a warm profile exposes the port in ~2s, but this also
+  runs from a launchd agent whose I/O is deprioritized, and a false negative costs a whole round.
+
+### Changed
+- **The daemon no longer swallows its workers' output.** `_run` captured stdout+stderr and discarded
+  everything but a 240-char tail folded into the status message, so when a consult produced nothing
+  the waiter's per-poll heartbeat (`CGC_WAIT alive: gen/len/done/begin/end/ac`) — the one line that
+  says *which* failure happened — was gone. Each job now streams a full transcript to
+  `$CGC_SPOOL_DIR/logs/<rid>.log`, **live**, so a 25-minute consult can be watched while it runs;
+  `await` names that path on every failure. This is what turned today's two silent 25-minute
+  failures into a diagnosis in seconds.
+- **The egress gate distinguishes "could not check" from "not public".** They demand opposite
+  actions and were reported identically: a `gh` that timed out produced "repo … is not confirmed
+  PUBLIC", which reads as a security verdict the repo never earned and tells the caller to give up
+  on a job a retry would have sent. `unverified:` now marks a failed *check* (retry) and `refused:`
+  a real verdict (stop). `gh` reads its token from the OS keyring, which can block far longer under
+  a launchd daemon than in a shell, so the gate also allows 25s and retries once — a single 20s
+  attempt cost a real consult its whole budget. A 404 stays terminal: that IS gh's answer.
+  The daemon no longer marks the plist `ProcessType: Background`, which told launchd to throttle a
+  job whose entire purpose is driving a GUI Chrome. **Re-run `cgc install-daemon` to pick this up.**
+- **`prep` stopped dumping MCP-only artifacts into the agent's context.** `poll_js`, `preflight_js`,
+  the window script and the ScheduleWakeup wake plan exist only for the MCP fallback; nothing on the
+  default CDP+daemon path reads them (`cdp_consult.py` rebuilds the sentinels from the rid). Printing
+  them cost ~2.5k chars of dead JS on every consult. The CDP path now prints `request_id` +
+  `prompt_file` (115 bytes) and a `CGC_NEXT` line with the exact `enqueue` command to copy; the MCP
+  backend still prints the full set.
+
 ## [0.1.0] — 2026-07-01
 
 First public release. Experimental pre-release (the CDP/browser-automation path is
