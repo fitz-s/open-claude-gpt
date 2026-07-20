@@ -95,7 +95,19 @@ finish() {
   exit 0
 }
 
-if curl -s -m 2 "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1; then
+# CGC_RESTART=1 forces a fresh browser even if one is up. A Chrome that has been alive a long time
+# can reach a state where it still serves its EXISTING tabs but every newly created tab never
+# answers Runtime.enable — which kills every consult, since each send opens its own tab. Only a
+# restart clears it, and the daemon can do that itself: the profile keeps the login, and a consult
+# whose tab is lost is recoverable through `enqueue --kind retrieve`.
+if [ "${CGC_RESTART:-0}" = "1" ]; then
+  echo "CGC_RESTART: replacing the debug Chrome on port $PORT" >&2
+  pkill -f -- "--user-data-dir=$PROFILE" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    curl -s -m 1 "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+elif curl -s -m 2 "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1; then
   [ "$GATE" = "1" ] || echo "CGC_OK debug Chrome already up on port $PORT (profile $PROFILE)"
   finish "$(probe_login)"
 fi

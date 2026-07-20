@@ -368,6 +368,7 @@ class CDP:
         # not a failure. Letting it escape produced a 30-line websocket traceback in the job log,
         # which tells the caller nothing it can act on and looks like a crash rather than a blip.
         last = None
+        created_tid = tid if create_url else None
         for attempt in range(3):
             try:
                 self.ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=timeout)
@@ -385,12 +386,24 @@ class CDP:
                 if attempt < 2:
                     time.sleep(2.0)
         else:
+            # Close the tab we opened. Every failed attach used to leak one, and they pile up as
+            # blank targets in a browser that is already unwell.
+            if created_tid:
+                try:
+                    _b = websocket.create_connection(
+                        json.load(urllib.request.urlopen(f"{base}/json/version", timeout=5))
+                        ["webSocketDebuggerUrl"], timeout=5)
+                    _b.send(json.dumps({"id": 99, "method": "Target.closeTarget",
+                                        "params": {"targetId": created_tid}}))
+                    _b.close()
+                except Exception:
+                    pass
             raise SystemExit(
-                f"CGC_ERROR cdp_attach_failed: could not attach to the debug Chrome on port "
-                f"{port} after 3 tries ({type(last).__name__}: {last}). Chrome is reachable or this "
-                f"would have failed earlier, so this is usually a tab that was mid-navigation or a "
-                f"browser busy with a long conversation. Nothing was sent; re-enqueue to retry. If "
-                f"it repeats, the user can restart the debug Chrome.")
+                f"CGC_ERROR cdp_attach_failed: opened a tab on port {port} but it never answered "
+                f"Runtime.enable in 3 tries ({type(last).__name__}: {last}). Measured cause: this "
+                f"Chrome can still serve its EXISTING tabs while every NEWLY created tab stays "
+                f"unresponsive — an about:blank tab reproduces it — so the browser needs "
+                f"restarting, not the job retrying. Nothing was sent.")
 
     def conversation_id(self):
         """The /c/<id> conversation id of the attached tab, or '' if not in a conversation yet.
