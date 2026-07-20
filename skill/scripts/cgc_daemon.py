@@ -37,6 +37,12 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.request
+
+try:
+    import websocket
+except ImportError:  # only the sweep needs it; never break the daemon over a missing extra
+    websocket = None
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cgc_spool as spool  # noqa: E402  (shares config load, paths, gate)
@@ -62,6 +68,92 @@ def _other_live_jobs(rid) -> list:
     return out
 
 
+def _sweep_tabs() -> int:
+    """Close leftover ChatGPT tabs when nothing is running.
+
+    Tabs accumulate. Fixing the leaks in submit's failure paths removes the known source, but not
+    the one no code path can cover: a worker killed mid-send — by a daemon restart, say — never runs
+    its cleanup at all, and its tab stays. Each one holds a renderer, and a browser carrying enough
+    of them stops being able to start new ones, which is the failure that ends every consult (a
+    freshly created tab that never answers Runtime.enable).
+
+    Guarded by the same rule as the restart: only when NO job is live, so a tab this sweep sees is
+    by definition unowned. One tab is kept, because the profile with zero windows is a worse state
+    to leave the browser in than one with a spare."""
+    if _other_live_jobs(None):
+        return 0
+    try:
+        base = f"http://127.0.0.1:{os.environ.get('CGC_PORT', '9333')}"
+        info = json.load(urllib.request.urlopen(f"{base}/json", timeout=5))
+        pages = [t for t in info if t.get("type") == "page"]
+        if len(pages) <= 1:
+            return 0
+        ver = json.load(urllib.request.urlopen(f"{base}/json/version", timeout=5))
+        bw = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=5)
+        for i, t in enumerate(pages[1:], start=1):
+            bw.send(json.dumps({"id": 900 + i, "method": "Target.closeTarget",
+                                "params": {"targetId": t["id"]}}))
+        bw.close()
+        sys.stderr.write(f"CGC_DAEMON swept {len(pages) - 1} unowned browser tab(s)\n")
+        return len(pages) - 1
+    except Exception as e:
+        sys.stderr.write(f"CGC_DAEMON tab sweep skipped: {type(e).__name__}\n")
+        return 0
+
+
+def _new_tab_healthy(port=None) -> bool:
+    """Can this browser produce a USABLE tab? That is the capability every send needs and the exact
+    one that breaks — an unwell Chrome keeps serving its existing tabs while new ones never answer
+    Runtime.enable, so "the port is up" and "the session is logged in" both stay true while consults
+    die. Checked by doing the real thing on a throwaway about:blank, then cleaning it up."""
+    if websocket is None:
+        return True
+    port = port or os.environ.get("CGC_PORT", "9333")
+    base = f"http://127.0.0.1:{port}"
+    tid = bw = None
+    try:
+        ver = json.load(urllib.request.urlopen(f"{base}/json/version", timeout=5))
+        bw = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=8)
+        bw.send(json.dumps({"id": 1, "method": "Target.createTarget",
+                            "params": {"url": "about:blank"}}))
+        for _ in range(50):
+            m = json.loads(bw.recv())
+            if m.get("id") == 1:
+                tid = m.get("result", {}).get("targetId")
+                break
+        if not tid:
+            return False
+        tgt = None
+        for _ in range(20):
+            info = json.load(urllib.request.urlopen(f"{base}/json", timeout=5))
+            hit = [t for t in info if t.get("id") == tid and t.get("webSocketDebuggerUrl")]
+            if hit:
+                tgt = hit[0]
+                break
+            time.sleep(0.2)
+        if not tgt:
+            return False
+        w = websocket.create_connection(tgt["webSocketDebuggerUrl"], timeout=8)
+        w.send(json.dumps({"id": 2, "method": "Runtime.enable"}))
+        while True:
+            r = json.loads(w.recv())
+            if r.get("id") == 2:
+                break
+        w.close()
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            if bw and tid:
+                bw.send(json.dumps({"id": 3, "method": "Target.closeTarget",
+                                    "params": {"targetId": tid}}))
+            if bw:
+                bw.close()
+        except Exception:
+            pass
+
+
 def _restart_chrome(rid=None) -> bool:
     """Replace the debug Chrome. The daemon owns the browser's lifecycle, so a browser that can no
     longer open a usable tab is the daemon's problem to fix, not an errand for a human — the whole
@@ -80,7 +172,18 @@ def _restart_chrome(rid=None) -> bool:
         return False
     code, _so, _se = _run(["bash", _LAUNCH], 120, rid,
                           env_extra={"CGC_RESTART": "1", "CGC_GATE": "1"})
-    return code == 0
+    if code != 0:
+        return False
+    # The launcher proves the PORT is up and the session is logged in. Neither is the thing that
+    # broke: what fails is opening a working tab, and a browser that has just restarted also needs a
+    # moment before its target list is stable — a retry 3s after a "successful" restart failed with
+    # `No such target id`. So confirm the actual capability before handing the job back.
+    for _ in range(15):
+        if _new_tab_healthy():
+            return True
+        time.sleep(2.0)
+    sys.stderr.write(f"CGC_DAEMON {rid}: Chrome restarted but still cannot open a working tab\n")
+    return False
 
 _running = True
 
@@ -356,6 +459,8 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
             # the daemon itself stayed up.
             if time.time() >= next_orphan_scan:
                 _recover_orphans()
+                if websocket is not None:
+                    _sweep_tabs()
                 next_orphan_scan = time.time() + 60
             # reap
             for rid in list(children):

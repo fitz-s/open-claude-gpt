@@ -122,14 +122,36 @@ CHROME_LOG="${CGC_STATE_DIR:-/tmp/cgc}/chrome.log"
 mkdir -p "$(dirname "$CHROME_LOG")"
 # allow-origins scoped to loopback (NOT '*') — the CDP client connects from this origin.
 # debugging-address pinned to loopback so the port is never reachable off-host.
-"$CHROME" \
-  --remote-debugging-port="$PORT" \
-  --remote-debugging-address=127.0.0.1 \
-  --remote-allow-origins="http://127.0.0.1:$PORT" \
-  --user-data-dir="$PROFILE" \
-  --no-first-run --no-default-browser-check \
-  "$PROJECT_URL" >>"$CHROME_LOG" 2>&1 &
-CHROME_PID=$!
+#
+# The three --disable-*backgrounding/throttling flags target the failure that ends consults: this
+# browser runs unattended and unfocused for 25 minutes at a stretch, and the observed breakage is
+# that a LONG-RUNNING Chrome keeps serving its existing tabs while every NEWLY created one stops
+# answering Runtime.enable — i.e. new renderers never come up. Two candidate causes were tested and
+# REFUTED here: it is not tab accumulation (25 targets, new tabs still ready in 0.00s) and not
+# leaked DevTools websockets (60 open, same). What fits the remaining evidence is the OS throttling
+# an unfocused background app's renderer startup, which is exactly what these flags disable. They
+# are the standard automation flags and change nothing about what the browser is allowed to reach.
+# The root cause is NOT proven; the daemon's restart-on-attach-failure remains the real safety net.
+# Start Chrome in its OWN SESSION (setsid via start_new_session), not as a child in this process
+# group. When the daemon launches Chrome, Chrome inherits the launchd job's process group at fork
+# time — re-parenting to init later does not change that — so `launchctl kickstart -k`, which kills
+# the job by group, takes the browser with it. That is why restarting the daemon kept killing
+# Chrome, and why "the debug Chrome closed" kept becoming a human errand. A new session makes the
+# browser outlive every daemon restart.
+CHROME_PID=$(python3 - "$CHROME" "$PORT" "$PROFILE" "$PROJECT_URL" "$CHROME_LOG" <<'PY'
+import subprocess, sys
+chrome, port, profile, url, logf = sys.argv[1:6]
+f = open(logf, "ab")
+p = subprocess.Popen(
+    [chrome, f"--remote-debugging-port={port}", "--remote-debugging-address=127.0.0.1",
+     f"--remote-allow-origins=http://127.0.0.1:{port}", f"--user-data-dir={profile}",
+     "--no-first-run", "--no-default-browser-check",
+     "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
+     "--disable-background-timer-throttling", url],
+    stdout=f, stderr=f, start_new_session=True)
+print(p.pid)
+PY
+)
 
 # A warm profile on an idle Mac exposes the port in ~2s, but this also runs from a launchd agent
 # whose I/O is deprioritized, so allow 40s before calling it dead. Waiting is free; a false
