@@ -816,6 +816,74 @@ _CODE_URL_RE = re.compile(
     re.IGNORECASE)
 
 
+# ChatGPT has shipped two turn schemas. Keep them as SEPARATE adapters rather than unioning the
+# selectors: when both attributes are present at different levels of the DOM, one union query
+# double-counts wrapper and content nodes and interleaves their order. Pick the family whose USER
+# turns contain this request's rid, then read the page through that family alone.
+_ADAPTERS = (
+    ("data-turn-v1", '[data-turn="user"]', '[data-turn="assistant"]'),
+    ("legacy-author-role-v1", '[data-message-author-role="user"]', '[data-message-author-role="assistant"]'),
+)
+
+# How long after the click the request's own user turn must appear, and how long after that some
+# sign of generation must appear. These are failure DETECTORS, not deadlines — they never extend or
+# replace STUCK_AFTER_S. Their whole purpose is to turn a DOM-contract break into a named failure in
+# under a minute instead of a full silent hour, which is exactly what cost two complete consults.
+_RID_LANDED_S = 10
+_GENERATION_SIGNAL_S = 45
+
+
+def _contract_js(rid):
+    """Report, per adapter family: does a USER turn carry this rid, and is the assistant side alive?
+
+    Counting user turns (what this used to do) only proves the page grew a message. It cannot tell
+    'my prompt was sent' from 'something else appeared', and it says nothing about whether we can
+    still READ the reply — the failure that burned two 25-minute rounds."""
+    tag = json.dumps(f"BEGIN_RESPONSE:{rid}")
+    fams = json.dumps([{"name": n, "u": u, "a": a} for n, u, a in _ADAPTERS])
+    return ("(function(){var TAG=%s,F=%s,out=[];"
+            "for(var i=0;i<F.length;i++){"
+            "var us=document.querySelectorAll(F[i].u),as=document.querySelectorAll(F[i].a),hit=false;"
+            "for(var j=0;j<us.length;j++){if((us[j].textContent||'').indexOf(TAG)>=0){hit=true;break;}}"
+            "out.push({adapter:F[i].name,ridLanded:hit,users:us.length,assistants:as.length});}"
+            "var gen=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"]');"
+            "return JSON.stringify({families:out,generating:gen});})()" % (tag, fams))
+
+
+def _await_contract(c, rid):
+    """After the click, hold the send to a contract instead of hoping.
+
+    Returns (verdict, adapter, detail). Verdicts:
+      "ok"            a user turn carries this rid AND the assistant side is observable
+      "unknown_send"  no adapter can find the rid — this does NOT prove nothing was sent, so a
+                      human must look; auto-resending could duplicate a 25-minute consult
+      "selector_drift" the rid landed (so the send definitely happened) but no assistant turn or
+                      generating indicator is recognizable — the send worked and our READER is
+                      broken, which is a tool defect, not a missing answer
+    """
+    adapter, detail = None, {}
+    end = time.time() + _RID_LANDED_S
+    while time.time() < end:
+        time.sleep(0.5)
+        detail = json.loads(c.eval(_contract_js(rid)) or "{}")
+        for fam in detail.get("families", []):
+            if fam.get("ridLanded"):
+                adapter = fam["adapter"]
+                break
+        if adapter:
+            break
+    if not adapter:
+        return "unknown_send", None, detail
+    end = time.time() + _GENERATION_SIGNAL_S
+    while time.time() < end:
+        detail = json.loads(c.eval(_contract_js(rid)) or "{}")
+        fam = next((f for f in detail.get("families", []) if f["adapter"] == adapter), {})
+        if fam.get("assistants", 0) > 0 or detail.get("generating"):
+            return "ok", adapter, detail
+        time.sleep(1.0)
+    return "selector_drift", adapter, detail
+
+
 def _read_prompt(path):
     """Read the prompt to send. `-` means stdin, which is how the daemon hands over the EXACT bytes
     its egress gate validated.
@@ -926,13 +994,30 @@ def cmd_submit(a) -> int:
         # the thread if THIS send's composer insert/click silently failed — so require the
         # count to have grown past before_user_count there. A fresh tab always starts at 0,
         # so ">0" and "> before_user_count" are equivalent and new-tab behavior is unchanged.
-        n = 0
-        for _ in range(10):
-            time.sleep(0.5)
-            n = c.eval("document.querySelectorAll(" + _JS_U + ").length")
-            if n and n > before_user_count:
-                break
-        ok = bool(n and n > before_user_count)
+        verdict, adapter, contract = _await_contract(c, a.rid)
+        if verdict == "unknown_send":
+            c.close()
+            print(json.dumps({"ok": False, "submitted": None, "rid": a.rid,
+                              "reason": "unknown_send", "contract": contract}))
+            sys.stderr.write(
+                "CGC_ERROR unknown_send: clicked send, but no known turn schema shows a user turn "
+                f"carrying BEGIN_RESPONSE:{a.rid} within {_RID_LANDED_S}s. This does NOT prove the "
+                "prompt was not sent, so it will NOT be resent automatically — a duplicate would "
+                "cost another full round. A human should look at the ChatGPT window.\n"
+                f"observed: {json.dumps(contract)}\n")
+            return 3
+        if verdict == "selector_drift":
+            c.close()
+            print(json.dumps({"ok": False, "submitted": True, "rid": a.rid,
+                              "reason": "selector_drift", "adapter": adapter, "contract": contract}))
+            sys.stderr.write(
+                f"CGC_ERROR selector_drift: the prompt WAS sent (its rid is in a {adapter} user "
+                f"turn), but no assistant turn or generating indicator is recognizable within "
+                f"{_GENERATION_SIGNAL_S}s. ChatGPT's DOM has moved and this tool can no longer read "
+                "replies — a tool defect, not a missing answer. Do not resend; fix the adapter.\n"
+                f"observed: {json.dumps(contract)}\n")
+            return 1
+        n, ok = 1, True
         # The URL transitions /project -> /c/<id> a beat after the message sends; poll for it.
         # SUBMIT-RACE: a submit that reports ok=true with no captured conversation id is worse
         # than a clean failure — a later `wait`/`followup --conversation auto` would resolve to
@@ -961,21 +1046,18 @@ def cmd_submit(a) -> int:
                 "the tab's URL shows a /c/<id>.\n")
             return 2
         _write_state(conversation=conv, rid=a.rid)  # so `followup`/`wait` can auto-resolve
-        print(json.dumps({"ok": ok, "userMsgs": n, "model": model_now,
+        print(json.dumps({"ok": ok, "userMsgs": n, "model": model_now, "adapter": adapter,
                           "modelConfirmed": model_confirmed, "conversation_id": conv}))
         out = os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
-        # Hand the agent the EXACT bounded waiter to run (run_in_background:true). `timeout 899` is
-        # REQUIRED (the goal-guard denies an unbounded/over-cap bg waiter) and clears the inner
-        # --timeout 870 by ~29s so the salvage grab runs first. nohup makes an UNTRACKED process
-        # that never wakes you. On this DIRECT path a 25-min consult outlives one agent wait — re-run
-        # `wait` (it re-attaches via --conversation) instead of trusting a mid-stream salvage.
+        # Hand the agent the exact waiter to run (run_in_background:true). It holds the whole
+        # consult itself — no wrapper, no slicing. The 899/870 pair this used to print existed for
+        # a 900s background-task cap that was measured not to exist.
         sys.stderr.write(
             "CGC_SUBMITTED. Now run the detached waiter (run_in_background:true) — copy verbatim:\n"
-            f"  timeout 899 python3 {os.path.abspath(__file__)} wait --rid {a.rid} "
-            f"--conversation {conv} --out {out} --poll 20 --timeout 870\n"
-            "MANDATORY: keep the `timeout 899` prefix. If the goal-guard fires, ADD/KEEP `timeout 899` "
-            "(option a) — NEVER use `nohup … & disown` (option c): an untracked process's exit does "
-            "NOT wake you, so the answer lands silently and you wait forever.\n")
+            f"  python3 {os.path.abspath(__file__)} wait --rid {a.rid} "
+            f"--conversation {conv} --out {out}\n"
+            "NEVER `nohup … & disown`: an untracked process's exit does NOT wake you, so the "
+            "answer lands silently and you wait forever.\n")
         return 0
     finally:
         c.close()
@@ -1222,8 +1304,8 @@ def cmd_followup(a) -> int:
         return cmd_wait(a)
     sys.stderr.write(
         "CGC_FOLLOWUP sent. Run the detached waiter (run_in_background:true) — conv+rid pre-filled:\n"
-        f"  timeout 899 python3 {os.path.abspath(__file__)} wait --rid {rid or 'auto'} "
-        f"--conversation {conv} --out {default_out} --poll 20 --timeout 870\n"
+        f"  python3 {os.path.abspath(__file__)} wait --rid {rid or 'auto'} "
+        f"--conversation {conv} --out {default_out}\n"
         "(Or skip this: pass --watch --out <file> to followup so send+wait is ONE backgrounded command.)\n")
     return 0
 
@@ -1318,9 +1400,9 @@ def cmd_wait(a) -> int:
                     "that opens a new conversation and loses ChatGPT's context, and do NOT arm a bare "
                     "`until [ -s file ]` watcher — nothing writes that file). It's ONE backgrounded "
                     "command that sends AND waits (its exit is the wake — no separate step to forget):\n"
-                    f"  timeout 899 python3 {os.path.abspath(__file__)} followup "
+                    f"  python3 {os.path.abspath(__file__)} followup "
                     "--task \"<local results + next question>\" --title \"<what's new>\" "
-                    f"--watch --out {os.path.join(CGC_STATE_DIR, 'answer_<r2>.txt')} --timeout 870\n"
+                    f"--watch --out {os.path.join(CGC_STATE_DIR, 'answer_<r2>.txt')}\n"
                     "  (run_in_background:true; --conversation defaults to this thread; read --out on wake.)\n"
                     "Do this each time local verification raises a question/disagreement; when the user "
                     "says 'follow up till it flags nothing', loop until the answer is clean.\n")
@@ -1491,7 +1573,7 @@ def main() -> int:
     fu.add_argument("--poll", type=int, default=20, help="(--watch) seconds between DOM checks")
     fu.add_argument("--timeout", type=int, default=STUCK_AFTER_S,
                     help="(--watch) seconds to wait for the answer (default 1500 = 25 min, how long "
-                         "a GPT-5.6 Pro round reasons). The agent must pass 870 — Claude Code kills "
+                         "the point past which the job is stuck rather than slow)."
                          "its background tasks at 900s.")
     fu.add_argument("--settle-seconds", type=int, default=300, help="(--watch) unwrapped-answer settle window")
     fu.add_argument("--min-unwrapped", type=int, default=1500, help="(--watch) min chars to accept an unwrapped answer")
@@ -1508,7 +1590,7 @@ def main() -> int:
     w.add_argument("--poll", type=int, default=20, help="seconds between DOM checks")
     w.add_argument("--timeout", type=int, default=STUCK_AFTER_S,
                    help="seconds to wait for the answer (default 1500 = 25 min, how long a GPT-5.6 "
-                        "Pro round reasons). The agent must pass 870 — Claude Code kills its "
+                        "the point past which the job is stuck rather than slow)."
                         "background tasks at 900s.")
     w.add_argument("--keep-tab", action="store_true",
                    help="do not close the consult's tab after retrieving (default: close it, so "
