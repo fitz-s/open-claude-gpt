@@ -412,7 +412,7 @@ def test_health_check_is_the_real_capability_not_a_ping(daemon):
     assert "Target.closeTarget" in src, "the probe must not leak the tab it opens"
 
 
-def test_health_probe_keeps_the_last_tab():
+def test_health_probe_keeps_the_last_tab(daemon):
     """A browser with zero pages has nothing for the login probe to evaluate on, so the gate
     degrades to 'login unverified' and the login check fails OPEN. Observed exactly that."""
     import inspect
