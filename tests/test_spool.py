@@ -402,3 +402,64 @@ def test_await_reports_a_dead_daemon_as_broken_not_as_still_running(spool, tmp_p
     monkeypatch.setattr(spool, "daemon_alive", lambda: False)
     monkeypatch.setattr(spool, "DAEMON_GRACE_S", 0)
     assert spool.cmd_await(_await_args(rid, str(tmp_path / "b.txt"), timeout=3)) == 1
+
+# ---- private repos: a user-declared allowlist, never a blanket off switch ----
+#
+# A ChatGPT GitHub connector can read repos the account has access to, private included, so
+# "ChatGPT cannot open a private link" is no longer true once one is configured. That kills the
+# CAPABILITY argument for public-only but not the SAFETY one: this gate is what mitigates a
+# prompt-injected agent exfiltrating private data. A boolean would let an injected agent name any
+# private repo the connector reaches; naming them keeps the decision with the human.
+
+_PRIV = "review https://github.com/acme/secret-thing/tree/main"
+
+
+def test_private_repo_is_still_refused_by_default(spool, monkeypatch):
+    monkeypatch.delenv("CGC_GATE_PRIVATE_REPOS", raising=False)
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (False, "visibility=private"))
+    ok, why = spool.validate_prompt(_PRIV)
+    assert ok is False and "not confirmed PUBLIC" in why
+
+
+def test_an_allowlisted_private_repo_passes(spool, monkeypatch):
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", "acme/secret-thing")
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (False, "visibility=private"))
+    ok, why = spool.validate_prompt(_PRIV)
+    assert ok, why
+
+
+def test_allowlisting_one_repo_does_not_allow_another(spool, monkeypatch):
+    """The whole point of naming them: an injected agent cannot reach a repo the human did not."""
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", "acme/something-else")
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (False, "visibility=private"))
+    ok, why = spool.validate_prompt(_PRIV)
+    assert ok is False and "not confirmed PUBLIC" in why
+
+
+def test_allowlist_is_case_insensitive(spool, monkeypatch):
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", "ACME/Secret-Thing")
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (False, "visibility=private"))
+    assert spool.validate_prompt(_PRIV)[0]
+
+
+def test_star_restores_the_boolean_behaviour(spool, monkeypatch):
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", "*")
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (False, "visibility=private"))
+    assert spool.validate_prompt(_PRIV)[0]
+
+
+def test_allowlisted_but_unresolvable_repo_is_still_refused(spool, monkeypatch):
+    """An allowlist entry says 'this repo of mine may go', not 'skip the check'. If gh cannot even
+    confirm the repo exists, nothing is known and nothing is sent."""
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", "acme/secret-thing")
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (False, "unverified: gh timed out"))
+    ok, why = spool.validate_prompt(_PRIV)
+    assert ok is False and why.startswith("unverified:")
+
+
+def test_allowlist_never_exempts_secrets(spool, monkeypatch):
+    """Allowing a repo says nothing about credentials in the prose around it."""
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", "*")
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (False, "visibility=private"))
+    ok, why = spool.validate_prompt(_PRIV + "\nAKIAABCDEFGHIJKLMNOP\n")
+    assert ok is False and "AWS access key id" in why
