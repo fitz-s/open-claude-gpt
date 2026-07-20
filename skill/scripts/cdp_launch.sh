@@ -123,15 +123,11 @@ mkdir -p "$(dirname "$CHROME_LOG")"
 # allow-origins scoped to loopback (NOT '*') — the CDP client connects from this origin.
 # debugging-address pinned to loopback so the port is never reachable off-host.
 #
-# The three --disable-*backgrounding/throttling flags target the failure that ends consults: this
-# browser runs unattended and unfocused for 25 minutes at a stretch, and the observed breakage is
-# that a LONG-RUNNING Chrome keeps serving its existing tabs while every NEWLY created one stops
-# answering Runtime.enable — i.e. new renderers never come up. Two candidate causes were tested and
-# REFUTED here: it is not tab accumulation (25 targets, new tabs still ready in 0.00s) and not
-# leaked DevTools websockets (60 open, same). What fits the remaining evidence is the OS throttling
-# an unfocused background app's renderer startup, which is exactly what these flags disable. They
-# are the standard automation flags and change nothing about what the browser is allowed to reach.
-# The root cause is NOT proven; the daemon's restart-on-attach-failure remains the real safety net.
+# The --disable-*backgrounding/throttling flags suit a browser that runs unattended and unfocused
+# for 25 minutes at a stretch. They are NOT the fix for the "new tabs never answer Runtime.enable"
+# failure that used to end every consult — that was an http_proxy with no 127.0.0.1 exemption
+# hijacking the loopback CDP calls (see cdp_consult.py's proxy-free opener and
+# docs/TROUBLESHOOTING.md).
 # Start Chrome in its OWN SESSION (setsid via start_new_session), not as a child in this process
 # group. When the daemon launches Chrome, Chrome inherits the launchd job's process group at fork
 # time — re-parenting to init later does not change that — so `launchctl kickstart -k`, which kills
