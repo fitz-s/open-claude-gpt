@@ -43,6 +43,7 @@ Any of these can be set in the environment (they win over the config file), in a
 | `CGC_STATE_DIR` | `/tmp/cgc` | **Tool-owned scratch** for prompt/refs/answer files — safe to `rm -rf` at any time. Not a durable store: don't rely on files here surviving a reboot or cleanup. If you want to keep an answer, copy it (or point `--out`) to a durable path like `./cgc_answers/`. |
 | `CGC_SPOOL_DIR` | `$CGC_STATE_DIR/spool` | Spool dir for the `enqueue`/`await`/`watch` daemon path (pending/processing/done job files + a daemon heartbeat). Tool-owned scratch, same rules as `CGC_STATE_DIR`. |
 | `CGC_GATE_ALLOW_GIST` | `0` | Let the daemon's egress gate accept gist links. Default off because a gist's visibility can't be cheaply proven public the way a repo can via `gh`; set to `1` if you intend to deliver via gist. |
+| `CGC_GATE_PRIVATE_REPOS` | *(empty)* | Comma-separated `owner/repo` list the gate may send **even though they are not public**, e.g. `acme/api,acme/infra`. Empty (the default) means public-only. `*` allows any repo your `gh` can resolve. Only set this if your ChatGPT account has a **GitHub connector** authorized — otherwise ChatGPT cannot open the link and answers blind. See "Private repos" below. |
 | `CLAUDE_SKILLS_DIR` | `~/.claude/skills` | Where `install.sh` puts the skill. |
 
 Any variable can also be overridden per-invocation with a flag, e.g. `--port`,
@@ -68,6 +69,31 @@ CGC_AUTO_MODEL=0                             # off: send on whatever is shown
 Off is equivalent to `--model skip`. The per-consult `--model` flag overrides both
 for a single call. Turn it off if you don't have a Pro plan and don't want the
 fail-closed guard, or if you manage the model manually in the ChatGPT UI.
+
+### Private repos (only with a ChatGPT GitHub connector)
+
+By default the gate sends links only to gh-confirmed **public** repos. Two separate reasons sat
+behind that, and a GitHub connector removes exactly one of them:
+
+- **Capability** — without a connector ChatGPT simply cannot open a private link, so the consult
+  answers blind. A connector removes this.
+- **Safety** — this gate is the mitigation for a *prompt-injected* agent exfiltrating private data.
+  A connector does not remove this; if anything it raises the stakes, because the connector can
+  reach every repo your account can.
+
+So private repos are enabled by **naming them**, not by a switch:
+
+```bash
+cgc set-project ...                                   # unrelated, shown for shape
+export CGC_GATE_PRIVATE_REPOS="acme/api,acme/infra"   # these two may be sent
+export CGC_GATE_PRIVATE_REPOS="*"                     # anything gh can resolve — deliberate, broad
+```
+
+An allowlist bounds the blast radius to repos you chose. A boolean would let an injected prompt
+name any private repo the connector can reach, which is the exact failure this gate exists to
+prevent. Everything else still applies to an allowlisted repo: the secret scan runs, and a repo
+`gh` cannot resolve at all is still refused, because an allowlist entry means "this repo of mine
+may go", not "skip the check".
 
 ### Finding your ChatGPT project URL
 

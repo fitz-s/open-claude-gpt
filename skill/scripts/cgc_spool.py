@@ -298,6 +298,20 @@ _GH_TIMEOUT_S = 25
 _GH_ATTEMPTS = 2
 
 
+def _private_allowlist() -> set:
+    """Repos the USER has declared may be sent even though they are not public.
+
+    A ChatGPT GitHub connector can read repos the account has access to, public or private, so
+    "ChatGPT cannot open a private link" stops being true once one is configured. That removes the
+    CAPABILITY argument for public-only, but not the SAFETY one: this gate is the mitigation for a
+    prompt-injected agent exfiltrating private data, and a plain on/off switch would let an injected
+    agent name ANY private repo the connector can reach. An allowlist keeps the decision with the
+    human and bounds the blast radius to repos they actually named. `*` restores the boolean
+    behaviour for anyone who wants it, deliberately and in one obvious place."""
+    raw = os.environ.get("CGC_GATE_PRIVATE_REPOS", "").strip()
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+
 def _repo_is_public(slug: str) -> tuple:
     """Ask gh whether owner/repo is public. Returns (public: bool, detail: str).
 
@@ -373,8 +387,16 @@ def validate_prompt(prompt_text: str) -> tuple:
         if owner.lower() in ("orgs", "sponsors", "settings", "features"):  # not repo paths
             continue
         slugs.add(f"{owner}/{repo}")
+    allowed = _private_allowlist()
     for slug in sorted(slugs):
         ok, detail = _repo_is_public(slug)
+        if not ok and ("*" in allowed or slug.lower() in allowed):
+            # Declared sendable by the user. Still fail closed on a repo gh could not resolve AT
+            # ALL — an allowlist entry says "this repo of mine may go", not "skip the check".
+            if detail.startswith("unverified:"):
+                return False, (f"unverified: {slug} is allowlisted, but gh could not confirm it "
+                               f"exists ({detail.split(':', 1)[1].strip()}). Re-enqueue to retry.")
+            continue
         if not ok:
             if detail.startswith("unverified:"):
                 return False, (f"unverified: could not check whether repo {slug} is public "
