@@ -28,6 +28,13 @@ Prereqs (once per machine): `pip install websocket-client`; `gh auth status` OK;
 
 This is enforced, not promised: `tests/test_security.py` runs the whole `deliver → prep → enqueue` chain with `gh` removed from `PATH` entirely and requires it to succeed. If a future change reintroduces a network call on your side, that test fails instead of the classifier denying you mid-consult. **`deliver` therefore does NOT verify repo visibility itself** — it stamps the refs "TO BE VERIFIED AT THE EGRESS GATE" and the daemon does the authoritative `gh` check before anything is sent, failing closed on a private or unverifiable repo exactly as before. Nothing is weakened; the check simply happens where it is authoritative. (Driving it by hand? `cgc deliver` passes `--verify` and checks up front.)
 
+**If the classifier denies you, never try to get around it.** Not with a different command shape, not with a wrapper or a pipe, not by re-running it "more quietly", and never by asking the user to enable bypass mode. Two reasons, and the second is the expensive one:
+
+1. A denial on one of these commands means the tool is wrong, not the classifier. Every command in this Quickstart is local-only and provably so (`tests/test_security.py` runs the whole chain with `gh` deleted from `PATH`). If one is denied, something reintroduced an external call — that is a bug to report, not an obstacle to route around.
+2. **Attempting a bypass appears to poison the whole session.** Observed: a session whose agent tried bypass-flavoured commands then had even `cgc_spool.py enqueue` denied — a pure local file write that succeeds normally in a clean session, with the same rid and the same prompt file. (Mechanism unverified — the classifier's internals are not visible from here — but the correlation was clear and the cost was a dead session.)
+
+So: relay the denied command verbatim to the user, say which step it was, and stop. If a session is already refusing local commands, a fresh session is the remedy — nothing you type will win that argument.
+
 **The daemon is always up — do not check it.** The user installs it once with `cgc install-daemon` (a launchd agent: starts at login, respawns if it dies), and it opens the debug Chrome itself when it needs to. So there is no preflight: **never run `cgc queue`/`doctor` "to make sure" before a consult** — that costs tokens on every round and tells you nothing you'd act on. Just `enqueue`. In the rare case it is genuinely down, `enqueue`/`await` say so in one line (exit 2) — relay `cgc install-daemon` to the user and move on. You never start it yourself.
 
 ```bash

@@ -363,9 +363,34 @@ class CDP:
                 target = pages[0]
         self.target_id = target.get("id")
         self.target_url = target.get("url", "")
-        self.ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=timeout)
-        self.call("Runtime.enable")
-        self.call("Page.enable")
+        # Attaching can time out transiently — a tab that is mid-navigation, or a Chrome busy
+        # rendering a long conversation, simply does not answer within the window. That is a retry,
+        # not a failure. Letting it escape produced a 30-line websocket traceback in the job log,
+        # which tells the caller nothing it can act on and looks like a crash rather than a blip.
+        last = None
+        for attempt in range(3):
+            try:
+                self.ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=timeout)
+                self.call("Runtime.enable")
+                self.call("Page.enable")
+                break
+            except Exception as e:
+                last = e
+                try:
+                    if getattr(self, "ws", None):
+                        self.ws.close()
+                except Exception:
+                    pass
+                self.ws = None
+                if attempt < 2:
+                    time.sleep(2.0)
+        else:
+            raise SystemExit(
+                f"CGC_ERROR cdp_attach_failed: could not attach to the debug Chrome on port "
+                f"{port} after 3 tries ({type(last).__name__}: {last}). Chrome is reachable or this "
+                f"would have failed earlier, so this is usually a tab that was mid-navigation or a "
+                f"browser busy with a long conversation. Nothing was sent; re-enqueue to retry. If "
+                f"it repeats, the user can restart the debug Chrome.")
 
     def conversation_id(self):
         """The /c/<id> conversation id of the attached tab, or '' if not in a conversation yet.
