@@ -71,6 +71,12 @@ import time
 import urllib.parse
 import urllib.request
 
+# Every urllib target in this script is the loopback CDP endpoint (127.0.0.1:<debug-port>).
+# Loopback must never traverse an HTTP proxy: with http_proxy set (e.g. a local LLM router),
+# urlopen would route /json to the proxy and get its HTML back, so json.load fails and the
+# debug Chrome looks dead. Force a proxy-free global opener for all urlopen calls here.
+urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
+
 try:
     import fcntl  # advisory file locking (POSIX only) — degrade gracefully if unavailable
 except ImportError:

@@ -39,6 +39,12 @@ import sys
 import time
 import urllib.request
 
+# All urllib targets here are the loopback CDP endpoint (127.0.0.1:CGC_PORT). Loopback must never
+# go through an HTTP proxy: with http_proxy set, urlopen routes /json to the proxy and gets its
+# HTML, so the health check (_new_tab_healthy) fails and the daemon restarts a perfectly healthy
+# Chrome in a loop. Force a proxy-free global opener for every urlopen call.
+urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
+
 try:
     import websocket
 except ImportError:  # only the sweep needs it; never break the daemon over a missing extra
@@ -144,10 +150,16 @@ def _new_tab_healthy(port=None) -> bool:
     except Exception:
         return False
     finally:
+        # Close the probe tab — unless it is the only one left. A browser with zero pages has
+        # nothing for the login probe to evaluate on, so `cdp_launch --gate` degrades to
+        # "CGC_READY (login unverified)" and the login check quietly fails OPEN.
         try:
             if bw and tid:
-                bw.send(json.dumps({"id": 3, "method": "Target.closeTarget",
-                                    "params": {"targetId": tid}}))
+                others = [t for t in json.load(urllib.request.urlopen(f"{base}/json", timeout=5))
+                          if t.get("type") == "page" and t.get("id") != tid]
+                if others:
+                    bw.send(json.dumps({"id": 3, "method": "Target.closeTarget",
+                                        "params": {"targetId": tid}}))
             if bw:
                 bw.close()
         except Exception:
