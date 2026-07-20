@@ -200,3 +200,27 @@ with that public PR link — carrying diff + intent + discussion + CI. A pushed
 commit that has a PR never falls back to a gist. Tree/blob links are pinned to a
 resolved SHA so a link stays immutable even if the branch moves during a long
 consult.
+
+
+## The agent side makes no network call — and that is tested
+
+The auto-mode data-exfiltration classifier sits above the permission system and denies any agent
+Bash call that reaches an external host. The architecture's answer is not to ask users to turn that
+classifier off — a safe, installed skill must work under the default safety posture — but to make
+the claim true: every command the agent runs (`deliver`, `prep`, `enqueue`, `await`) is local-only.
+
+`deliver` was the exception nobody noticed. It shelled out to `gh` to check repo visibility, resolve
+a ref, list PR files, and find a commit's PR — four calls to github.com from the agent's own process
+— so the classifier correctly denied it. None of that was needed to BUILD the links: the slug comes
+from `git remote`, and SHAs, merge-bases and compare ranges come from local git. `gh` only
+pre-verified and enriched, and the security-critical half of that (is the repo public?) was already
+being re-checked authoritatively by the daemon's egress gate. So `deliver` now defers it:
+
+- `deliver` is **offline by default** and stamps refs "TO BE VERIFIED AT THE EGRESS GATE".
+- The daemon's gate runs `gh` on every repo slug in the rendered prompt and fails closed.
+- `--verify` opts back into the up-front check for humans driving `cgc deliver` by hand.
+
+Offline is the DEFAULT rather than a flag the agent must remember, so the invariant holds by
+construction. `tests/test_security.py` runs `deliver → prep → enqueue` with `gh` absent from `PATH`
+and requires success, so a regression fails a test instead of surfacing as a classifier denial in
+the middle of someone's consult.

@@ -132,7 +132,10 @@ PYEOF
     exec python3 "$S/cgc_spool.py" status ;;
   enqueue|await) exec python3 "$S/cgc_spool.py" "$cmd" "$@" ;;
   queue)    exec python3 "$S/cgc_spool.py" status "$@" ;;
-  deliver|prep)          exec python3 "$S/consult.py" "$cmd" "$@" ;;
+  deliver)  # human-driven: allowed to verify provenance over the network up front. The AGENT
+            # path calls consult.py directly and stays offline (see consult.py _GH_ALLOWED).
+            exec python3 "$S/consult.py" deliver --verify "$@" ;;
+  prep)     exec python3 "$S/consult.py" prep "$@" ;;
   submit|followup|wait|status)
             # cdp_consult.py takes --port BEFORE the subcommand; pass through as-is.
             exec python3 "$S/cdp_consult.py" "$cmd" "$@" ;;

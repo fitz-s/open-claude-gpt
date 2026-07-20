@@ -139,7 +139,22 @@ def _git(args, cwd):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
+# Whether this process may talk to github.com at all.
+#
+# `deliver` is run BY THE AGENT, and every `gh` call in it reaches out to github.com. That made the
+# architecture's central claim — the agent touches only local files, the daemon does everything
+# external — false in the one place nobody looked, and Claude Code's auto-mode classifier correctly
+# denied the command. The fix is not to ask users to disable a safety classifier; it is to stop
+# making the call. Nothing `gh` does here is required to BUILD the links: the slug, SHAs, merge-base
+# and compare ranges all come from local git. `gh` only pre-verifies and enriches — and the one
+# security-critical part of that, "is this repo really public?", is re-checked authoritatively by
+# the daemon's egress gate before anything is sent. So the agent defers it instead of duplicating it.
+_GH_ALLOWED = False
+
+
 def _gh(args, cwd):
+    if not _GH_ALLOWED:
+        return None, "offline: deliver makes no network calls; the egress gate verifies provenance"
     try:
         r = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=20, cwd=cwd)
     except Exception:
@@ -228,6 +243,8 @@ def _render_groups(groups):
 
 
 def cmd_deliver(a: argparse.Namespace) -> int:
+    global _GH_ALLOWED
+    _GH_ALLOWED = bool(getattr(a, "verify", False))
     """Build purpose-grouped, ChatGPT-browsable GitHub refs. AGENT-DRIVEN.
 
     The AGENT decides what the task needs and passes it explicitly — different repo
@@ -248,7 +265,9 @@ def cmd_deliver(a: argparse.Namespace) -> int:
     slug = a.repo or (_github_slug(_git(["remote", "get-url", "origin"], root)) if root else None)
     if not slug:
         out.update(mode="manual", needs_gist=True,
-                   note="no repo slug — pass --repo owner/repo, or deliver via gist/upload")
+                   note=("no repo slug — pass --repo owner/repo. A gist fallback needs a network "
+                         "write, which this command deliberately cannot do; the gate refuses gist "
+                         "links by default anyway (CGC_GATE_ALLOW_GIST)."))
         print(json.dumps(out, ensure_ascii=False, indent=2)); return 0
     out["slug"] = slug
     base = "https://github.com/" + slug
@@ -430,6 +449,21 @@ def cmd_deliver(a: argparse.Namespace) -> int:
         print(json.dumps(out, ensure_ascii=False, indent=2)); return 0
 
     body = _render_groups(groups)
+    if not _GH_ALLOWED:
+        # Provenance is DEFERRED, not skipped. The daemon's gate re-checks every repo slug in the
+        # rendered prompt with `gh` and fails closed, so a private repo still cannot be sent — the
+        # check simply happens at the egress point, where it is authoritative, instead of here,
+        # where it is advisory and costs the agent an external call it is not allowed to make.
+        out["public_ok"] = None
+        out["visibility"] = "deferred"
+        body = ("> Source visibility: TO BE VERIFIED AT THE EGRESS GATE — these links are not sent "
+                "until the consult daemon confirms every repo is public.\n\n") + body
+        refs_file = str(pathlib.Path(CGC_STATE_DIR) / f"refs_{time.strftime('%Y%m%d-%H%M%S')}.md")
+        pathlib.Path(CGC_STATE_DIR).mkdir(parents=True, exist_ok=True)
+        pathlib.Path(refs_file).write_text(body, encoding="utf-8")
+        out["refs_file"] = refs_file
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
     is_public = visibility == "public"
     # Fail-closed: only a CONFIRMED public repo gets the PUBLIC stamp. Anything else —
     # PRIVATE, or visibility UNKNOWN because `gh` is missing/unauthenticated/errored —
@@ -754,6 +788,11 @@ def main() -> int:
     pd.add_argument("--files", nargs="*", help="repo-relative paths for close-reading blob links (need --ref for a non-local repo)")
     pd.add_argument("--issues", nargs="*", help="issue numbers to add to intent refs")
     pd.add_argument("--base", help="base ref for AUTO compare (default: merge-base with origin HEAD)")
+    pd.add_argument("--verify", action="store_true",
+                    help="check repo visibility and enrich via `gh` (NETWORK). Off by default: the "
+                         "agent must make no external call, and the daemon's egress gate re-checks "
+                         "provenance authoritatively before anything is sent. Use it when driving "
+                         "deliver by hand.")
     pd.add_argument("--allow-nonpublic", action="store_true",
                     help="explicitly allow delivering refs when the repo is PRIVATE or visibility "
                          "could not be confirmed (gh missing/unauthenticated/errored). Without this, "
