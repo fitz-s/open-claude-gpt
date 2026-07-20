@@ -6,6 +6,15 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Added
+- **`consult.py fire` — deliver + prep + enqueue in one call.** The agent makes no decision between
+  those three stages: deliver's `refs_file` feeds prep, prep's rid and prompt file feed enqueue.
+  Splitting them across three Bash calls made the model copy implementation paths from one JSON blob
+  to the next — pure token cost, plus a chance to relay the wrong rid — so a consult now costs two
+  agent round-trips instead of four. The individual verbs remain for debugging and for editing the
+  refs or the prompt in between. `deliver` and `prep` return their state (main prints it) so the
+  fusion composes tested functions in-process rather than re-implementing them.
+
 ### Changed
 - **One deadline replaces three timeouts, and two of the three were never timeouts.**
   `CONSULT_TIMEOUT_S = 1500` was an *expectation* — how long a GPT-5.6 Pro round reasons.

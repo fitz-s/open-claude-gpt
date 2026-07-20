@@ -268,7 +268,7 @@ def cmd_deliver(a: argparse.Namespace) -> int:
                    note=("no repo slug — pass --repo owner/repo. A gist fallback needs a network "
                          "write, which this command deliberately cannot do; the gate refuses gist "
                          "links by default anyway (CGC_GATE_ALLOW_GIST)."))
-        print(json.dumps(out, ensure_ascii=False, indent=2)); return 0
+        return out
     out["slug"] = slug
     base = "https://github.com/" + slug
     # Repo visibility — the consult sends a LINK to an external model, so the delivered payload
@@ -431,11 +431,11 @@ def cmd_deliver(a: argparse.Namespace) -> int:
                 out.update(mode="local", needs_gist=True,
                            note="HEAD not pushed AND no associated PR — push the branch then re-run, "
                                 "pass explicit --pr/--ref/--compare, or deliver local state via gist")
-                print(json.dumps(out, ensure_ascii=False, indent=2)); return 0
+                return out
 
     out["groups"] = {k: v for k, v in groups.items() if v}
     if not any(groups.values()):
-        print(json.dumps(out, ensure_ascii=False, indent=2)); return 0
+        return out
 
     # Fail-closed browsable-URL guarantee: a refs file that carries no actual
     # github.com / gist.github.com / raw.githubusercontent.com link is not a source
@@ -446,7 +446,7 @@ def cmd_deliver(a: argparse.Namespace) -> int:
             "NO BROWSABLE URL: none of the rendered refs are a github.com / gist.github.com / "
             "raw.githubusercontent.com link — refusing to emit a refs file. Push the code and pass "
             "--ref/--pr, or `gh gist create` and use the gist link.")
-        print(json.dumps(out, ensure_ascii=False, indent=2)); return 0
+        return out
 
     body = _render_groups(groups)
     if not _GH_ALLOWED:
@@ -462,8 +462,7 @@ def cmd_deliver(a: argparse.Namespace) -> int:
         pathlib.Path(CGC_STATE_DIR).mkdir(parents=True, exist_ok=True)
         pathlib.Path(refs_file).write_text(body, encoding="utf-8")
         out["refs_file"] = refs_file
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return 0
+        return out
     is_public = visibility == "public"
     # Fail-closed: only a CONFIRMED public repo gets the PUBLIC stamp. Anything else —
     # PRIVATE, or visibility UNKNOWN because `gh` is missing/unauthenticated/errored —
@@ -495,14 +494,13 @@ def cmd_deliver(a: argparse.Namespace) -> int:
                 "VISIBILITY UNKNOWN: could not confirm this repo is public (gh missing, unauthenticated, "
                 "or errored) — refusing to emit a refs file that would read as a public delivery. "
                 "Auth gh (gh auth login) and re-run, or pass --allow-nonpublic to explicitly override.")
-        print(json.dumps(out, ensure_ascii=False, indent=2)); return 0
+        return out
 
     pathlib.Path(CGC_STATE_DIR).mkdir(parents=True, exist_ok=True)
     refs_file = os.path.join(CGC_STATE_DIR, f"refs_{time.strftime('%Y%m%d-%H%M%S')}.md")
     pathlib.Path(refs_file).write_text(body, encoding="utf-8")
     out["refs_file"] = refs_file
-    print(json.dumps(out, ensure_ascii=False, indent=2))
-    return 0
+    return out
 
 
 def cmd_prep(a: argparse.Namespace) -> int:
@@ -719,19 +717,53 @@ def cmd_prep(a: argparse.Namespace) -> int:
             "repoll_seconds": repoll,
             "max_polls": max_polls,
         })
-    print(json.dumps(state, ensure_ascii=False, indent=2))
     if a.backend != "mcp" and prompt_file:
         sys.stderr.write(
             f"CGC_NEXT enqueue it (LOCAL write; the user's daemon validates + sends):\n"
             f"  python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cgc_spool.py')} "
             f"enqueue --rid {rid} --prompt-file {prompt_file}\n")
-    return 0
+    return state
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(prog="consult.py")
-    sub = p.add_subparsers(dest="cmd", required=True)
-    pp = sub.add_parser("prep")
+
+def cmd_fire(a: argparse.Namespace) -> int:
+    """deliver -> prep -> enqueue, in one process.
+
+    The agent makes no decision between those three stages: deliver's refs_file feeds prep, prep's
+    rid and prompt_file feed enqueue, and nothing in between is a judgement call. Splitting them
+    across three Bash calls made the model copy implementation paths from one JSON blob to the next
+    — pure cost, plus a chance to relay the wrong rid. The stages stay available on their own for
+    debugging and for anyone who wants to edit the refs or the prompt in between."""
+    import cgc_spool as spool
+
+    if not a.no_code:
+        d = cmd_deliver(a)
+        if not isinstance(d, dict) or not d.get("refs_file"):
+            note = (d or {}).get("note") or "deliver produced no refs"
+            sys.stderr.write(f"CGC_ERROR fire_no_refs: {note}\n")
+            return 2
+        a.refs_file = d["refs_file"]
+    else:
+        a.refs_file = None
+
+    st = cmd_prep(a)
+    if not isinstance(st, dict) or not st.get("prompt_file"):
+        return 2
+    rid, prompt_file = st["request_id"], st["prompt_file"]
+
+    eq = argparse.Namespace(
+        rid=rid, prompt_file=prompt_file, kind="submit",
+        project_url=a.project_url, conversation="auto", model=a.model,
+        out=a.out, poll=spool.POLL_S, timeout=spool.STUCK_AFTER_S, quiet=True)
+    if spool.cmd_enqueue(eq) != 0:
+        return 2
+    out = os.path.abspath(a.out or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt"))
+    return {"rid": rid, "out": out,
+            "await": f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cgc_spool.py')} "
+                     f"await --rid {rid} --out {out}"}
+
+
+def _add_prep_args(pp):
     pp.add_argument("--backend", choices=["cdp", "mcp"], default="cdp",
                     help="cdp (default): skip the DOM-window script (unused on CDP). "
                          "mcp: also render retrieval_window.js for the MCP fallback.")
@@ -772,10 +804,10 @@ def main() -> int:
                     help="expected Pro latency; first wake lands at ~85%% of it. Default 25 — a "
                          "GPT-5.6 Pro consult reasons for a long time (multi-angle, proof-style). "
                          "Raise it further (40+) for a genuinely huge review to cut wake count.")
-    pp.set_defaults(fn=cmd_prep)
+    return pp
 
-    pd = sub.add_parser("deliver", help="build purpose-grouped GitHub refs for ChatGPT to browse "
-                                        "(agent-driven; auto-detects only when no target is given)")
+
+def _add_deliver_args(pd):
     pd.add_argument("--repo-dir", default=".", help="path inside the local git repo (for auto-detect)")
     pd.add_argument("--repo", help="explicit target repo 'owner/repo' (different from the local origin)")
     pd.add_argument("--pr", help="explicit PR number → /pull/N + /pull/N/files")
@@ -800,10 +832,36 @@ def main() -> int:
                          "only ever stamp PUBLIC when gh confirms visibility=='public'. With this flag "
                          "set, the refs file is written with a 'NON-PUBLIC (explicitly allowed)' stamp "
                          "instead of the PUBLIC stamp.")
+    return pd
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="consult.py")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # `fire` is the normal path: one call instead of three, because the agent makes no decision
+    # between deliver, prep and enqueue. The individual verbs stay for debugging and for editing
+    # the refs or the prompt in between.
+    pf = sub.add_parser("fire", help="deliver + prep + enqueue in ONE call (the normal path)")
+    _add_deliver_args(pf)
+    _add_prep_args(pf)
+    pf.add_argument("--model", default=os.environ.get("CGC_MODEL", "Pro"))
+    pf.add_argument("--out", help="answer file (default $CGC_STATE_DIR/answer_<rid>.txt)")
+    pf.add_argument("--project-url", default=os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/"))
+    pf.set_defaults(fn=cmd_fire)
+
+    pp = _add_prep_args(sub.add_parser("prep"))
+    pp.set_defaults(fn=cmd_prep)
+    pd = _add_deliver_args(sub.add_parser(
+        "deliver", help="build purpose-grouped GitHub refs (agent-driven)"))
     pd.set_defaults(fn=cmd_deliver)
 
     a = p.parse_args()
-    return a.fn(a)
+    r = a.fn(a)
+    if isinstance(r, dict):
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return 0
+    return r
 
 
 if __name__ == "__main__":

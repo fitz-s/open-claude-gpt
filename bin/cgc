@@ -11,7 +11,8 @@
 #   cgc uninstall-daemon              remove that launchd agent and stop the daemon
 #   cgc watch   [--once]              run the egress daemon in the FOREGROUND (debugging / one-off)
 #   cgc up                            start the debug Chrome AND the daemon (detached) — ad-hoc setup
-#   cgc deliver <args…>               resolve GitHub links for a consult   (consult.py deliver)
+#   cgc fire    <args…>               deliver+prep+enqueue in ONE call — the normal path
+#   cgc deliver <args…>               resolve GitHub links only            (consult.py deliver)
 #   cgc prep    <args…>               render the consult prompt            (consult.py prep)
 #   cgc enqueue <args…>               queue a job for the daemon (LOCAL write) (cgc_spool.py enqueue)
 #   cgc await   <args…>               poll the local answer file for a queued job (cgc_spool.py await)
@@ -22,8 +23,8 @@
 #   cgc status  <args…>               one-shot progress JSON               (cdp_consult.py status)
 #
 # AUTO-MODE PATH (default under Claude Code's data-exfiltration classifier):
-#   deliver → prep → enqueue → await. The agent only touches LOCAL files; the user-started
-#   `cgc watch` daemon performs the external send after re-validating the code is public.
+#   fire → await. The agent only touches LOCAL files (fire makes no network call either);
+#   the user's launchd daemon performs the external send after re-validating the code is public.
 #   DIRECT PATH (submit/wait) talks to chatgpt.com from the agent's own Bash call, which the
 #   auto-mode classifier hard-denies — use it only in interactive mode or when driving by hand.
 #   cgc set-project <url>|--clear     persist which ChatGPT project consults open (all users)
@@ -136,6 +137,7 @@ PYEOF
             # path calls consult.py directly and stays offline (see consult.py _GH_ALLOWED).
             exec python3 "$S/consult.py" deliver --verify "$@" ;;
   prep)     exec python3 "$S/consult.py" prep "$@" ;;
+  fire)     exec python3 "$S/consult.py" fire "$@" ;;
   submit|followup|wait|status)
             # cdp_consult.py takes --port BEFORE the subcommand; pass through as-is.
             exec python3 "$S/cdp_consult.py" "$cmd" "$@" ;;
