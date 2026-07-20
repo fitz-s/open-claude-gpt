@@ -291,3 +291,37 @@ def test_the_gate_validated_bytes_are_what_get_sent(daemon, monkeypatch, tmp_pat
     assert send_cmd[send_cmd.index("--prompt-file") + 1] == "-", \
         "the child must be handed bytes on stdin, never a path it can reopen"
     assert str(pf) not in send_cmd, "the mutable prompt path must not reach the sender"
+
+
+def test_browser_repair_actually_triggers_on_an_attach_failure(daemon, monkeypatch, tmp_path):
+    """The detection must read the job LOG, not the returned stderr. stderr is redirected into that
+    log, so the returned string is only its last 240 chars — and the token sits at the START of a
+    long message, so an `in se` check silently never fired and the repair never ran."""
+    calls = []
+
+    def _fake_run(cmd, timeout, rid=None, stdin_text=None, env_extra=None):
+        calls.append((cmd, env_extra))
+        if cmd[0] == "bash":                       # the launcher restart
+            return 0, "", ""
+        if len([c for c in calls if c[0][0] != "bash"]) == 1:
+            # first submit: write the real failure into the log, return only a tail like _run does
+            with open(daemon.spool.log_path(rid), "a", encoding="utf-8") as f:
+                f.write("CGC_ERROR cdp_attach_failed: " + "x" * 500 + "\n")
+            return 1, "", "x" * 240
+        return 0, json.dumps({"conversation_id": "c1"}), ""
+
+    monkeypatch.setattr(daemon, "_run", _fake_run)
+    monkeypatch.setattr(daemon.spool, "validate_prompt", lambda t: (True, "ok"))
+    rid = "REQ-20260707-120000-00c001"
+    pf = tmp_path / "p.md"
+    pf.write_text("https://github.com/acme/widgets", encoding="utf-8")
+    path = daemon.spool.processing_path(rid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"rid": rid, "kind": "submit", "prompt_file": str(pf),
+                   "out": str(tmp_path / "a.txt")}, f)
+
+    daemon.run_worker(path)
+    restarts = [c for c in calls if c[0][0] == "bash"]
+    assert len(restarts) == 1, "a browser that cannot open a tab must be restarted, not re-tried"
+    assert restarts[0][1]["CGC_RESTART"] == "1"
