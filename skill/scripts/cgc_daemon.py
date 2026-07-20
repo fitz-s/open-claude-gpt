@@ -198,7 +198,10 @@ def run_worker(processing_file: str) -> int:
            "--project-url", job.get("project_url", "https://chatgpt.com/"),
            "--model", job.get("model", "Pro")]
     code, so, se = _run(cmd, 240, rid, stdin_text=prompt)
-    if code != 0 and "cdp_attach_failed" in (se or ""):
+    # Match against the LOG, not `se`. stderr is redirected into the job log, so `se` is only its
+    # last 240 chars — and this token sits at the START of a long message, so checking `se` silently
+    # never matched and the repair never ran.
+    if code != 0 and "cdp_attach_failed" in _tail_file(spool.log_path(rid), 4000):
         # The browser can still serve its existing tabs but cannot produce a working new one, and
         # every send needs a new one. Retrying the job changes nothing; replacing Chrome does.
         sys.stderr.write(f"CGC_DAEMON {rid}: debug Chrome cannot open a usable tab — restarting it\n")
