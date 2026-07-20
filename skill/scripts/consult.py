@@ -493,7 +493,13 @@ def cmd_prep(a: argparse.Namespace) -> int:
     # Per-consult scratch lives in $CGC_STATE_DIR (default /tmp/cgc) so it is easy to
     # clean (`rm -rf`) and does not flat-litter /tmp. Answers go wherever `wait --out` points.
     scratch = pathlib.Path(CGC_STATE_DIR)
+    # 0700: prompts are public by construction, but this directory also holds refs, embedded local
+    # context and (from the waiter) answers, under a world-traversable /tmp.
     scratch.mkdir(parents=True, exist_ok=True)
+    try:
+        scratch.chmod(0o700)
+    except OSError:
+        pass
 
     # The DOM-windowing script is ONLY used by the MCP fallback (Backend B). On the
     # default CDP backend it is dead weight — skip it (was creating a junk file/consult).

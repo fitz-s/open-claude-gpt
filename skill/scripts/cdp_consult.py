@@ -884,6 +884,24 @@ def _await_contract(c, rid):
     return "selector_drift", adapter, detail
 
 
+def _write_private(path, text):
+    """Write an answer/salvage file readable only by this user.
+
+    The PROMPT is public by construction — the egress gate enforces that. The ANSWER is not: a reply
+    can quote private context, and follow-up rounds carry local results outright. These land under a
+    world-traversable /tmp, so leaving them at the umask's mercy made confidentiality a property of
+    the host's configuration rather than of this tool."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def _read_prompt(path):
     """Read the prompt to send. `-` means stdin, which is how the daemon hands over the EXACT bytes
     its egress gate validated.
@@ -1383,8 +1401,7 @@ def cmd_wait(a) -> int:
                 return 3
             if st.get("done"):
                 ans = c.eval(_extract_js(rid)) or ""
-                with open(a.out, "w", encoding="utf-8") as f:
-                    f.write(ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
+                _write_private(a.out, ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
                 sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out}\n")
                 conv = conv or c.conversation_id()
                 _write_state(conversation=conv, status="answered")  # mark this job answered
@@ -1422,18 +1439,15 @@ def cmd_wait(a) -> int:
                 elif time.time() - settle_start >= a.settle_seconds:
                     ans = c.eval(_extract_js(rid)) or ""
                     if ans:
-                        with open(a.out, "w", encoding="utf-8") as f:
-                            f.write(ans)
+                        _write_private(a.out, ans)
                         sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out} (recovered at settle)\n")
                         if not a.keep_tab:
                             c.close_tab()
                         return 0
                     raw = c.eval(_last_assistant_js(rid)) or ""
                     if len(raw) >= a.min_unwrapped:
-                        with open(a.out, "w", encoding="utf-8") as f:
-                            f.write(raw)
-                        with open(a.out + ".raw", "w", encoding="utf-8") as f:
-                            f.write(raw)
+                        _write_private(a.out, raw)
+                        _write_private(a.out + ".raw", raw)
                         sys.stderr.write(
                             f"CGC_UNWRAPPED wrote {len(raw)} chars to {a.out} (also saved to {a.out}.raw): "
                             f"the model did NOT emit BEGIN/END_RESPONSE:{rid}, so the whole last message "
@@ -1442,8 +1456,7 @@ def cmd_wait(a) -> int:
                             c.close_tab()
                         return 0
                     # tiny + stable + no sentinel → stub/gap, not a dead answer. Keep polling.
-                    with open(a.out + ".raw", "w", encoding="utf-8") as f:
-                        f.write(raw)
+                    _write_private(a.out + ".raw", raw)
                     sys.stderr.write(
                         f"CGC_WAIT stub-stable: last assistant only {len(raw)} chars, no sentinel — "
                         f"likely a thinking/streaming gap; still waiting (raw saved to {a.out}.raw).\n")
@@ -1470,18 +1483,15 @@ def cmd_wait(a) -> int:
         #   the salvage case above (they do not conflict).
         rescue = c.eval(_extract_js(rid)) or ""
         if rescue:
-            with open(a.out, "w", encoding="utf-8") as f:
-                f.write(rescue)
+            _write_private(a.out, rescue)
             sys.stderr.write(f"CGC_DONE wrote {len(rescue)} chars to {a.out} (rescued at timeout)\n")
             if not a.keep_tab:
                 c.close_tab()
             return 0
         raw = c.eval(_last_assistant_js(rid)) or ""
         if len(raw) >= a.min_unwrapped:
-            with open(a.out, "w", encoding="utf-8") as f:
-                f.write(raw)
-            with open(a.out + ".raw", "w", encoding="utf-8") as f:
-                f.write(raw)
+            _write_private(a.out, raw)
+            _write_private(a.out + ".raw", raw)
             sys.stderr.write(
                 f"CGC_UNWRAPPED wrote {len(raw)} chars to {a.out} (also saved to {a.out}.raw): the "
                 f"model did NOT emit BEGIN/END_RESPONSE:{rid} — best-effort salvage at timeout; "
@@ -1490,8 +1500,7 @@ def cmd_wait(a) -> int:
                 c.close_tab()
             return 0
         # Genuinely empty / only short streaming stubs — no usable answer at all.
-        with open(a.out + ".raw", "w", encoding="utf-8") as f:
-            f.write(raw)
+        _write_private(a.out + ".raw", raw)
         sys.stderr.write(
             f"CGC_ERROR timeout_no_answer: no wrapped answer and no substantial unwrapped message "
             f"({len(raw)} chars, raw saved to {a.out}.raw) at timeout for {rid}.\n")

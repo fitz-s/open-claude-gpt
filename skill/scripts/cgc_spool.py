@@ -137,11 +137,12 @@ def ensure_dirs():
     enforces that. The ANSWERS are not: a consult's reply can quote private context, and follow-up
     rounds carry local results outright. Leaving them at the umask's mercy under a world-traversable
     /tmp made confidentiality a property of the host's configuration rather than of this tool."""
-    os.makedirs(SPOOL_DIR, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(SPOOL_DIR, 0o700)
-    except OSError:
-        pass
+    for d in (CGC_STATE_DIR, SPOOL_DIR):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
     for d in _SUBDIRS:
         os.makedirs(os.path.join(SPOOL_DIR, d), mode=0o700, exist_ok=True)
 
