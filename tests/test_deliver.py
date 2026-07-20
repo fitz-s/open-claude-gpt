@@ -60,6 +60,10 @@ def _make_namespace(mod, tmp_state_dir, **overrides):
     we exercise the EXPLICIT (agent-driven) branch without hitting the network."""
     import argparse
     ns = argparse.Namespace(
+        # verify=True: these tests exercise the NETWORK path's fail-closed provenance logic (with
+        # _gh monkeypatched, so nothing is actually sent). The agent path is offline by default and
+        # defers provenance to the daemon's gate — covered in test_security.py.
+        verify=True,
         repo_dir=ROOT,
         repo="acme/widgets",
         pr="1",

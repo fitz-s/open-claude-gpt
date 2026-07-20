@@ -161,3 +161,73 @@ def test_both_schemas_are_kept_separate_never_unioned():
     assert names == ["data-turn-v1", "legacy-author-role-v1"]
     for _n, u, a in _CDP._ADAPTERS:
         assert "," not in u and "," not in a, "each adapter must query ONE schema"
+
+
+# ---- the agent path must make NO network call, provably ----
+#
+# The architecture's central claim is that the agent touches only local files and the daemon does
+# everything external. `consult.py deliver` quietly broke it: every `gh` call in it reaches
+# github.com, and Claude Code's auto-mode classifier correctly denied the command. The answer to a
+# safety classifier blocking you is never "tell users to disable the classifier" — it is to stop
+# making the call. This test makes the claim executable instead of aspirational.
+
+import json
+import subprocess as _sp
+import sys as _sys
+import tempfile as _tf
+
+_REPO = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_CONSULT = _os.path.join(_REPO, "skill", "scripts", "consult.py")
+_SPOOL = _os.path.join(_REPO, "skill", "scripts", "cgc_spool.py")
+
+
+def _no_network_env(tmp):
+    """A PATH with no `gh` on it at all, so any attempt to reach GitHub fails loudly."""
+    env = dict(_os.environ)
+    env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+    env["CGC_STATE_DIR"] = str(tmp)
+    env["CGC_SPOOL_DIR"] = str(_os.path.join(str(tmp), "spool"))
+    return env
+
+
+def test_deliver_produces_refs_with_gh_entirely_absent(tmp_path):
+    env = _no_network_env(tmp_path)
+    head = _sp.run(["git", "-C", _REPO, "rev-parse", "HEAD"],
+                   capture_output=True, text=True).stdout.strip()
+    r = _sp.run([_sys.executable, _CONSULT, "deliver", "--repo", "acme/widgets", "--ref", head],
+                capture_output=True, text=True, env=env, cwd=_REPO, timeout=60)
+    assert r.returncode == 0, r.stderr
+    state = json.loads(r.stdout)
+    assert state["refs_file"] and _os.path.exists(state["refs_file"])
+    assert state["visibility"] == "deferred", "provenance is deferred to the gate, not skipped"
+    body = open(state["refs_file"], encoding="utf-8").read()
+    assert "github.com/acme/widgets" in body
+
+
+def test_the_whole_agent_path_runs_with_gh_entirely_absent(tmp_path):
+    """deliver -> prep -> enqueue, end to end, with no way to reach GitHub. If any of these ever
+    needs the network again, this fails rather than surfacing later as a classifier denial."""
+    env = _no_network_env(tmp_path)
+    head = _sp.run(["git", "-C", _REPO, "rev-parse", "HEAD"],
+                   capture_output=True, text=True).stdout.strip()
+    d = json.loads(_sp.run([_sys.executable, _CONSULT, "deliver", "--repo", "acme/widgets",
+                            "--ref", head],
+                           capture_output=True, text=True, env=env, cwd=_REPO, timeout=60).stdout)
+    p = _sp.run([_sys.executable, _CONSULT, "prep", "--refs-file", d["refs_file"],
+                 "--title", "t", "--task", "probe"],
+                capture_output=True, text=True, env=env, cwd=_REPO, timeout=60)
+    assert p.returncode == 0, p.stderr
+    st = json.loads(p.stdout)
+    e = _sp.run([_sys.executable, _SPOOL, "enqueue", "--rid", st["request_id"],
+                 "--prompt-file", st["prompt_file"]],
+                capture_output=True, text=True, env=env, cwd=_REPO, timeout=60)
+    assert e.returncode == 0, e.stderr
+    assert json.loads(e.stdout)["queued"] is True
+
+
+def test_deliver_defaults_to_offline_and_only_verify_opts_in():
+    """The default is what makes the invariant hold by construction. A flag the agent must remember
+    to pass is a footgun, so the network path is the one that has to be asked for."""
+    src = open(_CONSULT, encoding="utf-8").read()
+    assert "_GH_ALLOWED = False" in src
+    assert '_GH_ALLOWED = bool(getattr(a, "verify", False))' in src
