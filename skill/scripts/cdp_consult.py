@@ -902,6 +902,64 @@ def _write_private(path, text):
         pass
 
 
+# The composer is the input side of the same UI contract the post-send checks cover. It gets its own
+# helper because the failure it used to produce — a bare `composer_not_ready` — told the caller
+# nothing about WHY, and the caller's only guess was "tab not on ChatGPT or login lapsed". That sent
+# a human off to re-log-in while they were already logged in and the page had merely not finished
+# loading. A failure has to name which of those it actually is.
+_COMPOSER_SEL = 'div[role="textbox"][contenteditable="true"],#prompt-textarea'
+
+
+def _composer_state_js():
+    js = """(function(){return JSON.stringify({
+      composer: !!document.querySelector(__SEL__),
+      onChatGPT: /(^|\\.)chatgpt\\.com$/.test(location.hostname),
+      loginWall: !!document.querySelector('input[type="password"]')
+                 || /^\\/(auth|login)(\\/|$)/i.test(location.pathname),
+      captcha: !!document.querySelector('iframe[src*="captcha" i],iframe[title*="captcha" i]'),
+      readyState: document.readyState,
+      path: location.pathname.slice(0,60)
+    });})()"""
+    return js.replace("__SEL__", json.dumps(_COMPOSER_SEL))
+
+
+def _await_composer(c, seconds=60):
+    """Wait for the composer, and on failure say which thing is actually wrong.
+
+    Chrome is often started by this very command, so the project page can still be loading when the
+    first probe runs; 15s was too tight for a cold profile under a launchd-spawned browser."""
+    st = {}
+    end = time.time() + seconds
+    while time.time() < end:
+        time.sleep(0.5)
+        try:
+            st = json.loads(c.eval(_composer_state_js()) or "{}")
+        except Exception:
+            st = {}
+        if st.get("composer"):
+            return True, st
+        if st.get("loginWall") or st.get("captcha"):
+            return False, st
+    return False, st
+
+
+def _composer_failure(st):
+    """(exit_code, message). Login/captcha need a human; anything else is ours to retry."""
+    if st.get("loginWall"):
+        return 3, ("CGC_ERROR login_needed: the debug Chrome is showing a login page. A human must "
+                   "log into ChatGPT in that window — the agent never types credentials.")
+    if st.get("captcha"):
+        return 3, ("CGC_ERROR captcha: ChatGPT is showing a challenge. A human must clear it in the "
+                   "debug Chrome window.")
+    if not st.get("onChatGPT", True):
+        return 1, (f"CGC_ERROR wrong_page: the tab is not on chatgpt.com (path {st.get('path')!r}). "
+                   "Nothing was sent.")
+    return 1, ("CGC_ERROR composer_not_ready: the ChatGPT page never finished producing its input "
+               f"box (readyState={st.get('readyState')!r}, path={st.get('path')!r}). "
+               "**Login is NOT the problem** — do not ask anyone to re-log-in on account of this. "
+               "The page did not load in time; re-enqueue and it will retry.")
+
+
 def _read_prompt(path):
     """Read the prompt to send. `-` means stdin, which is how the daemon hands over the EXACT bytes
     its egress gate validated.
@@ -959,16 +1017,12 @@ def cmd_submit(a) -> int:
         if a.reuse_tab:
             before_user_count = c.eval(
                 "document.querySelectorAll(" + _JS_U + ").length") or 0
-        # wait for composer to hydrate
-        for _ in range(30):
-            time.sleep(0.5)
-            ready = c.eval(
-                "(function(){var d=document.querySelector('div[role=\"textbox\"][contenteditable=\"true\"],#prompt-textarea');"
-                "return !!d;})()")
-            if ready:
-                break
-        else:
-            raise SystemExit("CGC_ERROR composer_not_ready")
+        ready, _cstate = _await_composer(c)
+        if not ready:
+            _code, _msg = _composer_failure(_cstate)
+            c.close()
+            sys.stderr.write(_msg + "\n")
+            return _code
         # Model selection — fully automated (must run AFTER navigate, which resets the
         # model to the project default). Tries each switcher menu until the target tier
         # is selected. FAIL-CLOSED: if it genuinely cannot select the target, do NOT send.
@@ -1180,15 +1234,11 @@ def cmd_followup(a) -> int:
     try:
         # composer should already be present at the bottom of an existing conversation
         # (re-opened tabs need a beat longer to hydrate the thread + composer)
-        for _ in range(40):
-            ready = c.eval(
-                "(function(){var d=document.querySelector('div[role=\"textbox\"][contenteditable=\"true\"],#prompt-textarea');"
-                "return !!d;})()")
-            if ready:
-                break
-            time.sleep(0.5)
-        else:
-            raise SystemExit("CGC_ERROR composer_not_ready")
+        ready, _cstate = _await_composer(c)
+        if not ready:
+            _code, _msg = _composer_failure(_cstate)
+            sys.stderr.write(_msg + "\n")
+            return _code
         # CONVERSATION-INTEGRITY GUARD (before any model-selection/insert): after attaching to a
         # live tab or re-opening the closed thread above, the page's URL can lag a beat behind
         # the target /c/<conv> (freshly-created tab still on about:blank/transitional URL, or a
