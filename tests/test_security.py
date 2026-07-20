@@ -231,3 +231,50 @@ def test_deliver_defaults_to_offline_and_only_verify_opts_in():
     src = open(_CONSULT, encoding="utf-8").read()
     assert "_GH_ALLOWED = False" in src
     assert '_GH_ALLOWED = bool(getattr(a, "verify", False))' in src
+
+
+# ---- a failure must name itself, or a human gets sent to fix the wrong thing ----
+#
+# A consult died with a bare `composer_not_ready`. The page had simply not finished loading, but the
+# only guidance available said "tab not on ChatGPT or login lapsed", so the agent asked its human to
+# go re-log-in — while the session was perfectly valid. An error that cannot distinguish its own
+# causes turns into wasted human time.
+
+def test_slow_page_is_not_reported_as_a_login_problem():
+    code, msg = _CDP._composer_failure(
+        {"onChatGPT": True, "loginWall": False, "captcha": False,
+         "readyState": "loading", "path": "/g/g-p-x/project"})
+    assert code == 1, "a slow page is ours to retry, not a human action"
+    assert "Login is NOT the problem" in msg
+    assert "readyState" in msg and "loading" in msg
+
+
+def test_a_real_login_wall_is_reported_as_human_action():
+    code, msg = _CDP._composer_failure({"onChatGPT": True, "loginWall": True})
+    assert code == 3 and "log into ChatGPT" in msg
+    assert "never types credentials" in msg
+
+
+def test_captcha_is_human_action_too():
+    code, msg = _CDP._composer_failure({"onChatGPT": True, "captcha": True})
+    assert code == 3 and "challenge" in msg
+
+
+def test_wrong_page_is_named_as_such():
+    code, msg = _CDP._composer_failure({"onChatGPT": False, "path": "/somewhere/else"})
+    assert code == 1 and "not on chatgpt.com" in msg
+
+
+def test_composer_wait_stops_early_on_a_login_wall(monkeypatch):
+    """No point burning 60s of hydration wait on a page that is showing a login form."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    calls = []
+
+    class _C:
+        def eval(self, _e):
+            calls.append(1)
+            return json.dumps({"composer": False, "onChatGPT": True, "loginWall": True})
+
+    ready, st = _CDP._await_composer(_C(), seconds=60)
+    assert ready is False and st["loginWall"] is True
+    assert len(calls) == 1, "must bail on the first observation, not poll for a minute"
