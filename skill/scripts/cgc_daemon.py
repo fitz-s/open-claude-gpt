@@ -43,6 +43,17 @@ import cgc_spool as spool  # noqa: E402  (shares config load, paths, gate)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CDP = os.path.join(_HERE, "cdp_consult.py")
+_LAUNCH = os.path.join(_HERE, "cdp_launch.sh")
+
+
+def _restart_chrome(rid=None) -> bool:
+    """Replace the debug Chrome. The daemon owns the browser's lifecycle, so a browser that can no
+    longer open a usable tab is the daemon's problem to fix, not an errand for a human — the whole
+    point of running it under launchd was to stop consults stalling on people. Safe to do: the
+    profile keeps the login, and a consult whose tab is lost is recoverable via `--kind retrieve`."""
+    code, _so, _se = _run(["bash", _LAUNCH], 120, rid,
+                          env_extra={"CGC_RESTART": "1", "CGC_GATE": "1"})
+    return code == 0
 
 _running = True
 
@@ -71,7 +82,7 @@ def _tail_file(path, n=240):
         return ""
 
 
-def _run(cmd, timeout, rid=None, stdin_text=None):
+def _run(cmd, timeout, rid=None, stdin_text=None, env_extra=None):
     """Run a cdp_consult.py subcommand; return (exit, stdout, stderr). Never raises on non-zero.
 
     stderr streams LIVE into the job's log instead of being captured and discarded. Both halves of
@@ -93,7 +104,8 @@ def _run(cmd, timeout, rid=None, stdin_text=None):
     try:
         r = subprocess.run(cmd, input=stdin_text, stdout=subprocess.PIPE,
                            stderr=(log or subprocess.PIPE),
-                           text=True, timeout=timeout, env=dict(os.environ))
+                           text=True, timeout=timeout,
+                           env={**os.environ, **(env_extra or {})})
         code, so, se = r.returncode, r.stdout, (r.stderr or "")
     except subprocess.TimeoutExpired as e:
         code, so, se = 124, "", f"subprocess timeout: {e}"
@@ -186,6 +198,12 @@ def run_worker(processing_file: str) -> int:
            "--project-url", job.get("project_url", "https://chatgpt.com/"),
            "--model", job.get("model", "Pro")]
     code, so, se = _run(cmd, 240, rid, stdin_text=prompt)
+    if code != 0 and "cdp_attach_failed" in (se or ""):
+        # The browser can still serve its existing tabs but cannot produce a working new one, and
+        # every send needs a new one. Retrying the job changes nothing; replacing Chrome does.
+        sys.stderr.write(f"CGC_DAEMON {rid}: debug Chrome cannot open a usable tab — restarting it\n")
+        if _restart_chrome(rid):
+            code, so, se = _run(cmd, 240, rid, stdin_text=prompt)
     spool.write_status(rid, "processing", msg=f"{reason}; sent sha256={_sha[:16]}")
     conv = ""
     try:
