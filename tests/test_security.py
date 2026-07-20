@@ -93,3 +93,71 @@ def test_non_pro_target_requires_an_exact_first_line_match():
 def test_no_switchers_at_all_is_not_a_confirmation():
     ok, shown = _CDP._model_verdict([], "Pro")
     assert ok is False and shown is None
+
+
+# ---- UI-contract detection: a DOM change must fail in seconds, not in an hour ----
+#
+# Two complete 25-minute consults were lost silently because ChatGPT moved its turn markup and this
+# tool kept polling a selector that matched nothing. Counting user turns proved only that the page
+# grew a message; it could not tell "my prompt landed" from "something appeared", and said nothing
+# about whether the reply was still readable.
+
+class _FakeClient:
+    """Replays a scripted sequence of _contract_js observations."""
+
+    def __init__(self, frames):
+        self.frames = list(frames)
+
+    def eval(self, _expr):
+        import json as _j
+        return _j.dumps(self.frames[0] if len(self.frames) == 1 else self.frames.pop(0))
+
+
+def _fam(name, rid_landed, assistants=0):
+    return {"adapter": name, "ridLanded": rid_landed, "users": 1, "assistants": assistants}
+
+
+def test_contract_picks_the_adapter_that_carries_this_rid(monkeypatch):
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    c = _FakeClient([{"families": [_fam("data-turn-v1", True, assistants=1),
+                                   _fam("legacy-author-role-v1", False)], "generating": False}])
+    verdict, adapter, _ = _CDP._await_contract(c, "REQ-20260719-000000-abcdef")
+    assert verdict == "ok" and adapter == "data-turn-v1"
+
+
+def test_rid_never_lands_is_unknown_send_and_must_not_auto_resend(monkeypatch):
+    """Not seeing the rid does NOT prove nothing was sent. Resending could duplicate a 25-minute
+    consult, so this is the human-inspection outcome, not the retry outcome."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    c = _FakeClient([{"families": [_fam("data-turn-v1", False),
+                                   _fam("legacy-author-role-v1", False)], "generating": False}])
+    verdict, adapter, _ = _CDP._await_contract(c, "REQ-20260719-000000-abcdef")
+    assert verdict == "unknown_send" and adapter is None
+
+
+def test_rid_landed_but_no_assistant_signal_is_selector_drift(monkeypatch):
+    """The exact failure that cost two rounds: the send worked, the READER is broken. That is a tool
+    defect — distinct from 'the model produced no answer' — and it must be named within seconds."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    monkeypatch.setattr(_CDP, "_GENERATION_SIGNAL_S", 0.01)
+    c = _FakeClient([{"families": [_fam("data-turn-v1", True, assistants=0)], "generating": False}])
+    verdict, adapter, _ = _CDP._await_contract(c, "REQ-20260719-000000-abcdef")
+    assert verdict == "selector_drift" and adapter == "data-turn-v1"
+
+
+def test_generating_indicator_alone_satisfies_the_contract(monkeypatch):
+    """A Pro round streams reasoning stubs before any assistant node settles, so the busy indicator
+    must count as a live assistant side or every Pro consult would be called drift."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    c = _FakeClient([{"families": [_fam("data-turn-v1", True, assistants=0)], "generating": True}])
+    verdict, _, _ = _CDP._await_contract(c, "REQ-20260719-000000-abcdef")
+    assert verdict == "ok"
+
+
+def test_both_schemas_are_kept_separate_never_unioned():
+    """Unioning the two selector families double-counts wrapper and content nodes when both
+    attributes exist at different DOM levels, and interleaves their order."""
+    names = [n for n, _u, _a in _CDP._ADAPTERS]
+    assert names == ["data-turn-v1", "legacy-author-role-v1"]
+    for _n, u, a in _CDP._ADAPTERS:
+        assert "," not in u and "," not in a, "each adapter must query ONE schema"
