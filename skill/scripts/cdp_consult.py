@@ -1058,7 +1058,7 @@ def cmd_submit(a) -> int:
         ready, _cstate = _await_composer(c)
         if not ready:
             _code, _msg = _composer_failure(_cstate)
-            c.close()
+            c.close_tab()   # nothing was sent and this page never loaded — do not leak it
             sys.stderr.write(_msg + "\n")
             return _code
         # Model selection — fully automated (must run AFTER navigate, which resets the
@@ -1106,6 +1106,9 @@ def cmd_submit(a) -> int:
         # so ">0" and "> before_user_count" are equivalent and new-tab behavior is unchanged.
         verdict, adapter, contract = _await_contract(c, a.rid)
         if verdict == "unknown_send":
+            # Deliberately NOT close_tab(): this outcome exists because a human has to look
+            # at this window to see whether the prompt actually went. Closing it destroys
+            # the only evidence. It is the one failure allowed to leave a tab behind.
             c.close()
             print(json.dumps({"ok": False, "submitted": None, "rid": a.rid,
                               "reason": "unknown_send", "contract": contract}))
@@ -1117,7 +1120,7 @@ def cmd_submit(a) -> int:
                 f"observed: {json.dumps(contract)}\n")
             return 3
         if verdict == "selector_drift":
-            c.close()
+            c.close_tab()   # the send is confirmed and the conversation persists server-side
             print(json.dumps({"ok": False, "submitted": True, "rid": a.rid,
                               "reason": "selector_drift", "adapter": adapter, "contract": contract}))
             sys.stderr.write(

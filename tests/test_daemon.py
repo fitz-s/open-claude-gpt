@@ -353,3 +353,60 @@ def test_chrome_is_restarted_when_nothing_else_is_live(daemon, monkeypatch):
     monkeypatch.setattr(daemon, "_run", _fake)
     assert daemon._restart_chrome("REQ-20260707-120000-00d003") is True
     assert ran[0][1]["CGC_RESTART"] == "1"
+
+
+def test_tab_sweep_never_runs_while_a_job_is_live(daemon, monkeypatch):
+    """A tab the sweep can see must be unowned. The only cheap way to guarantee that is to sweep
+    only when nothing is running — otherwise it would close the tab a live send is using."""
+    other = "REQ-20260707-120000-00e001"
+    path = daemon.spool.processing_path(other)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"rid": other, "kind": "submit"}, f)
+    daemon.spool.write_status(other, "processing", worker_pid=os.getpid())
+
+    touched = []
+    monkeypatch.setattr(daemon.urllib.request, "urlopen",
+                        lambda *a, **k: touched.append(a) or (_ for _ in ()).throw(AssertionError()))
+    assert daemon._sweep_tabs() == 0
+    assert touched == [], "must not even look at the browser while a job is live"
+
+
+def test_tab_sweep_is_a_noop_with_one_tab(daemon, monkeypatch):
+    """The browser is left with a tab on purpose — a profile with zero windows is a worse state."""
+    import io
+
+    class _R:
+        def __init__(self, payload): self._p = json.dumps(payload).encode()
+        def read(self): return self._p
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(daemon.urllib.request, "urlopen",
+                        lambda *a, **k: io.BytesIO(json.dumps([{"type": "page", "id": "A"}]).encode()))
+    assert daemon._sweep_tabs() == 0
+
+
+def test_restart_is_not_reported_successful_until_a_tab_actually_works(daemon, monkeypatch):
+    """The launcher proves the port is up and the session is logged in. Neither is what broke: an
+    unwell Chrome keeps serving existing tabs while new ones never answer Runtime.enable, so both
+    those checks stay true while every consult dies. A retry 3s after a 'successful' restart failed
+    with `No such target id`, because the browser was still settling."""
+    monkeypatch.setattr(daemon, "_run", lambda *a, **k: (0, "", ""))
+    monkeypatch.setattr(daemon.time, "sleep", lambda n: None)
+    monkeypatch.setattr(daemon, "_other_live_jobs", lambda rid: [])
+    monkeypatch.setattr(daemon, "_new_tab_healthy", lambda: False)
+    assert daemon._restart_chrome("REQ-20260707-120000-00f001") is False, \
+        "a browser that still cannot open a tab is not a successful restart"
+
+    monkeypatch.setattr(daemon, "_new_tab_healthy", lambda: True)
+    assert daemon._restart_chrome("REQ-20260707-120000-00f002") is True
+
+
+def test_health_check_is_the_real_capability_not_a_ping(daemon):
+    """It must create a tab and drive it, because 'the port answers' was already true when the
+    browser was broken."""
+    import inspect
+    src = inspect.getsource(daemon._new_tab_healthy)
+    assert "Target.createTarget" in src and "Runtime.enable" in src
+    assert "Target.closeTarget" in src, "the probe must not leak the tab it opens"

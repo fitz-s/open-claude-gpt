@@ -33,6 +33,32 @@ The launcher waits 40s for the port. That is generous on purpose — it also run
 from the launchd daemon, whose I/O launchd deprioritizes, and a false "Chrome
 didn't start" throws away a whole 25-minute consult.
 
+## The debug Chrome keeps dying, or stops being able to open tabs
+
+Two different faults, often confused.
+
+**"Chrome closed by itself", usually right after the daemon restarted.** It was not Chrome. A
+browser launched by the daemon inherited the launchd job's process group at fork time — re-parenting
+to init later does not change that — so `launchctl kickstart -k`, which kills the job by group, took
+the browser with it. The launcher now starts Chrome in its own session (`start_new_session`), so it
+outlives every daemon restart. Verify: `ps -o pid,pgid -p $(pgrep -f remote-debugging-port=9333)` —
+pid and pgid should be equal, meaning Chrome leads its own group.
+
+**Every consult fails to attach, while the browser looks fine.** The signature is a long-running
+Chrome that still serves its EXISTING tabs at full speed while every NEWLY created tab never answers
+`Runtime.enable`. Since each send opens its own tab, every consult dies, and "the port is up" and
+"the session is logged in" both stay true throughout — which is why the daemon's health check
+creates a real throwaway tab and drives it rather than pinging the port.
+
+Two candidate causes were tested and **refuted**: it is not tab accumulation (25 open targets, new
+tabs still ready in 0.00s) and not leaked DevTools websockets (60 open, same). The remaining
+explanation consistent with the evidence — time-dependent, cleared by a restart, existing renderers
+unaffected — is the OS throttling renderer startup for an unfocused background app, so the launcher
+passes `--disable-renderer-backgrounding`, `--disable-backgrounding-occluded-windows` and
+`--disable-background-timer-throttling`. **That root cause is not proven.** The real safety net is
+that the daemon detects the condition and restarts the browser itself, then verifies a new tab
+actually works before handing the job back.
+
 ## A consult finished but produced nothing — where is the evidence?
 Every job the daemon runs writes a full transcript of its send + wait to
 
