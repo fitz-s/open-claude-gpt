@@ -98,11 +98,12 @@ def _stub_gh(visibility_result):
 def _run_deliver(mod, ns, tmp_state_dir, visibility_result):
     mod._gh = _stub_gh(visibility_result)
     mod.CGC_STATE_DIR = tmp_state_dir
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        rc = mod.cmd_deliver(ns)
-    assert rc == 0
-    return json.loads(buf.getvalue())
+    # cmd_deliver RETURNS its state now (main() prints it), so `fire` can compose deliver -> prep
+    # -> enqueue in one process instead of the agent relaying JSON between three Bash calls.
+    # Reading the return value is also what these assertions actually wanted.
+    out = mod.cmd_deliver(ns)
+    assert isinstance(out, dict), f"expected a state dict, got {out!r}"
+    return out
 
 
 def test_public_repo_stamps_public_and_sets_public_ok():

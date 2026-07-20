@@ -46,11 +46,38 @@ _CDP = os.path.join(_HERE, "cdp_consult.py")
 _LAUNCH = os.path.join(_HERE, "cdp_launch.sh")
 
 
+def _other_live_jobs(rid) -> list:
+    """Other rids currently being worked. Restarting Chrome is GLOBAL — it takes every tab with it —
+    so it must not be done while someone else's consult is mid-flight."""
+    out = []
+    try:
+        names = os.listdir(spool._p("processing"))
+    except OSError:
+        return out
+    for n in names:
+        if not n.endswith(".json") or n[:-5] == rid:
+            continue
+        if spool._live_owner(n[:-5]) is not None:
+            out.append(n[:-5])
+    return out
+
+
 def _restart_chrome(rid=None) -> bool:
     """Replace the debug Chrome. The daemon owns the browser's lifecycle, so a browser that can no
     longer open a usable tab is the daemon's problem to fix, not an errand for a human — the whole
     point of running it under launchd was to stop consults stalling on people. Safe to do: the
-    profile keeps the login, and a consult whose tab is lost is recoverable via `--kind retrieve`."""
+    profile keeps the login, and a consult whose tab is lost is recoverable via `--kind retrieve`.
+
+    Not safe to do BLINDLY, though: the restart is global. Doing it for one job while others are
+    sending or waiting would tear their tabs away too, which is how a healthy consult ends up
+    reported as broken."""
+    others = _other_live_jobs(rid)
+    if others:
+        sys.stderr.write(
+            f"CGC_DAEMON {rid}: NOT restarting Chrome — {len(others)} other consult(s) are live "
+            f"({', '.join(others[:3])}). A restart is global and would break them too. This job "
+            f"fails; re-enqueue it once they finish.\n")
+        return False
     code, _so, _se = _run(["bash", _LAUNCH], 120, rid,
                           env_extra={"CGC_RESTART": "1", "CGC_GATE": "1"})
     return code == 0

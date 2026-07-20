@@ -38,34 +38,30 @@ So: relay the denied command verbatim to the user, say which step it was, and st
 **The daemon is always up — do not check it.** The user installs it once with `cgc install-daemon` (a launchd agent: starts at login, respawns if it dies), and it opens the debug Chrome itself when it needs to. So there is no preflight: **never run `cgc queue`/`doctor` "to make sure" before a consult** — that costs tokens on every round and tells you nothing you'd act on. Just `enqueue`. In the rare case it is genuinely down, `enqueue`/`await` say so in one line (exit 2) — relay `cgc install-daemon` to the user and move on. You never start it yourself.
 
 ```bash
-# 0. Nothing. Do NOT check the daemon, do not run doctor — the daemon is installed once
-#    (`cgc install-daemon`) and launchd keeps it running forever, restarting it if it dies.
-#    Just enqueue. If it somehow isn't running, `await` tells you in one line (exit 2).
-
-# 1. Deliver the code as a link (public-PR example). Note "refs_file" in the JSON.
-#    LOCAL-ONLY: builds links from local git; it does NOT call gh, so the classifier never sees it.
-#    Provenance ("is this repo public?") is verified by the daemon's gate before the send.
-python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py deliver --repo owner/repo --pr 123
-
-# 2. Prep the prompt (writes the prompt file; capture request_id from the JSON). See "Steer the round".
-#    --title + --role + --task are the steering levers — pass a sharp title and a job-matched role.
-python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py prep --refs-file <refs_file> \
+# 1. Fire it — ONE call: resolves the GitHub links, renders the prompt, queues the job.
+#    All local; no network from your side. The daemon validates and sends.
+#    --title + --role + --task are the steering levers (see "Steer the round").
+python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py fire --repo owner/repo --pr 123 \
   --title "<sharp headline>" --role "You are a <persona matched to the job>." --task "<the question>"
 
-# 3. Enqueue the job — a LOCAL write. The user's daemon validates (re-checks the repo is PUBLIC) + sends.
-python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py enqueue --rid <request_id> --prompt-file <prompt_file>
+# 2. Await DETACHED — run_in_background:true, then go do other work; it wakes you with the answer's
+#    path. It waits as long as the consult takes. NEVER `nohup … & disown` (an untracked process
+#    never wakes you). `fire` prints this exact line; copy it.
+python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid> --out <out>
 
-# 4. Await DETACHED — dispatch with run_in_background:true, then go do other work; it wakes you on done.
-#    `await` is a LOCAL file poll (no network), so the classifier never blocks it. It waits as long
-#    as the consult takes — no wrapper, no slicing, no re-running. NEVER `nohup … & disown`: an
-#    untracked process never wakes you.
-python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <request_id> --out /tmp/cgc/answer_<request_id>.txt
-
-# 5. On wake: read the answer, then verify locally.
-#    Read /tmp/cgc/answer_<request_id>.txt    (enqueue's default --out; it also prints the exact await line)
-#    To continue the thread, prep --followup then enqueue --kind followup --conversation auto (NOT a new
-#    plain prep+enqueue, which opens a NEW conversation). See "Follow-up rounds".
+# 3. On wake: read the answer file it names, then verify locally.
+#    To continue the thread: prep --followup, then enqueue --kind followup --conversation <id>
+#    (NOT a fresh fire — that opens a NEW conversation). See "Follow-up rounds".
 ```
+
+Do NOT check the daemon first, and do not run `doctor` — it is installed once (`cgc install-daemon`)
+and launchd keeps it alive. A preflight costs tokens every round and tells you nothing you would act
+on; if it is genuinely down, `fire` says so in one line.
+
+`fire` is `deliver` + `prep` + `enqueue` in one process. Those three still exist as separate verbs
+for debugging, or when you want to edit the refs or the prompt in between — but you make no decision
+between them on the normal path, so relaying their JSON by hand is pure cost. For a consult with no
+code subject at all (a maths proof, a research question), add `--no-code`.
 Error → cause: `await` returns exactly three things, because exactly three are actionable. **`0`** = the answer is on disk and its path is printed — go read it. **`3`** = a human must act in the ChatGPT window (login/captcha/rate-limit/model, or a **GPT-5.6 safeguard refusal** — its synchronous cyber/bio classifier occasionally intervenes on legitimate dual-use work like vuln/security review); the user acts, then re-enqueue. **`1`** = broken, and the job-log path is printed. "Still running" is not a return value: a consult routinely takes ~25 minutes and `await` simply keeps waiting. It gives up only after **60 minutes**, which is far past anything the work explains — so that is a malfunction, not a slow answer, and re-running the wait cannot fix it. `enqueue` refuses locally (exit 2) on a missing code link or a detected secret. The daemon's own `GATE REFUSED` (via `cgc queue` / its log) = the repo isn't gh-confirmed public, a gist link (`CGC_GATE_ALLOW_GIST=1` to allow), or a secret — read its FIRST WORD: `refused:` is a verdict (fix the input; re-enqueueing cannot help), `unverified:` means the check itself failed (`gh` timed out) and nothing is known, so re-enqueue to retry. **On any failure `await` prints `CGC_LOG <path>` — the full send+wait transcript, streamed live. Read it before guessing.** Its heartbeat is the diagnosis: `ac=0` throughout = ChatGPT never produced an assistant turn (nothing was sent, or the page changed shape); `begin=true end=false` = the answer is being written right now. Full detail in **Pipeline A**; the DIRECT submit/wait fallback (interactive mode only) and the no-debug-profile path are in **[references/mcp-fallback.md](references/mcp-fallback.md)**.
 
 ## Roles (keep distinct)

@@ -325,3 +325,31 @@ def test_browser_repair_actually_triggers_on_an_attach_failure(daemon, monkeypat
     restarts = [c for c in calls if c[0][0] == "bash"]
     assert len(restarts) == 1, "a browser that cannot open a tab must be restarted, not re-tried"
     assert restarts[0][1]["CGC_RESTART"] == "1"
+
+
+def test_chrome_is_not_restarted_while_another_consult_is_live(daemon, monkeypatch, tmp_path):
+    """The restart is global — it takes every tab with it. Doing it for one job while another is
+    sending or waiting is how a healthy consult gets reported as broken; observed exactly that."""
+    other = "REQ-20260707-120000-00d001"
+    path = daemon.spool.processing_path(other)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"rid": other, "kind": "submit"}, f)
+    daemon.spool.write_status(other, "processing", worker_pid=os.getpid())  # alive
+
+    ran = []
+    monkeypatch.setattr(daemon, "_run", lambda *a, **k: ran.append(a) or (0, "", ""))
+    assert daemon._restart_chrome("REQ-20260707-120000-00d002") is False
+    assert ran == [], "must not have launched anything"
+
+
+def test_chrome_is_restarted_when_nothing_else_is_live(daemon, monkeypatch):
+    ran = []
+
+    def _fake(cmd, timeout, rid=None, stdin_text=None, env_extra=None):
+        ran.append((cmd, env_extra))
+        return 0, "", ""
+
+    monkeypatch.setattr(daemon, "_run", _fake)
+    assert daemon._restart_chrome("REQ-20260707-120000-00d003") is True
+    assert ran[0][1]["CGC_RESTART"] == "1"

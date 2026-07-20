@@ -512,6 +512,13 @@ def cmd_enqueue(a) -> int:
         return 2
     write_status(a.rid, "queued", out=os.path.abspath(out))
     up = daemon_alive()
+    if getattr(a, "quiet", False):
+        # Composed into `fire`, which prints the one receipt that matters. Two receipts for one
+        # action is the noise this whole pass is trying to remove.
+        if not up:
+            sys.stderr.write("CGC_WARN daemon_down: queued, but nothing will send it until the "
+                             "daemon runs. Relay: cgc install-daemon\n")
+        return 0
     print(json.dumps({"queued": True, "rid": a.rid, "out": os.path.abspath(out), "daemon_up": up}))
     if not up:
         sys.stderr.write(
