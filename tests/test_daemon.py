@@ -418,3 +418,26 @@ def test_health_probe_keeps_the_last_tab(daemon):
     import inspect
     src = inspect.getsource(daemon._new_tab_healthy)
     assert "if others:" in src, "the probe must not close the only remaining tab"
+
+
+def test_admission_and_restart_take_the_same_lock(daemon):
+    """The restart guard was check-then-act: _other_live_jobs() is a lock-free snapshot, and the
+    dispatcher can admit a worker between the scan and the restart — so a consult that started a
+    moment later still had its tab torn away. That is how live consults were lost, and how the
+    agents watching them then re-dispatched duplicates."""
+    import inspect
+    loop = inspect.getsource(daemon.run_loop)
+    assert "lifecycle_lock()" in loop, "admission must be serialised"
+    claim_at = loop.index("spool.claim(pf)")
+    lock_at = loop.index("lifecycle_lock()")
+    pid_at = loop.index("worker_pid=p.pid")
+    assert lock_at < claim_at < pid_at, "the lock must span claim through publishing the pid"
+    worker = inspect.getsource(daemon.run_worker)
+    assert "lifecycle_lock()" in worker, "the restart must take the same lock"
+
+
+def test_the_lock_never_blocks_a_consult_forever(daemon):
+    """A lock that can hang is worse than the race it closes; it must degrade loudly."""
+    import inspect
+    src = inspect.getsource(daemon.spool.lifecycle_lock)
+    assert "proceeding unserialised" in src and "timeout" in src

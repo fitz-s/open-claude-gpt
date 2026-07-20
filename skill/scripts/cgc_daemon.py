@@ -167,7 +167,7 @@ def _new_tab_healthy(port=None) -> bool:
 
 
 def _restart_chrome(rid=None) -> bool:
-    """Replace the debug Chrome. The daemon owns the browser's lifecycle, so a browser that can no
+    """Replace the debug Chrome. Call inside spool.lifecycle_lock(). The daemon owns the browser's lifecycle, so a browser that can no
     longer open a usable tab is the daemon's problem to fix, not an errand for a human — the whole
     point of running it under launchd was to stop consults stalling on people. Safe to do: the
     profile keeps the login, and a consult whose tab is lost is recoverable via `--kind retrieve`.
@@ -175,6 +175,8 @@ def _restart_chrome(rid=None) -> bool:
     Not safe to do BLINDLY, though: the restart is global. Doing it for one job while others are
     sending or waiting would tear their tabs away too, which is how a healthy consult ends up
     reported as broken."""
+    # Held across the scan AND the restart: without it the dispatcher can admit a worker between
+    # the two, and that worker's tab is destroyed by a restart that believed it was alone.
     others = _other_live_jobs(rid)
     if others:
         sys.stderr.write(
@@ -347,7 +349,9 @@ def run_worker(processing_file: str) -> int:
         # The browser can still serve its existing tabs but cannot produce a working new one, and
         # every send needs a new one. Retrying the job changes nothing; replacing Chrome does.
         sys.stderr.write(f"CGC_DAEMON {rid}: debug Chrome cannot open a usable tab — restarting it\n")
-        if _restart_chrome(rid):
+        with spool.lifecycle_lock():
+            _repaired = _restart_chrome(rid)
+        if _repaired:
             code, so, se = _run(cmd, 240, rid, stdin_text=prompt)
     spool.write_status(rid, "processing", msg=f"{reason}; sent sha256={_sha[:16]}")
     conv = ""
@@ -482,15 +486,18 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
             for pf in spool.list_pending():
                 if len(children) >= concurrency:
                     break
-                claimed = spool.claim(pf)
-                if not claimed:
-                    continue  # another worker took it
-                rid = os.path.basename(claimed)[:-5]
-                p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker", claimed],
-                                     env=dict(os.environ))
-                children[rid] = p
-                # Record who owns this job, so orphan detection is a fact rather than a timer.
-                spool.write_status(rid, "processing", worker_pid=p.pid)
+                # Admission is serialised against browser restart: claim, spawn and publish the
+                # worker pid atomically, so a worker is never invisible to a neighbour scan while it
+                # is being admitted.
+                with spool.lifecycle_lock():
+                    claimed = spool.claim(pf)
+                    if not claimed:
+                        continue  # another worker took it
+                    rid = os.path.basename(claimed)[:-5]
+                    p = subprocess.Popen([sys.executable, os.path.abspath(__file__),
+                                          "--worker", claimed], env=dict(os.environ))
+                    children[rid] = p
+                    spool.write_status(rid, "processing", worker_pid=p.pid)
                 sys.stderr.write(f"CGC_DAEMON dispatched {rid} pid={p.pid} "
                                  f"({len(children)}/{concurrency} busy)\n")
             if once and not children and not spool.list_pending():

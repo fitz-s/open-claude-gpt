@@ -278,6 +278,54 @@ def read_status(rid):
     return _read_json(status_path(rid))
 
 
+LIFECYCLE_LOCK = _p("lifecycle.lock")
+
+
+class lifecycle_lock:
+    """Serialises worker ADMISSION against browser RESTART across processes.
+
+    Checking "is anyone else live?" and then restarting Chrome is check-then-act, and the dispatcher
+    can admit a worker in between — so a consult that started a moment after the scan still gets its
+    tab torn away by a restart that believed it was alone. That is not theoretical: it is how live
+    consults were lost, and how the agents watching them then re-dispatched duplicates.
+
+    Both sides take this lock: the dispatcher holds it from claim through publishing the worker pid,
+    so a worker is never invisible while it is being admitted; the restart holds it from the
+    neighbour scan through the restart itself. Degrades to a no-op without fcntl, which only costs
+    the atomicity it never had."""
+
+    def __init__(self, timeout=30):
+        self.timeout = timeout
+        self.fh = None
+
+    def __enter__(self):
+        if fcntl is None:
+            return self
+        ensure_dirs()
+        self.fh = open(LIFECYCLE_LOCK, "a+")
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.time() > deadline:
+                    # Never block a consult forever on a lock; proceed unserialised and say so.
+                    sys.stderr.write("CGC_WARN lifecycle_lock: timed out; proceeding unserialised\n")
+                    return self
+                time.sleep(0.2)
+
+    def __exit__(self, *exc):
+        if self.fh is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+                self.fh.close()
+            except OSError:
+                pass
+        return False
+
+
 def _live_owner(rid):
     """The pid currently working this job, or None. Used to stop a second worker being started on an
     id that already has one, and to stop a superseded worker writing the current one's outcome."""

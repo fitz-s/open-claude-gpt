@@ -173,6 +173,8 @@ def test_both_schemas_are_kept_separate_never_unioned():
 
 import json
 import subprocess as _sp
+
+import pytest
 import sys as _sys
 import tempfile as _tf
 
@@ -278,3 +280,39 @@ def test_composer_wait_stops_early_on_a_login_wall(monkeypatch):
     ready, st = _CDP._await_composer(_C(), seconds=60)
     assert ready is False and st["loginWall"] is True
     assert len(calls) == 1, "must bail on the first observation, not poll for a minute"
+
+
+# ---- loopback must never traverse an HTTP proxy ----
+#
+# ROOT CAUSE of the failure that killed consults for a whole day. These scripts reach the debug
+# browser over loopback HTTP, and urllib honours http_proxy. With a local proxy running and no
+# 127.0.0.1 exemption in no_proxy, /json returned the proxy's HTML, json.load threw, and the daemon
+# concluded Chrome could not open a tab — so it restarted a healthy browser in a loop, destroying
+# whatever consults were in flight.
+
+@pytest.mark.parametrize("script", ["cdp_consult.py", "cgc_daemon.py"])
+def test_scripts_install_a_proxy_free_opener(script):
+    src = open(_os.path.join(_REPO, "skill", "scripts", script), encoding="utf-8").read()
+    assert "ProxyHandler({})" in src and "install_opener" in src, (
+        f"{script} reaches the CDP endpoint over loopback; without a proxy-free opener an "
+        f"http_proxy in the environment silently hijacks those calls")
+    assert src.index("install_opener") < src.index("def "), (
+        "the opener must be installed at import time, before any urlopen can run")
+
+
+def test_a_proxy_free_opener_actually_drops_proxy_handling(monkeypatch):
+    """Not just that the line exists — that it does the thing. Passing an EMPTY ProxyHandler makes
+    build_opener drop proxy handling altogether, while the default opener carries the environment's
+    proxies and would send a loopback request to them."""
+    import urllib.request
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:59999")
+    monkeypatch.setenv("no_proxy", "example.com")     # deliberately NOT exempting 127.0.0.1
+
+    default = urllib.request.build_opener()
+    carried = [h.proxies for h in default.handlers if type(h).__name__ == "ProxyHandler"]
+    assert carried and carried[0].get("http") == "http://127.0.0.1:59999", (
+        "precondition: without the fix, urllib would route loopback through this proxy")
+
+    ours = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    assert not [h for h in ours.handlers if type(h).__name__ == "ProxyHandler"], (
+        "the proxy-free opener must carry no proxy handling at all")

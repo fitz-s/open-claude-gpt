@@ -458,8 +458,12 @@ def cmd_deliver(a: argparse.Namespace) -> int:
         out["visibility"] = "deferred"
         body = ("> Source visibility: TO BE VERIFIED AT THE EGRESS GATE — these links are not sent "
                 "until the consult daemon confirms every repo is public.\n\n") + body
-        refs_file = str(pathlib.Path(CGC_STATE_DIR) / f"refs_{time.strftime('%Y%m%d-%H%M%S')}.md")
+        # Unique per call, not per second: two concurrent deliveries at the same second wrote the
+        # same path, so one consult could read the OTHER's repository references and review the
+        # wrong source without anything looking wrong.
         pathlib.Path(CGC_STATE_DIR).mkdir(parents=True, exist_ok=True)
+        refs_file = str(pathlib.Path(CGC_STATE_DIR) /
+                        f"refs_{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}.md")
         pathlib.Path(refs_file).write_text(body, encoding="utf-8")
         out["refs_file"] = refs_file
         return out
@@ -736,6 +740,17 @@ def cmd_fire(a: argparse.Namespace) -> int:
     debugging and for anyone who wants to edit the refs or the prompt in between."""
     import cgc_spool as spool
 
+    # A follow-up must continue its thread. fire inherits --followup from prep's argument set, and
+    # enqueuing kind="submit" with conversation="auto" would open a FRESH conversation — the round
+    # would look fine and silently lose everything the thread already knows, which is the worst
+    # shape of bug: no error, wrong answer.
+    if a.followup and (not a.conversation or a.conversation == "auto"):
+        sys.stderr.write(
+            "CGC_ERROR followup_needs_conversation: --followup continues an existing thread, so it "
+            "needs --conversation <id> (the id `await` printed when that thread's answer landed). "
+            "Without it this would open a new conversation and lose the thread's context.\n")
+        return 2
+
     if not a.no_code:
         d = cmd_deliver(a)
         if not isinstance(d, dict) or not d.get("refs_file"):
@@ -752,8 +767,9 @@ def cmd_fire(a: argparse.Namespace) -> int:
     rid, prompt_file = st["request_id"], st["prompt_file"]
 
     eq = argparse.Namespace(
-        rid=rid, prompt_file=prompt_file, kind="submit",
-        project_url=a.project_url, conversation="auto", model=a.model,
+        rid=rid, prompt_file=prompt_file,
+        kind="followup" if a.followup else "submit",
+        project_url=a.project_url, conversation=(a.conversation or "auto"), model=a.model,
         out=a.out, poll=spool.POLL_S, timeout=spool.STUCK_AFTER_S, quiet=True)
     if spool.cmd_enqueue(eq) != 0:
         return 2
@@ -848,6 +864,7 @@ def main() -> int:
     pf.add_argument("--model", default=os.environ.get("CGC_MODEL", "Pro"))
     pf.add_argument("--out", help="answer file (default $CGC_STATE_DIR/answer_<rid>.txt)")
     pf.add_argument("--project-url", default=os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/"))
+    pf.add_argument("--conversation", help="REQUIRED with --followup: the thread to continue")
     pf.set_defaults(fn=cmd_fire)
 
     pp = _add_prep_args(sub.add_parser("prep"))
