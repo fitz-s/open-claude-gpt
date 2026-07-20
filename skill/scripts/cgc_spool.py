@@ -278,8 +278,28 @@ def read_status(rid):
     return _read_json(status_path(rid))
 
 
+def _live_owner(rid):
+    """The pid currently working this job, or None. Used to stop a second worker being started on an
+    id that already has one, and to stop a superseded worker writing the current one's outcome."""
+    st = read_status(rid) or {}
+    if st.get("state") not in ("processing",):
+        return None
+    pid = st.get("worker_pid")
+    return pid if pid is not None and _pid_alive(pid) else None
+
+
 def finish_job(rid, *, state, exit, out=None, msg=None, conversation=None):
-    """Terminal transition: write the final status and move the job out of processing/ into done/."""
+    """Terminal transition: write the final status and move the job out of processing/ into done/.
+
+    Fenced by worker identity. A worker that has been superseded — its Chrome tab pulled out from
+    under it by a browser restart, say — would otherwise report ITS failure as the job's outcome
+    while the current worker is still succeeding, so a healthy consult reads as `error` while it is
+    happily generating. Observed exactly that."""
+    owner = (read_status(rid) or {}).get("worker_pid")
+    if owner is not None and owner != os.getpid() and _pid_alive(owner):
+        sys.stderr.write(f"CGC_STALE {rid}: not recording '{state}' — pid {os.getpid()} was "
+                         f"superseded by pid {owner}, which still owns this job.\n")
+        return
     write_status(rid, state, exit=exit, out=out, msg=msg, conversation=conversation)
     src = processing_path(rid)
     if os.path.exists(src):
@@ -438,6 +458,14 @@ def cmd_enqueue(a) -> int:
             f"  python3 {os.path.abspath(__file__)} await --rid {a.rid} "
             f"--out {os.path.abspath(out)}\n")
         return 0
+    busy = _live_owner(a.rid)
+    if busy is not None:
+        sys.stderr.write(
+            f"CGC_ERROR already_running: {a.rid} is being worked right now by pid {busy}. Enqueuing "
+            f"it again would put TWO workers on one id — they share a status file, an answer path "
+            f"and a job log, so they overwrite each other's results and the log reads as one "
+            f"incoherent stream. Await the existing one, or use a new rid.\n")
+        return 2
     if not a.prompt_file:
         sys.stderr.write("CGC_ERROR need_prompt_file: --prompt-file is required "
                          "(only --kind retrieve may omit it).\n")

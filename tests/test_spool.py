@@ -463,3 +463,53 @@ def test_allowlist_never_exempts_secrets(spool, monkeypatch):
     monkeypatch.setattr(spool, "_repo_is_public", lambda s: (False, "visibility=private"))
     ok, why = spool.validate_prompt(_PRIV + "\nAKIAABCDEFGHIJKLMNOP\n")
     assert ok is False and "AWS access key id" in why
+
+
+# ---- one id, one worker ------------------------------------------------------
+#
+# Re-enqueuing a rid that was already being worked put two workers on one id. They share a status
+# file, an answer path and a job log, so they overwrite each other and the log reads as a single
+# incoherent stream — observed live: a superseded worker wrote `error` while the current one was
+# still happily generating, and the job looked dead when it was fine.
+
+def _enq_args(spool, rid, prompt_file):
+    return argparse.Namespace(rid=rid, prompt_file=str(prompt_file), kind="submit",
+                              project_url="https://chatgpt.com/", conversation="auto",
+                              model="Pro", out=None, poll=20, timeout=spool.STUCK_AFTER_S)
+
+
+def test_enqueue_refuses_a_rid_that_already_has_a_live_worker(spool, tmp_path, capsys):
+    rid = _rid("bb0001")
+    pf = tmp_path / "p.md"
+    pf.write_text("review https://github.com/acme/widgets", encoding="utf-8")
+    spool.write_status(rid, "processing", worker_pid=os.getpid())   # this process is alive
+    assert spool.cmd_enqueue(_enq_args(spool, rid, pf)) == 2
+    assert "already_running" in capsys.readouterr().err
+
+
+def test_enqueue_allows_a_rid_whose_worker_is_gone(spool, tmp_path):
+    """A dead worker is exactly the recovery case; it must not be mistaken for a live one."""
+    rid = _rid("bb0002")
+    pf = tmp_path / "p.md"
+    pf.write_text("review https://github.com/acme/widgets", encoding="utf-8")
+    spool.write_status(rid, "processing", worker_pid=2 ** 22)
+    assert spool.cmd_enqueue(_enq_args(spool, rid, pf)) == 0
+
+
+def test_a_superseded_worker_cannot_record_the_jobs_outcome(spool, tmp_path):
+    """The live failure: a worker whose tab was pulled away by a browser restart reported its own
+    error as the job's result while the current worker was still generating."""
+    rid = _rid("bb0003")
+    spool.write_status(rid, "processing", worker_pid=os.getpid())   # current owner = this process
+    # a DIFFERENT, superseded worker tries to terminalise it
+    import unittest.mock as _m
+    with _m.patch.object(spool.os, "getpid", return_value=999999):
+        spool.finish_job(rid, state="error", exit=2, msg="my tab died")
+    assert spool.read_status(rid)["state"] == "processing", "stale worker must not win"
+
+
+def test_the_current_owner_can_still_finish_normally(spool, tmp_path):
+    rid = _rid("bb0004")
+    spool.write_status(rid, "processing", worker_pid=os.getpid())
+    spool.finish_job(rid, state="done", exit=0, msg="answer retrieved")
+    assert spool.read_status(rid)["state"] == "done"
