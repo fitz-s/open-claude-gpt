@@ -17,10 +17,10 @@
 #   cgc enqueue <args…>               queue a job for the daemon (LOCAL write) (cgc_spool.py enqueue)
 #   cgc await   <args…>               poll the local answer file for a queued job (cgc_spool.py await)
 #   cgc queue   [--rid R]             show daemon liveness + spool contents (cgc_spool.py status)
-#   cgc submit  <args…>               DIRECT send (no daemon; blocked in auto mode) (cdp_consult.py submit)
-#   cgc followup <args…>              continue a thread                    (cdp_consult.py followup)
-#   cgc wait    <args…>               DIRECT poll (no daemon)              (cdp_consult.py wait)
-#   cgc status  <args…>               one-shot progress JSON               (cdp_consult.py status)
+#   cgc submit / followup             RETIRED — the store daemon's send_round is the sole send path
+#                                     (use `cgc fire` / `prep --followup` + `enqueue --kind followup`)
+#   cgc wait    <args…>               read-only DIRECT poll (no send)      (cdp_consult.py wait)
+#   cgc status  <args…>               read-only one-shot progress JSON     (cdp_consult.py status)
 #
 # AUTO-MODE PATH (default under Claude Code's data-exfiltration classifier):
 #   fire → await. The agent only touches LOCAL files (fire makes no network call either);
@@ -138,8 +138,14 @@ PYEOF
             exec python3 "$S/consult.py" deliver --verify "$@" ;;
   prep)     exec python3 "$S/consult.py" prep "$@" ;;
   fire)     exec python3 "$S/consult.py" fire "$@" ;;
-  submit|followup|wait|status)
-            # cdp_consult.py takes --port BEFORE the subcommand; pass through as-is.
+  submit|followup)
+            # Direct send is retired: the daemon's send_round is the SOLE egress path, so the gate
+            # can never be bypassed by which verb sent. Use fire (submit) / prep --followup + enqueue.
+            echo "cgc $cmd: direct send is retired — the store-backed daemon is the only send path." >&2
+            echo "  new consult:  cgc fire ...        follow-up:  cgc prep --followup ... && cgc enqueue --kind followup --conversation <id> ..." >&2
+            exit 2 ;;
+  wait|status)
+            # Read-only diagnostics only (no send). cdp_consult.py takes --port BEFORE the subcommand.
             exec python3 "$S/cdp_consult.py" "$cmd" "$@" ;;
   set-project)
     # Persist which ChatGPT project a fresh consult opens, for ALL future consults, in the
