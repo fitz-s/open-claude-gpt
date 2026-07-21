@@ -73,6 +73,68 @@ def test_gate_rejection_never_sends(env):
     assert s.get_round(r["rid"])["state"] == store_mod.GATE_REJECTED
 
 
+def test_transient_gate_failure_requeues_not_terminal(env):
+    """A `refused:` gate reason is authoritative and terminal, but an `unverified:` reason is a
+    TRANSIENT failure (gh missing/timed out — could not CONFIRM public, not proven private). It must
+    requeue, not terminally reject, so a temporary gh outage does not permanently strand a legit
+    consult. The round is `ready` (pre-send) so nothing has left."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    sent = []
+    final = backend.process_round(s, r, lambda *a, **k: sent.append(k) or {"code": 1},
+                                  daemon_instance_id="d1",
+                                  validate=lambda p: (False, "unverified: gh timed out after 8s"))
+    assert final == store_mod.QUEUED
+    assert sent == [], "a gate that could not confirm must not send"
+    assert r["rid"] in s.recover()["dispatchable"], "requeued → safe to retry once gh recovers"
+
+
+def test_auto_retrieve_recovers_possibly_accepted_with_conversation(env):
+    """A possibly_accepted round with a known conversation is re-attached READ-ONLY exactly once: the
+    waiter's rid-sentinel check means it completes only if THIS round's own answer is on the thread,
+    and it never re-sends. This automates the manual `wait --rid --conversation` recovery."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    aid = s.begin_send(r["rid"], "b", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid, "conv-live")
+    s.mark_waiting(r["rid"])
+    s.set_state(r["rid"], store_mod.POSSIBLY_ACCEPTED, error_code="wait died — retrieve, don't resend")
+    # recover() offers it as retrievable (has conv, not yet auto-retrieved).
+    assert r["rid"] in s.recover()["retrievable"]
+    calls = []
+
+    def cdp(kind, **kw):
+        calls.append(kind)
+        with open(kw["out"], "w") as f:
+            f.write("the answer that was already generated")
+        return {"code": 0, "out": kw["out"], "stderr": ""}
+
+    final = backend.resume_round(s, s.get_round(r["rid"]), cdp)
+    assert final == store_mod.COMPLETED_VERIFIED
+    assert calls == ["wait"], "auto-retrieve must ONLY wait — never re-send"
+
+
+def test_auto_retrieve_is_bounded_to_one_attempt(env):
+    """A send that never landed has no matching sentinel, so the read-only wait finds nothing and the
+    round returns to possibly_accepted. It must NOT be offered for auto-retrieve again — else it would
+    re-attach every loop, burning a full wait budget each time. Bounded by the auto_retrieve event."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    aid = s.begin_send(r["rid"], "b", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid, "conv-live")
+    s.mark_waiting(r["rid"])
+    s.set_state(r["rid"], store_mod.POSSIBLY_ACCEPTED, error_code="wait died")
+
+    def cdp_no_answer(kind, **kw):
+        return {"code": 4, "out": kw["out"], "stderr": "no matching sentinel"}
+
+    final = backend.resume_round(s, s.get_round(r["rid"]), cdp_no_answer)
+    assert final == store_mod.POSSIBLY_ACCEPTED       # sentinel absent → back to uncertain
+    assert s.was_auto_retrieved(r["rid"])
+    assert r["rid"] not in s.recover()["retrievable"], "must not auto-retrieve a second time"
+    assert r["rid"] in s.recover()["uncertain"], "still needs a human after the one bounded attempt"
+
+
 def test_login_blocker_is_blocked_not_uncertain(env):
     store_mod, backend, s, tmp = env
     r = _ready_round(store_mod, s)

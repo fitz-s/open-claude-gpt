@@ -168,6 +168,30 @@ def test_recover_classifies_all_buckets(store):
         assert "D" not in bucket, "terminal rounds are not recovered"
 
 
+def test_retrievable_bucket_only_conversation_bearing_possibly_accepted(store):
+    """A possibly_accepted round is auto-retrievable (read-only, once) ONLY if it has a resolvable
+    conversation — with an address the rid-sentinel wait can recover it safely; without one there is
+    nothing to attach to and it must stay a human's job. And never after its one bounded attempt."""
+    m, s = store
+    # possibly_accepted WITH a conversation → retrievable (and still uncertain).
+    s.create_round("P", "submit"); s.set_state("P", m.READY)
+    p_aid = s.begin_send("P", "b", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(p_aid, "conv-p"); s.mark_waiting("P")
+    s.set_state("P", m.POSSIBLY_ACCEPTED, error_code="wait died")
+    # possibly_accepted with NO conversation → uncertain only, never retrievable.
+    s.create_round("N", "submit"); s.set_state("N", m.READY)
+    n_aid = s.begin_send("N", "b", "h" * 64, daemon_instance_id="d1")
+    s.mark_possibly_accepted(n_aid, "submit gave no conversation")
+
+    rec = s.recover()
+    assert set(rec["uncertain"]) == {"P", "N"}
+    assert rec["retrievable"] == ["P"], "only the conversation-bearing one is auto-retrievable"
+
+    s.record_auto_retrieve("P")
+    assert "P" not in s.recover()["retrievable"], "one bounded attempt only"
+    assert "P" in s.recover()["uncertain"], "still surfaced to the human after the attempt"
+
+
 def test_promote_sending_to_uncertain_is_idempotent(store):
     m, s = store
     s.create_round("S", "submit"); s.set_state("S", m.READY)

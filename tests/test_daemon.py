@@ -312,6 +312,27 @@ def test_run_stderr_is_scoped_to_the_current_attempt_not_the_cumulative_log(daem
     assert "ambiguous" in se2, "attempt 2's own stderr must be what is returned"
 
 
+def test_ready_orphan_is_redispatched_not_stranded(daemon, monkeypatch):
+    """A `ready` round with no live worker (its Popen failed, or the worker died before begin_send)
+    was stranded forever: claim_ready only picks `queued`, and recover() reported it as dispatchable
+    but nothing acted on it. _dispatch_store must re-dispatch it — a `ready` round is pre-send, so
+    re-running process_round from it is safe."""
+    spawned = []
+
+    class _P:
+        pid = 4321
+    monkeypatch.setattr(daemon.subprocess, "Popen", lambda argv, **k: spawned.append(argv) or _P())
+
+    with daemon.store_mod.Store() as s:
+        s.create_round("REQ-20260707-120000-00d001", "submit")
+        s.set_state("REQ-20260707-120000-00d001", daemon.store_mod.READY)  # claimed, worker never ran
+
+    daemon._dispatch_store({}, concurrency=3, daemon_instance_id="d1")
+    worker_argvs = [a for a in spawned if "--worker-store" in a]
+    assert any("REQ-20260707-120000-00d001" in a for a in worker_argvs), \
+        "the orphaned ready round must be re-dispatched"
+
+
 def test_store_mode_skips_legacy_orphan_recovery_and_tab_sweep(daemon, monkeypatch):
     """In store mode the legacy file-spool maintenance is both redundant and harmful: _recover_orphans
     rewrites the rollback spool (priming a future rollback to duplicate an uncertain send) and
@@ -325,7 +346,7 @@ def test_store_mode_skips_legacy_orphan_recovery_and_tab_sweep(daemon, monkeypat
         def __enter__(self): return self
         def __exit__(self, *a): return False
         def promote_sending_to_uncertain(self): return []
-        def recover(self): return {"dispatchable": [], "reattach": [], "uncertain": []}
+        def recover(self): return {"dispatchable": [], "reattach": [], "uncertain": [], "retrievable": []}
         def claim_ready(self, *a): return None
     monkeypatch.setattr(daemon.store_mod, "Store", lambda *a, **k: _S())
 

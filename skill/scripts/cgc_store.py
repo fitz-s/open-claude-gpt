@@ -374,17 +374,47 @@ class Store:
           - reattach:     accepted/waiting — a conversation exists or the RID landed; resume polling.
           - uncertain:    sending/possibly_accepted — needs explicit reconciliation, NEVER auto-send.
         """
-        out = {"dispatchable": [], "reattach": [], "uncertain": []}
+        out = {"dispatchable": [], "reattach": [], "uncertain": [], "retrievable": []}
         for row in self.db.execute("SELECT rid,state FROM rounds WHERE state NOT IN (%s)"
                                     % ",".join("?" * len(TERMINAL)), tuple(sorted(TERMINAL))):
             s = row["state"]
+            rid = row["rid"]
             if s in (QUEUED, READY):
-                out["dispatchable"].append(row["rid"])
+                out["dispatchable"].append(rid)
             elif s in (ACCEPTED, WAITING):
-                out["reattach"].append(row["rid"])
+                out["reattach"].append(rid)
             elif s in UNCERTAIN:
-                out["uncertain"].append(row["rid"])
+                out["uncertain"].append(rid)
+                # A possibly_accepted round WITH a known conversation can be re-attached READ-ONLY:
+                # the waiter verifies END_RESPONSE:<rid>, so it completes ONLY if THIS round's own
+                # answer is actually present on the thread, and it NEVER re-sends. That makes one
+                # automatic retrieve safe — it recovers the common "accepted, then the waiter died or
+                # timed out" stranding (which otherwise sits uncertain until a human runs `wait` by
+                # hand) without ever risking a duplicate. Bounded to a single auto-attempt by an event
+                # marker, so a send that truly never landed (no matching sentinel) falls back to the
+                # human after one try instead of looping a full wait budget forever.
+                if s == POSSIBLY_ACCEPTED and self.conversation_of(rid) and not self.was_auto_retrieved(rid):
+                    out["retrievable"].append(rid)
         return out
+
+    def conversation_of(self, rid: str) -> str | None:
+        """The ChatGPT conversation id addressable for this round via its thread, or None."""
+        row = self.db.execute(
+            "SELECT t.conversation_id c FROM rounds r JOIN threads t ON r.thread_id=t.thread_id "
+            "WHERE r.rid=?", (rid,)).fetchone()
+        return row["c"] if row and row["c"] else None
+
+    def was_auto_retrieved(self, rid: str) -> bool:
+        row = self.db.execute(
+            "SELECT 1 FROM events WHERE rid=? AND kind='auto_retrieve' LIMIT 1", (rid,)).fetchone()
+        return row is not None
+
+    def record_auto_retrieve(self, rid: str) -> None:
+        """Mark that this round has had its one automatic read-only retrieve — the bound that keeps a
+        never-landed send from re-attaching every loop. Recorded BEFORE the wait, so a crash mid-wait
+        still counts the attempt."""
+        with self._tx():
+            self._event("auto_retrieve", rid=rid, detail="one-shot read-only reattach of possibly_accepted")
 
     def promote_sending_to_uncertain(self) -> list[str]:
         """Recovery step: a round left in `sending` when the daemon restarts means the worker died
