@@ -297,9 +297,15 @@ class lifecycle_lock:
     def __init__(self, timeout=30):
         self.timeout = timeout
         self.fh = None
+        self.acquired = False
 
     def __enter__(self):
         if fcntl is None:
+            # The supported deployment (macOS) always has fcntl. This branch only keeps import
+            # working on exotic platforms, where admission and restart cannot be serialised at all
+            # — report acquired so the daemon still runs, accepting the non-atomicity it had before
+            # any lock existed. (A first-principles rebuild fails startup here instead.)
+            self.acquired = True
             return self
         ensure_dirs()
         self.fh = open(LIFECYCLE_LOCK, "a+")
@@ -307,22 +313,28 @@ class lifecycle_lock:
         while True:
             try:
                 fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.acquired = True
                 return self
             except OSError:
                 if time.time() > deadline:
-                    # Never block a consult forever on a lock; proceed unserialised and say so.
-                    sys.stderr.write("CGC_WARN lifecycle_lock: timed out; proceeding unserialised\n")
+                    # Could NOT acquire — a browser restart (or a peer admission) holds the lock.
+                    # Return NOT acquired and let the caller fail closed (skip + retry). A lock that
+                    # runs its body unlocked is not a lock: that fail-open is exactly how a restart
+                    # tore the tab off a worker admitted while it was in progress.
+                    sys.stderr.write(f"CGC_WARN lifecycle_lock: not acquired within {self.timeout}s "
+                                     "— caller fails closed (job stays queued, retried)\n")
                     return self
                 time.sleep(0.2)
 
     def __exit__(self, *exc):
         if self.fh is not None:
             try:
-                if fcntl is not None:
+                if self.acquired and fcntl is not None:
                     fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
                 self.fh.close()
             except OSError:
                 pass
+        self.acquired = False
         return False
 
 
