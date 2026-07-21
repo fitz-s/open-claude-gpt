@@ -594,5 +594,46 @@ def test_is_conv_url_logic_matches_source():
     )
 
 
+# ============================================================================
+# SHARED CONTRACT: the source-legitimacy gate has two implementations —
+#   1. cgc_spool.validate_prompt   rule 1 (the authoritative egress gate)
+#   2. cdp_consult._has_sendable_source  (the send-time backstop, direct path + daemon child)
+# Both must agree on whether a prompt carries a legitimate basis to send: a real code LINK, or a
+# sentinel prep stamps to declare it needs none (follow-up / --no-code). They drifted once — the
+# backstop honored only the follow-up sentinel — so every `prep --no-code` consult passed the spool
+# gate and was refused at send with no_code_source. This test pins them together.
+# ============================================================================
+
+_GATE_MATRIX = [
+    # (name, prompt, expect_sendable)
+    ("bare_prose_no_link", "Please review the design of my repo, it is a big refactor.", False),
+    ("no_code_sentinel",
+     "# Prove it\nThis consult references no code — it is a self-contained question.\nProve it.\n",
+     True),
+    ("followup_sentinel",
+     "Continuing this consult. Here are the local results since the last round.\n", True),
+    ("real_code_link", "Review https://github.com/acme/widget/tree/abc123 for races.\n", True),
+]
+
+
+@pytest.mark.parametrize("name,prompt,expect", _GATE_MATRIX, ids=[c[0] for c in _GATE_MATRIX])
+def test_source_gate_parity(name, prompt, expect, monkeypatch):
+    """cdp_consult's send-gate and cgc_spool's rule 1 must reach the identical send/refuse verdict.
+    Every prompt in the matrix is secret-free and gist-free, so validate_prompt's other rules never
+    fire; the link case monkeypatches the public-repo check so no network is touched."""
+    cdp = _load("cdp_consult.py")
+    spool = _load("cgc_spool.py")
+    monkeypatch.setattr(spool, "_repo_is_public", lambda slug: (True, "public"))
+
+    cdp_sendable = cdp._has_sendable_source(prompt)
+    spool_ok, spool_why = spool.validate_prompt(prompt)
+
+    assert cdp_sendable == expect, f"{name}: cdp backstop verdict wrong"
+    assert spool_ok == expect, f"{name}: spool gate verdict wrong ({spool_why})"
+    assert cdp_sendable == spool_ok, (
+        f"{name}: source gates DISAGREE — cdp={cdp_sendable} spool={spool_ok} ({spool_why}); "
+        "the two implementations of the source-legitimacy contract have drifted")
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

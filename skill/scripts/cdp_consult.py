@@ -859,6 +859,26 @@ _CODE_URL_RE = re.compile(
     r"https://(?:www\.)?(?:github\.com|gist\.github\.com|raw\.githubusercontent\.com)/\S+",
     re.IGNORECASE)
 
+# Two sentence-sentinels prep stamps into the rendered prompt to declare a LEGITIMATE reason it
+# carries no code LINK: a follow-up (the thread already holds the code) or a self-contained no-code
+# question (maths/research/writing). Every source gate MUST honor BOTH — cgc_spool.validate_prompt
+# does. Honoring only one is not "stricter", it is WRONG: it refuses a prompt prep authorized, at
+# the moment of send. A prior version of the backstop below checked only the follow-up sentinel, so
+# every `prep --no-code` consult passed the spool gate and was then refused here with
+# no_code_source. Keep this predicate in lockstep with cgc_spool.validate_prompt's rule 1.
+_FOLLOWUP_SENTINEL = "continuing this consult"
+_NO_CODE_SENTINEL = "references no code"
+
+
+def _has_sendable_source(prompt: str) -> bool:
+    """The send-time mirror of cgc_spool.validate_prompt rule 1: a prompt is sendable iff it carries
+    a real code LINK, or a sentinel declaring it legitimately needs none. A prose Context section is
+    NOT the code — ChatGPT can't read the repo from a description and answers blind."""
+    low = prompt.lower()
+    return (bool(_CODE_URL_RE.search(prompt))
+            or _FOLLOWUP_SENTINEL in low
+            or _NO_CODE_SENTINEL in low)
+
 
 # ChatGPT has shipped two turn schemas. Keep them as SEPARATE adapters rather than unioning the
 # selectors: when both attributes are present at different levels of the DOM, one union query
@@ -1020,23 +1040,20 @@ def _read_prompt(path):
 
 def cmd_submit(a) -> int:
     prompt = _read_prompt(a.prompt_file)
-    # Backstop (prep already hard-blocks at render): refuse to send a prompt with no actual CODE LINK.
+    # Backstop (prep already hard-blocks at render; the spool gate re-checks): refuse to send a
+    # prompt that has neither a real CODE LINK nor a sentinel declaring it legitimately needs none.
     # A prose Context section is NOT the code — ChatGPT can't read the repo from a description and
-    # answers blind ("no file access / can't cite file:line"). Require a github/gist link unless it's a
-    # follow-up (the thread already holds the code). No override — fail closed.
-    # PROVENANCE: a real https URL on github.com/gist.github.com/raw.githubusercontent.com, NOT
-    # merely the substring "github" anywhere in the prompt (spoofable by e.g. writing the word
-    # "github" in prose with no actual link — that used to satisfy the old `"github" in low` gate).
-    low = prompt.lower()
-    has_code_link = bool(_CODE_URL_RE.search(prompt))
-    is_followup = "continuing this consult" in low
-    if not has_code_link and not is_followup:
+    # answers blind ("no file access / can't cite file:line"). PROVENANCE: a real https URL on
+    # github.com/gist.github.com/raw.githubusercontent.com, NOT the bare substring "github" (which a
+    # prose mention used to spoof under the old `"github" in low` gate). No override — fail closed.
+    if not _has_sendable_source(prompt):
         sys.stderr.write(
             "CGC_ERROR no_code_source: this prompt has no code link (no github/gist URL) — ChatGPT "
             "cannot read your repo and would answer BLIND (the recurring 'no file access' failure; a "
             "prose Context section is NOT the code). Deliver the link first: consult.py deliver "
             "--repo <owner/repo> --ref <sha> (whole-repo /tree link) → pass its refs_file to prep "
-            "--refs-file. NOT submitting.\n")
+            "--refs-file. If the question has NO code subject at all (maths/research/writing), render "
+            "it with `prep --no-code`. NOT submitting.\n")
         return 2
     if not a.no_gate:
         _ensure_chrome(a.port)  # automated Step 0: start debug Chrome if down + check login
