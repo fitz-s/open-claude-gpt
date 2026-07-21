@@ -319,7 +319,11 @@ class CDP:
         if create_url:
             ver = json.load(urllib.request.urlopen(f"{base}/json/version", timeout=5))
             bw = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=timeout)
-            bw.send(json.dumps({"id": 1, "method": "Target.createTarget", "params": {"url": create_url}}))
+            # background:true — create the consult tab WITHOUT activating it, so a consult never
+            # yanks Chrome (or the whole desktop) to the foreground and interrupts the user's work.
+            # The waiter drives and reads the tab over CDP, which does not need it focused.
+            bw.send(json.dumps({"id": 1, "method": "Target.createTarget",
+                                "params": {"url": create_url, "background": True}}))
             tid = None
             for _ in range(50):
                 m = json.loads(bw.recv())
@@ -1598,10 +1602,11 @@ def cmd_wait(a) -> int:
                 last_len = cur_len
             time.sleep(a.poll)
         # Timeout: the answer is usually PRESENT but was virtualized out of the inactive tab's
-        # DOM (the failure that returned "no answer" on a completed consult). Force-render hard
-        # — bring the tab to front AND scroll — so React commits the answer node, then re-read.
+        # DOM (the failure that returned "no answer" on a completed consult). Force-render by
+        # SCROLLING the node into view so React commits it — WITHOUT Page.bringToFront, which would
+        # yank the tab to the foreground and interrupt the user. The answer is read via textContent,
+        # which survives a backgrounded/virtualized tab, so focus is not required to extract it.
         try:
-            c.call("Page.bringToFront", {})
             c.eval(_FORCE_RENDER_JS)
         except Exception:
             pass
