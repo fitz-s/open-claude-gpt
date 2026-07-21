@@ -105,9 +105,9 @@ def _new_id() -> str:
 
 
 def store_enabled() -> bool:
-    """The cutover flag. Off (default) → the file-spool path runs unchanged; on → enqueue/await/the
-    daemon worker use this store. One switch, one authority — never both at once."""
-    return os.environ.get("CGC_STORE_BACKEND", "").strip().lower() in ("1", "true", "yes", "on")
+    """The backend switch, now DEFAULT ON — the store is the control plane. Set CGC_STORE_BACKEND=0
+    to roll back to the (still-present) file-spool path. One switch, one authority, never both."""
+    return os.environ.get("CGC_STORE_BACKEND", "1").strip().lower() in ("1", "true", "yes", "on")
 
 
 def new_daemon_instance_id() -> str:

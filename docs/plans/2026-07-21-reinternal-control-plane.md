@@ -92,17 +92,21 @@ delete the file-spool lifecycle machinery. Tests stay green at every phase.
   - Rollback: remove the `CGC_STORE_BACKEND` line from `~/.config/cgc/config` and restart the daemon
     — the file-spool path is unchanged and still present.
 
-- [ ] 4. **Single egress path**
-  - Files: `bin/cgc`, `skill/SKILL.md`, `docs/`
-  - What: `bin/cgc submit/followup` enqueue to the daemon rather than calling CDP send directly;
-    remove the MCP fallback from the automatic send surface (keep as documented human-only note).
-    send_round becomes the sole click path.
+- [x] 4. **Single egress path** — DONE
+  - `store_enabled()` now DEFAULT ON (store is the control plane; `CGC_STORE_BACKEND=0` rolls back).
+  - `bin/cgc submit/followup` retired — they refuse and point to `fire`/`enqueue`, so the store
+    daemon's send_round is the SOLE send path and the gate can't be bypassed by which verb sent.
+    `wait`/`status` kept as read-only diagnostics. MCP was already off the automatic path (explicit
+    `--backend mcp` only), retained as a documented human fallback per the consult.
 
-- [ ] 5. **Retire the file-spool lifecycle machinery**
-  - Files: `skill/scripts/cgc_spool.py`, `skill/scripts/cgc_daemon.py`, `skill/scripts/cdp_consult.py`
-  - What: once the store is the sole authority — delete worker-PID fencing, pending/processing/done
-    directory-as-state, lifecycle_lock, active.json, automatic orphan resubmission. Introduce the
-    one-scheduler-actor model (send_concurrency=1) + `browser_epoch`.
+- [ ] 5. **Retire the file-spool lifecycle machinery** — HELD (dormant, rollback-only)
+  - With store default-on, the spool machinery (worker-PID fencing, pending/processing/done as
+    state, lifecycle_lock, active.json, orphan resubmission) is now UNREACHABLE on the default path
+    — the correctness/security intent (nothing governed by PID/lock/dir-state) is already achieved.
+  - Physically deleting it + the one-scheduler-actor / `browser_epoch` daemon rewrite is deliberately
+    deferred until the store backend has proven itself in real use — deleting the rollback net the
+    day of cutover is exactly what the consult's migration/rollback discipline warns against. Do it
+    once the store has real mileage; nothing depends on it meanwhile.
 
 - [ ] 6. **Test & verify** (every phase, not just the end)
   - Run: `python3 -m pytest tests/ -q` and `python3 -m py_compile skill/scripts/*.py && node -c skill/scripts/retrieval_window.js`
