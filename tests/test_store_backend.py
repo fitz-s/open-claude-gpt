@@ -143,6 +143,41 @@ def test_salvage_marks_unverified(env):
     assert final == store_mod.COMPLETED_UNVERIFIED
 
 
+def test_followup_continues_same_conversation_not_new_submit(env):
+    """Regression: the store worker submitted for EVERY kind, so a followup opened a NEW conversation
+    and lost the thread. A followup must attach to its conversation via the followup path, never
+    submit."""
+    store_mod, backend, s, tmp = env
+    s.create_round("REQ-20260721-000000-0000ff", "followup", out_path=str(tmp / "f.txt"),
+                   prompt="continuing this consult; the next question",
+                   spec_json=json.dumps({"conversation": "conv-existing"}))
+    s.set_state("REQ-20260721-000000-0000ff", store_mod.READY)
+    calls = []
+
+    def cdp(kind, **kw):
+        calls.append((kind, kw.get("conversation")))
+        with open(kw["out"], "w") as f:
+            f.write("the follow-up answer on the same thread")
+        return {"code": 0, "out": kw["out"], "stderr": ""}
+
+    final = backend.process_round(s, s.get_round("REQ-20260721-000000-0000ff"), cdp,
+                                  daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.COMPLETED_VERIFIED
+    assert calls == [("followup", "conv-existing")], \
+        "followup MUST attach to the existing conversation, never submit a fresh one"
+
+
+def test_followup_without_conversation_fails_not_new_thread(env):
+    store_mod, backend, s, tmp = env
+    s.create_round("REQ-20260721-000000-0000fe", "followup", out_path=str(tmp / "f.txt"),
+                   prompt="continuing this consult", spec_json=json.dumps({"conversation": "auto"}))
+    s.set_state("REQ-20260721-000000-0000fe", store_mod.READY)
+    final = backend.process_round(s, s.get_round("REQ-20260721-000000-0000fe"),
+                                  lambda *a, **k: pytest.fail("must not send"),
+                                  daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.FAILED  # no conversation → fail, never open a new thread
+
+
 def test_retrieve_attaches_without_sending(env):
     store_mod, backend, s, tmp = env
     s.create_round("REQ-20260721-000000-00000r", "retrieve", out_path="/tmp/r.txt",
