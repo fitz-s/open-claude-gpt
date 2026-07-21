@@ -130,6 +130,42 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         store.set_state(rid, store_mod.WAITING, expect=store_mod.READY)
         return _wait_phase(store, rid, conv, spec, run_cdp)
 
+    # followup: CONTINUE the same thread — attach to its conversation and send there, never open a
+    # new one (a fresh submit would silently lose the thread's context, the worst kind of bug).
+    if r["kind"] == "followup":
+        conv = spec.get("conversation")
+        if not conv or conv == "auto":
+            conv = _thread_conv(store, r)
+        if not conv:
+            store.finish(rid, store_mod.FAILED,
+                         error_code="followup needs an explicit conversation id — no thread to continue")
+            return store_mod.FAILED
+        ok, reason = validate(prompt)
+        if not ok:
+            store.gate_reject(rid, reason)
+            return store_mod.GATE_REJECTED
+        attempt = store.begin_send(rid, prompt, store_mod.sha256(prompt),
+                                   daemon_instance_id=daemon_instance_id)
+        out_tmp = os.path.join(store_mod.CGC_STATE_DIR, f"_wait_{rid}.txt")
+        res = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt, out=out_tmp,
+                      poll=spec.get("poll"), timeout=spec.get("timeout"))
+        code = res.get("code")
+        stderr = (res.get("stderr") or "").lower()
+        answer = _read_answer(out_tmp)
+        if code == 0 and answer.strip():
+            store.mark_accepted(attempt, conv)       # same thread, confirmed
+            store.mark_waiting(rid)
+            unverified = os.path.exists(out_tmp + ".raw")
+            final = store_mod.COMPLETED_UNVERIFIED if unverified else store_mod.COMPLETED_VERIFIED
+            store.finish(rid, final, result_text=answer)
+            return final
+        if any(m.lower() in stderr for m in _NOT_SENT_BLOCK):
+            store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
+                            error_code=_first_marker(stderr, _NOT_SENT_BLOCK))
+            return store_mod.BLOCKED
+        store.mark_possibly_accepted(attempt, f"followup produced no answer (exit {code}) — retrieve, don't resend")
+        return store_mod.POSSIBLY_ACCEPTED
+
     ok, reason = validate(prompt)
     if not ok:
         store.gate_reject(rid, reason)
@@ -185,19 +221,29 @@ def resume_round(store, r: dict, run_cdp) -> str:
     return _wait_phase(store, rid, conv, spec, run_cdp)
 
 
+def _thread_conv(store, r) -> str | None:
+    tid = r.get("thread_id")
+    if not tid:
+        return None
+    row = store.db.execute("SELECT conversation_id FROM threads WHERE thread_id=?", (tid,)).fetchone()
+    return row["conversation_id"] if row else None
+
+
+def _read_answer(path) -> str:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
 def _wait_phase(store, rid, conv, spec, run_cdp) -> str:
     out_tmp = os.path.join(store_mod.CGC_STATE_DIR, f"_wait_{rid}.txt")
     res = run_cdp("wait", rid=rid, conversation=conv, out=out_tmp,
                   poll=spec.get("poll"), timeout=spec.get("timeout"))
     code = res.get("code")
     answer_path = res.get("out") or out_tmp
-    answer = ""
-    if os.path.exists(answer_path):
-        try:
-            with open(answer_path, encoding="utf-8") as f:
-                answer = f.read()
-        except OSError:
-            answer = ""
+    answer = _read_answer(answer_path)
     if code == 0 and answer.strip():
         unverified = os.path.exists(answer_path + ".raw")
         store.finish(rid, store_mod.COMPLETED_UNVERIFIED if unverified else store_mod.COMPLETED_VERIFIED,

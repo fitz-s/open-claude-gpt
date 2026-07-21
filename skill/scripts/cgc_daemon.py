@@ -76,6 +76,17 @@ def _make_run_cdp():
             except Exception:
                 conv = ""
             return {"code": code, "conversation": conv, "stderr": se}
+        if kind == "followup":
+            # CONTINUE the existing conversation: cdp_consult followup --watch attaches to --conversation
+            # and sends+waits in one call (never opens a new thread). Same command the file-spool
+            # worker used, so the proven followup path is unchanged.
+            poll = str(kw.get("poll") or spool.POLL_S)
+            timeout = int(kw.get("timeout") or spool.STUCK_AFTER_S)
+            cmd = [sys.executable, _CDP, "followup", "--conversation", kw["conversation"],
+                   "--prompt-file", "-", "--rid", kw["rid"], "--watch", "--out", kw["out"],
+                   "--poll", poll, "--timeout", str(timeout)]
+            code, _so, se = _run(cmd, timeout + 40, kw["rid"], stdin_text=kw["prompt"])
+            return {"code": code, "out": kw["out"], "stderr": se}
         if kind == "wait":
             poll = str(kw.get("poll") or spool.POLL_S)
             timeout = int(kw.get("timeout") or spool.STUCK_AFTER_S)
