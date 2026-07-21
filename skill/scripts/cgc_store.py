@@ -308,16 +308,26 @@ class Store:
         """The click landed: the RID (and ideally a conversation id) is observed. conversation_id may
         be None if the RID landed but the URL has not stabilised yet — `accepted` tolerates that."""
         rid = self._attempt_round(attempt_id)
+        now = _now()
         with self._tx():
             r = self.db.execute("SELECT state,thread_id FROM rounds WHERE rid=?", (rid,)).fetchone()
             if r["state"] not in (SENDING, POSSIBLY_ACCEPTED):
                 raise IllegalTransition(f"{rid}: mark_accepted from {r['state']!r}")
             self.db.execute(
                 "UPDATE attempts SET phase=?,last_progress_at=?,remote_evidence_json=? WHERE attempt_id=?",
-                (ACCEPTED, _now(), evidence_json, attempt_id))
-            if conversation_id and r["thread_id"]:
+                (ACCEPTED, now, evidence_json, attempt_id))
+            if conversation_id:
+                # A fresh submit has no thread until its conversation is first known (here). Create
+                # and link one keyed by the conversation id, so the id is never lost — followup and
+                # retrieve depend on it. An existing thread just gets its conversation set/updated.
+                tid = r["thread_id"] or conversation_id
+                self.db.execute(
+                    "INSERT OR IGNORE INTO threads(thread_id,conversation_id,created_at,updated_at) "
+                    "VALUES(?,?,?,?)", (tid, conversation_id, now, now))
                 self.db.execute("UPDATE threads SET conversation_id=?,updated_at=? WHERE thread_id=?",
-                                (conversation_id, _now(), r["thread_id"]))
+                                (conversation_id, now, tid))
+                if not r["thread_id"]:
+                    self.db.execute("UPDATE rounds SET thread_id=? WHERE rid=?", (tid, rid))
             self._apply_round_fields(rid, state=ACCEPTED)
             self._event("accepted", rid=rid, attempt_id=attempt_id,
                         detail=f"conv={conversation_id or 'pending'}")

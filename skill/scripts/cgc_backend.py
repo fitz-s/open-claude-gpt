@@ -162,6 +162,29 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
     return store_mod.POSSIBLY_ACCEPTED
 
 
+def resume_round(store, r: dict, run_cdp) -> str:
+    """Reattach to a round that was already `accepted`/`waiting` when a worker died (daemon restart,
+    closed tab) and resume polling its existing conversation — the store peer of the spool's orphan
+    recovery. It NEVER re-sends; a round with no conversation cannot be resumed and is left uncertain
+    for human reconciliation (never auto-resent)."""
+    rid = r["rid"]
+    spec = json.loads(r["spec_json"]) if r.get("spec_json") else {}
+    tid = r.get("thread_id")
+    conv = None
+    if tid:
+        row = store.db.execute("SELECT conversation_id FROM threads WHERE thread_id=?", (tid,)).fetchone()
+        conv = row["conversation_id"] if row else None
+    if not conv:
+        # accepted but no conversation recorded → we cannot address it; do not resend, mark uncertain.
+        if r["state"] != store_mod.POSSIBLY_ACCEPTED:
+            store.set_state(rid, store_mod.POSSIBLY_ACCEPTED,
+                            error_code="accepted but no conversation to reattach — retrieve manually")
+        return store_mod.POSSIBLY_ACCEPTED
+    if r["state"] == store_mod.ACCEPTED:
+        store.mark_waiting(rid)
+    return _wait_phase(store, rid, conv, spec, run_cdp)
+
+
 def _wait_phase(store, rid, conv, spec, run_cdp) -> str:
     out_tmp = os.path.join(store_mod.CGC_STATE_DIR, f"_wait_{rid}.txt")
     res = run_cdp("wait", rid=rid, conversation=conv, out=out_tmp,

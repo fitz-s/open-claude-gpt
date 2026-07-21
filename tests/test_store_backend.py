@@ -162,6 +162,35 @@ def test_retrieve_attaches_without_sending(env):
     assert calls == ["wait"], "retrieve must only wait — it must never submit/send"
 
 
+def test_resume_reattaches_and_never_resends(env):
+    store_mod, backend, s, tmp = env
+    # a round that was accepted+waiting when its worker died
+    r = _ready_round(store_mod, s)
+    aid = s.begin_send(r["rid"], "b", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid, "conv-live"); s.mark_waiting(r["rid"])
+    calls = []
+
+    def cdp(kind, **kw):
+        calls.append(kind)
+        with open(kw["out"], "w") as f:
+            f.write("resumed answer")
+        return {"code": 0, "out": kw["out"], "stderr": ""}
+
+    final = backend.resume_round(s, s.get_round(r["rid"]), cdp)
+    assert final == store_mod.COMPLETED_VERIFIED
+    assert calls == ["wait"], "resume must ONLY wait — never submit/resend"
+
+
+def test_resume_without_conversation_is_uncertain(env):
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    # force accepted state with NO conversation recorded (thread-less)
+    aid = s.begin_send(r["rid"], "b", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid)  # no conversation
+    final = backend.resume_round(s, s.get_round(r["rid"]), lambda *a, **k: pytest.fail("must not send"))
+    assert final == store_mod.POSSIBLY_ACCEPTED
+
+
 def test_enqueue_and_await_roundtrip(env, monkeypatch):
     store_mod, backend, s, tmp = env
     # enqueue via the CLI-facing helper

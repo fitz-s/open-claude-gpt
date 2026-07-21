@@ -44,6 +44,21 @@ def test_create_and_get_round(store):
     assert s.get_round("nope") is None
 
 
+def test_accept_persists_conversation_for_a_threadless_submit(store):
+    """A fresh submit has no thread at enqueue; when the conversation first arrives at accept, a
+    thread must be created and linked so the id is never lost (followup/retrieve depend on it).
+    Regression: live cutover verification found the id was silently dropped."""
+    m, s = store
+    s.create_round("REQ-1", "submit")  # no thread_id
+    s.set_state("REQ-1", m.READY)
+    aid = s.begin_send("REQ-1", "b", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid, conversation_id="conv-xyz")
+    r = s.get_round("REQ-1")
+    assert r["thread_id"] == "conv-xyz"
+    th = s.db.execute("SELECT conversation_id FROM threads WHERE thread_id=?", ("conv-xyz",)).fetchone()
+    assert th["conversation_id"] == "conv-xyz"
+
+
 def test_happy_path_transitions(store):
     m, s = store
     s.create_round("REQ-1", "submit")
