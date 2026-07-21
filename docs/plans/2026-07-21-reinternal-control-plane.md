@@ -73,12 +73,18 @@ delete the file-spool lifecycle machinery. Tests stay green at every phase.
     map CDP `unknown_send` → `possibly_accepted`; success → `accepted(conversation)`; pre-send fail →
     retryable. Test with a stubbed cdp_invoke covering success / unknown_send / pre-send-fail / crash.
 
-- [ ] 3. **Cut daemon dispatch over to the store + one-shot migration**
-  - Files: `skill/scripts/cgc_daemon.py`, `skill/scripts/cgc_spool.py`, `tests/test_migration.py`
-  - What: daemon claims `ready` rounds from the store and calls send_round; a `spool→store` migration
-    (queued→queued; processing+conv→waiting/accepted; processing-no-conv→possibly_accepted, never
-    queued; terminal+answer→completed; terminal-no-answer→failed). Drain old daemon first; no
-    dual-authority. `enqueue`/`await`/`fire` read/write the store (CLI contract unchanged).
+- [x] 3a. **Spool→store migration** — `skill/scripts/cgc_migrate.py` + `Store.import_round` — DONE
+  - What: read-only spool→store mapping (queued→queued; processing+conv→waiting;
+    processing-no-conv→**possibly_accepted, never queued**; done+answer→completed_verified /
+    completed_unverified if `.raw` salvage; blocker→blocked; else→failed). Pure `plan_migration()` +
+    `migrate_spool_to_store()`; idempotent; never mutates the spool. 5 tests against a synthetic spool.
+
+- [ ] 3b. **Daemon dispatch + CLI over the store (the LIVE cutover)**
+  - Files: `skill/scripts/cgc_daemon.py`, `skill/scripts/cgc_spool.py`, `bin/cgc`
+  - What: daemon claims `ready` rounds from the store and calls send_round; `enqueue`/`await`/`fire`
+    read/write the store (CLI contract unchanged). **The operational cutover**: drain the running
+    daemon, snapshot, run the migration once, restart on the new path. No dual-authority; never
+    replay `sending`/`possibly_accepted`. This is the first step that touches the live system.
 
 - [ ] 4. **Single egress path**
   - Files: `bin/cgc`, `skill/SKILL.md`, `docs/`
