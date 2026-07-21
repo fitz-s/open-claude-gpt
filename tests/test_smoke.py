@@ -160,9 +160,9 @@ def test_sentinel_parse_missing_end():
 
 
 def test_sentinel_parse_two_assistant_messages():
-    # (4) extraneous text before/after the wrapper (as if two assistant messages/turns were
-    # concatenated) — the parser must still find the FIRST bare BEGIN and the FIRST bare END
-    # after it, ignoring trailing junk.
+    # (4) v3: END must be the LAST non-blank line. Trailing content after a bare END means that END
+    # is not the terminator (still streaming, or an injected early END) → NOT done. Accepting the
+    # FIRST END (v2) was exactly the truncation vector a browsed public repo could exploit.
     m = _cdp()
     text = (
         "irrelevant text before\n"
@@ -172,8 +172,8 @@ def test_sentinel_parse_two_assistant_messages():
         "trailing junk not part of any block\n"
     )
     done, body = m._sentinel_parse(text, _RID)
-    assert done is True
-    assert body == "first body"
+    assert done is False
+    assert body == ""
 
 
 def test_sentinel_parse_valid_final_bare_wrapper():
