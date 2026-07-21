@@ -159,6 +159,24 @@ def test_model_not_selectable_requeues(env):
     assert r["rid"] in s.recover()["dispatchable"]
 
 
+def test_attach_failure_is_provably_not_sent_requeues(env):
+    """A pre-click browser failure — the debug Chrome opened a tab that never answered Runtime.enable
+    (cdp_attach_failed), or a new tab could not be created — happens BEFORE the click, so it proves
+    this attempt did not send. It must requeue (retry may immediately work), not strand as uncertain.
+    Safe because _run scopes stderr to the current invocation, so the marker is this attempt's own."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+
+    def cdp(kind, **kw):
+        return {"code": 1, "conversation": "",
+                "stderr": "CGC_ERROR cdp_attach_failed: opened a tab but it never answered Runtime.enable"}
+
+    final = backend.process_round(s, r, cdp, daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.QUEUED
+    rec = s.recover()
+    assert r["rid"] in rec["dispatchable"] and r["rid"] not in rec["uncertain"]
+
+
 def test_unknown_send_is_possibly_accepted(env):
     store_mod, backend, s, tmp = env
     r = _ready_round(store_mod, s)
