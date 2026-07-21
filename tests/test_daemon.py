@@ -339,7 +339,9 @@ def test_chrome_is_not_restarted_while_another_consult_is_live(daemon, monkeypat
 
     ran = []
     monkeypatch.setattr(daemon, "_run", lambda *a, **k: ran.append(a) or (0, "", ""))
-    assert daemon._restart_chrome("REQ-20260707-120000-00d002") is False
+    ok, why = daemon._restart_chrome("REQ-20260707-120000-00d002")
+    assert ok is False
+    assert "suppressed" in why and "re-enqueue" in why, why  # actionable reason, not opaque failure
     assert ran == [], "must not have launched anything"
 
 
@@ -351,7 +353,7 @@ def test_chrome_is_restarted_when_nothing_else_is_live(daemon, monkeypatch):
         return 0, "", ""
 
     monkeypatch.setattr(daemon, "_run", _fake)
-    assert daemon._restart_chrome("REQ-20260707-120000-00d003") is True
+    assert daemon._restart_chrome("REQ-20260707-120000-00d003")[0] is True
     assert ran[0][1]["CGC_RESTART"] == "1"
 
 
@@ -396,11 +398,11 @@ def test_restart_is_not_reported_successful_until_a_tab_actually_works(daemon, m
     monkeypatch.setattr(daemon.time, "sleep", lambda n: None)
     monkeypatch.setattr(daemon, "_other_live_jobs", lambda rid: [])
     monkeypatch.setattr(daemon, "_new_tab_healthy", lambda: False)
-    assert daemon._restart_chrome("REQ-20260707-120000-00f001") is False, \
+    assert daemon._restart_chrome("REQ-20260707-120000-00f001")[0] is False, \
         "a browser that still cannot open a tab is not a successful restart"
 
     monkeypatch.setattr(daemon, "_new_tab_healthy", lambda: True)
-    assert daemon._restart_chrome("REQ-20260707-120000-00f002") is True
+    assert daemon._restart_chrome("REQ-20260707-120000-00f002")[0] is True
 
 
 def test_health_check_is_the_real_capability_not_a_ping(daemon):
@@ -460,3 +462,28 @@ def test_lifecycle_lock_second_holder_fails_closed(daemon):
             assert second.acquired is False, "second holder must fail closed while the lock is held"
     with LL(timeout=0.3) as after:
         assert after.acquired, "lock must be acquirable again once released"
+
+
+def test_daemon_singleton_refuses_a_second_daemon(daemon):
+    """Two daemons on one spool would each keep their own concurrency count and child map, doubling
+    the global cap and racing on the browser. The singleton lock refuses the second and frees on
+    release."""
+    if daemon.spool.fcntl is None:
+        import pytest
+        pytest.skip("no fcntl on this platform")
+    first = daemon.spool.acquire_daemon_singleton()
+    assert first is not None, "first daemon must acquire the singleton"
+    assert daemon.spool.acquire_daemon_singleton() is None, "a second daemon must be refused"
+    first.close()  # release
+    second = daemon.spool.acquire_daemon_singleton()
+    assert second is not None, "singleton must be re-acquirable once released"
+    second.close()
+
+
+def test_run_loop_takes_the_singleton_and_exits_if_held(daemon):
+    """run_loop must acquire the singleton before doing any work and exit cleanly if another daemon
+    already holds it — the enforcement, not just the primitive."""
+    import inspect
+    loop = inspect.getsource(daemon.run_loop)
+    assert "acquire_daemon_singleton()" in loop, "run_loop must acquire the daemon singleton"
+    assert "return 0" in loop and "already running" in loop, "and exit if another daemon holds it"

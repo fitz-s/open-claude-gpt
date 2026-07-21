@@ -51,6 +51,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -338,6 +339,30 @@ class lifecycle_lock:
         return False
 
 
+DAEMON_LOCK = _p("daemon.lock")
+
+
+def acquire_daemon_singleton():
+    """Take an exclusive, process-lifetime lock proving THIS is the only daemon on this spool.
+
+    The daemon's concurrency limit and child map live in one process's memory, so a second daemon
+    (launchd + `cgc watch` + an ad-hoc start can each spawn one) has no knowledge of the first's
+    children — the global cap silently doubles and two supervisors race on the same spool and
+    browser. Returns the open file handle on success (the CALLER must keep it alive for the daemon's
+    lifetime; the lock releases when the process exits and the fd closes), or None if another daemon
+    already holds it, in which case this process must exit rather than run a second supervisor."""
+    if fcntl is None:
+        return object()  # can't enforce; single-host macOS always has fcntl, so this never runs there
+    ensure_dirs()
+    fh = open(DAEMON_LOCK, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh
+    except OSError:
+        fh.close()
+        return None
+
+
 def _live_owner(rid):
     """The pid currently working this job, or None. Used to stop a second worker being started on an
     id that already has one, and to stop a superseded worker writing the current one's outcome."""
@@ -513,10 +538,11 @@ def cmd_enqueue(a) -> int:
         write_status(a.rid, "queued", out=os.path.abspath(out))
         print(json.dumps({"queued": True, "rid": a.rid, "out": os.path.abspath(out),
                           "kind": "retrieve", "daemon_up": daemon_alive()}))
+        argv = ["python3", os.path.abspath(__file__), "await", "--rid", a.rid,
+                "--out", os.path.abspath(out)]
         sys.stderr.write(
             f"CGC_QUEUED retrieve {a.rid} (attaches to {a.conversation}; sends nothing). Await it:\n"
-            f"  python3 {os.path.abspath(__file__)} await --rid {a.rid} "
-            f"--out {os.path.abspath(out)}\n")
+            f"  {' '.join(shlex.quote(x) for x in argv)}\n")
         return 0
     busy = _live_owner(a.rid)
     if busy is not None:
@@ -585,10 +611,11 @@ def cmd_enqueue(a) -> int:
             "CGC_WARN daemon_down: this job sits queued until the daemon runs. Relay ONE line:\n"
             "  cgc install-daemon    # launchd: starts at login, respawns if it dies\n")
     else:
+        argv = ["python3", os.path.abspath(__file__), "await", "--rid", a.rid,
+                "--out", os.path.abspath(out)]
         sys.stderr.write(
             f"CGC_QUEUED {a.rid}. Await it (LOCAL file poll, run_in_background:true):\n"
-            f"  python3 {os.path.abspath(__file__)} await --rid {a.rid} "
-            f"--out {os.path.abspath(out)}\n")
+            f"  {' '.join(shlex.quote(x) for x in argv)}\n")
     return 0
 
 

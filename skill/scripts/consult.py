@@ -31,6 +31,7 @@ import json
 import pathlib
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 import os
@@ -722,10 +723,11 @@ def cmd_prep(a: argparse.Namespace) -> int:
             "max_polls": max_polls,
         })
     if a.backend != "mcp" and prompt_file:
+        spool_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgc_spool.py")
+        argv = ["python3", spool_py, "enqueue", "--rid", rid, "--prompt-file", prompt_file]
         sys.stderr.write(
-            f"CGC_NEXT enqueue it (LOCAL write; the user's daemon validates + sends):\n"
-            f"  python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cgc_spool.py')} "
-            f"enqueue --rid {rid} --prompt-file {prompt_file}\n")
+            "CGC_NEXT enqueue it (LOCAL write; the user's daemon validates + sends):\n"
+            f"  {' '.join(shlex.quote(x) for x in argv)}\n")
     return state
 
 
@@ -774,9 +776,12 @@ def cmd_fire(a: argparse.Namespace) -> int:
     if spool.cmd_enqueue(eq) != 0:
         return 2
     out = os.path.abspath(a.out or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt"))
-    return {"rid": rid, "out": out,
-            "await": f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cgc_spool.py')} "
-                     f"await --rid {rid} --out {out}"}
+    spool_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgc_spool.py")
+    await_argv = ["python3", spool_py, "await", "--rid", rid, "--out", out]
+    # argv is the canonical receipt; the string is only a copyable display (shell-quoted so a path
+    # with a space or a shell metacharacter can't break or change the parsed command).
+    return {"rid": rid, "out": out, "await_argv": await_argv,
+            "await": " ".join(shlex.quote(x) for x in await_argv)}
 
 
 def _add_prep_args(pp):
