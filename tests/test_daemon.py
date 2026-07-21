@@ -37,6 +37,9 @@ def daemon(tmp_path, monkeypatch):
 
     d = _load_module("cgc_daemon", "cgc_daemon.py")
     d.spool.ensure_dirs()
+    # cgc_store caches DB_PATH at import; the module is shared across tests, so pin it to THIS test's
+    # tmp dir or a leaked round from a prior test bleeds into this one's store.
+    d.store_mod.DB_PATH = str(tmp_path / "state" / "control.db")
     return d
 
 
@@ -331,6 +334,57 @@ def test_ready_orphan_is_redispatched_not_stranded(daemon, monkeypatch):
     worker_argvs = [a for a in spawned if "--worker-store" in a]
     assert any("REQ-20260707-120000-00d001" in a for a in worker_argvs), \
         "the orphaned ready round must be re-dispatched"
+
+
+def test_dispatch_store_respects_concurrency_and_claims_distinct_rounds(daemon, monkeypatch):
+    """Parallel consults: _dispatch_store fills up to `concurrency` worker slots with DISTINCT rounds
+    (claim_ready is atomic, so no two workers get the same one), and holds the rest back until a slot
+    frees. Each worker occupies its slot for the whole consult (submit + the ~25-min wait), so this
+    cap is the real parallel-consult limit."""
+    spawned = []
+
+    class _P:
+        pid = 1000
+    monkeypatch.setattr(daemon.subprocess, "Popen",
+                        lambda argv, **k: spawned.append(argv[-1]) or _P())
+
+    with daemon.store_mod.Store() as s:
+        for i in range(5):
+            s.create_round(f"REQ-20260707-120000-00e0{i:02d}", "submit")  # 5 queued
+
+    children = {}
+    daemon._dispatch_store(children, concurrency=3, daemon_instance_id="d1")
+    assert len(children) == 3, "must fill exactly the 3 available slots"
+    assert len(set(spawned)) == 3, "each slot got a DISTINCT round — no double-claim"
+    # the two extra rounds stay queued for a later loop (nothing claimed them)
+    with daemon.store_mod.Store() as s:
+        queued = [r["rid"] for r in s.db.execute(
+            "SELECT rid FROM rounds WHERE state='queued'")]
+    assert len(queued) == 2, "surplus rounds wait for a free slot"
+
+
+def test_dispatch_store_reattach_takes_priority_over_new_sends(daemon, monkeypatch):
+    """Under a full-ish cap, an in-flight round that lost its worker (reattach) is dispatched BEFORE a
+    new queued send — resuming a paid, possibly-generating consult matters more than starting a new
+    one."""
+    spawned = []
+
+    class _P:
+        pid = 2000
+    monkeypatch.setattr(daemon.subprocess, "Popen",
+                        lambda argv, **k: spawned.append((argv[-2], argv[-1])) or _P())
+
+    with daemon.store_mod.Store() as s:
+        # one waiting round (reattach) + two queued (new sends)
+        s.create_round("REQ-20260707-120000-00f000", "submit"); s.set_state("REQ-20260707-120000-00f000", daemon.store_mod.READY)
+        aid = s.begin_send("REQ-20260707-120000-00f000", "b", "h" * 64, daemon_instance_id="d0")
+        s.mark_accepted(aid, "conv-live"); s.mark_waiting("REQ-20260707-120000-00f000")
+        s.create_round("REQ-20260707-120000-00f001", "submit")
+        s.create_round("REQ-20260707-120000-00f002", "submit")
+
+    daemon._dispatch_store({}, concurrency=1, daemon_instance_id="d1")
+    assert spawned == [("--worker-store-resume", "REQ-20260707-120000-00f000")], \
+        "the single slot went to the reattach, not a new send"
 
 
 def test_store_mode_skips_legacy_orphan_recovery_and_tab_sweep(daemon, monkeypatch):
