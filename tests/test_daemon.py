@@ -473,9 +473,10 @@ def test_daemon_singleton_refuses_a_second_daemon(daemon):
         pytest.skip("no fcntl on this platform")
     first = daemon.spool.acquire_daemon_singleton()
     assert first is not None, "first daemon must acquire the singleton"
-    assert daemon.spool.acquire_daemon_singleton() is None, "a second daemon must be refused"
+    # timeout=0 → immediate, non-blocking check (the default WAITS ~40s for a draining daemon)
+    assert daemon.spool.acquire_daemon_singleton(timeout=0) is None, "a second daemon must be refused"
     first.close()  # release
-    second = daemon.spool.acquire_daemon_singleton()
+    second = daemon.spool.acquire_daemon_singleton(timeout=0)
     assert second is not None, "singleton must be re-acquirable once released"
     second.close()
 

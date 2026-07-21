@@ -342,25 +342,34 @@ class lifecycle_lock:
 DAEMON_LOCK = _p("daemon.lock")
 
 
-def acquire_daemon_singleton():
+def acquire_daemon_singleton(timeout=40):
     """Take an exclusive, process-lifetime lock proving THIS is the only daemon on this spool.
 
     The daemon's concurrency limit and child map live in one process's memory, so a second daemon
     (launchd + `cgc watch` + an ad-hoc start can each spawn one) has no knowledge of the first's
     children — the global cap silently doubles and two supervisors race on the same spool and
     browser. Returns the open file handle on success (the CALLER must keep it alive for the daemon's
-    lifetime; the lock releases when the process exits and the fd closes), or None if another daemon
-    already holds it, in which case this process must exit rather than run a second supervisor."""
+    lifetime; the lock releases when the process exits and the fd closes), or None if it could not be
+    taken within `timeout`, in which case this process must exit rather than run a second supervisor.
+
+    It WAITS (up to timeout) rather than failing instantly: on SIGTERM the outgoing daemon holds the
+    lock through a ~30s drain, and a supervised respawn that gave up immediately left a no-daemon
+    window until the next respawn. Waiting past the drain lets the respawn take over cleanly, with no
+    two-daemon overlap. Pass timeout=0 for an immediate, non-blocking check."""
     if fcntl is None:
         return object()  # can't enforce; single-host macOS always has fcntl, so this never runs there
     ensure_dirs()
     fh = open(DAEMON_LOCK, "a+")
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return fh
-    except OSError:
-        fh.close()
-        return None
+    deadline = time.time() + timeout
+    while True:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if time.time() >= deadline:
+                fh.close()
+                return None
+            time.sleep(0.5)
 
 
 def _live_owner(rid):
@@ -752,6 +761,9 @@ def _point_at_log(rid, out=None):
 def cmd_status(a) -> int:
     ensure_dirs()
     up = daemon_alive()
+    import cgc_backend
+    if cgc_backend.store_enabled():
+        return cgc_backend.store_status(up, a.rid)
     print(f"daemon: {'UP' if up else 'DOWN'}   spool: {SPOOL_DIR}")
     for label in ("pending", "processing", "done"):
         try:

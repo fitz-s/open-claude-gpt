@@ -32,6 +32,36 @@ def store_enabled() -> bool:
     return store_mod.store_enabled()
 
 
+# ---- observability -----------------------------------------------------------
+def store_status(up: bool, rid: str | None = None) -> int:
+    """Post-cutover `cgc queue`/`status`: round counts by state + the active buckets, so the store is
+    as inspectable as the spool dirs were. Surfaces `uncertain` rounds prominently — those are the
+    only ones that need a human (possibly sent, deliberately not auto-resent)."""
+    with store_mod.Store() as s:
+        rows = s.db.execute(
+            "SELECT state, count(*) c FROM rounds GROUP BY state ORDER BY state").fetchall()
+        active = s.recover()
+        # possibly_accepted is the only bucket that needs a HUMAN; a `sending` round is just in-flight.
+        needs_human = [row["rid"] for row in s.db.execute(
+            "SELECT rid FROM rounds WHERE state=?", (store_mod.POSSIBLY_ACCEPTED,))]
+        print(f"daemon: {'UP' if up else 'DOWN'}   backend: STORE ({store_mod.DB_PATH})")
+        for r in rows:
+            print(f"  {r['state']:20s} {r['c']:3d}")
+        print(f"  active: dispatchable={len(active['dispatchable'])} "
+              f"reattach={len(active['reattach'])} in-flight/uncertain={len(active['uncertain'])}")
+        if needs_human:
+            print("  NEEDS RECONCILE (possibly sent, NOT auto-resent — retrieve, don't resend): "
+                  + " ".join(needs_human[:8]))
+        if rid:
+            rr = s.get_round(rid)
+            if rr:
+                fields = {k: rr[k] for k in ("state", "kind", "error_code", "current_attempt_id")}
+                print(f"  round[{rid}]: {json.dumps(fields)}")
+            else:
+                print(f"  round[{rid}]: (not in store)")
+    return 0
+
+
 # ---- enqueue -----------------------------------------------------------------
 def enqueue_round(a, prompt: str, out: str) -> int:
     """Create a queued round from the CLI args. The prompt BYTES live on the round (no pathname to
@@ -146,24 +176,20 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             return store_mod.GATE_REJECTED
         attempt = store.begin_send(rid, prompt, store_mod.sha256(prompt),
                                    daemon_instance_id=daemon_instance_id)
-        out_tmp = os.path.join(store_mod.CGC_STATE_DIR, f"_wait_{rid}.txt")
-        res = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt, out=out_tmp,
-                      poll=spec.get("poll"), timeout=spec.get("timeout"))
-        code = res.get("code")
-        stderr = (res.get("stderr") or "").lower()
-        answer = _read_answer(out_tmp)
-        if code == 0 and answer.strip():
+        # SEND only (not send+wait): so the round reaches `waiting` promptly and is reattach-able on a
+        # restart, exactly like submit. A combined followup --watch would leave it `sending` for the
+        # whole ~25-min answer, where a restart would strand it as possibly_accepted.
+        send = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt)
+        stderr = (send.get("stderr") or "").lower()
+        if send.get("code") == 0:
             store.mark_accepted(attempt, conv)       # same thread, confirmed
             store.mark_waiting(rid)
-            unverified = os.path.exists(out_tmp + ".raw")
-            final = store_mod.COMPLETED_UNVERIFIED if unverified else store_mod.COMPLETED_VERIFIED
-            store.finish(rid, final, result_text=answer)
-            return final
+            return _wait_phase(store, rid, conv, spec, run_cdp)
         if any(m.lower() in stderr for m in _NOT_SENT_BLOCK):
             store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
                             error_code=_first_marker(stderr, _NOT_SENT_BLOCK))
             return store_mod.BLOCKED
-        store.mark_possibly_accepted(attempt, f"followup produced no answer (exit {code}) — retrieve, don't resend")
+        store.mark_possibly_accepted(attempt, f"followup send failed (exit {send.get('code')}) — retrieve, don't resend")
         return store_mod.POSSIBLY_ACCEPTED
 
     ok, reason = validate(prompt)
