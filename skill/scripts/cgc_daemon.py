@@ -349,8 +349,11 @@ def run_worker(processing_file: str) -> int:
         # The browser can still serve its existing tabs but cannot produce a working new one, and
         # every send needs a new one. Retrying the job changes nothing; replacing Chrome does.
         sys.stderr.write(f"CGC_DAEMON {rid}: debug Chrome cannot open a usable tab — restarting it\n")
-        with spool.lifecycle_lock():
-            _repaired = _restart_chrome(rid)
+        with spool.lifecycle_lock() as lk:
+            # Fail closed: if admission (or a peer restart) holds the lock, a global restart now
+            # could tear tabs from workers being admitted under it. Skip the repair; the job is
+            # re-enqueued and a later attempt retries once the lock is free.
+            _repaired = _restart_chrome(rid) if lk.acquired else False
         if _repaired:
             code, so, se = _run(cmd, 240, rid, stdin_text=prompt)
     spool.write_status(rid, "processing", msg=f"{reason}; sent sha256={_sha[:16]}")
@@ -489,7 +492,13 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
                 # Admission is serialised against browser restart: claim, spawn and publish the
                 # worker pid atomically, so a worker is never invisible to a neighbour scan while it
                 # is being admitted.
-                with spool.lifecycle_lock():
+                with spool.lifecycle_lock() as lk:
+                    if not lk.acquired:
+                        # A browser restart holds the lock. Admitting now would hand a worker a tab
+                        # the in-progress restart destroys — the reported "my consult was killed"
+                        # bug. Admit nothing this cycle; pending jobs stay pending and retry next
+                        # loop, once the restart releases the lock (fail closed, never unserialised).
+                        break
                     claimed = spool.claim(pf)
                     if not claimed:
                         continue  # another worker took it

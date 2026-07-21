@@ -427,17 +427,36 @@ def test_admission_and_restart_take_the_same_lock(daemon):
     agents watching them then re-dispatched duplicates."""
     import inspect
     loop = inspect.getsource(daemon.run_loop)
-    assert "lifecycle_lock()" in loop, "admission must be serialised"
+    assert "lifecycle_lock(" in loop, "admission must be serialised"
     claim_at = loop.index("spool.claim(pf)")
-    lock_at = loop.index("lifecycle_lock()")
+    lock_at = loop.index("lifecycle_lock(")
     pid_at = loop.index("worker_pid=p.pid")
     assert lock_at < claim_at < pid_at, "the lock must span claim through publishing the pid"
     worker = inspect.getsource(daemon.run_worker)
-    assert "lifecycle_lock()" in worker, "the restart must take the same lock"
+    assert "lifecycle_lock(" in worker, "the restart must take the same lock"
 
 
-def test_the_lock_never_blocks_a_consult_forever(daemon):
-    """A lock that can hang is worse than the race it closes; it must degrade loudly."""
+def test_the_lock_fails_closed_not_open(daemon):
+    """A lock whose body runs unlocked is not a lock. On timeout it must report NOT acquired, and
+    BOTH callers must fail closed (skip + retry) rather than proceed unserialised — the old fail-open
+    is exactly how a global restart tore the tab off a just-admitted worker (the reported bug)."""
     import inspect
-    src = inspect.getsource(daemon.spool.lifecycle_lock)
-    assert "proceeding unserialised" in src and "timeout" in src
+    lock_src = inspect.getsource(daemon.spool.lifecycle_lock)
+    assert "proceeding unserialised" not in lock_src, "the lock must not run its body unlocked"
+    assert "self.acquired" in lock_src, "the lock must report acquisition so callers can fail closed"
+    loop = inspect.getsource(daemon.run_loop)
+    assert "lk.acquired" in loop, "admission must check acquisition and admit nothing while held"
+    worker = inspect.getsource(daemon.run_worker)
+    assert "lk.acquired" in worker, "restart must check acquisition and skip while held"
+
+
+def test_lifecycle_lock_second_holder_fails_closed(daemon):
+    """Functional proof (not source text): while one holder has the lock, a second acquisition
+    reports acquired is False within its timeout, and becomes acquirable again after release."""
+    LL = daemon.spool.lifecycle_lock
+    with LL() as held:
+        assert held.acquired, "first holder must acquire"
+        with LL(timeout=0.3) as second:
+            assert second.acquired is False, "second holder must fail closed while the lock is held"
+    with LL(timeout=0.3) as after:
+        assert after.acquired, "lock must be acquirable again once released"
