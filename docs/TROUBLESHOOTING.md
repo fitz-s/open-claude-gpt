@@ -85,7 +85,11 @@ in the window that opens, leave it open, and retry. Verify with
 ## `CGC_ERROR no_code_source`
 A non-followup consult was sent with no real code link. Run `deliver` first and
 pass its refs file to `prep --refs-file`. A `--context-file` of prose does **not**
-satisfy this — *prose about the code is not the code*.
+satisfy this — *prose about the code is not the code*. If the question has **no
+code subject at all** (maths/research/writing), render it with `prep --no-code` —
+that stamps a sentinel every gate honors, all the way through to the send. (This
+error firing on a `--no-code` consult meant the send-time backstop had drifted out
+of sync with the spool gate; the two now share one predicate.)
 
 ## `CGC_ERROR model_not_selectable`
 The target model tier (`CGC_MODEL`) isn't offered in the composer for this
