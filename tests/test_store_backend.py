@@ -156,15 +156,19 @@ def test_followup_continues_same_conversation_not_new_submit(env):
 
     def cdp(kind, **kw):
         calls.append((kind, kw.get("conversation")))
-        with open(kw["out"], "w") as f:
-            f.write("the follow-up answer on the same thread")
-        return {"code": 0, "out": kw["out"], "stderr": ""}
+        if kind == "wait":
+            with open(kw["out"], "w") as f:
+                f.write("the follow-up answer on the same thread")
+        return {"code": 0, "out": kw.get("out"), "stderr": ""}
 
     final = backend.process_round(s, s.get_round("REQ-20260721-000000-0000ff"), cdp,
                                   daemon_instance_id="d1", validate=_OK_GATE)
     assert final == store_mod.COMPLETED_VERIFIED
-    assert calls == [("followup", "conv-existing")], \
-        "followup MUST attach to the existing conversation, never submit a fresh one"
+    # send via followup (attach to the existing conversation), THEN a separate wait — so the round
+    # reaches `waiting` and is reattach-able, never a 25-min `sending`.
+    assert calls == [("followup", "conv-existing"), ("wait", "conv-existing")], \
+        "followup MUST attach to the existing conversation (never submit) and split send from wait"
+    assert s.get_round("REQ-20260721-000000-0000ff")["thread_id"] == "conv-existing"
 
 
 def test_followup_without_conversation_fails_not_new_thread(env):

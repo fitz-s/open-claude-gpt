@@ -77,16 +77,14 @@ def _make_run_cdp():
                 conv = ""
             return {"code": code, "conversation": conv, "stderr": se}
         if kind == "followup":
-            # CONTINUE the existing conversation: cdp_consult followup --watch attaches to --conversation
-            # and sends+waits in one call (never opens a new thread). Same command the file-spool
-            # worker used, so the proven followup path is unchanged.
-            poll = str(kw.get("poll") or spool.POLL_S)
-            timeout = int(kw.get("timeout") or spool.STUCK_AFTER_S)
+            # CONTINUE the existing conversation: attach to --conversation and SEND (no --watch, so it
+            # returns after sending). The caller then runs a separate "wait", so the round reaches
+            # `waiting` promptly and is reattach-able — never a 25-min `sending`. Never opens a new
+            # thread.
             cmd = [sys.executable, _CDP, "followup", "--conversation", kw["conversation"],
-                   "--prompt-file", "-", "--rid", kw["rid"], "--watch", "--out", kw["out"],
-                   "--poll", poll, "--timeout", str(timeout)]
-            code, _so, se = _run(cmd, timeout + 40, kw["rid"], stdin_text=kw["prompt"])
-            return {"code": code, "out": kw["out"], "stderr": se}
+                   "--prompt-file", "-", "--rid", kw["rid"]]
+            code, _so, se = _run(cmd, 240, kw["rid"], stdin_text=kw["prompt"])
+            return {"code": code, "stderr": se}
         if kind == "wait":
             poll = str(kw.get("poll") or spool.POLL_S)
             timeout = int(kw.get("timeout") or spool.STUCK_AFTER_S)
