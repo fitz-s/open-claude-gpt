@@ -169,6 +169,33 @@ class Store:
                  SCHEMA_VERSION))
             self._event("created", rid=rid, detail=f"kind={kind} state={state}")
 
+    def import_round(self, rid: str, kind: str, state: str, *, thread_id: str | None = None,
+                     conversation_id: str | None = None, source_mode: str | None = None,
+                     out_path: str | None = None, result_text: str | None = None,
+                     error_code: str | None = None, completion_confidence: str | None = None) -> None:
+        """Insert a round DIRECTLY in a target state — for the one-shot spool→store migration ONLY.
+        It is an import, not a transition (there is no prior state), so it bypasses the transition
+        table; the migrator is responsible for choosing a legal target state per the documented
+        mapping (notably: a sent-but-unconfirmed job maps to possibly_accepted, never queued)."""
+        if state not in _LEGAL:
+            raise ValueError(f"unknown state {state!r}")
+        now = _now()
+        with self._tx():
+            if thread_id is not None:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO threads(thread_id,conversation_id,created_at,updated_at) "
+                    "VALUES(?,?,?,?)", (thread_id, conversation_id, now, now))
+                if conversation_id is not None:
+                    self.db.execute("UPDATE threads SET conversation_id=?,updated_at=? WHERE thread_id=?",
+                                    (conversation_id, now, thread_id))
+            self.db.execute(
+                "INSERT INTO rounds(rid,thread_id,kind,source_mode,state,result_text,error_code,"
+                "completion_confidence,out_path,created_at,updated_at,schema_version) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (rid, thread_id, kind, source_mode, state, result_text, error_code,
+                 completion_confidence, out_path, now, now, SCHEMA_VERSION))
+            self._event("imported", rid=rid, detail=f"state={state}")
+
     def get_round(self, rid: str) -> dict | None:
         row = self.db.execute("SELECT * FROM rounds WHERE rid=?", (rid,)).fetchone()
         return dict(row) if row else None
