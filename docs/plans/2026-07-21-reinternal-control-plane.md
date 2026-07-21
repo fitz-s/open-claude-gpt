@@ -112,6 +112,57 @@ delete the file-spool lifecycle machinery. Tests stay green at every phase.
   - Run: `python3 -m pytest tests/ -q` and `python3 -m py_compile skill/scripts/*.py && node -c skill/scripts/retrieval_window.js`
   - Expected: all green at each phase; no phase leaves the tree red or the running system broken.
 
+## Diff-review follow-up (2026-07-21, GPT-5.6 Pro, conf 0.95)
+
+A second consult diff-reviewed the wired implementation against this design. Verdict: fix-forward —
+the store is the right architecture and implements the core no-auto-resend invariant, but the runtime
+had one automatic-duplicate path plus several stranding paths. Acted on:
+
+- [x] **S0 auto-resend duplicate (invariant violation) — FIXED** `033b036`. `_run` returned a
+  whole-file tail of the append-only per-rid log, so attempt 1's fail-closed marker (e.g.
+  `composer_not_ready`) could leak into attempt 2's classification → false proof-not-sent →
+  SENDING→QUEUED → attempt 3 duplicated a possible send. `_run` now returns only the CURRENT
+  invocation's stderr (log_start..EOF), so a proven-not-sent verdict is always the current attempt's
+  own and the SENDING→QUEUED/BLOCKED edges are sound (markers are emitted pre-click).
+- [x] **Legacy maintenance gated out of store mode — FIXED** `033b036`. `run_loop` ran
+  `_recover_orphans` (rewrites the rollback spool) and `_sweep_tabs` (closes tabs by file-spool PID,
+  blind to store rounds) before the store branch. Both now `if not _store_mode`.
+- [x] **ready-orphan liveness — FIXED** `add1973`. `_dispatch_store` re-dispatches `ready` rounds
+  with no live worker (begin_send's CAS fences double-dispatch); Popen guarded.
+- [x] **transient gate → requeue — FIXED** `add1973`. `unverified:` gate failures requeue instead of
+  terminal `gate_rejected`; `refused:` stays terminal.
+- [x] **auto-retrieve stranded sends — FIXED** `add1973`. possibly_accepted + known conversation is
+  re-attached READ-ONLY once (rid-sentinel completes only THIS round's answer; never re-sends),
+  automating the manual recovery both of today's stranded rounds needed. `recover()` gains
+  `retrievable`.
+
+### Still open (larger — need a green-light; NOT invariant-critical)
+- [ ] **Tier 2 — importable send adapter (S1).** Wire `cgc_send.send_round` via importable
+  `submit_once`/`followup_send_once(on_before_click)` called in-process from `run_worker_store` (the
+  worker is already an isolated process — no nested subprocess needed), so begin_send commits at the
+  true click boundary. Then pre-click failures (cdp_attach_failed, python startup) classify as
+  not-sent instead of uncertain, and SENDING reduces to {ACCEPTED, POSSIBLY_ACCEPTED}. Post-Fix-1
+  this is a RELIABILITY gain (fewer stranded-uncertain), not an invariant fix. Retires the
+  shadow-dead `cgc_send.py` by wiring it (the review: wire it, do not delete it).
+- [ ] **Driver split + legacy-module move = the real "retire dead code" (S1/S2).** The review's
+  reachability correction: as of `b967363` NONE of the file-spool machinery is both provably
+  unreachable AND safe to physically delete — gating it out of store mode (done) makes it unreachable
+  from the store *driver*, but physical deletion is blocked until: migration imports prompt/spec and
+  repairs null-prompt rows; crash tests cover every send boundary; store-native tab ownership +
+  browser_epoch + drain; active.json diagnostics move to SQLite; and `CGC_STORE_BACKEND=0` is
+  removed. The honest retirement step now is: split `run_loop` into `run_loop_store`/`run_loop_spool`
+  and MOVE (not delete) the legacy functions to `cgc_legacy_*.py`. Physical deletion only after the
+  preconditions — task 5.
+- [ ] **Migration payload import (S1).** `import_round` cannot carry `rendered_prompt`/`spec_json`, so
+  a future rollback+re-migrate would create empty-prompt rounds. Live cutover had zero in-flight, so
+  unexercised; fix before relying on re-migration.
+- [ ] **source_mode/provenance typed gate (S0 security-DESIGN, not a regression).** The gate still
+  secret-scans + verifies public-repo on the exact stored bytes (no open exfil hole), but derives
+  authority from prose, not a typed source manifest. Hardening, not a leak. Preserve
+  `CGC_GATE_PRIVATE_REPOS` as the user-controlled private_connector mode.
+- [ ] **Drain reaps worker process groups (S1); current_attempt_id CAS fencing (S2); completed_
+  unverified distinct exit code (S2); active.json → SQLite diagnostics (S2).**
+
 ## Risks / Open Questions
 - **Migration of a live system** is the highest risk. Rule: drain the old daemon, snapshot state,
   migrate in one transaction, never run both authorities, never replay `sending`/`possibly_accepted`.
