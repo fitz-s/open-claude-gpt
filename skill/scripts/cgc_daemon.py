@@ -104,8 +104,33 @@ def run_worker_store(rid: str) -> int:
     return 0
 
 
+def run_worker_store_resume(rid: str) -> int:
+    """Reattach to an accepted/waiting round and resume polling — the store peer of orphan recovery.
+    Never re-sends."""
+    with store_mod.Store() as s:
+        r = s.get_round(rid)
+        if r is None or r["state"] not in (store_mod.ACCEPTED, store_mod.WAITING):
+            return 1
+        final = cgc_backend.resume_round(s, r, _make_run_cdp())
+    sys.stderr.write(f"CGC_DAEMON store resume {rid} -> {final}\n")
+    return 0
+
+
 def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str) -> None:
-    """Claim ready store rounds and spawn a store worker each, up to the concurrency cap."""
+    """Claim ready rounds AND reattach orphaned accepted/waiting rounds (no live worker), each in its
+    own store worker, up to the concurrency cap. Reattach never re-sends — it resumes the existing
+    conversation, so a daemon restart mid-consult does not strand or duplicate a round."""
+    # Reattach first: an in-flight round that lost its worker is more urgent than a new send.
+    with store_mod.Store() as s:
+        reattach = [rid for rid in s.recover()["reattach"] if rid not in children]
+    for rid in reattach:
+        if len(children) >= concurrency:
+            return
+        env = dict(os.environ, CGC_DAEMON_INSTANCE=daemon_instance_id)
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker-store-resume", rid],
+                             env=env)
+        children[rid] = p
+        sys.stderr.write(f"CGC_DAEMON reattach(store) {rid} pid={p.pid} ({len(children)}/{concurrency})\n")
     while len(children) < concurrency:
         with store_mod.Store() as s:
             rnd = s.claim_ready(daemon_instance_id)
@@ -637,7 +662,10 @@ def main() -> int:
     p.add_argument("--once", action="store_true")
     p.add_argument("--worker", help="internal: process one claimed job file then exit")
     p.add_argument("--worker-store", help="internal: process one claimed store round then exit")
+    p.add_argument("--worker-store-resume", help="internal: reattach one accepted/waiting round then exit")
     a = p.parse_args()
+    if a.worker_store_resume:
+        return run_worker_store_resume(a.worker_store_resume)
     if a.worker_store:
         return run_worker_store(a.worker_store)
     if a.worker:

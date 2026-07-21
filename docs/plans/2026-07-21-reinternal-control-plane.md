@@ -79,12 +79,18 @@ delete the file-spool lifecycle machinery. Tests stay green at every phase.
     completed_unverified if `.raw` salvage; blocker→blocked; else→failed). Pure `plan_migration()` +
     `migrate_spool_to_store()`; idempotent; never mutates the spool. 5 tests against a synthetic spool.
 
-- [ ] 3b. **Daemon dispatch + CLI over the store (the LIVE cutover)**
-  - Files: `skill/scripts/cgc_daemon.py`, `skill/scripts/cgc_spool.py`, `bin/cgc`
-  - What: daemon claims `ready` rounds from the store and calls send_round; `enqueue`/`await`/`fire`
-    read/write the store (CLI contract unchanged). **The operational cutover**: drain the running
-    daemon, snapshot, run the migration once, restart on the new path. No dual-authority; never
-    replay `sending`/`possibly_accepted`. This is the first step that touches the live system.
+- [x] 3b. **Daemon dispatch + CLI over the store (the LIVE cutover)** — DONE + verified live
+  - `cgc_backend.py` (enqueue_round/await_round/process_round/resume_round); daemon
+    run_worker_store + _dispatch_store (claim ready + reattach accepted/waiting, never resend) +
+    startup recovery of interrupted `sending`→possibly_accepted; cmd_enqueue/cmd_await delegate
+    behind `CGC_STORE_BACKEND`. 11 lifecycle tests with a stubbed CDP.
+  - **Cutover executed**: flag persisted in `~/.config/cgc/config`; migration imported 13 rounds
+    (0 in-flight); daemon restarted in store mode. **Verified end-to-end on the live system**: a real
+    consult flowed queued→ready→sending→accepted→waiting→completed_verified and `await` materialized
+    a real 1327-byte answer. Live verification caught + fixed a real bug (conversation id dropped for
+    a thread-less submit → mark_accepted now creates/links the thread).
+  - Rollback: remove the `CGC_STORE_BACKEND` line from `~/.config/cgc/config` and restart the daemon
+    — the file-spool path is unchanged and still present.
 
 - [ ] 4. **Single egress path**
   - Files: `bin/cgc`, `skill/SKILL.md`, `docs/`
