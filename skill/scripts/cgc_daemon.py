@@ -337,12 +337,15 @@ def _run(cmd, timeout, rid=None, stdin_text=None, env_extra=None):
     empty for the 25 minutes you actually want to watch it. stdout is still captured, because the
     daemon parses submit's conversation id out of it."""
     log = None
+    log_start = 0  # byte offset where THIS invocation's stderr begins in the shared per-rid log
     if rid:
         try:
             os.makedirs(os.path.dirname(spool.log_path(rid)), exist_ok=True)
             log = open(spool.log_path(rid), "a", encoding="utf-8", buffering=1)
             log.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')}  {cmd[2] if len(cmd) > 2 else '?'} "
                       f"{rid} =====\n")
+            log.flush()
+            log_start = log.tell()  # everything the child streams from here on is THIS attempt's
         except OSError:
             log = None
     try:
@@ -356,17 +359,28 @@ def _run(cmd, timeout, rid=None, stdin_text=None, env_extra=None):
     except Exception as e:
         code, so, se = 1, "", f"subprocess error: {e}"
     if log:
+        # Recover THIS invocation's stderr from log_start..EOF — NOT a whole-file tail. The log is
+        # per-rid and append-only across every attempt, so a whole-file tail can still carry an
+        # EARLIER attempt's marker (e.g. attempt 1's `composer_not_ready`); the caller then reads
+        # that stale marker as proof the CURRENT attempt did not send and re-queues a send that may
+        # have already happened — an automatic duplicate consult. Scoping to log_start makes `se`
+        # reflect only the child that just ran, so a proven-not-sent verdict is always the current
+        # attempt's own. (No length cap: submit/followup logs are small; wait is big but its outcome
+        # is classified by exit code + answer file, never by these markers.)
+        try:
+            log.flush()
+            with open(spool.log_path(rid), encoding="utf-8", errors="replace") as rf:
+                rf.seek(log_start)
+                se = se or rf.read().strip()
+        except OSError:
+            pass
         try:
             if so:
                 log.write(so if so.endswith("\n") else so + "\n")
-            if se:
-                log.write(se if se.endswith("\n") else se + "\n")
             log.write(f"----- exit={code} -----\n")
             log.close()
         except OSError:
             pass  # logging must never break a consult
-        # stderr went to the file, so recover the tail the status message needs from there.
-        se = se or _tail_file(spool.log_path(rid))
     return code, so, se
 
 
@@ -602,7 +616,14 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
             # in processing/ forever. (Observed: daemon restarted 415s into a job whose window opens
             # at 1620s.) This also covers a worker that died without writing a terminal status while
             # the daemon itself stayed up.
-            if time.time() >= next_orphan_scan:
+            # Legacy file-spool maintenance — ONLY in spool mode. In store mode both are wrong:
+            # _recover_orphans rewrites the rollback spool (it can flip an old processing job back to
+            # `pending` "re-sending", priming a future CGC_STORE_BACKEND=0 rollback to duplicate an
+            # uncertain send), and _sweep_tabs decides liveness from file-spool PIDs alone — it knows
+            # nothing about store rounds, so it can close the tab of an active store send/wait. Store
+            # mode has its own recovery (startup promote_sending_to_uncertain + _dispatch_store
+            # reattach) and no tab sweep yet, which is safer than a sweep that guesses ownership.
+            if not _store_mode and time.time() >= next_orphan_scan:
                 _recover_orphans()
                 if websocket is not None:
                     _sweep_tabs()

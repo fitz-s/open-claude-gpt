@@ -293,6 +293,49 @@ def test_the_gate_validated_bytes_are_what_get_sent(daemon, monkeypatch, tmp_pat
     assert str(pf) not in send_cmd, "the mutable prompt path must not reach the sender"
 
 
+def test_run_stderr_is_scoped_to_the_current_attempt_not_the_cumulative_log(daemon):
+    """Regression (S0 auto-duplicate): the per-rid log is append-only across every attempt, so a
+    whole-file tail could carry an EARLIER attempt's `composer_not_ready` into the CURRENT attempt's
+    returned stderr. The store worker reads that stale marker as proof THIS attempt did not send and
+    re-queues a send that may already have happened. `_run` must return only log_start..EOF — the
+    child that just ran — so a proven-not-sent verdict is always the current attempt's own."""
+    rid = _rid("00c001")
+    # attempt 1: a pre-click fail-closed marker, written to the shared per-rid log.
+    c1 = [sys.executable, "-c", "import sys; sys.stderr.write('CGC_ERROR composer_not_ready: no input box\\n')"]
+    code1, _so1, se1 = daemon._run(c1, 30, rid)
+    assert "composer_not_ready" in se1, "the current attempt's own marker must be returned"
+    # attempt 2 on the SAME rid: clicks, then exits ambiguously with a SHORT stderr and no marker.
+    c2 = [sys.executable, "-c", "import sys; sys.stderr.write('clicked send; turn schema ambiguous\\n')"]
+    code2, _so2, se2 = daemon._run(c2, 30, rid)
+    assert "composer_not_ready" not in se2, \
+        "attempt 1's marker must NOT leak into attempt 2 — that leak is the auto-resend duplicate bug"
+    assert "ambiguous" in se2, "attempt 2's own stderr must be what is returned"
+
+
+def test_store_mode_skips_legacy_orphan_recovery_and_tab_sweep(daemon, monkeypatch):
+    """In store mode the legacy file-spool maintenance is both redundant and harmful: _recover_orphans
+    rewrites the rollback spool (priming a future rollback to duplicate an uncertain send) and
+    _sweep_tabs decides liveness from file-spool PIDs alone, so it can close an active store round's
+    tab. Store mode has its own recovery; the loop must not call either."""
+    monkeypatch.setattr(daemon.cgc_backend, "store_enabled", lambda: True)
+    monkeypatch.setattr(daemon.spool, "acquire_daemon_singleton", lambda *a, **k: object())
+    monkeypatch.setattr(daemon.store_mod, "new_daemon_instance_id", lambda: "d-test")
+
+    class _S:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def promote_sending_to_uncertain(self): return []
+        def recover(self): return {"dispatchable": [], "reattach": [], "uncertain": []}
+        def claim_ready(self, *a): return None
+    monkeypatch.setattr(daemon.store_mod, "Store", lambda *a, **k: _S())
+
+    called = {"orphans": 0, "sweep": 0}
+    monkeypatch.setattr(daemon, "_recover_orphans", lambda: called.__setitem__("orphans", called["orphans"] + 1))
+    monkeypatch.setattr(daemon, "_sweep_tabs", lambda: called.__setitem__("sweep", called["sweep"] + 1))
+    daemon.run_loop(poll=0.0, concurrency=1, once=True)
+    assert called == {"orphans": 0, "sweep": 0}, "store mode must not run legacy spool maintenance"
+
+
 def test_browser_repair_actually_triggers_on_an_attach_failure(daemon, monkeypatch, tmp_path):
     """The detection must read the job LOG, not the returned stderr. stderr is redirected into that
     log, so the returned string is only its last 240 chars — and the token sits at the START of a
