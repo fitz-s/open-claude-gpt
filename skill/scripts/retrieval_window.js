@@ -90,14 +90,19 @@
         if (!inFence && trimmedA === BEGIN) { i = a; break; }
       }
       if (i < 0) continue;
-      var j = -1;
-      for (var b = i + 1; b < lines.length; b++) {
-        var trimmedB = lines[b].trim();
-        if (isFenceToggle(trimmedB)) { inFence = !inFence; continue; }
-        if (!inFence && trimmedB === END) { j = b; break; }
+      // END must be the LAST non-blank line, bare and unfenced (anti-injection: an early bare END
+      // is ignored while real answer text still follows). Mirrors _sentinel_parse / _sentinel_js.
+      var last = -1;
+      for (var c = lines.length - 1; c > i; c--) {
+        if (lines[c].trim() !== "") { last = c; break; }
       }
-      if (!(j > i)) return null;   // require a matching END after BEGIN; no silent fallback
-      var body = lines.slice(i + 1, j).join("\n").trim();
+      if (last < 0 || lines[last].trim() !== END) return null;
+      var f2 = false;
+      for (var b = i + 1; b < last; b++) {
+        if (isFenceToggle(lines[b].trim())) { f2 = !f2; }
+      }
+      if (f2) return null;         // terminal END inside an unclosed fence → answer text, not wrapper
+      var body = lines.slice(i + 1, last).join("\n").trim();
       if (!body) return null;      // extracted body must be non-empty
       return body;
     }

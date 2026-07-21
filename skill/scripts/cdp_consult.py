@@ -526,27 +526,37 @@ _TEXT_FN = ("function __cgcText(el){if(!el)return '';"
             "return out.replace(/[ \\t]+\\n/g,'\\n').replace(/\\n{3,}/g,'\\n\\n');}")
 
 
-# ---- SHARED CONTRACT #1: fence-aware line-anchored sentinel parser (v2) -----
+# ---- SHARED CONTRACT #1: fence-aware line-anchored sentinel parser (v3) -----
 # The ONLY completion/extraction rule, in Python AND in the JS this file builds. A line merely
 # CONTAINING the sentinel text (quoted in prose, inside a fenced code block, etc.) must NOT match —
 # only a bare standalone line equal to the sentinel after trim() matches. v2 additionally ignores a
 # bare sentinel line that sits INSIDE a ``` / ~~~ fenced code block (v1 only ignored non-bare
-# occurrences; a bare sentinel-lookalike inside a fence used to false-match). This is what lets the
-# model safely quote BEGIN_RESPONSE:/END_RESPONSE: tokens — even as a bare line inside its own fenced
-# code — without those being mistaken for the real wrapper. Canonical Python implementation below;
-# the JS builder (_sentinel_js) mirrors it exactly so detect/extract/status/timeout-rescue never
-# drift apart.
+# occurrences; a bare sentinel-lookalike inside a fence used to false-match). v3 requires the END to
+# be the LAST NON-BLANK line, not merely the first END after BEGIN: because consults deliberately
+# point the model at PUBLIC repos it did not author, a repo can prompt-inject an early bare
+# END_RESPONSE:<rid> to truncate the answer, and taking the first END would honour it. Taking the
+# last non-blank line means an early injected END is ignored while real answer text still follows.
+# This is what lets the model safely quote BEGIN_RESPONSE:/END_RESPONSE: tokens — even as a bare line
+# inside its own fenced code — without those being mistaken for the real wrapper. Canonical Python
+# implementation below; the JS builder (_sentinel_js) mirrors it exactly so detect/extract/status/
+# timeout-rescue never drift apart.
 
 def _sentinel_parse(text: str, rid: str):
     """Fence-aware, line-anchored sentinel parser (SHARED CONTRACT #1, v2).
     Scans lines tracking a boolean in_fence: a line whose trimmed value STARTS WITH ``` or ~~~ is a
     fence toggle — it flips in_fence and is never itself treated as a sentinel line.
     begin = index of the FIRST line that is NOT in_fence AND whose trimmed value == 'BEGIN_RESPONSE:<rid>'
-    end   = index of the FIRST line AFTER begin that is NOT in_fence AND whose trimmed value ==
-            'END_RESPONSE:<rid>'
-    done  = begin found AND end found AND end > begin AND the extracted body is non-empty.
+    end   = the LAST NON-BLANK line, which must itself be a bare unfenced 'END_RESPONSE:<rid>'. Taking
+            the last non-blank line (NOT the first END after begin) is a security property: a browsed
+            PUBLIC repo can prompt-inject the model into emitting an early bare END_RESPONSE:<rid>
+            mid-answer to truncate it. An early END is not the terminal line while real answer text
+            still follows, so it is ignored; only a genuine terminal END closes extraction. Trailing
+            content after the END therefore means NOT done (still streaming, or injected) and the
+            waiter keeps polling.
+    done  = begin found AND the last non-blank line is that bare unfenced END AND the body is non-empty.
     Returns (done: bool, body: str) — body is '' when not done. The body itself MAY contain fenced
-    sentinel-lookalikes; only the boundary sentinels must be bare AND outside any fence.
+    sentinel-lookalikes, and even a bare early END line as literal text; only the terminal boundary
+    must be bare AND outside any fence.
     """
     norm = (text or "").replace("\r\n", "\n")
     lines = norm.split("\n")
@@ -568,19 +578,22 @@ def _sentinel_parse(text: str, rid: str):
             break
     if i is None:
         return False, ""
-    in_fence = False
-    j = None
-    for idx in range(i + 1, len(lines)):
-        line = lines[idx]
-        if _is_fence_toggle(line):
-            in_fence = not in_fence
-            continue
-        if not in_fence and line.strip() == end_tok:
-            j = idx
+    # END must be the LAST NON-BLANK line, bare and unfenced (see docstring: the anti-injection
+    # property — an early bare END is ignored while real answer text still follows it).
+    last = None
+    for idx in range(len(lines) - 1, i, -1):
+        if lines[idx].strip() != "":
+            last = idx
             break
-    if j is None or j <= i:
+    if last is None or lines[last].strip() != end_tok:
         return False, ""
-    body = "\n".join(lines[i + 1:j]).strip()
+    in_fence = False
+    for idx in range(i + 1, last):
+        if _is_fence_toggle(lines[idx]):
+            in_fence = not in_fence
+    if in_fence:  # terminal END sits inside an unclosed fence → it is answer text, not a wrapper
+        return False, ""
+    body = "\n".join(lines[i + 1:last]).strip()
     if not body:
         return False, ""
     return True, body
@@ -605,12 +618,17 @@ def _sentinel_js(rid: str, text_expr: str) -> str:
         "if(__fence(__lines[__a])){__inFence=!__inFence;continue;}"
         "if(!__inFence&&__lines[__a].trim()===__BG){__i=__a;break;}}"
         "if(__i<0)return {done:false,body:''};"
-        "__inFence=false;var __j=-1;"
-        "for(var __b=__i+1;__b<__lines.length;__b++){"
-        "if(__fence(__lines[__b])){__inFence=!__inFence;continue;}"
-        "if(!__inFence&&__lines[__b].trim()===__EN){__j=__b;break;}}"
-        "if(__j<0||__j<=__i)return {done:false,body:''};"
-        "var __body=__lines.slice(__i+1,__j).join('\\n').trim();"
+        # END must be the LAST NON-BLANK line, bare and unfenced — mirrors _sentinel_parse's
+        # anti-injection rule: an early bare END is ignored while real answer text still follows.
+        "var __last=-1;"
+        "for(var __c=__lines.length-1;__c>__i;__c--){"
+        "if(__lines[__c].trim()!==''){__last=__c;break;}}"
+        "if(__last<0||__lines[__last].trim()!==__EN)return {done:false,body:''};"
+        "__inFence=false;"
+        "for(var __b=__i+1;__b<__last;__b++){"
+        "if(__fence(__lines[__b]))__inFence=!__inFence;}"
+        "if(__inFence)return {done:false,body:''};"
+        "var __body=__lines.slice(__i+1,__last).join('\\n').trim();"
         "if(!__body)return {done:false,body:''};"
         "return {done:true,body:__body};})()"
     )

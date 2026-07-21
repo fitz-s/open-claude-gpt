@@ -658,18 +658,27 @@ def cmd_prep(a: argparse.Namespace) -> int:
     poll_js = (
         "(function(){"
         "var BG=" + json.dumps(begin) + ",EN=" + json.dumps(end) + ";"
+        # Single-return by design (a body-parity probe patches this one return). bi = first bare
+        # unfenced BEGIN. END must be the LAST non-blank line, bare and unfenced (anti-injection: an
+        # early bare END is ignored while real answer text still follows). Mirrors _sentinel_parse.
         "function parse(t){"
         "t=(t||'').replace(/\\r\\n/g,'\\n');var L=t.split('\\n');"
-        "var inFence=false,bi=-1,ei=-1;"
+        "var inFence=false,bi=-1;"
         "for(var i=0;i<L.length;i++){"
         "var ln=L[i].trim();"
         "if(ln.slice(0,3)==='```'||ln.slice(0,3)==='~~~'){inFence=!inFence;continue;}"
-        "if(inFence)continue;"
-        "if(ln===BG&&bi<0){bi=i;continue;}"
-        "if(ln===EN&&bi>=0&&ei<0&&i>bi){ei=i;break;}"
+        "if(!inFence&&ln===BG){bi=i;break;}"
         "}"
-        "var body=(bi>=0&&ei>bi)?L.slice(bi+1,ei).join('\\n').trim():'';"
-        "return {done:(bi>=0&&ei>bi&&body.length>0),len:t.length};"
+        "var last=-1;"
+        "if(bi>=0){for(var c=L.length-1;c>bi;c--){if(L[c].trim()!==''){last=c;break;}}}"
+        "var endok=false;"
+        "if(bi>=0&&last>bi&&L[last].trim()===EN){"
+        "var f2=false;"
+        "for(var b=bi+1;b<last;b++){var lb=L[b].trim();"
+        "if(lb.slice(0,3)==='```'||lb.slice(0,3)==='~~~')f2=!f2;}"
+        "endok=!f2;}"
+        "var body=endok?L.slice(bi+1,last).join('\\n').trim():'';"
+        "return {done:(endok&&body.length>0),len:t.length};"
         "}"
         # Either turn markup: older ChatGPT builds tag the message node
         # data-message-author-role="assistant", the current build tags the turn
