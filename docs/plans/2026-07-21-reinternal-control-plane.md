@@ -67,7 +67,7 @@ delete the file-spool lifecycle machinery. Tests stay green at every phase.
   - What: pure module + exhaustive unit tests (transitions legal/illegal, CAS, recovery classes,
     concurrent claim via two connections, possibly_accepted-never-replayed).
 
-- [ ] 2. **send_round boundary** wrapping the existing CDP adapter
+- [x] 2. **send_round boundary** wrapping the existing CDP adapter — DONE (7 tests; `cgc_send.py`)
   - Files: `skill/scripts/cgc_daemon.py` (or a new `cgc_send.py`), `tests/test_send_round.py`
   - What: `send_round(store, attempt_id, cdp_invoke)` — commit `sending` before invoking CDP submit;
     map CDP `unknown_send` → `possibly_accepted`; success → `accepted(conversation)`; pre-send fail →
