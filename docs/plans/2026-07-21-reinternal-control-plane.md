@@ -136,23 +136,31 @@ had one automatic-duplicate path plus several stranding paths. Acted on:
   automating the manual recovery both of today's stranded rounds needed. `recover()` gains
   `retrievable`.
 
-### Still open (larger — need a green-light; NOT invariant-critical)
-- [ ] **Tier 2 — importable send adapter (S1).** Wire `cgc_send.send_round` via importable
-  `submit_once`/`followup_send_once(on_before_click)` called in-process from `run_worker_store` (the
-  worker is already an isolated process — no nested subprocess needed), so begin_send commits at the
-  true click boundary. Then pre-click failures (cdp_attach_failed, python startup) classify as
-  not-sent instead of uncertain, and SENDING reduces to {ACCEPTED, POSSIBLY_ACCEPTED}. Post-Fix-1
-  this is a RELIABILITY gain (fewer stranded-uncertain), not an invariant fix. Retires the
-  shadow-dead `cgc_send.py` by wiring it (the review: wire it, do not delete it).
-- [ ] **Driver split + legacy-module move = the real "retire dead code" (S1/S2).** The review's
-  reachability correction: as of `b967363` NONE of the file-spool machinery is both provably
-  unreachable AND safe to physically delete — gating it out of store mode (done) makes it unreachable
-  from the store *driver*, but physical deletion is blocked until: migration imports prompt/spec and
-  repairs null-prompt rows; crash tests cover every send boundary; store-native tab ownership +
-  browser_epoch + drain; active.json diagnostics move to SQLite; and `CGC_STORE_BACKEND=0` is
-  removed. The honest retirement step now is: split `run_loop` into `run_loop_store`/`run_loop_spool`
-  and MOVE (not delete) the legacy functions to `cgc_legacy_*.py`. Physical deletion only after the
-  preconditions — task 5.
+### Tier 2 — send adapter: RESOLVED via the review's pre-spawn branch (not the full refactor)
+- [x] **Reliability captured cheaply; full refactor deliberately declined.** The review (at `b967363`,
+  BEFORE Fix-1) pushed to wire `cgc_send.send_round` through an importable click-boundary adapter. Its
+  stated URGENCY was that pre-spawn `begin_send` is "not safe IN COMBINATION with the text-based
+  reverse transitions" — but that combination was unsafe ONLY because of the cumulative-log leak,
+  which Fix-1 (`033b036`) closed. Post-Fix-1 the markers are reliable current-invocation proof, so
+  pre-spawn commit + a COMPLETE marker list is invariant-safe and simpler. `add1973`+this commit
+  extend `_NOT_SENT_RETRY` with the pre-click browser-failure family (attach_failed / new_tab* /
+  wrong_page), which captures the adapter's actual reliability win (attach failures requeue instead
+  of stranding). The click-boundary refactor's only residual gain is the negligible
+  "subprocess-never-started" strand + architectural purity — not worth rewriting a live browser file
+  (Occam). The review's own conditional applies: "if the project deliberately keeps pre-spawn
+  commitment, delete cgc_send.py" — done (it was shadow-dead, no production import).
+- [x] **Retired the one genuinely-dead file:** `cgc_send.py` + `test_send_round.py` deleted.
+
+### Still open (larger — NOT invariant-critical; deferred with reasons)
+- [ ] **File-spool machinery is NOT dead code — it is the rollback net.** The review's reachability
+  correction: NONE of it is both provably unreachable AND safe to physically delete. Fix-2 gated it
+  out of the store *path* (correctness/security intent already met: store mode is governed by no
+  PID/lock/spool-dir). A full `run_loop` split + move-to-`cgc_legacy_*.py` is behavior-neutral
+  reorganization that does NOT unlock deletion (still gated on: migration imports prompt/spec +
+  repairs null-prompt rows; crash tests at every send boundary; store-native tab ownership +
+  browser_epoch + drain; active.json → SQLite; `CGC_STORE_BACKEND=0` removed). Deleting the rollback
+  net days after cutover is exactly what the migration discipline forbids. Physical retirement = task
+  5, after the store earns mileage and the preconditions hold. Until then it stays, gated + documented.
 - [ ] **Migration payload import (S1).** `import_round` cannot carry `rendered_prompt`/`spec_json`, so
   a future rollback+re-migrate would create empty-prompt rounds. Live cutover had zero in-flight, so
   unexercised; fix before relying on re-migration.

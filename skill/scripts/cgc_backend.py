@@ -23,9 +23,17 @@ import time
 
 import cgc_store as store_mod
 
-# submit stderr markers that PROVE the click did not happen (cdp_consult fails closed before sending).
+# stderr markers cdp_consult emits FAIL-CLOSED, before the click — so their presence PROVES this
+# attempt did not send. Safe to trust because _run scopes stderr to the current invocation (an
+# earlier attempt's marker can no longer leak in): a marker here is always this attempt's own.
+#   _NOT_SENT_BLOCK: needs a human (login/captcha/rate-limit) → terminal blocked, never resent.
+#   _NOT_SENT_RETRY: a transient pre-click failure (bad tab/composer/model/page) → requeue; retry may
+#       immediately succeed. Includes the "browser can't open a working tab" family (attach_failed /
+#       new_tab*) that the file-spool path handled via browser-repair — requeuing lets a transient
+#       tab-open glitch retry instead of stranding a provably-unsent round as uncertain.
 _NOT_SENT_BLOCK = ("login_needed", "CGC_LOGIN", "captcha", "rate_limit", "usage")
-_NOT_SENT_RETRY = ("model_not_selectable", "composer_not_ready", "no_page_target")
+_NOT_SENT_RETRY = ("model_not_selectable", "composer_not_ready", "no_page_target",
+                   "attach_failed", "new_tab", "wrong_page")
 
 
 def store_enabled() -> bool:
