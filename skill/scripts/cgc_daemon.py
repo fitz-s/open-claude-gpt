@@ -166,7 +166,7 @@ def _new_tab_healthy(port=None) -> bool:
             pass
 
 
-def _restart_chrome(rid=None) -> bool:
+def _restart_chrome(rid=None):
     """Replace the debug Chrome. Call inside spool.lifecycle_lock(). The daemon owns the browser's lifecycle, so a browser that can no
     longer open a usable tab is the daemon's problem to fix, not an errand for a human — the whole
     point of running it under launchd was to stop consults stalling on people. Safe to do: the
@@ -174,30 +174,35 @@ def _restart_chrome(rid=None) -> bool:
 
     Not safe to do BLINDLY, though: the restart is global. Doing it for one job while others are
     sending or waiting would tear their tabs away too, which is how a healthy consult ends up
-    reported as broken."""
+    reported as broken.
+
+    Returns (ok, reason): ok True only on a verified-working restart. On failure, reason is the
+    ACTIONABLE explanation for the caller to persist to job status — some causes are transient
+    (neighbours live), so the message tells the caller to re-enqueue rather than reporting the
+    opaque attach failure that triggered the repair."""
     # Held across the scan AND the restart: without it the dispatcher can admit a worker between
     # the two, and that worker's tab is destroyed by a restart that believed it was alone.
     others = _other_live_jobs(rid)
     if others:
-        sys.stderr.write(
-            f"CGC_DAEMON {rid}: NOT restarting Chrome — {len(others)} other consult(s) are live "
-            f"({', '.join(others[:3])}). A restart is global and would break them too. This job "
-            f"fails; re-enqueue it once they finish.\n")
-        return False
+        why = (f"chrome restart suppressed: {len(others)} other consult(s) live "
+               f"({', '.join(others[:3])}) — a restart is global and would break them; "
+               f"re-enqueue once they finish")
+        sys.stderr.write(f"CGC_DAEMON {rid}: NOT restarting Chrome — {why}\n")
+        return False, why
     code, _so, _se = _run(["bash", _LAUNCH], 120, rid,
                           env_extra={"CGC_RESTART": "1", "CGC_GATE": "1"})
     if code != 0:
-        return False
+        return False, f"chrome restart failed: launcher exit {code}"
     # The launcher proves the PORT is up and the session is logged in. Neither is the thing that
     # broke: what fails is opening a working tab, and a browser that has just restarted also needs a
     # moment before its target list is stable — a retry 3s after a "successful" restart failed with
     # `No such target id`. So confirm the actual capability before handing the job back.
     for _ in range(15):
         if _new_tab_healthy():
-            return True
+            return True, ""
         time.sleep(2.0)
     sys.stderr.write(f"CGC_DAEMON {rid}: Chrome restarted but still cannot open a working tab\n")
-    return False
+    return False, "chrome restarted but still cannot open a working tab"
 
 _running = True
 
@@ -350,12 +355,21 @@ def run_worker(processing_file: str) -> int:
         # every send needs a new one. Retrying the job changes nothing; replacing Chrome does.
         sys.stderr.write(f"CGC_DAEMON {rid}: debug Chrome cannot open a usable tab — restarting it\n")
         with spool.lifecycle_lock() as lk:
-            # Fail closed: if admission (or a peer restart) holds the lock, a global restart now
-            # could tear tabs from workers being admitted under it. Skip the repair; the job is
-            # re-enqueued and a later attempt retries once the lock is free.
-            _repaired = _restart_chrome(rid) if lk.acquired else False
-        if _repaired:
+            if lk.acquired:
+                repaired, why = _restart_chrome(rid)
+            else:
+                # Fail closed: a peer admission/restart holds the lock; a global restart now could
+                # tear tabs from workers being admitted under it. Skip the repair (job re-enqueues).
+                repaired, why = False, ("chrome restart suppressed: browser lifecycle busy "
+                                        "(a peer admission or restart holds the lock) — re-enqueue")
+        if repaired:
             code, so, se = _run(cmd, 240, rid, stdin_text=prompt)
+        else:
+            # Persist the ACTIONABLE reason, not the opaque attach failure that triggered the repair.
+            # Nothing was sent; several causes are transient, so the message says to re-enqueue.
+            spool.finish_job(rid, state="error", exit=2, out=out,
+                             msg=f"{why}; log {spool.log_path(rid)}")
+            return 2
     spool.write_status(rid, "processing", msg=f"{reason}; sent sha256={_sha[:16]}")
     conv = ""
     try:
@@ -459,6 +473,15 @@ def _recover_orphans() -> int:
 
 def run_loop(poll: float, concurrency: int, once: bool) -> int:
     spool.ensure_dirs()
+    # Enforce a single daemon per spool: two supervisors (launchd + `cgc watch` + an ad-hoc start)
+    # would each keep their own concurrency count and child map, silently doubling the global cap
+    # and racing on the same browser. Hold the lock for this process's whole lifetime.
+    _singleton = spool.acquire_daemon_singleton()  # noqa: F841 — kept alive for the daemon's lifetime
+    if _singleton is None:
+        sys.stderr.write("CGC_DAEMON already running (another process holds the daemon singleton) — "
+                         "this one exits so two daemons don't share one spool with independent "
+                         "concurrency limits.\n")
+        return 0
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     spool.heartbeat_write(os.getpid())
