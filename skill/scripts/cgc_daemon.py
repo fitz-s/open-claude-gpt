@@ -118,7 +118,8 @@ def run_worker_store_resume(rid: str) -> int:
     Never re-sends."""
     with store_mod.Store() as s:
         r = s.get_round(rid)
-        if r is None or r["state"] not in (store_mod.ACCEPTED, store_mod.WAITING):
+        if r is None or r["state"] not in (store_mod.ACCEPTED, store_mod.WAITING,
+                                           store_mod.POSSIBLY_ACCEPTED):
             return 1
         final = cgc_backend.resume_round(s, r, _make_run_cdp())
     sys.stderr.write(f"CGC_DAEMON store resume {rid} -> {final}\n")
@@ -129,28 +130,51 @@ def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str) -
     """Claim ready rounds AND reattach orphaned accepted/waiting rounds (no live worker), each in its
     own store worker, up to the concurrency cap. Reattach never re-sends — it resumes the existing
     conversation, so a daemon restart mid-consult does not strand or duplicate a round."""
+    def _spawn(arg, rid, tag):
+        """Spawn a worker, guarding Popen: a spawn that raises must NOT silently drop the round. A
+        `ready` row whose spawn failed stays `ready` (pre-send, so re-running it is safe) and is
+        picked up as a ready-orphan next loop — never stranded."""
+        env = dict(os.environ, CGC_DAEMON_INSTANCE=daemon_instance_id)
+        try:
+            p = subprocess.Popen([sys.executable, os.path.abspath(__file__), arg, rid], env=env)
+        except OSError as e:
+            sys.stderr.write(f"CGC_DAEMON {tag} spawn failed for {rid}: {e} — retried next loop\n")
+            return False
+        children[rid] = p
+        sys.stderr.write(f"CGC_DAEMON {tag} {rid} pid={p.pid} ({len(children)}/{concurrency})\n")
+        return True
+
     # Reattach first: an in-flight round that lost its worker is more urgent than a new send.
     with store_mod.Store() as s:
-        reattach = [rid for rid in s.recover()["reattach"] if rid not in children]
+        rec = s.recover()
+        reattach = [rid for rid in rec["reattach"] if rid not in children]
+        # possibly_accepted + conversation → one-shot read-only auto-retrieve (never re-sends).
+        retrievable = [rid for rid in rec["retrievable"] if rid not in children]
+        # Ready-orphans: a `ready` round with no live worker — its worker's Popen failed, or the
+        # worker/daemon died before begin_send. claim_ready only picks `queued`, and recover() reports
+        # these as dispatchable but nothing acted on them, so the round sat `ready` forever. A `ready`
+        # round is pre-send (begin_send has not run), so re-running process_round from it is safe.
+        ready_orphans = [r["rid"] for r in
+                         (s.get_round(rid) for rid in rec["dispatchable"])
+                         if r and r["state"] == store_mod.READY and r["rid"] not in children]
     for rid in reattach:
         if len(children) >= concurrency:
             return
-        env = dict(os.environ, CGC_DAEMON_INSTANCE=daemon_instance_id)
-        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker-store-resume", rid],
-                             env=env)
-        children[rid] = p
-        sys.stderr.write(f"CGC_DAEMON reattach(store) {rid} pid={p.pid} ({len(children)}/{concurrency})\n")
+        _spawn("--worker-store-resume", rid, "reattach(store)")
+    for rid in retrievable:
+        if len(children) >= concurrency:
+            return
+        _spawn("--worker-store-resume", rid, "auto-retrieve(store)")
+    for rid in ready_orphans:
+        if len(children) >= concurrency:
+            return
+        _spawn("--worker-store", rid, "ready-orphan(store)")
     while len(children) < concurrency:
         with store_mod.Store() as s:
             rnd = s.claim_ready(daemon_instance_id)
         if rnd is None:
             return
-        rid = rnd["rid"]
-        env = dict(os.environ, CGC_DAEMON_INSTANCE=daemon_instance_id)
-        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker-store", rid], env=env)
-        children[rid] = p
-        sys.stderr.write(f"CGC_DAEMON dispatched(store) {rid} pid={p.pid} "
-                         f"({len(children)}/{concurrency} busy)\n")
+        _spawn("--worker-store", rnd["rid"], "dispatched(store)")
 
 
 def _other_live_jobs(rid) -> list:

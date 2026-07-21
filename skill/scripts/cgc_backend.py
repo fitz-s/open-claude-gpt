@@ -32,6 +32,26 @@ def store_enabled() -> bool:
     return store_mod.store_enabled()
 
 
+def _gate(store, rid: str, prompt: str, validate) -> str | None:
+    """Run the egress gate on a `ready` round. Two failure kinds, two outcomes:
+      - `refused:`     — an AUTHORITATIVE denial (secret detected / no public link / repo confirmed
+                         not public). Terminal GATE_REJECTED; the payload must never leave.
+      - `unverified:`  — a TRANSIENT gate failure (gh not installed, gh timed out, gh API error). The
+                         gate could not CONFIRM the repo is public, not that it is private. Requeue
+                         (the round is still `ready`, pre-send — nothing has left) so a temporary gh
+                         outage does not permanently strand a legitimate consult behind a terminal
+                         reject. The daemon poll paces the retry; gh's own timeout bounds a tight spin.
+    Returns the resulting state if the gate did not pass, else None (passed — caller proceeds to send)."""
+    ok, reason = validate(prompt)
+    if ok:
+        return None
+    if reason.startswith("unverified:"):
+        store.set_state(rid, store_mod.QUEUED, expect=store_mod.READY, error_code=reason)
+        return store_mod.QUEUED
+    store.gate_reject(rid, reason)
+    return store_mod.GATE_REJECTED
+
+
 # ---- observability -----------------------------------------------------------
 def store_status(up: bool, rid: str | None = None) -> int:
     """Post-cutover `cgc queue`/`status`: round counts by state + the active buckets, so the store is
@@ -170,10 +190,9 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             store.finish(rid, store_mod.FAILED,
                          error_code="followup needs an explicit conversation id — no thread to continue")
             return store_mod.FAILED
-        ok, reason = validate(prompt)
-        if not ok:
-            store.gate_reject(rid, reason)
-            return store_mod.GATE_REJECTED
+        gated = _gate(store, rid, prompt, validate)
+        if gated is not None:
+            return gated
         attempt = store.begin_send(rid, prompt, store_mod.sha256(prompt),
                                    daemon_instance_id=daemon_instance_id)
         # SEND only (not send+wait): so the round reaches `waiting` promptly and is reattach-able on a
@@ -192,10 +211,9 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         store.mark_possibly_accepted(attempt, f"followup send failed (exit {send.get('code')}) — retrieve, don't resend")
         return store_mod.POSSIBLY_ACCEPTED
 
-    ok, reason = validate(prompt)
-    if not ok:
-        store.gate_reject(rid, reason)
-        return store_mod.GATE_REJECTED
+    gated = _gate(store, rid, prompt, validate)
+    if gated is not None:
+        return gated
 
     attempt = store.begin_send(rid, prompt, store_mod.sha256(prompt),
                                daemon_instance_id=daemon_instance_id)
@@ -225,24 +243,28 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
 
 
 def resume_round(store, r: dict, run_cdp) -> str:
-    """Reattach to a round that was already `accepted`/`waiting` when a worker died (daemon restart,
-    closed tab) and resume polling its existing conversation — the store peer of the spool's orphan
-    recovery. It NEVER re-sends; a round with no conversation cannot be resumed and is left uncertain
-    for human reconciliation (never auto-resent)."""
+    """Reattach to a round and resume polling its existing conversation — the store peer of the
+    spool's orphan recovery. It NEVER re-sends (attach + wait is read-only; the waiter's rid-sentinel
+    check means it completes only if THIS round's own answer is on the thread). Handles three inputs:
+      - accepted / waiting          — a worker died mid-poll; resume it.
+      - possibly_accepted + conv    — a ONE-SHOT auto-retrieve (recover() only offers these once): the
+                                      send may have landed; read-only attach recovers it if so, and
+                                      falls back to uncertain (for a human) if the sentinel is absent.
+    A round with no addressable conversation cannot be resumed and is left uncertain."""
     rid = r["rid"]
     spec = json.loads(r["spec_json"]) if r.get("spec_json") else {}
-    tid = r.get("thread_id")
-    conv = None
-    if tid:
-        row = store.db.execute("SELECT conversation_id FROM threads WHERE thread_id=?", (tid,)).fetchone()
-        conv = row["conversation_id"] if row else None
+    conv = store.conversation_of(rid)
     if not conv:
-        # accepted but no conversation recorded → we cannot address it; do not resend, mark uncertain.
+        # no conversation recorded → we cannot address it; do NOT resend, leave uncertain.
         if r["state"] != store_mod.POSSIBLY_ACCEPTED:
             store.set_state(rid, store_mod.POSSIBLY_ACCEPTED,
                             error_code="accepted but no conversation to reattach — retrieve manually")
         return store_mod.POSSIBLY_ACCEPTED
-    if r["state"] == store_mod.ACCEPTED:
+    if r["state"] == store_mod.POSSIBLY_ACCEPTED:
+        # bound the auto-retrieve BEFORE the wait, so a never-landed send is not re-attached forever.
+        store.record_auto_retrieve(rid)
+        store.set_state(rid, store_mod.WAITING, expect=store_mod.POSSIBLY_ACCEPTED)
+    elif r["state"] == store_mod.ACCEPTED:
         store.mark_waiting(rid)
     return _wait_phase(store, rid, conv, spec, run_cdp)
 
