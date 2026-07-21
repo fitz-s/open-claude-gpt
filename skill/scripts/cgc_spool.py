@@ -516,6 +516,32 @@ def validate_prompt(prompt_text: str) -> tuple:
 # ---- CLI: enqueue -----------------------------------------------------------
 
 def cmd_enqueue(a) -> int:
+    import cgc_backend
+    if cgc_backend.store_enabled():
+        # Store cutover: submit/followup/retrieve all become rounds. retrieve still carries no
+        # payload (spec_json holds the conversation); the gate runs in the worker, not here.
+        out = a.out or os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
+        if a.kind == "retrieve" and (not a.conversation or a.conversation == "auto"):
+            sys.stderr.write("CGC_ERROR need_conversation: --kind retrieve requires an explicit "
+                             "--conversation <id>.\n")
+            return 2
+        prompt = ""
+        if a.kind != "retrieve":
+            if not a.prompt_file or not os.path.exists(a.prompt_file):
+                sys.stderr.write("CGC_ERROR need_prompt_file: --prompt-file is required.\n")
+                return 2
+            prompt = open(a.prompt_file, encoding="utf-8").read()
+            low = prompt.lower()
+            is_followup = a.kind == "followup" or "continuing this consult" in low
+            for rx, label in _SECRET_RES:
+                if rx.search(prompt):
+                    sys.stderr.write(f"CGC_ERROR gate_secret: prompt looks like it contains a {label} — NOT enqueuing.\n")
+                    return 2
+            if not _CODE_URL_RE.search(prompt) and not is_followup and "references no code" not in low:
+                sys.stderr.write("CGC_ERROR no_code_source: prompt has no public code link — deliver "
+                                 "a link first, or render a no-code question with `prep --no-code`.\n")
+                return 2
+        return cgc_backend.enqueue_round(a, prompt, os.path.abspath(out))
     if a.kind == "retrieve":
         # Retrieval attaches to a conversation that already exists and reads its answer. It sends
         # NOTHING, so there is no payload for the egress gate to validate — and that is guaranteed
@@ -636,6 +662,9 @@ def cmd_await(a) -> int:
     notice and manually retry. Waiting longer is the waiter's job, so the waiter just keeps waiting.
     The only reason it ever stops without an answer is STUCK_AFTER_S — and reaching that does not
     mean the answer is late, it means something is wrong and waiting more cannot fix it."""
+    import cgc_backend
+    if cgc_backend.store_enabled():
+        return cgc_backend.await_round(a)
     start = time.time()
     deadline = start + a.timeout
     rid = a.rid

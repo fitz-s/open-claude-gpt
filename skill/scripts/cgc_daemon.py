@@ -52,10 +52,71 @@ except ImportError:  # only the sweep needs it; never break the daemon over a mi
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cgc_spool as spool  # noqa: E402  (shares config load, paths, gate)
+import cgc_store as store_mod  # noqa: E402
+import cgc_backend  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CDP = os.path.join(_HERE, "cdp_consult.py")
 _LAUNCH = os.path.join(_HERE, "cdp_launch.sh")
+
+
+def _make_run_cdp():
+    """The injected CDP driver for the store worker: drives the SAME cdp_consult submit/wait
+    subprocesses the file-spool worker uses (so the proven browser path is unchanged) and returns
+    the small dict cgc_backend.process_round maps to round states."""
+    def run_cdp(kind, **kw):
+        if kind == "submit":
+            cmd = [sys.executable, _CDP, "submit", "--rid", kw["rid"], "--prompt-file", "-",
+                   "--project-url", kw["project_url"], "--model", kw["model"]]
+            code, so, se = _run(cmd, 240, kw["rid"], stdin_text=kw["prompt"])
+            conv = ""
+            try:
+                conv = (json.loads(so.strip().splitlines()[-1]) if so.strip() else {}).get(
+                    "conversation_id", "") or ""
+            except Exception:
+                conv = ""
+            return {"code": code, "conversation": conv, "stderr": se}
+        if kind == "wait":
+            poll = str(kw.get("poll") or spool.POLL_S)
+            timeout = int(kw.get("timeout") or spool.STUCK_AFTER_S)
+            cmd = [sys.executable, _CDP, "wait", "--rid", kw["rid"], "--conversation", kw["conversation"],
+                   "--out", kw["out"], "--poll", poll, "--timeout", str(timeout)]
+            code, _so, se = _run(cmd, timeout + 40, kw["rid"])
+            return {"code": code, "out": kw["out"], "stderr": se}
+        raise ValueError(f"unknown cdp kind {kind!r}")
+    return run_cdp
+
+
+def run_worker_store(rid: str) -> int:
+    """Process ONE claimed (`ready`) store round to a terminal/uncertain state, then exit — the
+    store-backed peer of run_worker(). Isolated in its own process so a hung/crashed send can't take
+    the daemon down; the risky browser work is still in cdp_consult subprocesses."""
+    with store_mod.Store() as s:
+        r = s.get_round(rid)
+        if r is None or r["state"] != store_mod.READY:
+            sys.stderr.write(f"CGC_DAEMON store worker: {rid} not in 'ready' ({r and r['state']})\n")
+            return 1
+        final = cgc_backend.process_round(
+            s, r, _make_run_cdp(),
+            daemon_instance_id=os.environ.get("CGC_DAEMON_INSTANCE", "d"),
+            validate=spool.validate_prompt)
+    sys.stderr.write(f"CGC_DAEMON store worker {rid} -> {final}\n")
+    return 0
+
+
+def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str) -> None:
+    """Claim ready store rounds and spawn a store worker each, up to the concurrency cap."""
+    while len(children) < concurrency:
+        with store_mod.Store() as s:
+            rnd = s.claim_ready(daemon_instance_id)
+        if rnd is None:
+            return
+        rid = rnd["rid"]
+        env = dict(os.environ, CGC_DAEMON_INSTANCE=daemon_instance_id)
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker-store", rid], env=env)
+        children[rid] = p
+        sys.stderr.write(f"CGC_DAEMON dispatched(store) {rid} pid={p.pid} "
+                         f"({len(children)}/{concurrency} busy)\n")
 
 
 def _other_live_jobs(rid) -> list:
@@ -490,6 +551,14 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
         f"poll {poll}s. This is the user-owned egress gate; the agent only reads/writes local files.\n")
     children = {}  # rid -> Popen
     next_orphan_scan = 0.0
+    _store_mode = cgc_backend.store_enabled()
+    daemon_instance_id = store_mod.new_daemon_instance_id()
+    if _store_mode:
+        # Recovery: a round left `sending` when the daemon died is uncertain, not resendable.
+        with store_mod.Store() as _s:
+            moved = _s.promote_sending_to_uncertain()
+        sys.stderr.write(f"CGC_DAEMON store backend (instance {daemon_instance_id[:8]}); "
+                         f"{len(moved)} interrupted send(s) marked possibly_accepted.\n")
     try:
         while _running:
             spool.heartbeat_write(os.getpid())
@@ -509,6 +578,14 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
                 if children[rid].poll() is not None:
                     del children[rid]
             # dispatch
+            if _store_mode:
+                _dispatch_store(children, concurrency, daemon_instance_id)
+                if once and not children:
+                    with store_mod.Store() as _s:
+                        if not _s.recover()["dispatchable"]:
+                            break
+                time.sleep(poll)
+                continue
             for pf in spool.list_pending():
                 if len(children) >= concurrency:
                     break
@@ -559,7 +636,10 @@ def main() -> int:
     p.add_argument("--concurrency", type=int, default=3)
     p.add_argument("--once", action="store_true")
     p.add_argument("--worker", help="internal: process one claimed job file then exit")
+    p.add_argument("--worker-store", help="internal: process one claimed store round then exit")
     a = p.parse_args()
+    if a.worker_store:
+        return run_worker_store(a.worker_store)
     if a.worker:
         return run_worker(a.worker)
     return run_loop(a.poll, max(1, a.concurrency), a.once)

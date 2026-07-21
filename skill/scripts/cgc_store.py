@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import hashlib
 import os
 import sqlite3
 import sys
@@ -64,8 +65,17 @@ FAILED = "failed"
 
 _LEGAL = {
     QUEUED: {READY, GATE_REJECTED, FAILED},
-    READY: {SENDING, BLOCKED, FAILED, QUEUED},   # QUEUED: release a claimed-but-unsent round back
-    SENDING: {ACCEPTED, POSSIBLY_ACCEPTED},
+    # READY -> WAITING: a `retrieve` round attaches to an existing conversation and waits, it never
+    # sends. GATE_REJECTED: the worker gates AFTER claiming (round is ready), so a rejection is a
+    # ready-state transition. QUEUED: release a claimed-but-unsent round back.
+    READY: {SENDING, WAITING, BLOCKED, FAILED, QUEUED, GATE_REJECTED},
+    # sending -> accepted|possibly_accepted is the default. sending -> blocked|queued is permitted
+    # ONLY for a submit that PROVABLY did not send (its fail-closed pre-click exits: login/captcha →
+    # blocked; model-not-selectable/composer-not-ready → queued to retry). A CRASH leaves the round
+    # in `sending` with no returned verdict, and recover() classifies that uncertain (→
+    # possibly_accepted), never dispatchable — so the anti-duplicate invariant holds: only a proven
+    # not-sent is ever re-queued, never a merely-possible send.
+    SENDING: {ACCEPTED, POSSIBLY_ACCEPTED, BLOCKED, QUEUED},
     ACCEPTED: {WAITING, POSSIBLY_ACCEPTED},
     POSSIBLY_ACCEPTED: {WAITING, ACCEPTED, FAILED},   # ONLY via explicit recovery/human, never auto
     WAITING: {COMPLETED_VERIFIED, COMPLETED_UNVERIFIED, BLOCKED, FAILED, POSSIBLY_ACCEPTED},
@@ -92,6 +102,22 @@ def _now() -> str:
 
 def _new_id() -> str:
     return uuid.uuid4().hex
+
+
+def store_enabled() -> bool:
+    """The cutover flag. Off (default) → the file-spool path runs unchanged; on → enqueue/await/the
+    daemon worker use this store. One switch, one authority — never both at once."""
+    return os.environ.get("CGC_STORE_BACKEND", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def new_daemon_instance_id() -> str:
+    """A fresh identity per daemon process — recorded on attempts so ownership is the daemon
+    INSTANCE, not a reusable OS pid."""
+    return _new_id()
+
+
+def sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 class Store:
@@ -153,20 +179,26 @@ class Store:
     # ---- rounds --------------------------------------------------------------
     def create_round(self, rid: str, kind: str, *, thread_id: str | None = None,
                      source_mode: str | None = None, out_path: str | None = None,
-                     spec_json: str | None = None, state: str = QUEUED) -> None:
+                     spec_json: str | None = None, prompt: str | None = None,
+                     state: str = QUEUED) -> None:
+        """Insert a new round. `prompt` (the exact rendered bytes to send) is stored on the round at
+        enqueue, so the CLI receipt is just the rid and there is no prompt PATHNAME whose contents
+        could drift before the gate reads them — the store row is the one copy."""
         if state not in _LEGAL:
             raise ValueError(f"unknown initial state {state!r}")
         now = _now()
+        psha = sha256(prompt) if prompt is not None else None
         with self._tx():
             if thread_id is not None:
                 self.db.execute(
                     "INSERT OR IGNORE INTO threads(thread_id,created_at,updated_at) VALUES(?,?,?)",
                     (thread_id, now, now))
             self.db.execute(
-                "INSERT INTO rounds(rid,thread_id,kind,source_mode,spec_json,out_path,state,"
-                "created_at,updated_at,schema_version) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (rid, thread_id, kind, source_mode, spec_json, out_path, state, now, now,
-                 SCHEMA_VERSION))
+                "INSERT INTO rounds(rid,thread_id,kind,source_mode,spec_json,rendered_prompt,"
+                "prompt_sha256,out_path,state,created_at,updated_at,schema_version) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (rid, thread_id, kind, source_mode, spec_json, prompt, psha, out_path, state,
+                 now, now, SCHEMA_VERSION))
             self._event("created", rid=rid, detail=f"kind={kind} state={state}")
 
     def import_round(self, rid: str, kind: str, state: str, *, thread_id: str | None = None,
