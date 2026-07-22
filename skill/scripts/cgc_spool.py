@@ -796,6 +796,9 @@ def main() -> int:
                         "conversation's answer without sending anything")
     e.add_argument("--project-url", default=os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/"))
     e.add_argument("--conversation", default="auto", help="(followup) /c/<id> or 'auto'")
+    e.add_argument("--parent", help="(followup) the rid of the consult being continued — resolves to "
+                                    "ITS conversation (causal, unambiguous under concurrency). "
+                                    "Preferred over --conversation auto.")
     e.add_argument("--model", default=os.environ.get("CGC_MODEL", "Pro"))
     e.add_argument("--out", help="answer file (default $CGC_STATE_DIR/answer_<rid>.txt)")
     e.add_argument("--poll", type=int, default=POLL_S)

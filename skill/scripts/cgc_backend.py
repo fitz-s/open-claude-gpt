@@ -95,23 +95,33 @@ def enqueue_round(a, prompt: str, out: str) -> int:
     """Create a queued round from the CLI args. The prompt BYTES live on the round (no pathname to
     drift); project_url/model/conversation/poll/timeout ride in spec_json for the worker."""
     conv = getattr(a, "conversation", None)
+    parent = getattr(a, "parent", None)
     with store_mod.Store() as s:
         if s.get_round(a.rid) is not None:
             sys.stderr.write(f"CGC_ERROR already_enqueued: {a.rid} already exists in the store.\n")
             return 2
-        # A follow-up with auto/last/no conversation continues the ACTIVE thread — resolve it to the
-        # last completed consult's conversation NOW, while the agent's intent is fresh (pinning it
-        # here, not at process time, avoids a concurrent consult stealing 'last'). FAIL CLOSED: a
-        # follow-up that resolves to nothing is refused, never silently opened as a fresh thread.
-        if a.kind == "followup" and (conv in (None, "auto", "last")):
-            conv = s.latest_conversation(exclude_rid=a.rid)
-            if not conv:
-                sys.stderr.write("CGC_ERROR followup_no_thread: --followup continues a thread, but no "
-                                 "completed consult exists to continue. Run a consult first, or pass "
-                                 "--conversation <id> explicitly.\n")
-                return 2
+        # Resolve the follow-up's thread NOW, while the agent's intent is fresh (pinning at enqueue,
+        # not at process time, keeps a concurrent consult from stealing the selection). Prefer CAUSAL
+        # identity — an explicit --parent <rid> resolves to THAT consult's conversation — over the
+        # global "last completed" heuristic (diff-review S1: under concurrent consults, global-latest
+        # can attach a follow-up to an unrelated thread). Either way FAIL CLOSED: if nothing resolves,
+        # refuse — never silently open a fresh conversation and lose the thread's context.
+        if a.kind == "followup":
+            if parent:
+                conv = s.conversation_of(parent)
+                if not conv:
+                    sys.stderr.write(f"CGC_ERROR followup_parent_unresolved: --parent {parent} has no "
+                                     "recorded conversation to continue.\n")
+                    return 2
+            elif conv in (None, "auto", "last"):
+                conv = s.latest_conversation(exclude_rid=a.rid)
+                if not conv:
+                    sys.stderr.write("CGC_ERROR followup_no_thread: --followup continues a thread, but "
+                                     "no completed consult exists to continue. Run a consult first, or "
+                                     "pass --parent <rid> / --conversation <id>.\n")
+                    return 2
         spec = {"project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
-                "conversation": conv, "poll": getattr(a, "poll", None),
+                "conversation": conv, "parent_rid": parent, "poll": getattr(a, "poll", None),
                 "timeout": getattr(a, "timeout", None)}
         thread = conv if conv not in (None, "auto", "last") else None
         s.create_round(a.rid, a.kind, thread_id=thread, out_path=out, prompt=prompt,
@@ -153,9 +163,9 @@ def await_round(a) -> int:
                 f"CGC_DONE {a.rid}: answer ready ({n} bytes){tag}. READ IT AT:\n  {out}\n"
                 "CGC_NEXT to CONTINUE this thread (re-review after your changes, re-check a fix, next "
                 "phase) — a FOLLOW-UP keeps ChatGPT's context; a fresh consult throws it away:\n"
-                f"  python3 {consult} fire --followup --no-code "
+                f"  python3 {consult} fire --followup --parent {a.rid} --no-code "
                 "--task \"<the diff I applied / local results + the next question>\" --title \"<what's new>\"\n"
-                "  (no --conversation needed — it continues THIS thread; add --refs-file for a fresh diff link.)\n")
+                f"  (--parent {a.rid} pins THIS consult's thread causally; add --refs-file for a fresh diff link.)\n")
             return 0
         if state == store_mod.BLOCKED:
             sys.stderr.write(f"CGC_BLOCKER {a.rid}: {r['error_code'] or 'login/captcha/rate-limit'}\n"
@@ -212,12 +222,15 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
     if r["kind"] == "followup":
         conv = spec.get("conversation")
         if not conv or conv in ("auto", "last"):
-            # enqueue normally resolves this to a concrete id; resolve again here so a round enqueued
-            # before that (or by another path) still continues the active thread rather than failing.
-            conv = _thread_conv(store, r) or store.latest_conversation(exclude_rid=rid)
+            # enqueue pins a concrete conversation (from --parent, or the last completed thread).
+            # Only fall back to THIS round's own pinned thread — never a process-time GLOBAL resolve:
+            # the diff-review flagged that a global "latest completed" at process time can attach to
+            # an unrelated conversation that finished after enqueue. Ambiguity refuses, never guesses.
+            conv = _thread_conv(store, r)
         if not conv:
             store.finish(rid, store_mod.FAILED,
-                         error_code="followup found no prior thread to continue — run a consult first")
+                         error_code="followup has no pinned thread to continue — pass --parent <rid> "
+                                    "or --conversation <id>")
             return store_mod.FAILED
         gated = _gate(store, rid, prompt, validate)
         if gated is not None:
@@ -290,9 +303,11 @@ def resume_round(store, r: dict, run_cdp) -> str:
                             error_code="accepted but no conversation to reattach — retrieve manually")
         return store_mod.POSSIBLY_ACCEPTED
     if r["state"] == store_mod.POSSIBLY_ACCEPTED:
-        # bound the auto-retrieve BEFORE the wait, so a never-landed send is not re-attached forever.
-        store.record_auto_retrieve(rid)
-        store.set_state(rid, store_mod.WAITING, expect=store_mod.POSSIBLY_ACCEPTED)
+        # Claim the one-shot auto-retrieve ATOMICALLY (marker + possibly_accepted->waiting in one
+        # transaction). If we lose the claim (already consumed, or no longer eligible), leave it for
+        # a human rather than racing another worker onto the same read-only retrieve.
+        if not store.claim_auto_retrieve(rid):
+            return store_mod.POSSIBLY_ACCEPTED
     elif r["state"] == store_mod.ACCEPTED:
         store.mark_waiting(rid)
     return _wait_phase(store, rid, conv, spec, run_cdp)
@@ -316,6 +331,15 @@ def _read_answer(path) -> str:
 
 def _wait_phase(store, rid, conv, spec, run_cdp) -> str:
     out_tmp = os.path.join(store_mod.CGC_STATE_DIR, f"_wait_{rid}.txt")
+    # Clear any stale answer + .raw sidecar from a PRIOR wait on this rid (e.g. a timed-out first
+    # wait, before an auto-retrieve). _wait_phase decides completed_verified vs _unverified purely
+    # from the .raw sidecar's existence, so a leftover .raw would downgrade a later CLEAN sentinel
+    # answer to unverified (diff-review S2). Start each wait from a blank slate.
+    for _p in (out_tmp, out_tmp + ".raw"):
+        try:
+            os.remove(_p)
+        except OSError:
+            pass
     res = run_cdp("wait", rid=rid, conversation=conv, out=out_tmp,
                   poll=spec.get("poll"), timeout=spec.get("timeout"))
     code = res.get("code")

@@ -780,7 +780,8 @@ def cmd_fire(a: argparse.Namespace) -> int:
     eq = argparse.Namespace(
         rid=rid, prompt_file=prompt_file,
         kind="followup" if a.followup else "submit",
-        project_url=a.project_url, conversation=(a.conversation or "auto"), model=a.model,
+        project_url=a.project_url, conversation=(a.conversation or "auto"),
+        parent=getattr(a, "parent", None), model=a.model,
         out=a.out, poll=spool.POLL_S, timeout=spool.STUCK_AFTER_S, quiet=True)
     if spool.cmd_enqueue(eq) != 0:
         return 2
@@ -882,6 +883,10 @@ def main() -> int:
                     help="with --followup, the thread to continue; omit (or 'last'/'auto') to "
                          "continue the LAST completed consult automatically — no id to track. Pass an "
                          "explicit /c/<id> only to target a specific older thread.")
+    pf.add_argument("--parent",
+                    help="with --followup, the rid of the consult being continued — resolves to ITS "
+                         "conversation (causal, unambiguous when other consults ran in between). "
+                         "Prefer this over bare --followup whenever you ran interleaved consults.")
     pf.set_defaults(fn=cmd_fire)
 
     pp = _add_prep_args(sub.add_parser("prep"))

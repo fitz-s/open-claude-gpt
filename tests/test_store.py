@@ -187,9 +187,28 @@ def test_retrievable_bucket_only_conversation_bearing_possibly_accepted(store):
     assert set(rec["uncertain"]) == {"P", "N"}
     assert rec["retrievable"] == ["P"], "only the conversation-bearing one is auto-retrievable"
 
-    s.record_auto_retrieve("P")
+    # Claiming the one-shot auto-retrieve is ATOMIC: it records the marker AND moves P to waiting in
+    # one transaction (so a crash can't leave the marker without the transition, stranding recovery).
+    assert s.claim_auto_retrieve("P") is True
+    assert s.get_round("P")["state"] == m.WAITING
     assert "P" not in s.recover()["retrievable"], "one bounded attempt only"
-    assert "P" in s.recover()["uncertain"], "still surfaced to the human after the attempt"
+    assert s.claim_auto_retrieve("P") is False, "second claim loses — already consumed"
+
+
+def test_terminals_are_immutable(store):
+    """A completed/blocked/failed round is FINAL. A second (racing) callback must not overwrite its
+    result — the diff-review's worker-overlap 'answer replacement' path, which a same-state write
+    would otherwise slip past the transition table."""
+    m, s = store
+    s.create_round("T", "submit"); s.set_state("T", m.READY)
+    aid = s.begin_send("T", "b", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid, "c"); s.mark_waiting("T")
+    s.finish("T", m.COMPLETED_VERIFIED, result_text="the real answer")
+    with pytest.raises(m.IllegalTransition):
+        s.finish("T", m.COMPLETED_VERIFIED, result_text="OVERWRITE")   # same-state overwrite
+    with pytest.raises(m.IllegalTransition):
+        s.set_state("T", m.FAILED)                                     # different terminal
+    assert s.get_round("T")["result_text"] == "the real answer", "terminal result is immutable"
 
 
 def test_promote_sending_to_uncertain_is_idempotent(store):
