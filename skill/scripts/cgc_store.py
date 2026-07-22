@@ -244,6 +244,12 @@ class Store:
             cur = row["state"]
             if expect is not None and cur != expect:
                 raise IllegalTransition(f"{rid}: expected state {expect!r}, found {cur!r}")
+            # Terminals are IMMUTABLE. A same-state write (new_state == cur) would otherwise bypass
+            # the transition table, letting a second/racing callback overwrite a terminal round's
+            # result_text/error_code — the diff-review's worker-overlap "answer replacement" path.
+            # A completed/blocked/failed/gate_rejected round is final; nothing may rewrite it.
+            if cur in TERMINAL:
+                raise IllegalTransition(f"{rid}: {cur!r} is terminal — no further writes")
             if new_state != cur and new_state not in _LEGAL.get(cur, set()):
                 raise IllegalTransition(f"{rid}: {cur!r} -> {new_state!r} is not a legal transition")
             self._apply_round_fields(rid, state=new_state, **fields)
@@ -422,12 +428,25 @@ class Store:
             "SELECT 1 FROM events WHERE rid=? AND kind='auto_retrieve' LIMIT 1", (rid,)).fetchone()
         return row is not None
 
-    def record_auto_retrieve(self, rid: str) -> None:
-        """Mark that this round has had its one automatic read-only retrieve — the bound that keeps a
-        never-landed send from re-attaching every loop. Recorded BEFORE the wait, so a crash mid-wait
-        still counts the attempt."""
+    def claim_auto_retrieve(self, rid: str) -> bool:
+        """ATOMICALLY claim the one-shot read-only retrieve of a possibly_accepted round: in a single
+        transaction, verify it is still possibly_accepted and not already claimed, record the
+        auto_retrieve marker, AND transition possibly_accepted -> waiting. Returns True if this caller
+        won the claim. Doing the marker and the state change in ONE transaction fixes the diff-review
+        race where a crash between two separate commits left the round possibly_accepted WITH the
+        marker — permanently excluded from `retrievable`, its recovery silently lost. Either both land
+        or neither does."""
         with self._tx():
+            row = self.db.execute("SELECT state FROM rounds WHERE rid=?", (rid,)).fetchone()
+            if row is None or row["state"] != POSSIBLY_ACCEPTED:
+                return False
+            if self.db.execute("SELECT 1 FROM events WHERE rid=? AND kind='auto_retrieve' LIMIT 1",
+                               (rid,)).fetchone() is not None:
+                return False
             self._event("auto_retrieve", rid=rid, detail="one-shot read-only reattach of possibly_accepted")
+            self._apply_round_fields(rid, state=WAITING)
+            self._event("state", rid=rid, detail=f"{POSSIBLY_ACCEPTED} -> {WAITING} (auto-retrieve)")
+        return True
 
     def promote_sending_to_uncertain(self) -> list[str]:
         """Recovery step: a round left in `sending` when the daemon restarts means the worker died

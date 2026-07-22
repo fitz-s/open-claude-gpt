@@ -335,6 +335,45 @@ def test_followup_auto_resolves_to_the_last_completed_thread(env):
     assert r["thread_id"] == conv
 
 
+def test_followup_parent_resolves_causally_not_to_global_latest(env):
+    """--parent <rid> pins the follow-up to THAT consult's conversation, even when a DIFFERENT consult
+    completed more recently. Global 'last completed' would attach to the wrong thread under concurrent
+    consults (diff-review S1); causal parent resolution does not."""
+    store_mod, backend, s, tmp = env
+    _complete_a_consult(store_mod, s, rid="REQ-20260721-000000-000AAA", conv="conv-A")
+    _complete_a_consult(store_mod, s, rid="REQ-20260721-000000-000BBB", conv="conv-B")  # globally latest
+    assert s.latest_conversation() == "conv-B"
+    a = types.SimpleNamespace(rid="REQ-20260721-000000-000fp1", kind="followup",
+                              parent="REQ-20260721-000000-000AAA", project_url="https://chatgpt.com/",
+                              model="Pro", conversation="auto", poll=1, timeout=1)
+    assert backend.enqueue_round(a, "continuing A specifically", str(tmp / "f.txt")) == 0
+    r = s.get_round("REQ-20260721-000000-000fp1")
+    assert json.loads(r["spec_json"])["conversation"] == "conv-A", "parent pins causally, not latest"
+    assert r["thread_id"] == "conv-A"
+
+
+def test_stale_raw_sidecar_does_not_downgrade_a_verified_answer(env):
+    """A .raw sidecar left by a PRIOR wait (e.g. a timed-out first attempt) must not make a later
+    clean sentinel answer complete as unverified — _wait_phase decides confidence from .raw existence,
+    so it clears the slate before each wait (diff-review S2)."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    wait_tmp = os.path.join(store_mod.CGC_STATE_DIR, f"_wait_{r['rid']}.txt")
+    os.makedirs(store_mod.CGC_STATE_DIR, exist_ok=True)
+    with open(wait_tmp + ".raw", "w") as f:
+        f.write("stale salvage from an earlier wait")
+
+    def cdp(kind, **kw):
+        if kind == "submit":
+            return {"code": 0, "conversation": "conv-9", "stderr": ""}
+        with open(kw["out"], "w") as f:
+            f.write("BEGIN\nthe clean sentinel answer\nEND")
+        return {"code": 0, "out": kw["out"], "stderr": ""}
+
+    final = backend.process_round(s, r, cdp, daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.COMPLETED_VERIFIED, "a stale .raw must not downgrade a verified answer"
+
+
 def test_followup_auto_with_no_prior_thread_is_refused_at_enqueue(env):
     """Fail-closed: a follow-up that resolves to no thread is refused BEFORE a round is created — it
     never silently opens a fresh conversation and loses context."""
