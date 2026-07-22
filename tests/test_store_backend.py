@@ -310,6 +310,54 @@ def test_resume_without_conversation_is_uncertain(env):
     assert final == store_mod.POSSIBLY_ACCEPTED
 
 
+def _complete_a_consult(store_mod, s, rid="REQ-20260721-000000-000caf", conv="conv-active"):
+    s.create_round(rid, "submit")
+    s.set_state(rid, store_mod.READY)
+    aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid, conv); s.mark_waiting(rid)
+    s.finish(rid, store_mod.COMPLETED_VERIFIED, result_text="the first answer")
+    return conv
+
+
+def test_followup_auto_resolves_to_the_last_completed_thread(env):
+    """The zero-bookkeeping follow-up: `--conversation auto` on a follow-up is resolved AT ENQUEUE to
+    the last completed consult's conversation, so the agent never has to track and pass the id. This
+    is what was broken (store had no 'active thread' notion → auto follow-ups failed → agents opened
+    fresh conversations instead of continuing the thread)."""
+    store_mod, backend, s, tmp = env
+    conv = _complete_a_consult(store_mod, s)
+    a = types.SimpleNamespace(rid="REQ-20260721-000000-000cf1", kind="followup",
+                              project_url="https://chatgpt.com/", model="Pro", conversation="auto",
+                              poll=1, timeout=1)
+    assert backend.enqueue_round(a, "continuing; the next question", str(tmp / "f.txt")) == 0
+    r = s.get_round("REQ-20260721-000000-000cf1")
+    assert json.loads(r["spec_json"])["conversation"] == conv, "auto pinned to the last thread"
+    assert r["thread_id"] == conv
+
+
+def test_followup_auto_with_no_prior_thread_is_refused_at_enqueue(env):
+    """Fail-closed: a follow-up that resolves to no thread is refused BEFORE a round is created — it
+    never silently opens a fresh conversation and loses context."""
+    store_mod, backend, s, tmp = env
+    a = types.SimpleNamespace(rid="REQ-20260721-000000-000cf2", kind="followup",
+                              project_url="https://chatgpt.com/", model="Pro", conversation="auto",
+                              poll=1, timeout=1)
+    assert backend.enqueue_round(a, "continuing", str(tmp / "f.txt")) == 2
+    assert s.get_round("REQ-20260721-000000-000cf2") is None, "no doomed round created"
+
+
+def test_latest_conversation_ignores_inflight_and_self(env):
+    store_mod, backend, s, tmp = env
+    # an in-flight (waiting) consult is NOT a resolvable thread — you cannot continue an unanswered one
+    s.create_round("REQ-20260721-000000-00wait", "submit"); s.set_state("REQ-20260721-000000-00wait", store_mod.READY)
+    waid = s.begin_send("REQ-20260721-000000-00wait", "p", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(waid, "conv-inflight"); s.mark_waiting("REQ-20260721-000000-00wait")
+    assert s.latest_conversation() is None, "an unanswered thread is not offered"
+    conv = _complete_a_consult(store_mod, s, rid="REQ-20260721-000000-00done", conv="conv-done")
+    assert s.latest_conversation() == conv
+    assert s.latest_conversation(exclude_rid="REQ-20260721-000000-00done") is None, "excludes itself"
+
+
 def test_enqueue_and_await_roundtrip(env, monkeypatch):
     store_mod, backend, s, tmp = env
     # enqueue via the CLI-facing helper

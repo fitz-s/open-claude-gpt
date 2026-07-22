@@ -37,17 +37,22 @@ def _ns(mod, tmp, **over):
     return ns
 
 
-def test_followup_without_a_conversation_is_refused_before_any_side_effect(tmp_path, monkeypatch, capsys):
-    """fire inherits --followup from prep's arguments. Enqueuing it as kind='submit' with
-    conversation='auto' would open a FRESH conversation and silently lose everything the thread
-    knew — no error, wrong answer, which is the worst shape a bug can take."""
+def test_followup_without_a_conversation_defaults_to_the_active_thread(tmp_path, monkeypatch):
+    """A bare `--followup` no longer needs a hand-tracked id: fire defaults --conversation to 'auto'
+    (the active thread) and enqueues kind='followup'. The fail-closed guarantee — never silently open
+    a fresh conversation — moves to the backend enqueue, which resolves 'auto' to the last completed
+    consult or refuses (store: see test_store_backend; spool: active.json / no_active_thread). fire's
+    job is only to stop making the agent copy a conversation id around."""
     mod = _load()
     monkeypatch.setattr(mod, "CGC_STATE_DIR", str(tmp_path))
-    called = []
-    monkeypatch.setattr(mod, "cmd_deliver", lambda a: called.append("deliver"))
-    assert mod.cmd_fire(_ns(mod, tmp_path, followup=True, no_code=True)) == 2
-    assert called == [], "must refuse before doing anything"
-    assert "followup_needs_conversation" in capsys.readouterr().err
+    seen = {}
+    sys.path.insert(0, os.path.join(ROOT, "skill", "scripts"))
+    import cgc_spool as spool
+    monkeypatch.setattr(spool, "cmd_enqueue", lambda a: seen.update(vars(a)) or 0)
+    r = mod.cmd_fire(_ns(mod, tmp_path, followup=True, no_code=True))
+    assert isinstance(r, dict), "no longer refused up front"
+    assert seen["kind"] == "followup"
+    assert seen["conversation"] == "auto", "defaults to the active thread — no id to track"
 
 
 def test_followup_with_a_conversation_enqueues_as_a_followup(tmp_path, monkeypatch):

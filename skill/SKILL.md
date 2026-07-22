@@ -50,8 +50,9 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py fire --repo owner/re
 python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid> --out <out>
 
 # 3. On wake: read the answer file it names, then verify locally.
-#    To continue the thread: prep --followup, then enqueue --kind followup --conversation <id>
-#    (NOT a fresh fire — that opens a NEW conversation). See "Follow-up rounds".
+#    To continue the thread (re-review, re-check a fix, next phase): `fire --followup` — no
+#    conversation id needed, it continues the last thread. NOT a fresh `fire` (opens a NEW
+#    conversation and loses ChatGPT's context). See "Follow-up rounds".
 ```
 
 Do NOT check the daemon first, and do not run `doctor` — it is installed once (`cgc install-daemon`)
@@ -175,15 +176,16 @@ If Backend A is live, you never need the MCP fallback.
 ## Follow-up rounds — a consult is a thread, not a one-shot
 The highest-value consults are a loop: get the answer → act locally → **report back into the same thread**. ChatGPT keeps the whole conversation's context and model, so a follow-up is cheap and lands deeper than a fresh consult. Follow up to: feed local test/verification results back ("your fix passed except this one DST case — real bug or test artifact?"), resolve a finding you couldn't reproduce, hand it the diff you applied for a re-check, or push to the next phase of a plan.
 
-**In auto mode, a follow-up goes through the daemon too** (the direct `followup` below is the interactive-mode fallback — it drives chatgpt.com from your Bash call, which the classifier blocks in auto mode). Three local steps, continuing the SAME thread:
+**Re-reviewing a PR, re-checking a fix, next phase of a plan → this is a FOLLOW-UP, not a new consult.** The single most common mistake is firing a FRESH consult to re-review after changes: that opens a new ChatGPT conversation, throws away the reviewer's memory of round 1 (its own findings, your codebase, what it already ruled out), and bills a full cold round. Continue the thread instead — the reviewer re-reads your diff against everything it already said.
+
+**In auto mode a follow-up goes through the daemon.** The easy path is ONE call — `fire --followup`, no conversation id to track (it continues the LAST completed consult's thread automatically; the store remembers which one):
 ```bash
-# render the follow-up prompt (note the new rid) …
-python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py prep --followup --task "<local results + next question>" --title "<what's new>"
-# … enqueue it against the active thread, then await (LOCAL, detached):
-python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py enqueue --rid <r2> --kind followup --conversation auto --prompt-file <rendered_prompt_file>
+# ONE call — deliver+prep+enqueue a follow-up on the last thread (add --refs-file for a fresh diff):
+python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py fire --followup \
+  --task "<local results / the diff I applied + the next question>" --title "<what's new>" --no-code
 python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <r2> --out /tmp/cgc/answer_<r2>.txt
 ```
-`--conversation auto` continues the active thread; on done `await` prints this exact recipe again (`CGC_NEXT`). The interactive-mode direct form follows.
+`--followup` with no `--conversation` continues the active thread; pass an explicit `--conversation /c/<id>` only to target a specific OLDER thread (e.g. if you ran other consults in between). It is FAIL-CLOSED: if no completed consult exists to continue, enqueue refuses (`followup_no_thread`) rather than silently opening a fresh one. The `prep --followup` → `enqueue --kind followup --conversation auto` two-step still works if you need to edit the prompt in between. On done `await` prints the `CGC_NEXT` recipe again. The interactive-mode direct form follows.
 
 **Follow-up is now TWO commands — as easy as round 1 (submit + wait). Make it a reflex after every consult you act on.** `submit` records the live thread, so follow-up needs **zero bookkeeping**: no conversation id, no rid, no prompt file to track. **ALWAYS continue with `followup` — NEVER `prep`+`submit` again** (a fresh submit opens a NEW conversation and throws away ChatGPT's context; it is the #1 way "follow-up" silently fails). You do NOT need `--keep-tab` — the thread persists at `/c/<id>` and `followup`/`wait` re-open it automatically if the tab closed.
 

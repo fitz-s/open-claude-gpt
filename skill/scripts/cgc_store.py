@@ -404,6 +404,19 @@ class Store:
             "WHERE r.rid=?", (rid,)).fetchone()
         return row["c"] if row and row["c"] else None
 
+    def latest_conversation(self, exclude_rid: str | None = None) -> str | None:
+        """The conversation of the most-recently-completed consult — the 'active thread' a follow-up
+        with `--conversation auto`/`last` continues. This is what restores zero-bookkeeping follow-up
+        in the store world: the store, not a conversation id the agent had to remember and pass,
+        knows which thread you last got an answer from. Only COMPLETED rounds qualify — you cannot
+        continue a thread that has not answered yet — and the new follow-up round excludes itself."""
+        row = self.db.execute(
+            "SELECT t.conversation_id c FROM rounds r JOIN threads t ON r.thread_id=t.thread_id "
+            "WHERE r.state IN (?,?) AND t.conversation_id IS NOT NULL AND r.rid != ? "
+            "ORDER BY r.updated_at DESC LIMIT 1",
+            (COMPLETED_VERIFIED, COMPLETED_UNVERIFIED, exclude_rid or "")).fetchone()
+        return row["c"] if row else None
+
     def was_auto_retrieved(self, rid: str) -> bool:
         row = self.db.execute(
             "SELECT 1 FROM events WHERE rid=? AND kind='auto_retrieve' LIMIT 1", (rid,)).fetchone()
