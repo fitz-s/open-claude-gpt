@@ -6,7 +6,31 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-22
+
+The control plane is rebuilt on a single SQLite transactional store, replacing the file-spool / PID /
+rename / lock / active.json arrangement. The cutover was driven first-principles from a design
+teardown (`docs/plans/2026-07-21-reinternal-control-plane.md`) and then hardened against two
+adversarial GPT-5.6 Pro code reviews (the second reached via the new causal follow-up, dogfooded).
+
 ### Added
+- **SQLite transactional control plane (`cgc_store.py`)** — one authority for threads, rounds,
+  attempts, and browser state (WAL, `synchronous=FULL`, `foreign_keys=ON`, 0600), with an explicit
+  round **state machine** whose legal-transition table raises on an illegal move. Every recovery
+  decision is a transition over NAMED states in one transaction, not inference over files and PIDs.
+- **The at-most-once anti-duplicate invariant, made structural** — `sending`/`possibly_accepted` are
+  never dispatchable; `begin_send` durably commits `ready→sending` before the click, so a crash
+  mid-send becomes `possibly_accepted` and is never auto-resent. Exactly-once is impossible (no remote
+  idempotency key); at-most-once automatic retry under uncertainty is the guarantee.
+- **Store-native recovery** — startup promotion of interrupted `sending`, reattach of orphaned
+  `accepted`/`waiting` rounds, ready-orphan re-dispatch, and a **one-shot read-only auto-retrieve** of
+  a `possibly_accepted` round with a known conversation (the rid-sentinel completes it only if THIS
+  round's answer is on the thread — recovers a stranded consult without ever risking a duplicate).
+- **Zero-bookkeeping, causal follow-up** — `fire --followup` continues a thread with no id to track;
+  `--parent <rid>` pins the follow-up to THAT consult's conversation (causal, unambiguous under
+  concurrency). Fail-closed: a follow-up that resolves to no thread is refused, never opened fresh.
+- **One-shot spool→store migration (`cgc_migrate.py`)** (drain-only: refuses active legacy work) and
+  a `status` observability surface (round counts by state; `possibly_accepted` flagged NEEDS RECONCILE).
 - **`consult.py fire` — deliver + prep + enqueue in one call.** The agent makes no decision between
   those three stages: deliver's `refs_file` feeds prep, prep's rid and prompt file feed enqueue.
   Splitting them across three Bash calls made the model copy implementation paths from one JSON blob
@@ -110,6 +134,44 @@ releases until it stabilizes.
   them cost ~2.5k chars of dead JS on every consult. The CDP path now prints `request_id` +
   `prompt_file` (115 bytes) and a `CGC_NEXT` line with the exact `enqueue` command to copy; the MCP
   backend still prints the full set.
+- **Store is the default control plane** (`CGC_STORE_BACKEND=1`); the file-spool path is retained
+  only as a rollback net, gated out of the store path. `bin/cgc submit`/`followup` retired — the
+  daemon's gated send is the sole automatic egress path.
+- **`STUCK_AFTER_S` 3600 → 5400 (90 min).** A deep re-reasoning follow-up was observed to think
+  ~62 min; at 3600 the waiter timed out minutes before the answer landed and stranded the round.
+  Completion detection itself is prompt; the budget was simply shorter than the long-tail work.
+- **The consult tab never steals foreground focus** (`Target.createTarget background:true`; no
+  `Page.bringToFront`).
+
+### Security
+- **The egress gate is enforced by the click owner too.** `cdp_consult.py submit`/`followup` run the
+  full gate (public-repo verification + secret scan) over the exact bytes, fail-closed, so a DIRECT
+  invocation cannot bypass the daemon's validator. A recognized code URL that does not canonicalize to
+  a verifiable owner/repo (percent-/double-encoded, non-repo) now fails closed — closing a URL
+  classification fail-open where a percent-encoded owner skipped visibility verification.
+- **Rollback can no longer auto-resend** — legacy orphan recovery marks a no-conversation orphan a
+  blocker for human reconciliation instead of re-sending it.
+- **Scope of the gate's guarantee, stated exactly:** no recognized secret leaves, and every cited
+  repo is gh-confirmed public. It does NOT vet arbitrary prose — a `--no-code`/follow-up prompt is
+  exempt from the public-link rule by design, so the caller is responsible for its content. A typed,
+  control-plane-attested source manifest (the stronger boundary) is tracked, not shipped.
+
+### Fixed
+- **Cross-attempt marker leak that caused an automatic duplicate send** — `_run` now returns only the
+  current invocation's stderr (was a whole-file tail of the append-only per-rid log); the legacy
+  Chrome-repair branch matches that scoped stderr too.
+- **Legacy maintenance ran under the store backend** (`_recover_orphans`, `_sweep_tabs`) — gated to
+  spool mode only.
+- **`completed_unverified` is no longer automatic success** — `await` returns review-required and
+  materializes the answer for a human (an unwrapped salvage can carry another round's answer).
+- **Post-send blocker guidance** no longer recommends a duplicate re-enqueue; **auto-retrieve claim**
+  is now one atomic transaction; **terminal rounds are immutable**; a **stale `.raw` sidecar** no
+  longer downgrades a verified answer; ready-forever liveness and transient-gate stranding closed.
+
+### Deferred (documented, tracked in the plan — NOT in this release)
+- Typed `source_mode`/provenance gate; unwrapped-salvage structural attribution binding; full worker
+  process-group kill/reap on daemon restart; migration payload import; `blocked` pre-/post-send state
+  split; physical deletion of the file-spool machinery (kept as the rollback net).
 
 ## [0.1.0] — 2026-07-01
 

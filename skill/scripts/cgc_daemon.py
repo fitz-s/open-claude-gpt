@@ -8,8 +8,15 @@
 #   network egress is therefore never an agent tool call, so the classifier never gates it.
 #
 #   It is a VALIDATING gate, not a blind relay: every job is re-checked (public-repo verification +
-#   secret scan, in cgc_spool.validate_prompt) BEFORE the send, fail-closed. A prompt-injected agent
-#   can only enqueue a job the gate will reject unless it references genuinely public code.
+#   secret scan, in cgc_spool.validate_prompt) BEFORE the send, fail-closed. What the gate GUARANTEES
+#   is bounded and exact: no recognized secret leaves, and every cited repo is gh-confirmed public (a
+#   recognized-but-unclassifiable code URL fails closed). What it does NOT do: vet arbitrary PROSE. A
+#   `--no-code` / follow-up prompt is exempt from the public-link rule by design (maths/research/
+#   writing consults, and threads that already hold the code), so a prompt-injected agent CAN route
+#   private free text through one — the gate stops secrets and private-repo LINKS, not the provenance
+#   of prose the caller chose to send. Closing that needs a typed, control-plane-attested source
+#   manifest (deferred — see the plan); until then the security claim is exactly "secrets + repo
+#   visibility", not "arbitrary-content safe".
 """
 The consult egress daemon. Start it ONCE (the user, not the agent):
 

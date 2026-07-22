@@ -171,6 +171,51 @@ had one automatic-duplicate path plus several stranding paths. Acted on:
 - [ ] **Drain reaps worker process groups (S1); current_attempt_id CAS fencing (S2); completed_
   unverified distinct exit code (S2); active.json → SQLite diagnostics (S2).**
 
+## Second diff-review + re-review (2026-07-22, GPT-5.6 Pro, conf 0.94/0.96)
+
+A full-flow review (`4cf575`) then a re-review of the fixes (`2a5184`, via the new causal
+`--parent` follow-up — dogfooded). The store steady-state path was validated at-most-once safe in
+both rounds. Landed:
+
+- [x] **S0 egress boundary — cdp_consult enforces the gate** (`fe370db`). Direct submit/followup now
+  run `validate_prompt` over the exact bytes, fail-closed.
+- [x] **S0 rollback auto-resend — closed** (`fe370db`). Legacy no-conversation orphan → blocker, never
+  auto-resent.
+- [x] **S0 URL classification fail-open** (`f3024db`). `_classify_code_urls` canonicalizes every
+  recognized code URL and enforces 1:1 recognized→verified; percent-encoded / double-encoded /
+  non-repo URLs fail closed (the `%66itz-s` bypass).
+- [x] **S0 legacy stale attach marker** (`f3024db`). The Chrome-repair check reads the current
+  invocation's stderr, not the whole-file log tail.
+- [x] **completed_unverified is not auto-success** (`f3024db`). `await` returns review-required (3),
+  materialized for a human, no auto-followup.
+- [x] **Post-send blocker guidance** (`f3024db`). A round with a conversation → retrieve, never
+  "re-enqueue".
+- [x] **Drain-only migration** (`f3024db`). Refuses (MigrationBlocked) on any pending/processing
+  legacy job.
+- [x] **followup causal `--parent`, atomic auto-retrieve claim, immutable terminals, fresh wait
+  slate** (`fdcd98a`).
+
+### Deliberately NOT blocking v0.2.0 (reasoned against the review, honestly scoped)
+- **Free-text prose provenance (review's rank-1 blocker).** A `--no-code`/follow-up prompt is exempt
+  from the public-link rule BY DESIGN (maths/research/writing consults; threads that hold the code),
+  so a prompt-injected agent can route private prose through one. This is inherent to a tool whose
+  job is sending questions to ChatGPT — the gate's guarantee is bounded and now stated exactly:
+  **no recognized secret leaves; every cited repo is gh-confirmed public.** It never claimed to vet
+  arbitrary prose, and the agent is told to check content before sending (SKILL "Safety gate"). The
+  proper fix — a typed, control-plane-attested source manifest that constructs prompts only from
+  verified sources — is a DIFFERENT, more restrictive product; tracked, not shipped. The over-claim
+  ("approved prompts are safe") is removed from the daemon header.
+- **Direct-caller env/PATH bypass (review's other egress blocker).** The review assumes an untrusted
+  process can run `cdp_consult.py submit` with a chosen env/PATH. In THIS harness it cannot: the
+  auto-mode data-exfiltration classifier HARD-DENIES an agent's direct external send (the reason the
+  daemon exists), and the daemon validates with the *user's* own env/PATH, which the agent cannot
+  set. The added cdp_consult gate is defense-in-depth. A control-plane-issued prompt-bound receipt
+  (the review's design) is the proper hardening if the direct path ever became agent-reachable —
+  deferred.
+- **Worker process-group kill/reap on restart, full blocked pre/post-send state split, structural
+  salvage attribution binding** — single-host scope; documented; terminal immutability + post-send
+  blocker guidance + unverified-not-success are the interim containment.
+
 ## Risks / Open Questions
 - **Migration of a live system** is the highest risk. Rule: drain the old daemon, snapshot state,
   migrate in one transaction, never run both authorities, never replay `sending`/`possibly_accepted`.
