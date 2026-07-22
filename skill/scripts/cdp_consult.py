@@ -904,6 +904,19 @@ def _has_sendable_source(prompt: str) -> bool:
             or _NO_CODE_SENTINEL in low)
 
 
+def _egress_gate(prompt: str):
+    """Run the full egress gate (public-repo verification + secret scan) over the exact bytes about
+    to be sent. Delegates to cgc_spool.validate_prompt — the SAME validator the daemon uses — so the
+    click owner enforces the boundary itself and a direct send cannot bypass it. Imported lazily to
+    keep cdp_consult standalone-runnable; a gate that cannot load must FAIL CLOSED, never send."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import cgc_spool as _spool
+        return _spool.validate_prompt(prompt)
+    except Exception as e:  # noqa: BLE001 — a gate that errors must refuse, not wave the send through
+        return False, f"refused: egress gate could not run ({type(e).__name__}: {e})"
+
+
 # ChatGPT has shipped two turn schemas. Keep them as SEPARATE adapters rather than unioning the
 # selectors: when both attributes are present at different levels of the DOM, one union query
 # double-counts wrapper and content nodes and interleaves their order. Pick the family whose USER
@@ -1078,6 +1091,17 @@ def cmd_submit(a) -> int:
             "--repo <owner/repo> --ref <sha> (whole-repo /tree link) → pass its refs_file to prep "
             "--refs-file. If the question has NO code subject at all (maths/research/writing), render "
             "it with `prep --no-code`. NOT submitting.\n")
+        return 2
+    # EGRESS GATE (defense in depth). The click owner independently re-validates the EXACT bytes it
+    # is about to send — public-repo verification + secret scan, fail-closed — so a DIRECT
+    # cdp_consult invocation cannot bypass the daemon's gate and exfiltrate a private-repo URL or
+    # secret-bearing text. On the daemon path this re-checks what process_round already validated;
+    # one extra gh call is negligible against a consult, and "the daemon already checked" cannot be
+    # trusted from an untrusted direct caller (diff-review S0). No skip flag — a forgeable "already
+    # gated" bit would reopen the hole.
+    _ok, _reason = _egress_gate(prompt)
+    if not _ok:
+        sys.stderr.write(f"CGC_ERROR gate_refused: {_reason} — NOT submitting.\n")
         return 2
     if not a.no_gate:
         _ensure_chrome(a.port)  # automated Step 0: start debug Chrome if down + check login
@@ -1305,6 +1329,14 @@ def cmd_followup(a) -> int:
         prompt_file, rid = _render_followup(a)
         sys.stderr.write(f"CGC_FOLLOWUP rendered {prompt_file} (rid {rid})\n")
     prompt = _read_prompt(prompt_file)
+    # EGRESS GATE (defense in depth) — same as submit: the click owner re-validates the exact bytes,
+    # so a direct followup cannot bypass the daemon's gate. A followup prompt is rule-1-exempt (the
+    # thread already holds the code) but still secret-scanned and public-repo-checked for any NEW
+    # link it introduces (diff-review S0).
+    _ok, _reason = _egress_gate(prompt)
+    if not _ok:
+        sys.stderr.write(f"CGC_ERROR gate_refused: {_reason} — NOT sending the follow-up.\n")
+        return 2
     # A consult is a THREAD: the conversation persists server-side at /c/<id> even after
     # its tab is closed (default), so follow-up must NOT depend on round-1 having kept the
     # tab. Attach to a live tab if one exists; otherwise RE-OPEN the conversation by URL.

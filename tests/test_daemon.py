@@ -187,13 +187,18 @@ def test_orphan_with_a_live_conversation_is_retrieved_not_resent(daemon):
     assert queued["kind"] == "retrieve" and queued["conversation"] == "conv-abc"
 
 
-def test_orphan_without_a_conversation_is_resent(daemon):
-    """Nothing to attach to — it never got that far — so re-sending is the only recovery."""
+def test_orphan_without_a_conversation_is_NOT_resent(daemon):
+    """No conversation was recorded, but the worker may have died AFTER the click — so the send may
+    already have reached ChatGPT. Re-sending would duplicate a possible send (the at-most-once
+    violation the store forbids), so recovery marks it a blocker for human reconciliation, NEVER
+    auto-resends. (This also closes the rollback path the diff-review flagged S0.)"""
     rid = "REQ-20260707-120000-0000a4"
     _job(daemon, rid, age_s=5)
     daemon.spool.write_status(rid, "processing", worker_pid=2 ** 22)
     assert daemon._recover_orphans() == 1
-    assert daemon.spool._read_json(daemon.spool.pending_path(rid))["kind"] == "submit"
+    assert not os.path.exists(daemon.spool.pending_path(rid)), "must NOT be re-queued for a fresh send"
+    st = daemon.spool.read_status(rid)
+    assert st["state"] == "blocker", "marked for human reconciliation, not auto-resent"
 
 
 def test_a_pre_pid_job_still_falls_back_to_the_age_rule(daemon):

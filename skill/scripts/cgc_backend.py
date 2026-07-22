@@ -33,7 +33,7 @@ import cgc_store as store_mod
 #       tab-open glitch retry instead of stranding a provably-unsent round as uncertain.
 _NOT_SENT_BLOCK = ("login_needed", "CGC_LOGIN", "captcha", "rate_limit", "usage")
 _NOT_SENT_RETRY = ("model_not_selectable", "composer_not_ready", "no_page_target",
-                   "attach_failed", "new_tab", "wrong_page")
+                   "attach_failed", "new_tab", "wrong_page", "gate_refused")
 
 
 def store_enabled() -> bool:
