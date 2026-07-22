@@ -593,9 +593,18 @@ def _recover_orphans() -> int:
                 spool.write_status(rid, "queued",
                                    msg=f"worker died; re-attaching to {conv} to read its answer")
             else:
-                os.rename(src, spool.pending_path(rid))
-                spool.write_status(rid, "queued",
-                                   msg="worker died before a conversation existed; re-sending")
+                # No conversation recorded → the send MAY already have reached ChatGPT before the
+                # worker died (an orphan can be post-click). Re-sending would duplicate a possible
+                # send — the same at-most-once violation the store forbids. NEVER auto-resend; mark
+                # it for human reconciliation. This also closes the rollback path the diff-review
+                # flagged S0: a store round imported as possibly_accepted leaves a legacy processing
+                # record, and a later CGC_STORE_BACKEND=0 rollback must not turn it back into an
+                # automatic send.
+                spool.finish_job(
+                    rid, state="blocker", exit=3,
+                    out=job.get("out") or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt"),
+                    msg="worker died before a conversation was recorded — the send may have happened; "
+                        "NOT auto-resent (at-most-once). Retrieve by conversation or reconcile by hand.")
         except (OSError, ValueError):
             continue
         n += 1
