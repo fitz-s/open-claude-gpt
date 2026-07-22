@@ -80,10 +80,22 @@ def store(tmp_path):
     s.close()
 
 
+def test_drain_only_refuses_active_legacy_work(spool, store):
+    """Production migration is DRAIN-ONLY: with pending/processing legacy jobs present, it refuses
+    (import_round cannot carry their prompt/spec, so it would create unrunnable rows) — the operator
+    must drain the old daemon first. The `spool` fixture has active work, so the default aborts."""
+    m, s = store
+    mig = _load("cgc_migrate")
+    with pytest.raises(mig.MigrationBlocked):
+        mig.migrate_spool_to_store(spool, s)          # default require_drained=True
+    assert s.recover() == {"dispatchable": [], "reattach": [], "uncertain": [], "retrievable": []}, \
+        "aborts before writing ANY store state"
+
+
 def test_mapping_states(spool, store):
     m, s = store
     mig = _load("cgc_migrate")
-    summary = mig.migrate_spool_to_store(spool, s)
+    summary = mig.migrate_spool_to_store(spool, s, require_drained=False)
     assert summary["imported"] == 8
     want = {
         "REQ-20260721-000000-00000a": "queued",
@@ -104,7 +116,7 @@ def test_sent_without_conversation_is_never_dispatchable(spool, store):
     re-sent. It lands possibly_accepted and recover() classifies it uncertain, never dispatchable."""
     m, s = store
     mig = _load("cgc_migrate")
-    mig.migrate_spool_to_store(spool, s)
+    mig.migrate_spool_to_store(spool, s, require_drained=False)
     rec = s.recover()
     c = "REQ-20260721-000000-00000c"
     assert c in rec["uncertain"]
@@ -117,7 +129,7 @@ def test_sent_without_conversation_is_never_dispatchable(spool, store):
 def test_completed_answer_text_is_carried_over(spool, store):
     m, s = store
     mig = _load("cgc_migrate")
-    mig.migrate_spool_to_store(spool, s)
+    mig.migrate_spool_to_store(spool, s, require_drained=False)
     d = s.get_round("REQ-20260721-000000-00000d")
     assert d["result_text"] == "the answer D" and d["completion_confidence"] == "verified"
     e = s.get_round("REQ-20260721-000000-00000e")
@@ -127,8 +139,8 @@ def test_completed_answer_text_is_carried_over(spool, store):
 def test_migration_is_idempotent(spool, store):
     m, s = store
     mig = _load("cgc_migrate")
-    first = mig.migrate_spool_to_store(spool, s)
-    second = mig.migrate_spool_to_store(spool, s)
+    first = mig.migrate_spool_to_store(spool, s, require_drained=False)
+    second = mig.migrate_spool_to_store(spool, s, require_drained=False)
     assert first["imported"] == 8 and second["imported"] == 0 and second["skipped"] == 8
 
 
@@ -137,7 +149,7 @@ def test_migration_does_not_mutate_the_spool(spool, store):
     mig = _load("cgc_migrate")
     before = {sub: sorted(os.listdir(os.path.join(spool, sub)))
               for sub in ("pending", "processing", "done", "status")}
-    mig.migrate_spool_to_store(spool, s)
+    mig.migrate_spool_to_store(spool, s, require_drained=False)
     after = {sub: sorted(os.listdir(os.path.join(spool, sub)))
              for sub in ("pending", "processing", "done", "status")}
     assert before == after, "migration must read the spool, never modify it"

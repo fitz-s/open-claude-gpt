@@ -480,10 +480,13 @@ def run_worker(processing_file: str) -> int:
            "--project-url", job.get("project_url", "https://chatgpt.com/"),
            "--model", job.get("model", "Pro")]
     code, so, se = _run(cmd, 240, rid, stdin_text=prompt)
-    # Match against the LOG, not `se`. stderr is redirected into the job log, so `se` is only its
-    # last 240 chars — and this token sits at the START of a long message, so checking `se` silently
-    # never matched and the repair never ran.
-    if code != 0 and "cdp_attach_failed" in _tail_file(spool.log_path(rid), 4000):
+    # Match THIS invocation's stderr (`se`), never the whole-file tail. `_run` now returns the full
+    # current-invocation stderr (log_start..EOF), so the START-of-message token is present AND the
+    # match is isolated to the attempt that just ran. Using _tail_file here would reintroduce the
+    # exact cross-attempt leak the diff-review flagged S0: a stale `cdp_attach_failed` from an
+    # EARLIER attempt could match after THIS attempt clicked-then-failed, restarting Chrome and
+    # automatically re-running submit — a resend of a possibly-clicked send.
+    if code != 0 and "cdp_attach_failed" in se:
         # The browser can still serve its existing tabs but cannot produce a working new one, and
         # every send needs a new one. Retrying the job changes nothing; replacing Chrome does.
         sys.stderr.write(f"CGC_DAEMON {rid}: debug Chrome cannot open a usable tab — restarting it\n")

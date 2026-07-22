@@ -34,3 +34,28 @@ def test_egress_gate_allows_a_followup_with_no_new_link():
     cdp = _load("cdp_consult.py")
     ok, _reason = cdp._egress_gate("continuing this consult; here are my local results, next question…")
     assert ok is True
+
+
+# --- URL classification fail-open (diff-review S0): a recognized code URL that does not classify to
+# a verifiable owner/repo must FAIL CLOSED, never be silently skipped from visibility verification. ---
+
+def test_classify_decodes_single_percent_encoding_to_a_clean_slug():
+    """github.com/%66itz-s/repo is URI-equivalent to github.com/fitz-s/repo, so it must decode to the
+    slug 'fitz-s/repo' and be VERIFIED (the old code saw the raw %66 and skipped verification)."""
+    spool = _load("cgc_spool.py")
+    slugs, refuse = spool._classify_code_urls("see https://github.com/%66itz-s/repo for the code")
+    assert refuse is None and "fitz-s/repo" in slugs
+
+
+def test_validate_refuses_double_encoded_owner_without_network():
+    """A double-encoded owner (%2566itz-s -> %66itz-s after one decode) is ambiguous and cannot be a
+    real repo segment — refuse before any visibility check (no gh call needed)."""
+    spool = _load("cgc_spool.py")
+    ok, reason = spool.validate_prompt("review https://github.com/%2566itz-s/private-repo now")
+    assert ok is False and "refused" in reason.lower()
+
+
+def test_validate_refuses_a_code_url_with_no_owner_repo():
+    spool = _load("cgc_spool.py")
+    ok, reason = spool.validate_prompt("see https://raw.githubusercontent.com/onlyowner and review")
+    assert ok is False and "refused" in reason.lower()

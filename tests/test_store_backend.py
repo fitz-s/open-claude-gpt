@@ -397,6 +397,35 @@ def test_latest_conversation_ignores_inflight_and_self(env):
     assert s.latest_conversation(exclude_rid="REQ-20260721-000000-00done") is None, "excludes itself"
 
 
+def test_await_unverified_is_review_required_not_success(env, tmp_path):
+    """completed_unverified (salvaged without the sentinel wrapper) is NOT automatic success: await
+    materializes it for a human but returns review-required (3), never 0, and emits no auto-followup
+    — an unwrapped salvage can carry the wrong round's answer (diff-review)."""
+    store_mod, backend, s, tmp = env
+    rid = "REQ-20260721-000000-00unv1"
+    s.create_round(rid, "submit")
+    s.set_state(rid, store_mod.READY)
+    aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid, "conv-u"); s.mark_waiting(rid)
+    s.finish(rid, store_mod.COMPLETED_UNVERIFIED, result_text="a salvaged, unwrapped answer")
+    out = str(tmp / "u.txt")
+    aw = types.SimpleNamespace(rid=rid, out=out, timeout=2, poll=1)
+    assert backend.await_round(aw) == 3, "unverified must be review-required, never auto-success (0)"
+    assert open(out).read() == "a salvaged, unwrapped answer", "still materialized for the human"
+
+
+def test_await_verified_is_success(env, tmp_path):
+    store_mod, backend, s, tmp = env
+    rid = "REQ-20260721-000000-00ver1"
+    s.create_round(rid, "submit"); s.set_state(rid, store_mod.READY)
+    aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid, "conv-v"); s.mark_waiting(rid)
+    s.finish(rid, store_mod.COMPLETED_VERIFIED, result_text="the verified answer")
+    out = str(tmp / "v.txt")
+    aw = types.SimpleNamespace(rid=rid, out=out, timeout=2, poll=1)
+    assert backend.await_round(aw) == 0
+
+
 def test_enqueue_and_await_roundtrip(env, monkeypatch):
     store_mod, backend, s, tmp = env
     # enqueue via the CLI-facing helper

@@ -104,9 +104,29 @@ def plan_migration(spool_dir):
     return rows
 
 
-def migrate_spool_to_store(spool_dir, store):
+class MigrationBlocked(Exception):
+    """Refused because the spool is not drained — migrating active work would create unrunnable rows."""
+
+
+def migrate_spool_to_store(spool_dir, store, require_drained: bool = True):
     """Apply plan_migration into `store`. Returns a summary {imported, skipped, by_state}. A rid
-    already in the store is skipped (idempotent re-run). Reads only; the spool is left intact."""
+    already in the store is skipped (idempotent re-run). Reads only; the spool is left intact.
+
+    DRAIN-ONLY (default): refuse if any `pending`/`processing` legacy job still exists. import_round
+    cannot carry a job's rendered_prompt or execution spec, so a migrated `pending` round would be a
+    queued row with a null prompt — unrunnable, and an idempotent re-run cannot repair it (the rid
+    already exists). The safe contract is: drain the old daemon (let in-flight consults finish) FIRST,
+    then migrate the settled spool. require_drained=False is for tests exercising the state mapping on
+    an un-drained spool; production must not use it (diff-review S1)."""
+    if require_drained:
+        pending = _rids_in(spool_dir, "pending")
+        processing = _rids_in(spool_dir, "processing")
+        if pending or processing:
+            raise MigrationBlocked(
+                f"refusing to migrate: {len(pending)} pending + {len(processing)} processing legacy "
+                "job(s) are still active. Their prompt/spec cannot be imported faithfully, so this "
+                "would create unrunnable rows. DRAIN the old daemon first (let in-flight consults "
+                "finish or reconcile them), then migrate the settled spool.")
     summary = {"imported": 0, "skipped": 0, "by_state": {}}
     for row in plan_migration(spool_dir):
         rid = row["rid"]
