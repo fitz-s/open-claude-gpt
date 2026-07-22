@@ -148,7 +148,14 @@ def await_round(a) -> int:
             _materialize(out, text)
             n = len(text.encode("utf-8"))
             tag = "" if state == store_mod.COMPLETED_VERIFIED else " (UNVERIFIED salvage — check it isn't cut off)"
-            sys.stderr.write(f"CGC_DONE {a.rid}: answer ready ({n} bytes){tag}. READ IT AT:\n  {out}\n")
+            consult = os.path.join(os.path.dirname(os.path.abspath(__file__)), "consult.py")
+            sys.stderr.write(
+                f"CGC_DONE {a.rid}: answer ready ({n} bytes){tag}. READ IT AT:\n  {out}\n"
+                "CGC_NEXT to CONTINUE this thread (re-review after your changes, re-check a fix, next "
+                "phase) — a FOLLOW-UP keeps ChatGPT's context; a fresh consult throws it away:\n"
+                f"  python3 {consult} fire --followup --no-code "
+                "--task \"<the diff I applied / local results + the next question>\" --title \"<what's new>\"\n"
+                "  (no --conversation needed — it continues THIS thread; add --refs-file for a fresh diff link.)\n")
             return 0
         if state == store_mod.BLOCKED:
             sys.stderr.write(f"CGC_BLOCKER {a.rid}: {r['error_code'] or 'login/captcha/rate-limit'}\n"
