@@ -136,11 +136,13 @@ STATE_PATH = os.path.join(CGC_STATE_DIR, "active.json")
 
 STATE_LOCK_PATH = STATE_PATH + ".lock"
 
-# How long a consult takes: a GPT-5.6 Pro round reasons ~25 min. Same number as
-# cgc_spool.STUCK_AFTER_S. This is NOT a budget for the consult — a GPT-5.6 Pro round reasons
-# ~25 min and must never be killed for it. It is the point past which waiting is no longer
-# explained by the work, so the job is stuck and the log is what to read next.
-STUCK_AFTER_S = 3600
+# How long a consult takes: a GPT-5.6 Pro round reasons ~25 min typically, but a deep one (esp. a
+# follow-up that re-reasons from scratch) was observed at ~62 min. Same number as
+# cgc_spool.STUCK_AFTER_S — keep them in sync. This is NOT a budget for the consult and must never
+# kill a healthy one for thinking; it is the point past which waiting is no longer explained by the
+# work. 3600 stranded a 62-min answer minutes before it landed, so 5400 (90 min) covers the long
+# tail; the read-only auto-retrieve backstops anything beyond it.
+STUCK_AFTER_S = 5400
 
 
 @contextlib.contextmanager
@@ -1718,9 +1720,9 @@ def main() -> int:
     fu.add_argument("--out", help="answer file for --watch mode")
     fu.add_argument("--poll", type=int, default=20, help="(--watch) seconds between DOM checks")
     fu.add_argument("--timeout", type=int, default=STUCK_AFTER_S,
-                    help="(--watch) seconds to wait for the answer (default 1500 = 25 min, how long "
-                         "the point past which the job is stuck rather than slow)."
-                         "its background tasks at 900s.")
+                    help=f"(--watch) seconds to wait for the answer (default {STUCK_AFTER_S} = "
+                         f"{STUCK_AFTER_S // 60} min — the point past which the job is stuck rather "
+                         "than slow; a deep round can reason ~60 min).")
     fu.add_argument("--settle-seconds", type=int, default=300, help="(--watch) unwrapped-answer settle window")
     fu.add_argument("--min-unwrapped", type=int, default=1500, help="(--watch) min chars to accept an unwrapped answer")
     fu.add_argument("--keep-tab", action="store_true", help="(--watch) keep the tab after retrieving")
@@ -1735,9 +1737,9 @@ def main() -> int:
     w.add_argument("--out", required=True)
     w.add_argument("--poll", type=int, default=20, help="seconds between DOM checks")
     w.add_argument("--timeout", type=int, default=STUCK_AFTER_S,
-                   help="seconds to wait for the answer (default 1500 = 25 min, how long a GPT-5.6 "
-                        "the point past which the job is stuck rather than slow)."
-                        "background tasks at 900s.")
+                   help=f"seconds to wait for the answer (default {STUCK_AFTER_S} = "
+                        f"{STUCK_AFTER_S // 60} min — the point past which the job is stuck rather "
+                        "than slow; a deep GPT-5.6 Pro round can reason ~60 min).")
     w.add_argument("--keep-tab", action="store_true",
                    help="do not close the consult's tab after retrieving (default: close it, so "
                         "concurrent consults' tabs don't accumulate)")
