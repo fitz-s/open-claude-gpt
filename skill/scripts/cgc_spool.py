@@ -119,6 +119,41 @@ _SLUG_RE = re.compile(
     r"https://(?:www\.)?(?:github\.com|raw\.githubusercontent\.com)/"
     r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", re.IGNORECASE)
 _GIST_RE = re.compile(r"https://gist\.github\.com/\S+", re.IGNORECASE)
+_CLEAN_SEG_RE = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+def _classify_code_urls(text: str):
+    """Turn every RECOGNIZED code URL into an owner/repo slug to verify, FAILING CLOSED on any URL
+    that cannot be classified. The bug this closes (diff-review S0): the broad _CODE_URL_RE accepts a
+    github URL, but the narrow slug extraction skipped percent-encoded owners (e.g.
+    github.com/%66itz-s/private = github.com/fitz-s/private), so NO visibility check ran and the
+    prompt was approved after verifying zero repos. Here the invariant is 1:1 — a recognized code URL
+    that does not resolve to a clean owner/repo (unclassifiable, double-encoded, or non-repo path) is
+    a hard refusal, never silently dropped from verification. Returns (slugs, refuse_reason)."""
+    from urllib.parse import urlsplit, unquote
+    slugs = set()
+    for url in _CODE_URL_RE.findall(text):
+        u = url.rstrip('.,);]}"\'>')
+        parts = urlsplit(u)
+        host = parts.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host == "gist.github.com":
+            continue  # gists carry no owner/repo slug; rule 3 handles them separately
+        segs = [s for s in unquote(parts.path).split("/") if s]
+        owner = segs[0] if len(segs) >= 1 else None
+        repo = segs[1] if len(segs) >= 2 else None
+        # owner/repo must be CLEAN slug chars — a residual '%' means double-encoding, anything else
+        # non-slug means this is not a repo path we can verify. Either way: refuse.
+        if (not owner or not repo
+                or not _CLEAN_SEG_RE.fullmatch(owner) or not _CLEAN_SEG_RE.fullmatch(repo)):
+            if owner and owner.lower() in ("orgs", "sponsors", "settings", "features", "about",
+                                           "topics", "trending", "marketplace"):
+                continue  # a non-repo github path (not a code source) — not a slug to verify
+            return None, (f"refused: code URL {u!r} does not resolve to a verifiable owner/repo "
+                          "(unclassifiable or ambiguously encoded) — failing closed.")
+        slugs.add(f"{owner}/{repo}")
+    return slugs, None
 
 # Obvious-secret patterns — the gate refuses to send a prompt matching any of these, fail-closed.
 # Not exhaustive (nothing is); it catches the high-signal shapes so an injected --task/--context
@@ -501,13 +536,11 @@ def validate_prompt(prompt_text: str) -> tuple:
     if _GIST_RE.search(text) and os.environ.get("CGC_GATE_ALLOW_GIST", "0").strip().lower() in ("0", "false", "no", "off", ""):
         return False, "refused: prompt contains a gist link and CGC_GATE_ALLOW_GIST is off — the gate cannot verify a gist is public"
 
-    # 2. every repo slug must be gh-confirmed public.
-    slugs = set()
-    for m in _SLUG_RE.finditer(text):
-        owner, repo = m.group(1), m.group(2)
-        if owner.lower() in ("orgs", "sponsors", "settings", "features"):  # not repo paths
-            continue
-        slugs.add(f"{owner}/{repo}")
+    # 2. every recognized code URL must classify to a repo slug (fail closed on any that doesn't),
+    #    and every slug must be gh-confirmed public.
+    slugs, refuse = _classify_code_urls(text)
+    if refuse:
+        return False, refuse
     allowed = _private_allowlist()
     for slug in sorted(slugs):
         ok, detail = _repo_is_public(slug)

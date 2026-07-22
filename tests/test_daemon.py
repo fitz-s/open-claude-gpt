@@ -417,9 +417,11 @@ def test_store_mode_skips_legacy_orphan_recovery_and_tab_sweep(daemon, monkeypat
 
 
 def test_browser_repair_actually_triggers_on_an_attach_failure(daemon, monkeypatch, tmp_path):
-    """The detection must read the job LOG, not the returned stderr. stderr is redirected into that
-    log, so the returned string is only its last 240 chars — and the token sits at the START of a
-    long message, so an `in se` check silently never fired and the repair never ran."""
+    """The detection must read THIS invocation's returned stderr — which `_run` now scopes to the
+    current subprocess (log_start..EOF), so the token IS present AND isolated to the attempt that
+    just ran. Reading the whole-file log tail instead would reintroduce the cross-attempt leak the
+    diff-review flagged S0 (a stale marker from an earlier attempt restarting Chrome after a later
+    post-click failure — an automatic resend)."""
     calls = []
 
     def _fake_run(cmd, timeout, rid=None, stdin_text=None, env_extra=None):
@@ -427,10 +429,8 @@ def test_browser_repair_actually_triggers_on_an_attach_failure(daemon, monkeypat
         if cmd[0] == "bash":                       # the launcher restart
             return 0, "", ""
         if len([c for c in calls if c[0][0] != "bash"]) == 1:
-            # first submit: write the real failure into the log, return only a tail like _run does
-            with open(daemon.spool.log_path(rid), "a", encoding="utf-8") as f:
-                f.write("CGC_ERROR cdp_attach_failed: " + "x" * 500 + "\n")
-            return 1, "", "x" * 240
+            # first submit: a pre-click attach failure; _run returns this invocation's full stderr.
+            return 1, "", "CGC_ERROR cdp_attach_failed: opened a tab but it never answered Runtime.enable"
         return 0, json.dumps({"conversation_id": "c1"}), ""
 
     monkeypatch.setattr(daemon, "_run", _fake_run)

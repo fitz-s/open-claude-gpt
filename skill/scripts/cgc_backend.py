@@ -135,7 +135,13 @@ def enqueue_round(a, prompt: str, out: str) -> int:
 
 
 # ---- await -------------------------------------------------------------------
-_TERMINAL_OK = store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED
+# Only a SENTINEL-VERIFIED answer is automatic success. completed_unverified (the model skipped the
+# BEGIN/END_RESPONSE:<rid> wrapper, so the answer was salvaged by size/position) is NOT auto-success:
+# the diff-review showed its salvage can attribute a DIFFERENT round's answer to this rid under
+# concurrent same-thread sends, and handing automation a silent "success" there can corrupt
+# downstream autonomous work. Unverified answers are materialized for a human, but await returns
+# review-required and never emits the auto-followup nudge.
+_TERMINAL_OK = (store_mod.COMPLETED_VERIFIED,)
 
 
 def await_round(a) -> int:
@@ -150,26 +156,51 @@ def await_round(a) -> int:
             sys.stderr.write(f"CGC_BROKEN {a.rid}: no such round in the store.\n")
             return 1
         state = r["state"]
-        if state in _TERMINAL_OK:
+        if state == store_mod.COMPLETED_VERIFIED:
             text = r["result_text"] or ""
             if not text:
                 sys.stderr.write(f"CGC_BROKEN {a.rid}: round is {state} but its result_text is empty.\n")
                 return 1
             _materialize(out, text)
             n = len(text.encode("utf-8"))
-            tag = "" if state == store_mod.COMPLETED_VERIFIED else " (UNVERIFIED salvage — check it isn't cut off)"
             consult = os.path.join(os.path.dirname(os.path.abspath(__file__)), "consult.py")
             sys.stderr.write(
-                f"CGC_DONE {a.rid}: answer ready ({n} bytes){tag}. READ IT AT:\n  {out}\n"
+                f"CGC_DONE {a.rid}: answer ready ({n} bytes). READ IT AT:\n  {out}\n"
                 "CGC_NEXT to CONTINUE this thread (re-review after your changes, re-check a fix, next "
                 "phase) — a FOLLOW-UP keeps ChatGPT's context; a fresh consult throws it away:\n"
                 f"  python3 {consult} fire --followup --parent {a.rid} --no-code "
                 "--task \"<the diff I applied / local results + the next question>\" --title \"<what's new>\"\n"
                 f"  (--parent {a.rid} pins THIS consult's thread causally; add --refs-file for a fresh diff link.)\n")
             return 0
+        if state == store_mod.COMPLETED_UNVERIFIED:
+            text = r["result_text"] or ""
+            _materialize(out, text)  # materialize so a human CAN read it — but this is NOT auto-success
+            n = len(text.encode("utf-8"))
+            sys.stderr.write(
+                f"CGC_REVIEW_REQUIRED {a.rid}: an answer was salvaged WITHOUT the BEGIN/END_RESPONSE:"
+                f"{a.rid} wrapper ({n} bytes) written to:\n  {out}\n"
+                "A HUMAN must verify it is (a) complete/not cut off AND (b) actually this round's "
+                "answer — an unwrapped salvage can pick up a different message if another consult ran "
+                "on the same thread. Do NOT auto-chain a follow-up on it; re-run the consult if in "
+                "doubt.\n")
+            return 3
         if state == store_mod.BLOCKED:
-            sys.stderr.write(f"CGC_BLOCKER {a.rid}: {r['error_code'] or 'login/captcha/rate-limit'}\n"
-                             "A human must act in the ChatGPT window, then re-enqueue.\n")
+            # A blocker BEFORE the send (login/model/composer at submit) is safely re-enqueued; a
+            # blocker AFTER the send (login/captcha/rate-limit hit during the wait) is NOT — the
+            # consult may still be generating or already complete, so re-enqueue would duplicate it.
+            # A recorded conversation means the send crossed the fence → retrieve, don't resend.
+            with store_mod.Store() as _s:
+                conv = _s.conversation_of(a.rid)
+            if conv:
+                sys.stderr.write(
+                    f"CGC_BLOCKER {a.rid} (post-send): {r['error_code'] or 'login/captcha/rate-limit'}\n"
+                    f"The consult was already sent to conversation {conv}. Clear the blocker in the "
+                    "ChatGPT window, then RETRIEVE it (enqueue --kind retrieve --conversation "
+                    f"{conv}) — do NOT re-enqueue a fresh consult, it would duplicate this one.\n")
+            else:
+                sys.stderr.write(
+                    f"CGC_BLOCKER {a.rid} (pre-send): {r['error_code'] or 'login/captcha/rate-limit'}\n"
+                    "Nothing was sent. A human must clear it in the ChatGPT window, then re-enqueue.\n")
             return 3
         if state == store_mod.POSSIBLY_ACCEPTED:
             sys.stderr.write(
