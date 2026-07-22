@@ -94,14 +94,26 @@ def store_status(up: bool, rid: str | None = None) -> int:
 def enqueue_round(a, prompt: str, out: str) -> int:
     """Create a queued round from the CLI args. The prompt BYTES live on the round (no pathname to
     drift); project_url/model/conversation/poll/timeout ride in spec_json for the worker."""
-    spec = {"project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
-            "conversation": getattr(a, "conversation", None), "poll": getattr(a, "poll", None),
-            "timeout": getattr(a, "timeout", None)}
-    thread = spec["conversation"] if spec["conversation"] not in (None, "auto") else None
+    conv = getattr(a, "conversation", None)
     with store_mod.Store() as s:
         if s.get_round(a.rid) is not None:
             sys.stderr.write(f"CGC_ERROR already_enqueued: {a.rid} already exists in the store.\n")
             return 2
+        # A follow-up with auto/last/no conversation continues the ACTIVE thread — resolve it to the
+        # last completed consult's conversation NOW, while the agent's intent is fresh (pinning it
+        # here, not at process time, avoids a concurrent consult stealing 'last'). FAIL CLOSED: a
+        # follow-up that resolves to nothing is refused, never silently opened as a fresh thread.
+        if a.kind == "followup" and (conv in (None, "auto", "last")):
+            conv = s.latest_conversation(exclude_rid=a.rid)
+            if not conv:
+                sys.stderr.write("CGC_ERROR followup_no_thread: --followup continues a thread, but no "
+                                 "completed consult exists to continue. Run a consult first, or pass "
+                                 "--conversation <id> explicitly.\n")
+                return 2
+        spec = {"project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
+                "conversation": conv, "poll": getattr(a, "poll", None),
+                "timeout": getattr(a, "timeout", None)}
+        thread = conv if conv not in (None, "auto", "last") else None
         s.create_round(a.rid, a.kind, thread_id=thread, out_path=out, prompt=prompt,
                        spec_json=json.dumps(spec))
     print(json.dumps({"queued": True, "rid": a.rid, "out": out, "backend": "store"}))
@@ -192,11 +204,13 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
     # new one (a fresh submit would silently lose the thread's context, the worst kind of bug).
     if r["kind"] == "followup":
         conv = spec.get("conversation")
-        if not conv or conv == "auto":
-            conv = _thread_conv(store, r)
+        if not conv or conv in ("auto", "last"):
+            # enqueue normally resolves this to a concrete id; resolve again here so a round enqueued
+            # before that (or by another path) still continues the active thread rather than failing.
+            conv = _thread_conv(store, r) or store.latest_conversation(exclude_rid=rid)
         if not conv:
             store.finish(rid, store_mod.FAILED,
-                         error_code="followup needs an explicit conversation id — no thread to continue")
+                         error_code="followup found no prior thread to continue — run a consult first")
             return store_mod.FAILED
         gated = _gate(store, rid, prompt, validate)
         if gated is not None:

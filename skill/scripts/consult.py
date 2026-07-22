@@ -751,16 +751,16 @@ def cmd_fire(a: argparse.Namespace) -> int:
     debugging and for anyone who wants to edit the refs or the prompt in between."""
     import cgc_spool as spool
 
-    # A follow-up must continue its thread. fire inherits --followup from prep's argument set, and
-    # enqueuing kind="submit" with conversation="auto" would open a FRESH conversation — the round
-    # would look fine and silently lose everything the thread already knows, which is the worst
-    # shape of bug: no error, wrong answer.
-    if a.followup and (not a.conversation or a.conversation == "auto"):
-        sys.stderr.write(
-            "CGC_ERROR followup_needs_conversation: --followup continues an existing thread, so it "
-            "needs --conversation <id> (the id `await` printed when that thread's answer landed). "
-            "Without it this would open a new conversation and lose the thread's context.\n")
-        return 2
+    # A follow-up continues a thread — but it no longer needs a hand-tracked conversation id. A bare
+    # `--followup` (or `--conversation auto`/`last`) defaults to the LAST completed consult's thread,
+    # which enqueue resolves from the store while the intent is fresh. This is the whole point of
+    # follow-up ergonomics: the store remembers which thread you last got an answer from, so the
+    # cheap path (continue the thread ChatGPT already has context for) is also the zero-effort path.
+    # It stays FAIL-CLOSED: if nothing resolves, enqueue refuses — it never opens a fresh conversation
+    # and silently loses the thread's context. Pass an explicit --conversation to target a specific
+    # older thread (e.g. when other consults ran in between).
+    if a.followup and not a.conversation:
+        a.conversation = "auto"
 
     if not a.no_code:
         d = cmd_deliver(a)
@@ -878,7 +878,10 @@ def main() -> int:
     pf.add_argument("--model", default=os.environ.get("CGC_MODEL", "Pro"))
     pf.add_argument("--out", help="answer file (default $CGC_STATE_DIR/answer_<rid>.txt)")
     pf.add_argument("--project-url", default=os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/"))
-    pf.add_argument("--conversation", help="REQUIRED with --followup: the thread to continue")
+    pf.add_argument("--conversation",
+                    help="with --followup, the thread to continue; omit (or 'last'/'auto') to "
+                         "continue the LAST completed consult automatically — no id to track. Pass an "
+                         "explicit /c/<id> only to target a specific older thread.")
     pf.set_defaults(fn=cmd_fire)
 
     pp = _add_prep_args(sub.add_parser("prep"))
