@@ -431,7 +431,7 @@ def is_canonical_conversation(conversation) -> bool:
     single source of truth for 'this value may key a conversation lease'; every lease-taking and
     lease-locking path gates on it so equivalent-but-differently-spelled handles cannot split the
     lock namespace."""
-    return bool(_CONV_ID_RE.match(conversation or ""))
+    return bool(_CONV_ID_RE.fullmatch(conversation or ""))
 
 
 def _conversation_lease_path(conversation):

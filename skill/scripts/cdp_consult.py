@@ -44,8 +44,9 @@ Subcommands:
            keeping its context + model). Attaches to an existing tab if one is still
            open, or reopens the conversation at /c/<conversation_id> otherwise —
            --keep-tab is an optional convenience, not a requirement.
-  Both submit and followup share one PRE-CLICK paste boundary (_paste_prompt): a failure there —
-  including a crash — exits EXIT_NOT_SENT_PRECLICK (6), proving the send click was never issued.
+  Both submit and followup share one PRE-CLICK paste boundary (_paste_prompt): a CAUGHT failure
+  there exits EXIT_NOT_SENT_PRECLICK (6), proving the send click was never issued. An uncontrolled
+  process death (SIGKILL, uncatchable crash) produces no exit 6 and stays classified uncertain.
   wait    --rid R --out F [--port P] [--poll S] [--timeout S]
           poll until the answer is complete, extract it between the bare-line BEGIN/END
           sentinels, write to --out, exit 0. Run as a detached background Bash;
