@@ -93,6 +93,16 @@ uncertain-round machinery live):
   where it is free), and the successor inherits the prior's resolved conversation/parent so
   same-fingerprint retries cannot diverge to different threads.
 
+- **Sends survive a heavy, freshly-rehydrated DOM; pre-click failures are provably unsent.** A
+  follow-up to a long thread died pasting the whole prompt in one `Runtime.evaluate` (the CDP reply
+  outran the websocket read timeout on a ~30KB conversation DOM), leaving the draft in the composer,
+  no click issued — and the round classified `possibly_accepted`, forcing a manual reconcile
+  (observed twice). The composer is now cleared first, the prompt pasted in ~2KB chunks, and the
+  pasted length verified before any click; any failure before the click exits
+  `EXIT_NOT_SENT_PRECLICK` and lands as `FAILED` + `send_disposition=not_sent_proven` in one
+  transaction — the same fire (same `--request-key`) retries safely with no operator step. Failures
+  after the click keep the uncertain classification (the at-most-once invariant is untouched).
+
 A second adversarial re-review (same thread, at 39eeb72) confirmed the architecture but found four
 remaining concurrency/causality holes on the trust boundary; all fixed:
 
