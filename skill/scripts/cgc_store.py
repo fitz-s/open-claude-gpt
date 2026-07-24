@@ -228,7 +228,7 @@ def _relocate_legacy_db_locked(target: str, legacy: str, d: str) -> None:
         os.close(dfd)
     os.replace(legacy, legacy + ".migrated")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Ordered, transactional migrations: _MIGRATIONS[n] upgrades a version-(n-1) DB to version n.
 # A fresh DB is created at SCHEMA_VERSION directly by _DDL, so each migration must produce exactly
@@ -240,7 +240,19 @@ _MIGRATIONS = {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_rounds_request_key "
         "ON rounds(request_key) WHERE request_key IS NOT NULL",
     ],
+    # send_disposition: an operator's durable, explicit verdict about whether a round's send ever
+    # reached ChatGPT. Only 'not_sent_proven' is written (by record_not_sent_proof); its ABSENCE is
+    # not evidence of a send. It is the one thing that lets a post-send-uncertain FAILED round
+    # release its request-key — a generic FAILED never can, because the state alone cannot prove
+    # no-send (possibly_accepted->failed and waiting->failed are both legal reconciles).
+    3: [
+        "ALTER TABLE rounds ADD COLUMN send_disposition TEXT",
+    ],
 }
+
+# The only value ever stored in rounds.send_disposition: an explicit operator reconcile proving the
+# round's send never reached ChatGPT (e.g. browser inspection found no such message).
+NOT_SENT_PROVEN = "not_sent_proven"
 
 
 class SchemaTooNew(Exception):
@@ -292,6 +304,12 @@ UNCERTAIN = {SENDING, POSSIBLY_ACCEPTED}
 
 class IllegalTransition(Exception):
     """A state change the machine does not permit — a bug, surfaced instead of silently corrupting."""
+
+
+class RequestKeyRaced(Exception):
+    """A request-key transfer found the source row no longer holds the key — a concurrent retry moved
+    it first. The caller re-resolves to the current owner (the winner) rather than creating a second
+    successor, so exactly one successor ever owns a released key."""
 
 
 def _now() -> str:
@@ -450,6 +468,77 @@ class Store:
     def round_by_request_key(self, key: str) -> dict | None:
         row = self.db.execute("SELECT * FROM rounds WHERE request_key=?", (key,)).fetchone()
         return dict(row) if row else None
+
+    def has_send_attempt(self, rid: str) -> bool:
+        """True iff the round durably crossed the send fence at least once — begin_send is the ONLY
+        writer of the attempts table and the ONLY path into `sending`, so an attempt row is exact
+        proof the round entered `sending` (the click may have reached ChatGPT). Its ABSENCE is the
+        durable proof that nothing was ever sent — the condition under which a terminally-FAILED
+        round may release its request-key to a retry without risking a duplicate send."""
+        return self.db.execute(
+            "SELECT 1 FROM attempts WHERE rid=? LIMIT 1", (rid,)).fetchone() is not None
+
+    def record_not_sent_proof(self, rid: str, evidence: str) -> None:
+        """Operator reconcile: durably record that a round's send was PROVEN never to have reached
+        ChatGPT (e.g. browser inspection found no such message). This explicit act — and ONLY this —
+        qualifies a post-send-uncertain FAILED round to later release its request-key; a generic
+        FAILED never does, because possibly_accepted->failed and waiting->failed are legal reconciles
+        that do not themselves prove no-send. Drives a still-reconcilable round to FAILED as part of
+        the act; on an already-FAILED round it just stamps the durable proof."""
+        with self._tx():
+            row = self.db.execute("SELECT state FROM rounds WHERE rid=?", (rid,)).fetchone()
+            if row is None:
+                raise KeyError(rid)
+            cur = row["state"]
+            if cur == FAILED:
+                self.db.execute("UPDATE rounds SET send_disposition=?,updated_at=? WHERE rid=?",
+                                (NOT_SENT_PROVEN, _now(), rid))
+            elif FAILED in _LEGAL.get(cur, set()):
+                self._apply_round_fields(
+                    rid, state=FAILED, send_disposition=NOT_SENT_PROVEN,
+                    error_code=f"reconciled not-sent (proven): {evidence}")
+                self._event("state", rid=rid, detail=f"{cur} -> {FAILED} (not-sent proof)")
+            else:
+                raise IllegalTransition(
+                    f"{rid}: cannot record not-sent proof from {cur!r} — the reconcile applies to an "
+                    "uncertain or already-failed round, not one still in flight")
+            self._event("not_sent_proof", rid=rid, detail=evidence)
+
+    def transfer_request_key(self, old_rid: str, *, rid: str, kind: str,
+                             thread_id: str | None = None, out_path: str | None = None,
+                             spec_json: str | None = None, prompt: str | None = None,
+                             request_key: str, parent_rid: str | None = None,
+                             state: str = QUEUED) -> None:
+        """Atomically MOVE a request-key from a terminally-failed `old_rid` to a fresh successor
+        round, in ONE transaction: clear the old row's key and INSERT the new row already holding it,
+        so the UNIQUE key is never momentarily free for a concurrent retry to seize (the separate
+        clear-then-create the audit flagged left exactly such a window). Guards that `old_rid` still
+        holds the key; if a concurrent transfer already moved it, raises RequestKeyRaced so the caller
+        re-resolves to the winner instead of minting a second successor."""
+        if state not in _LEGAL:
+            raise ValueError(f"unknown initial state {state!r}")
+        now = _now()
+        psha = sha256(prompt) if prompt is not None else None
+        with self._tx():
+            row = self.db.execute("SELECT request_key FROM rounds WHERE rid=?", (old_rid,)).fetchone()
+            if row is None or row["request_key"] != request_key:
+                raise RequestKeyRaced(old_rid)
+            self.db.execute("UPDATE rounds SET request_key=NULL,updated_at=? WHERE rid=?",
+                            (now, old_rid))
+            self._event("key_released", rid=old_rid,
+                        detail=f"request-key transferred to {rid}: prior proven not sent")
+            if thread_id is not None:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO threads(thread_id,created_at,updated_at) VALUES(?,?,?)",
+                    (thread_id, now, now))
+            self.db.execute(
+                "INSERT INTO rounds(rid,thread_id,kind,source_mode,spec_json,rendered_prompt,"
+                "prompt_sha256,out_path,request_key,parent_rid,state,created_at,updated_at,"
+                "schema_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (rid, thread_id, kind, None, spec_json, prompt, psha, out_path,
+                 request_key, parent_rid, state, now, now, SCHEMA_VERSION))
+            self._event("created", rid=rid,
+                        detail=f"kind={kind} state={state} (request-key transfer from {old_rid})")
 
     def import_round(self, rid: str, kind: str, state: str, *, thread_id: str | None = None,
                      conversation_id: str | None = None, source_mode: str | None = None,
@@ -803,6 +892,7 @@ CREATE TABLE IF NOT EXISTS rounds (
   out_path              TEXT,
   request_key           TEXT,
   parent_rid            TEXT,
+  send_disposition      TEXT,
   created_at            TEXT NOT NULL,
   updated_at            TEXT NOT NULL,
   schema_version        INTEGER NOT NULL DEFAULT 1
