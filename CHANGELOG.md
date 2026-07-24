@@ -6,6 +6,69 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+Driven by a first-principles maturity audit (a 25-min GPT-5.6 Pro deep review of a48e3d1 collided
+with in-session user-side measurement). The audit's verdict: a strong anti-duplicate core inside an
+internally contradictory product shell — so this cycle is shell work: one authority, one durable
+home, one machine-readable contract, honest risk posture.
+
+### Changed — BREAKING
+- **The file-spool control plane is retired.** The SQLite store is the sole round authority;
+  `CGC_STORE_BACKEND` is gone (no rollback to the spool), and the spool dir now holds only daemon
+  runtime files (heartbeat, singleton lock, per-round logs). Legacy `pending/processing/done`
+  lifecycle, per-rid status files, pid fencing, and `lifecycle_lock` are deleted (~700 lines).
+- **The store moved out of /tmp.** `control.db` lives in `CGC_DATA_DIR` (default
+  `~/.local/state/cgc`) — durable state was living in a directory docs called deletable, making
+  `synchronous=FULL` crash-consistency moot across reboots. A legacy `/tmp`-era DB is relocated
+  automatically (sqlite backup API; original kept as `*.migrated`). install.sh restarts the launchd
+  daemon on upgrade to prevent version split-brain (observed live during rollout: the in-memory old
+  daemon recreated an empty /tmp DB while new CLI code used the durable one, stranding another
+  session's consult for 30 min).
+
+### Added
+- **JSON outcome envelope (schema 1).** Every `await` exit prints one machine-readable stdout line:
+  rid, parent_rid, state, retryable, human_action, next_command, answer_path, log_path, confidence,
+  error. Agents act on fields, not prose.
+- **`fire --request-key`** — logical idempotency: same key + same content returns the original
+  receipt (safe retry after lost output); different content refuses. Comparator normalizes the rid
+  out of the rendered bytes.
+- **`cgc cancel --rid`** — pre-send only (queued/ready), CAS-guarded, idempotent.
+- **Strict follow-up resolution.** Bare `--followup` refuses when "the last thread" is ambiguous
+  (a consult in flight, or two threads completed within 30 min); `--parent <rid>` is the
+  agent-documented causal path and is recorded on the round.
+- **Dead-reference detection at the gate.** Cited PR numbers and tree/blob/commit refs must exist
+  (gh, deduped, capped): a typo'd `--pr` now fails in seconds at the gate instead of 25 minutes
+  later at ChatGPT — the cost of offline `deliver`, repaid where gh already runs.
+- **Ordered schema migrations (v2).** Version read before DDL, pre-migration backup
+  (`control.db.v<n>.bak`), one transaction per version, and forward-refusal (`SchemaTooNew`) when
+  the DB was written by newer code.
+- **`cgc stats`** — completed/failed counts, unverified-completion rate, created→terminal latency
+  p50/p90, and a sentinel-drift alarm (>25% unverified, n≥8). Baseline at introduction: 24
+  completed, 20.8% unverified.
+- **Store-aware browser maintenance.** Tab sweep and Chrome repair run only with an empty worker
+  map; a browser permanently unable to open tabs no longer requeues attach-failures forever — the
+  daemon escalates to a cooldown-bounded restart.
+
+### Fixed
+- `await` on the store path had no daemon-liveness check: a dead daemon meant 90 silent minutes
+  instead of the promised one-line `cgc install-daemon` exit. Checked in every non-terminal state.
+- `uninstall.sh` targeted the wrong skill directory (`open-claude-gpt` vs the installed
+  `chatgpt-consult`) — default uninstall removed nothing.
+- README's first-consult walkthrough taught the retired `cgc submit`; now fire → await.
+- `make test` ran only the smoke test while `make check` claimed CI parity; it now runs the full
+  suite. CI gains a real matrix (ubuntu 3.8/3.11/3.13 + macos 3.13 — the primary platform was never
+  CI-run), a pinned `websocket-client>=1.6,<2`, and a doctor step that fails on crash/empty output.
+- `fire`'s stdout carried two JSON receipts (enqueue's + fire's), breaking `json.loads` consumers.
+
+### Docs
+- **SKILL.md 51KB → 8.5KB** (~12.7k → ~2.1k tokens per activation, measured): activation
+  discriminant with negative examples, the two-command path, the outcome envelope, a repeat-safety
+  table, `--parent` follow-up, steering levers. History and catalogs moved behind references;
+  retired-verb recipes deleted.
+- **Honest risk posture:** README "Know the risks before installing" + SECURITY.md sections on
+  ToS/account risk (programmatic output extraction sits against OpenAI consumer terms; the account
+  risk is the user's), the local threat boundary (loopback is not process authentication), the
+  exact gate guarantee (secrets/repos/refs — not arbitrary prose), and local retention/purge.
+
 ## [0.2.0] — 2026-07-22
 
 The control plane is rebuilt on a single SQLite transactional store, replacing the file-spool / PID /
