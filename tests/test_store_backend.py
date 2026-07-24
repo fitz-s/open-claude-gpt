@@ -456,9 +456,16 @@ def _enq_ns(rid, prompt_file, **over):
     import argparse
     d = dict(rid=rid, prompt_file=prompt_file, kind="submit",
              project_url="https://chatgpt.com/", conversation="auto", parent=None,
-             request_key=None, model="Pro", out=None, poll=1, timeout=5, quiet=False)
+             request_key=None, logical_sha=None, model="Pro", out=None, poll=1, timeout=5, quiet=False)
     d.update(over)
     return argparse.Namespace(**d)
+
+
+def _lsha(body):
+    """A stand-in for prep's placeholder-rendered logical-sha: hash the content that distinguishes
+    one logical request from another. Same body -> same identity; different body -> different."""
+    import hashlib
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 class TestRequestKeyIdempotency:
@@ -467,8 +474,9 @@ class TestRequestKeyIdempotency:
         # the rendered prompt embeds its rid (sentinel instructions) — reproduce that
         pf.write_text(f"{body}\nwrap in BEGIN_RESPONSE:{rid}\n", encoding="utf-8")
         prompt = pf.read_text()
-        return backend.enqueue_round(_enq_ns(rid, str(pf), request_key=key), prompt,
-                                     str(tmp_path / f"a_{rid}.txt"))
+        return backend.enqueue_round(
+            _enq_ns(rid, str(pf), request_key=key, logical_sha=_lsha(body)), prompt,
+            str(tmp_path / f"a_{rid}.txt"))
 
     def test_same_key_same_content_returns_original_receipt(self, env, capsys):
         store_mod, backend, s, tmp_path = env
@@ -620,6 +628,8 @@ class TestRequestFingerprint:
         pf = tmp_path / f"{rid}.md"
         pf.write_text(f"review https://github.com/acme/w\nwrap in BEGIN_RESPONSE:{rid}\n",
                       encoding="utf-8")
+        # fixed body -> a constant logical-sha, so only the ROUTING fields under test drive conflicts
+        over.setdefault("logical_sha", _lsha("review https://github.com/acme/w"))
         return backend.enqueue_round(_enq_ns(rid, str(pf), request_key=key, **over),
                                      pf.read_text(), str(tmp_path / f"a_{rid}.txt"))
 
@@ -950,34 +960,199 @@ class TestSourceTurnMatching:
             {"present": False, "is_last": False, "observed_rid": None}
 
 
-class TestKeyReleaseOnPreSendFailure:
-    def _enq(self, backend, tmp_path, rid, key):
-        pf = tmp_path / f"{rid}.md"
-        pf.write_text(f"review https://github.com/acme/w\nBEGIN_RESPONSE:{rid}\n", encoding="utf-8")
-        return backend.enqueue_round(_enq_ns(rid, str(pf), request_key=key),
-                                     pf.read_text(), str(tmp_path / f"a_{rid}.txt"))
+class TestKeyReleaseRequiresNoSendProof:
+    """Audit S3: a request-key releases to a retry ONLY when the store DURABLY proves the prior
+    round never sent. Fingerprint is compared FIRST (a different logical request always conflicts,
+    even after a failure). GENERIC FAILED does not release: possibly_accepted->failed and
+    waiting->failed are legal reconciles that do NOT prove no-send, so their key stays owned. Only
+    GATE_REJECTED, a FAILED that never entered `sending`, or an explicit operator not-sent proof
+    releases — and the release+successor is one atomic key transfer."""
 
-    def test_failed_prior_releases_the_key_and_the_retry_requeues(self, env, capsys):
-        """The envelope's retry contract is 're-run the SAME fire, same --request-key'. A prior
-        that terminally failed PRE-SEND (cancel, no-thread, gate reject — nothing ever left) must
-        not swallow that retry by returning its dead receipt (observed live: a proven-not-sent
-        followup could never be re-fired under its own key)."""
+    BODY = "review https://github.com/acme/w"
+
+    def _enq(self, backend, tmp_path, rid, key, body=None):
+        body = self.BODY if body is None else body
+        pf = tmp_path / f"{rid}.md"
+        pf.write_text(f"{body}\nBEGIN_RESPONSE:{rid}\n", encoding="utf-8")
+        return backend.enqueue_round(
+            _enq_ns(rid, str(pf), request_key=key, logical_sha=_lsha(body)),
+            pf.read_text(), str(tmp_path / f"a_{rid}.txt"))
+
+    @staticmethod
+    def _drive_possibly_accepted(store_mod, s, rid):
+        """queued -> ready -> sending (an attempt row now exists) -> possibly_accepted: the round has
+        crossed the send fence, so the click MAY have reached ChatGPT."""
+        s.set_state(rid, store_mod.READY)
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d")
+        s.mark_possibly_accepted(aid, "unknown send — uncertain")
+
+    # ---- release IS allowed (durable no-send proof) --------------------------
+    def test_gate_rejected_prior_releases_the_key(self, env, capsys):
         store_mod, backend, s, tmp_path = env
-        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0f9001", "kr1") == 0
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g0001", "kg1") == 0
+        s.set_state("REQ-20260707-120000-0g0001", store_mod.READY)
+        s.gate_reject("REQ-20260707-120000-0g0001", "refused: private repo")  # pre-send by construction
         capsys.readouterr()
-        assert backend.cancel_round("REQ-20260707-120000-0f9001") == 0  # terminal pre-send FAILED
-        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0f9002", "kr1") == 0
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g0002", "kg1") == 0
         out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-        assert out["rid"] == "REQ-20260707-120000-0f9002", "a fresh round, not the dead receipt"
-        assert not out.get("idempotent_repeat")
-        assert s.get_round("REQ-20260707-120000-0f9001")["request_key"] is None
-        assert s.get_round("REQ-20260707-120000-0f9002")["request_key"] == "kr1"
+        assert out["rid"] == "REQ-20260707-120000-0g0002" and not out.get("idempotent_repeat")
+        assert s.get_round("REQ-20260707-120000-0g0001")["request_key"] is None
+        assert s.get_round("REQ-20260707-120000-0g0002")["request_key"] == "kg1"
+
+    def test_failed_never_entered_sending_releases_the_key(self, env, capsys):
+        """A prior cancelled while QUEUED never called begin_send, so there is no attempt row — the
+        store durably proves nothing sent. Its key transfers to the retry (which requeues fresh)."""
+        store_mod, backend, s, tmp_path = env
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g1001", "kg2") == 0
+        capsys.readouterr()
+        assert backend.cancel_round("REQ-20260707-120000-0g1001") == 0  # FAILED, never sent
+        assert not s.has_send_attempt("REQ-20260707-120000-0g1001")
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g1002", "kg2") == 0
+        out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert out["rid"] == "REQ-20260707-120000-0g1002" and not out.get("idempotent_repeat")
+        assert s.get_round("REQ-20260707-120000-0g1001")["request_key"] is None
+        assert s.get_round("REQ-20260707-120000-0g1002")["request_key"] == "kg2"
+
+    def test_operator_not_sent_proof_releases_a_post_send_failure(self, env, capsys):
+        """The recorded incident: a send WebSocket-timed out post-click -> possibly_accepted; the
+        operator proved via browser inspection it never sent and reconciled it. That explicit
+        not-sent proof — and only it — lets the key move even though an attempt row exists."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0g2001"
+        assert self._enq(backend, tmp_path, rid, "kg3") == 0
+        self._drive_possibly_accepted(store_mod, s, rid)
+        s.record_not_sent_proof(rid, "browser inspection: no such message on the thread")
+        r = s.get_round(rid)
+        assert r["state"] == store_mod.FAILED and r["send_disposition"] == store_mod.NOT_SENT_PROVEN
+        capsys.readouterr()
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g2002", "kg3") == 0
+        out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert out["rid"] == "REQ-20260707-120000-0g2002" and not out.get("idempotent_repeat")
+        assert s.get_round(rid)["request_key"] is None
+
+    # ---- release is REFUSED (the send may have happened) ---------------------
+    def test_possibly_accepted_then_failed_keeps_the_key(self, env, capsys):
+        """possibly_accepted -> failed is a legal reconcile but NOT proof of no-send: FAILED alone is
+        insufficient. The key stays owned; the retry is refused as possibly-already-sent."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0g3001"
+        assert self._enq(backend, tmp_path, rid, "kg4") == 0
+        self._drive_possibly_accepted(store_mod, s, rid)
+        s.set_state(rid, store_mod.FAILED, expect=store_mod.POSSIBLY_ACCEPTED,
+                    error_code="operator reconcile without proof")
+        capsys.readouterr()
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g3002", "kg4") == 2
+        assert "request_key_locked" in capsys.readouterr().err
+        assert s.get_round(rid)["request_key"] == "kg4", "key retained — the send may have landed"
+        assert s.get_round("REQ-20260707-120000-0g3002") is None
+
+    def test_waiting_then_failed_keeps_the_key(self, env, capsys):
+        """waiting -> failed (a post-send wait failure reconciled) is likewise not no-send proof."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0g4001"
+        assert self._enq(backend, tmp_path, rid, "kg5") == 0
+        s.set_state(rid, store_mod.READY)
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d")
+        s.mark_accepted(aid, "conv-w")
+        s.mark_waiting(rid)
+        s.finish(rid, store_mod.FAILED, error_code="wait failed post-send")
+        capsys.readouterr()
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g4002", "kg5") == 2
+        assert "request_key_locked" in capsys.readouterr().err
+        assert s.get_round(rid)["request_key"] == "kg5"
 
     def test_live_or_completed_prior_still_owns_the_key(self, env, capsys):
         store_mod, backend, s, tmp_path = env
-        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0fa001", "kr2") == 0
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g5001", "kg6") == 0
         capsys.readouterr()
         # queued (live) prior: idempotent receipt, no new round
-        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0fa002", "kr2") == 0
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g5002", "kg6") == 0
         out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-        assert out["rid"] == "REQ-20260707-120000-0fa001" and out["idempotent_repeat"] is True
+        assert out["rid"] == "REQ-20260707-120000-0g5001" and out["idempotent_repeat"] is True
+
+    # ---- fingerprint FIRST, regardless of terminal state ---------------------
+    def test_different_fingerprint_after_failure_conflicts_not_releases(self, env, capsys):
+        """The core S3 point: a DIFFERENT logical request under the same key must CONFLICT even when
+        the prior FAILED releasably — the fingerprint is compared before any release decision, so a
+        failure can never let a different request seize the key."""
+        store_mod, backend, s, tmp_path = env
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g6001", "kg7") == 0
+        assert backend.cancel_round("REQ-20260707-120000-0g6001") == 0  # FAILED, never sent -> releasable
+        capsys.readouterr()
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g6002", "kg7",
+                         body="review https://github.com/acme/DIFFERENT") == 2
+        assert "request_key_conflict" in capsys.readouterr().err
+        assert s.get_round("REQ-20260707-120000-0g6001")["request_key"] == "kg7", "not released"
+        assert s.get_round("REQ-20260707-120000-0g6002") is None
+
+    # ---- atomic transfer under a concurrent retry race -----------------------
+    def test_concurrent_release_yields_exactly_one_successor(self, env, capsys, monkeypatch):
+        """Two retries race a released key. The transfer clears the old key and inserts the successor
+        in ONE guarded transaction, so exactly one successor owns the key; the loser (its pre-check
+        saw the stale failed prior) re-resolves to the winner's receipt, never a second successor."""
+        store_mod, backend, s, tmp_path = env
+        prior_rid = "REQ-20260707-120000-0g7001"
+        assert self._enq(backend, tmp_path, prior_rid, "kg8") == 0
+        assert backend.cancel_round(prior_rid) == 0                # FAILED, never sent -> releasable
+        stale = s.round_by_request_key("kg8")                       # both racers start from this view
+        capsys.readouterr()
+        # retry A wins: transfers the key to its fresh successor
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g7002", "kg8") == 0
+        assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["rid"] == \
+            "REQ-20260707-120000-0g7002"
+        # retry B raced: its pre-check still returns the STALE failed prior, not A's successor
+        real = store_mod.Store.round_by_request_key
+        calls = {"n": 0}
+
+        def racy(self, key):
+            calls["n"] += 1
+            return stale if calls["n"] == 1 else real(self, key)
+
+        monkeypatch.setattr(store_mod.Store, "round_by_request_key", racy)
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g7003", "kg8") == 0
+        out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert out["rid"] == "REQ-20260707-120000-0g7002" and out["idempotent_repeat"] is True
+        assert s.get_round("REQ-20260707-120000-0g7003") is None, "the loser created no round"
+        assert calls["n"] >= 2, "the raced transfer must re-resolve to the winner"
+
+    # ---- route preservation across a same-fingerprint retry ------------------
+    def test_bare_auto_followup_retry_inherits_the_original_conversation(self, env, capsys):
+        """Req 5: a bare-auto followup's fingerprint excludes the resolved thread, so two fires share
+        it. When the first FAILED pre-send and a DIFFERENT consult has since become the 'latest
+        completed', the retry must INHERIT the original resolved conversation, never re-resolve to
+        the newer thread — two same-fingerprint requests must not diverge to different conversations."""
+        store_mod, backend, s, tmp_path = env
+        _complete_a_consult(store_mod, s, rid="REQ-20260707-118000-0h0001", conv="conv-first")
+        body = "continuing; the next question"
+        a1 = _enq_ns("REQ-20260707-120000-0h0002", str(tmp_path / "fu1.md"), kind="followup",
+                     conversation="auto", request_key="kh1", logical_sha=_lsha(body))
+        assert backend.enqueue_round(a1, body, str(tmp_path / "fu1.txt")) == 0
+        assert json.loads(s.get_round("REQ-20260707-120000-0h0002")["spec_json"])["conversation"] \
+            == "conv-first"
+        assert backend.cancel_round("REQ-20260707-120000-0h0002") == 0   # FAILED pre-send -> releasable
+        # a different consult completes and, once the first is aged back, becomes the unambiguous latest
+        _complete_a_consult(store_mod, s, rid="REQ-20260707-119000-0h0003", conv="conv-second")
+        s.db.execute("UPDATE rounds SET updated_at='2020-01-01T00:00:00+00:00' "
+                     "WHERE rid='REQ-20260707-118000-0h0001'")
+        assert s.latest_conversation_strict()[0] == "conv-second", "re-resolution would pick conv-second"
+        capsys.readouterr()
+        a2 = _enq_ns("REQ-20260707-120000-0h0004", str(tmp_path / "fu2.md"), kind="followup",
+                     conversation="auto", request_key="kh1", logical_sha=_lsha(body))
+        assert backend.enqueue_round(a2, body, str(tmp_path / "fu2.txt")) == 0
+        r2 = s.get_round("REQ-20260707-120000-0h0004")
+        assert json.loads(r2["spec_json"])["conversation"] == "conv-first", \
+            "the retry inherited the prior's resolved thread, not the newer 'latest'"
+        assert r2["thread_id"] == "conv-first"
+        assert s.get_round("REQ-20260707-120000-0h0002")["request_key"] is None
+
+    # ---- S2: low-level --request-key demands --logical-sha -------------------
+    def test_request_key_without_logical_sha_is_refused(self, env, capsys):
+        store_mod, backend, s, tmp_path = env
+        pf = tmp_path / "p.md"
+        pf.write_text("review https://github.com/acme/w\nBEGIN_RESPONSE:x\n", encoding="utf-8")
+        rc = backend.enqueue_round(
+            _enq_ns("REQ-20260707-120000-0h9001", str(pf), request_key="kx", logical_sha=None),
+            pf.read_text(), str(tmp_path / "a.txt"))
+        assert rc == 2
+        assert "request_key_needs_logical_sha" in capsys.readouterr().err
+        assert s.get_round("REQ-20260707-120000-0h9001") is None

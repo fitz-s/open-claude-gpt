@@ -152,12 +152,13 @@ def _request_fingerprint(a, prompt: str) -> str:
     Caller-side fields only, deliberately not the enqueue-time RESOLVED conversation: resolution
     is derived state (and for a bare-auto followup it depends on what is in flight — including the
     original round a retry is trying to recover, which would deadlock the idempotent re-fire that
-    is this feature's whole point). The prompt identity prefers --logical-sha (the prompt rendered
-    with a literal <RID> placeholder, so user text containing a rid is never normalized away);
-    the fallback substitutes this round's own rid, which cannot appear in caller text (it did not
-    exist when the caller wrote it)."""
-    logical = getattr(a, "logical_sha", None) or store_mod.sha256(
-        (prompt or "").replace(a.rid, "<RID>"))
+    is this feature's whole point). The prompt identity is --logical-sha (the prompt rendered with a
+    literal <RID> placeholder, so user text containing a rid is never normalized away); enqueue
+    REFUSES a --request-key without it, so a keyed round's fingerprint is always logical-sha-based.
+    The raw-prompt hash below is only ever reached by a NON-keyed round, whose stored fingerprint is
+    never compared — so it must NOT normalize the rid out of user text (the S2 defect: a literal rid
+    in caller-supplied content could be erased and forge a false match)."""
+    logical = getattr(a, "logical_sha", None) or store_mod.sha256(prompt or "")
     conv = getattr(a, "conversation", None)
     return store_mod.sha256(json.dumps({
         "fp": 1, "kind": a.kind, "prompt": logical,
@@ -167,41 +168,117 @@ def _request_fingerprint(a, prompt: str) -> str:
     }, sort_keys=True))
 
 
-def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str) -> int:
-    """Same key seen before: same fingerprint returns the ORIGINAL receipt; anything else is a
-    conflict. Rows from before the structured fingerprint (spec_json carries the old request_sha
-    format or nothing) never silently match — conflict, the safe direction.
+def _release_eligible(s, prior: dict) -> bool:
+    """Does the store DURABLY prove the prior round's send never reached ChatGPT, so its request-key
+    may move to a retry? Three sufficient proofs, and nothing else:
+      - GATE_REJECTED — pre-send by construction (the gate runs while `ready`, before begin_send).
+      - FAILED with no send attempt EVER — has_send_attempt is False, i.e. the round never entered
+        `sending`, so nothing could have been sent (cancel-while-queued, no-thread, gate paths).
+      - FAILED carrying an explicit operator not-sent proof (send_disposition).
+    A FAILED round that DID cross the send fence (an attempt exists) with no such proof is
+    post-send-uncertain — possibly_accepted->failed / waiting->failed are legal reconciles that do
+    NOT prove no-send — so its key stays owned. FAILED alone is never sufficient."""
+    if prior["state"] == store_mod.GATE_REJECTED:
+        return True
+    if prior["state"] != store_mod.FAILED:
+        return False
+    if prior.get("send_disposition") == store_mod.NOT_SENT_PROVEN:
+        return True
+    return not s.has_send_attempt(prior["rid"])
 
-    Exception: a prior that terminally FAILED pre-send (failed / gate_rejected — every failed
-    round is pre-send by construction: post-send failures become blocked or possibly_accepted)
-    RELEASES the key. The envelope's retry contract says 're-run the SAME fire, same
-    --request-key'; returning the dead round's receipt there would satisfy the letter of
-    idempotency while permanently swallowing the retry (observed live). Nothing was ever sent, so
-    a fresh round under the same key cannot duplicate anything."""
-    if prior["state"] in (store_mod.FAILED, store_mod.GATE_REJECTED):
-        with s._tx():
-            s.db.execute("UPDATE rounds SET request_key=NULL WHERE rid=?", (prior["rid"],))
-            s._event("key_released", rid=prior["rid"],
-                     detail=f"request-key {rkey!r} released: terminal pre-send failure "
-                            f"({prior['state']}) must not swallow the retry")
-        sys.stderr.write(f"CGC_KEY_RELEASED request-key {rkey!r}: prior {prior['rid']} "
-                         f"terminally failed pre-send ({prior['state']}) — enqueuing a fresh "
-                         "round under the same key.\n")
-        return -1  # caller proceeds to create the new round
+
+def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str):
+    """Decide what a repeated request-key means. FINGERPRINT FIRST, always: a different logical
+    request under the same key is a conflict REGARDLESS of the prior's state — one key names one
+    intent, and releasing a key before comparing (the S3 defect) let a different request reuse it
+    after a failure. Rows predating the structured fingerprint carry none and so never match —
+    conflict, the safe direction.
+
+    With a MATCHING fingerprint:
+      - a live/completed prior returns its ORIGINAL receipt (idempotent repeat);
+      - a terminally-failed prior releases its key to the retry ONLY when the store durably proves
+        no send ever happened (_release_eligible); otherwise the key stays owned and the retry is
+        refused as possibly-already-sent.
+
+    Returns 0 (idempotent receipt printed), 2 (conflict), or prior['rid'] (str) — the row to
+    transfer the key FROM into a fresh successor."""
     pspec = json.loads(prior["spec_json"]) if prior.get("spec_json") else {}
-    if pspec.get("request_fingerprint") == fingerprint:
-        sys.stderr.write(f"CGC_IDEMPOTENT request-key {rkey!r} already enqueued as "
-                         f"{prior['rid']} — returning the original receipt, nothing new "
-                         "queued.\n")
-        print(json.dumps({"queued": True, "rid": prior["rid"],
-                          "out": prior["out_path"] or out, "backend": "store",
-                          "idempotent_repeat": True}))
+    if pspec.get("request_fingerprint") != fingerprint:
+        sys.stderr.write(f"CGC_ERROR request_key_conflict: request-key {rkey!r} was already "
+                         f"used by {prior['rid']} with a DIFFERENT logical request (content, "
+                         "kind, parent, conversation, project, or model differ). One key names "
+                         "one logical request — use a new key.\n")
+        return 2
+    if prior["state"] in (store_mod.FAILED, store_mod.GATE_REJECTED):
+        if _release_eligible(s, prior):
+            sys.stderr.write(f"CGC_KEY_RELEASED request-key {rkey!r}: prior {prior['rid']} "
+                             f"({prior['state']}) is durably proven not-sent — moving the key to a "
+                             "fresh round.\n")
+            return prior["rid"]  # caller performs the atomic transfer
+        sys.stderr.write(
+            f"CGC_ERROR request_key_locked: request-key {rkey!r} names {prior['rid']}, which "
+            "FAILED after its send may have reached ChatGPT (a durable send attempt exists and no "
+            "operator not-sent proof was recorded). Re-using the key could send a duplicate consult. "
+            "Retrieve/reconcile that round — record a not-sent proof if you have verified it never "
+            "sent — or use a new key.\n")
+        return 2
+    sys.stderr.write(f"CGC_IDEMPOTENT request-key {rkey!r} already enqueued as "
+                     f"{prior['rid']} — returning the original receipt, nothing new "
+                     "queued.\n")
+    print(json.dumps({"queued": True, "rid": prior["rid"],
+                      "out": prior["out_path"] or out, "backend": "store",
+                      "idempotent_repeat": True}))
+    return 0
+
+
+def _post_create_receipt(a, out: str) -> int:
+    """The shared tail after a round is created (fresh insert OR key transfer): warn if no daemon
+    will send it, then print the one queued receipt unless composed into `fire` (quiet)."""
+    import cgc_spool as _spool
+    if not _spool.daemon_alive():
+        sys.stderr.write("CGC_WARN daemon_down: queued, but nothing will send it until the daemon "
+                         "runs. Relay ONE line to the user: cgc install-daemon\n")
+    if getattr(a, "quiet", False):
+        # Composed into `fire`, which prints the one receipt that matters. Two receipts for one
+        # action is pure noise.
         return 0
-    sys.stderr.write(f"CGC_ERROR request_key_conflict: request-key {rkey!r} was already "
-                     f"used by {prior['rid']} with a DIFFERENT logical request (content, "
-                     "kind, parent, conversation, project, or model differ). One key names "
-                     "one logical request — use a new key.\n")
-    return 2
+    print(json.dumps({"queued": True, "rid": a.rid, "out": out, "backend": "store"}))
+    argv = ["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgc_spool.py"),
+            "await", "--rid", a.rid, "--out", out]
+    import shlex
+    sys.stderr.write(f"CGC_QUEUED {a.rid} (store). Await it:\n  {' '.join(shlex.quote(x) for x in argv)}\n")
+    return 0
+
+
+def _enqueue_transfer(s, a, prompt: str, out: str, prior: dict, fingerprint: str, rkey: str) -> int:
+    """Enqueue a same-fingerprint retry that inherits a released key from a proven-not-sent `prior`,
+    atomically. Route PRESERVATION (audit req 5): the successor reuses the prior's already-RESOLVED
+    conversation/parent rather than re-resolving — two same-fingerprint requests (e.g. a bare-auto
+    followup, whose fingerprint excludes the resolved thread) must never diverge to different
+    conversations because the 'last completed' thread moved between the two fires. The key transfer
+    and successor insert are one transaction; a lost race re-resolves to the winner's receipt."""
+    pspec = json.loads(prior["spec_json"]) if prior.get("spec_json") else {}
+    inh_conv = pspec.get("conversation")
+    inh_parent = pspec.get("parent_rid") or prior.get("parent_rid")
+    spec = {"project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
+            "conversation": inh_conv, "parent_rid": inh_parent, "poll": getattr(a, "poll", None),
+            "timeout": getattr(a, "timeout", None), "request_fingerprint": fingerprint}
+    thread = inh_conv if inh_conv not in (None, "auto", "last") else None
+    try:
+        s.transfer_request_key(prior["rid"], rid=a.rid, kind=a.kind, thread_id=thread,
+                               out_path=out, spec_json=json.dumps(spec), prompt=prompt,
+                               request_key=rkey, parent_rid=inh_parent)
+    except store_mod.RequestKeyRaced:
+        # A concurrent retry moved the key first — re-resolve to the current owner (the winner) and
+        # take its receipt, so exactly one successor ever owns the key.
+        winner = s.round_by_request_key(rkey)
+        if winner is None:
+            raise
+        res = _idempotent_receipt(s, winner, fingerprint, rkey, out)
+        if isinstance(res, int):
+            return res
+        return _enqueue_transfer(s, a, prompt, out, winner, fingerprint, rkey)
+    return _post_create_receipt(a, out)
 
 
 def enqueue_round(a, prompt: str, out: str) -> int:
@@ -216,6 +293,18 @@ def enqueue_round(a, prompt: str, out: str) -> int:
     conv = getattr(a, "conversation", None)
     parent = getattr(a, "parent", None)
     rkey = getattr(a, "request_key", None)
+    # A request-key's idempotency identity is its fingerprint, whose prompt component is --logical-sha
+    # (the placeholder render). Without it the low-level enqueue would fall back to hashing the raw
+    # prompt — which cannot safely distinguish logical requests when the caller supplies the prompt
+    # directly (S2). Refuse rather than key off an unsafe identity; the canonical fire/prep path
+    # always passes --logical-sha.
+    if rkey and not getattr(a, "logical_sha", None):
+        sys.stderr.write(
+            "CGC_ERROR request_key_needs_logical_sha: --request-key requires --logical-sha (the "
+            "placeholder-rendered content identity from prep). Without it the request-key "
+            "fingerprint cannot safely tell one logical request from another. Render via "
+            "prep/fire, or pass --logical-sha.\n")
+        return 2
     fingerprint = _request_fingerprint(a, prompt)
     with store_mod.Store() as s:
         # Writer-identity fence: if a daemon is LIVE, it must be operating THIS store. An old-code
@@ -237,9 +326,11 @@ def enqueue_round(a, prompt: str, out: str) -> int:
         if rkey:
             prior = s.round_by_request_key(rkey)
             if prior is not None:
-                rc = _idempotent_receipt(s, prior, fingerprint, rkey, out)
-                if rc >= 0:
-                    return rc
+                res = _idempotent_receipt(s, prior, fingerprint, rkey, out)
+                if isinstance(res, int):
+                    return res
+                # res is the prior rid → move its released key onto this retry, atomically.
+                return _enqueue_transfer(s, a, prompt, out, prior, fingerprint, rkey)
         if s.get_round(a.rid) is not None:
             sys.stderr.write(f"CGC_ERROR already_enqueued: {a.rid} already exists in the store.\n")
             return 2
@@ -281,31 +372,18 @@ def enqueue_round(a, prompt: str, out: str) -> int:
         except sqlite3.IntegrityError:
             # Two concurrent enqueues with the same key both saw "no prior row"; the unique index
             # on request_key made exactly one insert win. The loser resolves DETERMINISTICALLY to
-            # the winner's receipt (or a conflict) instead of surfacing a raw constraint error.
+            # the winner's receipt (or a conflict, or a proven-not-sent key transfer) instead of
+            # surfacing a raw constraint error.
             prior = s.round_by_request_key(rkey) if rkey else None
             if prior is None:
                 raise
-            rc = _idempotent_receipt(s, prior, fingerprint, rkey, out)
-            if rc >= 0:
-                return rc
-            # the racing winner had itself terminally failed pre-send — its key was released;
-            # one retry now claims it (a second conflict is a real error and propagates)
-            s.create_round(a.rid, a.kind, thread_id=thread, out_path=out, prompt=prompt,
-                           spec_json=json.dumps(spec), request_key=rkey, parent_rid=parent)
-    import cgc_spool as _spool
-    if not _spool.daemon_alive():
-        sys.stderr.write("CGC_WARN daemon_down: queued, but nothing will send it until the daemon "
-                         "runs. Relay ONE line to the user: cgc install-daemon\n")
-    if getattr(a, "quiet", False):
-        # Composed into `fire`, which prints the one receipt that matters. Two receipts for one
-        # action is pure noise.
-        return 0
-    print(json.dumps({"queued": True, "rid": a.rid, "out": out, "backend": "store"}))
-    argv = ["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgc_spool.py"),
-            "await", "--rid", a.rid, "--out", out]
-    import shlex
-    sys.stderr.write(f"CGC_QUEUED {a.rid} (store). Await it:\n  {' '.join(shlex.quote(x) for x in argv)}\n")
-    return 0
+            res = _idempotent_receipt(s, prior, fingerprint, rkey, out)
+            if isinstance(res, int):
+                return res
+            # the racing winner had itself terminally failed proven-not-sent — its key is released;
+            # move it onto this retry atomically (a second conflict is a real error and propagates).
+            return _enqueue_transfer(s, a, prompt, out, prior, fingerprint, rkey)
+    return _post_create_receipt(a, out)
 
 
 # ---- cancel ------------------------------------------------------------------
