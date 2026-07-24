@@ -1175,10 +1175,12 @@ def _settle_composer(c, seconds=5):
 
 
 def _clear_composer_js():
+    # Count only meaningful residue: an EMPTY ProseMirror composer keeps a placeholder paragraph
+    # whose innerText is "\n" (observed live — a raw length check misread it as a leftover draft).
     return ("(function(){var d=" + _composer_get_js() + ";if(!d)return -1;d.focus();"
             "document.execCommand('selectAll',false,null);"
             "document.execCommand('delete',false,null);"
-            "return (d.innerText||'').length;})()")
+            "return (d.innerText||'').replace(/[\\s\\u200b\\u200c\\ufeff]/g,'').length;})()")
 
 
 def _paste_chunk_js(chunk):
