@@ -166,10 +166,27 @@ def _request_fingerprint(a, prompt: str) -> str:
     }, sort_keys=True))
 
 
-def _idempotent_receipt(prior: dict, fingerprint: str, rkey: str, out: str) -> int:
+def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str) -> int:
     """Same key seen before: same fingerprint returns the ORIGINAL receipt; anything else is a
     conflict. Rows from before the structured fingerprint (spec_json carries the old request_sha
-    format or nothing) never silently match — conflict, the safe direction."""
+    format or nothing) never silently match — conflict, the safe direction.
+
+    Exception: a prior that terminally FAILED pre-send (failed / gate_rejected — every failed
+    round is pre-send by construction: post-send failures become blocked or possibly_accepted)
+    RELEASES the key. The envelope's retry contract says 're-run the SAME fire, same
+    --request-key'; returning the dead round's receipt there would satisfy the letter of
+    idempotency while permanently swallowing the retry (observed live). Nothing was ever sent, so
+    a fresh round under the same key cannot duplicate anything."""
+    if prior["state"] in (store_mod.FAILED, store_mod.GATE_REJECTED):
+        with s._tx():
+            s.db.execute("UPDATE rounds SET request_key=NULL WHERE rid=?", (prior["rid"],))
+            s._event("key_released", rid=prior["rid"],
+                     detail=f"request-key {rkey!r} released: terminal pre-send failure "
+                            f"({prior['state']}) must not swallow the retry")
+        sys.stderr.write(f"CGC_KEY_RELEASED request-key {rkey!r}: prior {prior['rid']} "
+                         f"terminally failed pre-send ({prior['state']}) — enqueuing a fresh "
+                         "round under the same key.\n")
+        return -1  # caller proceeds to create the new round
     pspec = json.loads(prior["spec_json"]) if prior.get("spec_json") else {}
     if pspec.get("request_fingerprint") == fingerprint:
         sys.stderr.write(f"CGC_IDEMPOTENT request-key {rkey!r} already enqueued as "
@@ -219,7 +236,9 @@ def enqueue_round(a, prompt: str, out: str) -> int:
         if rkey:
             prior = s.round_by_request_key(rkey)
             if prior is not None:
-                return _idempotent_receipt(prior, fingerprint, rkey, out)
+                rc = _idempotent_receipt(s, prior, fingerprint, rkey, out)
+                if rc >= 0:
+                    return rc
         if s.get_round(a.rid) is not None:
             sys.stderr.write(f"CGC_ERROR already_enqueued: {a.rid} already exists in the store.\n")
             return 2
@@ -253,9 +272,15 @@ def enqueue_round(a, prompt: str, out: str) -> int:
             # on request_key made exactly one insert win. The loser resolves DETERMINISTICALLY to
             # the winner's receipt (or a conflict) instead of surfacing a raw constraint error.
             prior = s.round_by_request_key(rkey) if rkey else None
-            if prior is not None:
-                return _idempotent_receipt(prior, fingerprint, rkey, out)
-            raise
+            if prior is None:
+                raise
+            rc = _idempotent_receipt(s, prior, fingerprint, rkey, out)
+            if rc >= 0:
+                return rc
+            # the racing winner had itself terminally failed pre-send — its key was released;
+            # one retry now claims it (a second conflict is a real error and propagates)
+            s.create_round(a.rid, a.kind, thread_id=thread, out_path=out, prompt=prompt,
+                           spec_json=json.dumps(spec), request_key=rkey, parent_rid=parent)
     import cgc_spool as _spool
     if not _spool.daemon_alive():
         sys.stderr.write("CGC_WARN daemon_down: queued, but nothing will send it until the daemon "

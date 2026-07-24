@@ -77,6 +77,12 @@ uncertain-round machinery live):
   window expired exactly there and burned the round's ONE-SHOT auto-retrieve on a render lag.
   Grace raised to 600s — waiting longer on a wrong tab is free (read-only); giving up early costs
   the recovery.
+- **A pre-send terminal failure releases its request-key.** The envelope's retry contract says
+  "re-run the SAME fire, same `--request-key`" — but a prior round that terminally failed
+  pre-send (cancelled, no-thread, gate-rejected; nothing ever left the machine) would answer that
+  retry with its own dead receipt, permanently swallowing the request (observed live). Such a
+  prior now releases the key and the retry enqueues fresh; live and completed priors still own
+  their key unchanged.
 
 ### Added
 - **JSON outcome envelope (schema 1).** Every `await` exit prints one machine-readable stdout line:

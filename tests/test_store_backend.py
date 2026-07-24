@@ -796,3 +796,36 @@ class TestRetrieveRidSemantics:
         assert final == store_mod.COMPLETED_VERIFIED
         assert seen["wait"]["rid"] == "auto", \
             "retrieve must adopt the conversation's rid, never pin its own fresh one"
+
+
+class TestKeyReleaseOnPreSendFailure:
+    def _enq(self, backend, tmp_path, rid, key):
+        pf = tmp_path / f"{rid}.md"
+        pf.write_text(f"review https://github.com/acme/w\nBEGIN_RESPONSE:{rid}\n", encoding="utf-8")
+        return backend.enqueue_round(_enq_ns(rid, str(pf), request_key=key),
+                                     pf.read_text(), str(tmp_path / f"a_{rid}.txt"))
+
+    def test_failed_prior_releases_the_key_and_the_retry_requeues(self, env, capsys):
+        """The envelope's retry contract is 're-run the SAME fire, same --request-key'. A prior
+        that terminally failed PRE-SEND (cancel, no-thread, gate reject — nothing ever left) must
+        not swallow that retry by returning its dead receipt (observed live: a proven-not-sent
+        followup could never be re-fired under its own key)."""
+        store_mod, backend, s, tmp_path = env
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0f9001", "kr1") == 0
+        capsys.readouterr()
+        assert backend.cancel_round("REQ-20260707-120000-0f9001") == 0  # terminal pre-send FAILED
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0f9002", "kr1") == 0
+        out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert out["rid"] == "REQ-20260707-120000-0f9002", "a fresh round, not the dead receipt"
+        assert not out.get("idempotent_repeat")
+        assert s.get_round("REQ-20260707-120000-0f9001")["request_key"] is None
+        assert s.get_round("REQ-20260707-120000-0f9002")["request_key"] == "kr1"
+
+    def test_live_or_completed_prior_still_owns_the_key(self, env, capsys):
+        store_mod, backend, s, tmp_path = env
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0fa001", "kr2") == 0
+        capsys.readouterr()
+        # queued (live) prior: idempotent receipt, no new round
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0fa002", "kr2") == 0
+        out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert out["rid"] == "REQ-20260707-120000-0fa001" and out["idempotent_repeat"] is True
