@@ -5,7 +5,8 @@
 set -euo pipefail
 
 SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
-DEST="$SKILLS_DIR/open-claude-gpt"
+# Must match install.sh's NAME — the skill installs as "chatgpt-consult".
+DEST="$SKILLS_DIR/chatgpt-consult"
 PURGE=0
 [ "${1:-}" = "--purge" ] && PURGE=1
 
@@ -75,6 +76,7 @@ fi
 
 if [ "$PURGE" = "1" ]; then
   STATE_DIR="${CGC_STATE_DIR:-/tmp/cgc}"
+  echo "• note: $STATE_DIR holds the consult store (control.db) — purging deletes all thread/round history"
   if guard_rm_rf "$STATE_DIR" "scratch"; then
     echo "• removed scratch $STATE_DIR"
   fi
