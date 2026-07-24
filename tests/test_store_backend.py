@@ -769,3 +769,30 @@ class TestStrictFollowupEdges:
         self._complete(store_mod, s, "REQ-20260707-120000-0f7003", "conv-A")
         conv, why = s.latest_conversation_strict()
         assert conv is None and "ambiguous" in why
+
+
+class TestRetrieveRidSemantics:
+    def test_retrieve_waits_with_auto_rid_not_its_own(self, env):
+        """A retrieve round's own rid is fresh by construction — pinning it would always
+        rid_mismatch against the conversation's actual last request, making the advertised
+        recovery path (`enqueue --kind retrieve --conversation <id>`) exit 2 unconditionally
+        (observed live). The waiter must resolve the rid FROM the page (auto)."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0f8001"
+        s.create_round(rid, "retrieve", thread_id="conv-r", prompt=None,
+                       spec_json=json.dumps({"conversation": "conv-r"}))
+        s.db.execute("UPDATE threads SET conversation_id='conv-r' WHERE thread_id='conv-r'")
+        s.set_state(rid, store_mod.READY)
+        seen = {}
+
+        def cdp(kind, **kw):
+            seen[kind] = kw
+            with open(kw["out"], "w") as f:
+                f.write("the earlier round's answer")
+            return {"code": 0, "out": kw["out"], "stderr": ""}
+
+        final = backend.process_round(s, s.get_round(rid), cdp,
+                                      daemon_instance_id="d1", validate=lambda p: (True, "ok"))
+        assert final == store_mod.COMPLETED_VERIFIED
+        assert seen["wait"]["rid"] == "auto", \
+            "retrieve must adopt the conversation's rid, never pin its own fresh one"

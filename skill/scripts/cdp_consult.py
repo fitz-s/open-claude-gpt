@@ -1529,9 +1529,14 @@ def cmd_wait(a) -> int:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
         # Tolerant rid resolution: right after submit the conversation/sentinel echo may
         # still be settling, so RETRY instead of dying. A patient waiter must reach its
-        # poll loop — never hard-exit at startup over a transient.
+        # poll loop — never hard-exit at startup over a transient. 600s, not 120: a
+        # followup on a long thread was observed to take >2 min before the just-sent user
+        # message committed to the DOM (the page still resolved to the PREVIOUS round's
+        # rid), and the 120s window expired exactly there — burning the round's one-shot
+        # auto-retrieve on a render lag. Waiting longer on a wrong tab costs nothing
+        # (read-only); giving up early costs the recovery.
         rid = None
-        rdl = time.time() + min(120, a.timeout)
+        rdl = time.time() + min(600, a.timeout)
         while time.time() < rdl:
             try:
                 rid = _resolve_rid(c, a.rid)

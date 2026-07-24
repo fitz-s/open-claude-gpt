@@ -508,13 +508,16 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
     spec = json.loads(r["spec_json"]) if r.get("spec_json") else {}
 
     # retrieve: attach to an existing conversation and wait — no gate, no send (nothing leaves).
+    # The waiter resolves the rid FROM the page (wait_rid="auto"): a retrieve round's own rid is
+    # fresh by construction, so pinning it would always rid_mismatch against the conversation's
+    # actual last request — the exact failure that made the advertised recovery path exit 2.
     if r["kind"] == "retrieve":
         conv = spec.get("conversation")
         if not conv or conv == "auto":
             store.finish(rid, store_mod.FAILED, error_code="retrieve needs an explicit conversation id")
             return store_mod.FAILED
         store.set_state(rid, store_mod.WAITING, expect=store_mod.READY)
-        return _wait_phase(store, rid, conv, spec, run_cdp)
+        return _wait_phase(store, rid, conv, spec, run_cdp, wait_rid="auto")
 
     # followup: CONTINUE the same thread — attach to its conversation and send there, never open a
     # new one (a fresh submit would silently lose the thread's context, the worst kind of bug).
@@ -628,7 +631,7 @@ def _read_answer(path) -> str:
         return ""
 
 
-def _wait_phase(store, rid, conv, spec, run_cdp) -> str:
+def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None) -> str:
     out_tmp = os.path.join(store_mod.CGC_STATE_DIR, f"_wait_{rid}.txt")
     # Clear any stale answer + .raw sidecar from a PRIOR wait on this rid (e.g. a timed-out first
     # wait, before an auto-retrieve). _wait_phase decides completed_verified vs _unverified purely
@@ -639,7 +642,7 @@ def _wait_phase(store, rid, conv, spec, run_cdp) -> str:
             os.remove(_p)
         except OSError:
             pass
-    res = run_cdp("wait", rid=rid, conversation=conv, out=out_tmp,
+    res = run_cdp("wait", rid=wait_rid or rid, conversation=conv, out=out_tmp,
                   poll=spec.get("poll"), timeout=spec.get("timeout"))
     code = res.get("code")
     answer_path = res.get("out") or out_tmp
