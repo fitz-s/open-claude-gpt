@@ -119,7 +119,7 @@ Claude Code you don't run these by hand — the skill orchestrates the whole arc
 
 ## Running under Claude Code's auto mode
 
-Claude Code's `auto` permission mode has a data-exfiltration classifier sitting **above** the permission system — it hard-denies any agent Bash call that sends data to an external host, including `chatgpt.com`, and a `permissions.allow` entry can't suppress it (it isn't a permission check). So the direct `submit`/`wait` path fails there. The fix: move the send off the agent entirely. The agent only does local file I/O — `cgc enqueue` writes a job file, `cgc await` polls for the answer file — neither touches the network, so the classifier never sees them. The actual send to ChatGPT happens in a daemon running in **your** login session, which independently re-verifies every job is public-only and secret-free before sending — a validating gate, not a way around the classifier. Install it once with **`cgc install-daemon`**: it registers a launchd agent that starts at login and respawns if it dies, and it opens the debug Chrome itself when needed. After that one command, no one — you or the agent — ever has to start or check it again. (`cgc watch` still runs it in the foreground for debugging; `cgc uninstall-daemon` reverses the install.)
+Claude Code's `auto` permission mode has a data-exfiltration classifier sitting **above** the permission system — it hard-denies any agent Bash call that sends data to an external host, including `chatgpt.com`, and a `permissions.allow` entry can't suppress it (it isn't a permission check). So the direct `submit`/`wait` path fails there. The fix: move the send off the agent entirely. The agent only touches the local SQLite store — `cgc enqueue` writes a queued round to `control.db`, `cgc await` polls that row until it's terminal — neither touches the network, so the classifier never sees them. The actual send to ChatGPT happens in a daemon running in **your** login session, which independently re-verifies every job is public-only and secret-free before sending — a validating gate, not a way around the classifier. Install it once with **`cgc install-daemon`**: it registers a launchd agent that starts at login and respawns if it dies, and it opens the debug Chrome itself when needed. After that one command, no one — you or the agent — ever has to start or check it again. (`cgc watch` still runs it in the foreground for debugging; `cgc uninstall-daemon` reverses the install.)
 
 ## Examples
 
@@ -170,7 +170,7 @@ It persists in the tool's own config (`~/.config/cgc/config`); a `CGC_PROJECT_UR
 | `CGC_CHROME` | auto-detect | explicit browser binary |
 | `CGC_STATE_DIR` | `/tmp/cgc` | scratch dir for prompt/refs/answer files (not durable) |
 | `CGC_DATA_DIR` | `~/.local/state/cgc` | durable data dir holding the consult store (`control.db`) |
-| `CGC_SPOOL_DIR` | `$CGC_STATE_DIR/spool` | daemon runtime files (heartbeat, singleton lock, per-round logs) |
+| `CGC_SPOOL_DIR` | `$CGC_STATE_DIR/spool` | per-round send+wait logs (deletable scratch — coordination locks live under `$CGC_DATA_DIR/locks`, not here) |
 | `CGC_GATE_ALLOW_GIST` | `0` | let the daemon's egress gate accept gist links (it can't cheaply prove one is public) |
 
 Full reference + prompt customization: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).

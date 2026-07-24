@@ -128,7 +128,7 @@ for very long consults (the bound is a safety cap, not the expected duration).
 There is deliberately no "still running" code. A consult routinely takes ~25 minutes
 and `await` simply keeps waiting; an earlier version returned `5` for this, which made
 every healthy round look like a failure that had to be manually retried. `await` stops
-without an answer only after 60 minutes, and that is a malfunction rather than a slow
+without an answer only after 90 minutes, and that is a malfunction rather than a slow
 answer — waiting again cannot fix it.
 
 `cdp_consult.py wait` (the daemon's own child, and the direct-path fallback) keeps a

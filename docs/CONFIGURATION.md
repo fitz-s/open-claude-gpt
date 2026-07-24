@@ -41,9 +41,9 @@ Any of these can be set in the environment (they win over the config file), in a
 | `CGC_PROFILE` | `~/.cgc-chrome` | Dedicated Chrome profile dir. Kept separate from your normal Chrome (CDP is disallowed on the default profile since Chrome 136). |
 | `CGC_CHROME` | auto-detect | Explicit browser binary. Auto-detected across Chrome/Chromium/Edge on macOS + Linux; set only if detection fails. |
 | `CGC_STATE_DIR` | `/tmp/cgc` | **Tool-owned scratch** for prompt/refs/answer files — safe to delete; everything here is re-derivable or copyable. Not durable across reboots: copy an answer you want to keep (or point `--out`) to your own path. |
-| `CGC_DATA_DIR` | `$XDG_STATE_HOME/cgc` or `~/.local/state/cgc` | **Durable data dir** holding the consult store `control.db` (threads, rounds, results — what `fire --followup` continues). Survives reboots; deleting it deletes consult history. A legacy `/tmp`-era `control.db` is relocated here automatically on first use (the old file is kept as `control.db.migrated`). |
+| `CGC_DATA_DIR` | `$XDG_STATE_HOME/cgc` or `~/.local/state/cgc` | **Durable data dir** holding the consult store `control.db` (threads, rounds, results — what `fire --followup` continues) and `locks/` (daemon heartbeat, singleton lock, per-round leases — coordination state a live daemon or worker may be holding; NOT safe to delete while either could be running). Survives reboots; deleting it deletes consult history. A legacy `/tmp`-era `control.db` is relocated here automatically on first use (the old file is kept as `control.db.migrated`). |
 | `CGC_STORE_DB` | `$CGC_DATA_DIR/control.db` | Explicit store DB path override (disables the automatic legacy relocation). |
-| `CGC_SPOOL_DIR` | `$CGC_STATE_DIR/spool` | Spool dir for the `enqueue`/`await`/`watch` daemon path (pending/processing/done job files + a daemon heartbeat). Tool-owned scratch, same rules as `CGC_STATE_DIR`. |
+| `CGC_SPOOL_DIR` | `$CGC_STATE_DIR/spool` | Per-round send+wait logs for the `enqueue`/`await`/`watch` daemon path. Tool-owned scratch, same rules as `CGC_STATE_DIR` — the round lifecycle itself lives in `control.db`, and the daemon heartbeat, singleton lock, and per-round leases live under `$CGC_DATA_DIR/locks` (NOT here — see below). |
 | `CGC_GATE_ALLOW_GIST` | `0` | Let the daemon's egress gate accept gist links. Default off because a gist's visibility can't be cheaply proven public the way a repo can via `gh`; set to `1` if you intend to deliver via gist. |
 | `CGC_GATE_PRIVATE_REPOS` | *(empty)* | Comma-separated `owner/repo` list the gate may send **even though they are not public**, e.g. `acme/api,acme/infra`. Empty (the default) means public-only. `*` allows any repo your `gh` can resolve. Only set this if your ChatGPT account has a **GitHub connector** authorized — otherwise ChatGPT cannot open the link and answers blind. See "Private repos" below. |
 | `CLAUDE_SKILLS_DIR` | `~/.claude/skills` | Where `install.sh` puts the skill. |
@@ -160,16 +160,18 @@ unfenced standalone line) breaks answer retrieval.
 
 ### The deadline
 
-**There is one deadline, and it is 60 minutes** (`STUCK_AFTER_S = 3600`, the default
+**There is one deadline, and it is 90 minutes** (`STUCK_AFTER_S = 5400`, the default
 `--timeout` on `cgc enqueue`, `cgc await`, `cdp_consult.py wait`, and `followup
 --watch`).
 
 It is not a budget for the consult. A GPT-5.6 Pro round reasons for about 25 minutes;
 that is how long the work *takes* — an expectation, not a deadline — and nothing is
 killed for reaching it. The deadline answers a different question: past what point is
-waiting no longer explained by the work? Beyond an hour the answer is not late,
+waiting no longer explained by the work? Beyond 90 minutes the answer is not late,
 something is broken, and the right response is to read
-`$CGC_SPOOL_DIR/logs/<rid>.log` rather than wait again.
+`$CGC_SPOOL_DIR/logs/<rid>.log` rather than wait again. (An earlier 3600s value
+stranded a deep re-reasoning follow-up that was observed to think ~62 minutes before
+answering — 5400s covers that observed tail with margin.)
 
 Earlier versions carried three numbers — a 1500s per-consult budget, an 870s agent
 window, and a `timeout 899` wrapper — because two of them were mis-named. The 1500s was
@@ -215,11 +217,12 @@ bin/cgc watch             # foreground, for debugging or a one-off
 ```
 
 With the daemon running, the agent's side of a consult is two local-only calls:
-`cgc enqueue` (writes a job to `CGC_SPOOL_DIR`) and `cgc await` (polls the matching
-answer file) — no network access from the agent's Bash call, so the classifier
-never triggers. `bin/cgc doctor` checks the daemon is running as part of its normal
-health check; `bin/cgc queue` shows daemon liveness plus what's currently in the
-spool. See [docs/ARCHITECTURE.md](ARCHITECTURE.md) for the full data flow and the
+`cgc enqueue` (writes a queued round to the SQLite store, `control.db`) and
+`cgc await` (polls that round until it's terminal, then materializes the answer) —
+no network access from the agent's Bash call, so the classifier never triggers.
+`bin/cgc doctor` checks the daemon is running as part of its normal health check;
+`bin/cgc queue` shows daemon liveness plus what's currently queued in the store.
+See [docs/ARCHITECTURE.md](ARCHITECTURE.md) for the full data flow and the
 validating egress gate the daemon runs before every send.
 
 ## The dedicated Chrome, in one place
