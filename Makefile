@@ -16,8 +16,8 @@ uninstall:       ## remove the installed skill
 doctor:          ## run the health check against this repo
 	CGC_HOME="$(PWD)/skill" python3 skill/scripts/cgc_doctor.py
 
-test:            ## run offline smoke tests
-	python3 tests/test_smoke.py
+test:            ## run the full offline suite (same set CI runs)
+	python3 -m pytest tests/ -q
 
 lint:            ## parse + shell-syntax + no-personal-identity checks
 	@python3 -c "import ast,glob;[ast.parse(open(f).read()) for f in glob.glob('skill/scripts/*.py')];print('py parse ok')"

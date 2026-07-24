@@ -82,22 +82,24 @@ In Claude Code the skill activates automatically — Claude reads its `SKILL.md`
 
 ## First consult
 
-The canonical path — deliver → prep → submit → wait — end to end by hand:
+The canonical path — fire → await — end to end by hand:
 
 ```bash
-# 1. Resolve GitHub refs into a grouped refs file, and capture its path
-REFS_FILE="$(bin/cgc deliver --repo owner/repo --ref main | python3 -c 'import json,sys; print(json.load(sys.stdin)["refs_file"])')"
+# 1. Fire it — ONE call: resolves the GitHub links, renders the prompt, queues the job.
+#    The daemon validates the refs are public and does the actual send.
+bin/cgc fire --repo owner/repo --ref main \
+  --title "Audit main" --role "You are a staff reviewer." --task "Review main for correctness risks."
 
-# 2. Render the outgoing prompt from that refs file
-bin/cgc prep --refs-file "$REFS_FILE"
-
-# 3. Submit the prompt to your logged-in ChatGPT Pro tab
-bin/cgc submit
-
-# 4. Run the exact waiter command that `submit` prints, to wait for the answer
+# 2. Run the exact `cgc await` line that `fire` prints — it waits for the answer
+#    and prints the answer file's path when the consult lands.
 ```
 
-Durable answers land in `./cgc_answers/answer_<RID>.txt`; `/tmp/cgc` (`CGC_STATE_DIR`) is tool-owned scratch only. In Claude Code you don't run these by hand — the skill orchestrates the whole arc for you.
+(`deliver`, `prep`, and `enqueue` still exist as separate verbs for debugging or editing the
+prompt in between; direct `submit`/`followup` are retired — the daemon is the sole send path.)
+
+Answers land in `$CGC_STATE_DIR` (default `/tmp/cgc`, e.g. `answer_<RID>.txt`). That directory is
+tool-owned and not durable across reboots — copy an answer you want to keep to your own path. In
+Claude Code you don't run these by hand — the skill orchestrates the whole arc for you.
 
 ## Running under Claude Code's auto mode
 
