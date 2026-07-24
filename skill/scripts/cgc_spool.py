@@ -329,6 +329,74 @@ def _repo_is_public(slug: str) -> tuple:
     return False, last
 
 
+# Dead-reference detection. deliver is offline by design (the agent side must make no network
+# call), so a typo'd PR number or a nonexistent ref sails through enqueue and dies 25 minutes later
+# when ChatGPT hits a 404 — or worse, answers around it. The daemon already runs gh here, so the
+# gate is the right (and only) place to verify the references actually exist: seconds of feedback
+# instead of a wasted round.
+_PR_URL_RE = re.compile(
+    r"https://(?:www\.)?github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)", re.IGNORECASE)
+_REF_URL_RE = re.compile(
+    r"https://(?:www\.)?github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:tree|blob|commit)/([A-Za-z0-9_./-]+)",
+    re.IGNORECASE)
+_EXISTENCE_CAP = 8  # dedup usually leaves 1-3; the cap bounds gh cost on a pathological prompt
+
+
+def _gh_exists(path: str) -> tuple:
+    """Does this GitHub API path resolve? Returns (True|False|None, detail) — None = could not ask
+    (gh missing/timed out), which is 'unverified', not a verdict."""
+    last = "unverified: gh never answered"
+    for _ in range(_GH_ATTEMPTS):
+        try:
+            r = subprocess.run(["gh", "api", path, "--jq", "1"],
+                               capture_output=True, text=True, timeout=_GH_TIMEOUT_S)
+        except FileNotFoundError:
+            return None, "unverified: gh not installed"
+        except subprocess.TimeoutExpired:
+            last = f"unverified: gh timed out after {_GH_TIMEOUT_S}s"
+            continue
+        except Exception as e:
+            last = f"unverified: gh error: {e}"
+            continue
+        if r.returncode == 0:
+            return True, "exists"
+        err = (r.stderr or "").strip()
+        if "404" in err or "Not Found" in err:
+            return False, "404"
+        last = f"unverified: gh api {path} failed: {err[:120]}"
+    return None, last
+
+
+def _verify_refs_exist(text: str, verified_slugs: set) -> str | None:
+    """Refuse dead references (nonexistent PR numbers / tree-blob-commit refs) on repos the gate
+    already vetted. Returns a refusal reason, or None when everything checked out. Fail-closed on a
+    gh outage the same way the visibility check is: `unverified:` → the caller requeues."""
+    checks = []
+    for slug, pr in set(_PR_URL_RE.findall(text)):
+        checks.append((f"repos/{slug}/pulls/{pr}", f"PR github.com/{slug}/pull/{pr}", slug))
+    for slug, ref in set(_REF_URL_RE.findall(text)):
+        ref = ref.split("/")[0]  # tree/<ref>/sub/path — only the ref segment names a commit
+        checks.append((f"repos/{slug}/commits/{ref}", f"ref {ref} of github.com/{slug}", slug))
+    admitted = {s.lower() for s in (verified_slugs or set())}
+    seen = set()
+    for path, label, slug in checks:
+        if path in seen:
+            continue
+        seen.add(path)
+        if len(seen) > _EXISTENCE_CAP:
+            break  # bounded cost; the leading references are the load-bearing ones
+        if admitted and slug.lower() not in admitted:
+            continue  # only check repos the visibility pass actually admitted
+        ok, detail = _gh_exists(path)
+        if ok is False:
+            return (f"refused: {label} does not exist (404 — a dead link). ChatGPT would browse to "
+                    "nothing or answer around it. Fix the reference and re-fire.")
+        if ok is None:
+            return (f"unverified: could not check that {label} exists ({detail.split(':', 1)[1].strip()}). "
+                    "Nothing is known about it and nothing was sent. Re-enqueue to retry.")
+    return None
+
+
 def validate_prompt(prompt_text: str) -> tuple:
     """The egress gate. Returns (ok: bool, reason: str). ok means: it is safe to send this prompt to
     the external ChatGPT session. Rules, all fail-closed:
@@ -386,7 +454,13 @@ def validate_prompt(prompt_text: str) -> tuple:
                                f"Re-enqueue to retry.")
             return False, f"refused: repo {slug} is not confirmed PUBLIC ({detail}) — will not send its link to an external service"
 
-    return True, f"ok: {len(slugs)} public repo(s), no secrets detected"
+    # 5. dead references: a typo'd PR number or nonexistent ref would otherwise fail 25 minutes
+    #    later at ChatGPT (or be silently answered around). The gate has gh anyway — check now.
+    dead = _verify_refs_exist(text, slugs)
+    if dead:
+        return False, dead
+
+    return True, f"ok: {len(slugs)} public repo(s), refs exist, no secrets detected"
 
 
 # ---- CLI: enqueue -----------------------------------------------------------
