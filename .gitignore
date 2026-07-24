@@ -9,6 +9,9 @@ venv/
 /tmp/cgc/
 *.answer.txt
 
+# local tool state (session/telemetry files with machine-local paths) — never ship
+.omc/
+
 # local env / secrets — never commit
 .env
 
