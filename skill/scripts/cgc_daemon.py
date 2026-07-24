@@ -3,7 +3,7 @@
 # Authority basis: open-claude-gpt skill v2 (CDP backend). The USER-STARTED egress daemon that
 #   makes a consult work under Claude Code's auto-mode data-exfiltration classifier without any
 #   per-user settings edit (see cgc_spool.py header for the full rationale). The agent only writes
-#   a local job file (`enqueue`) and reads a local answer file (`await`); THIS process — started
+#   a queued round to the local store (`enqueue`) and reads a local answer file (`await`); THIS process — started
 #   once by the user, exactly like the debug Chrome — is what actually talks to chatgpt.com. Its
 #   network egress is therefore never an agent tool call, so the classifier never gates it.
 #
@@ -67,9 +67,9 @@ _LAUNCH = os.path.join(_HERE, "cdp_launch.sh")
 
 
 def _make_run_cdp():
-    """The injected CDP driver for the store worker: drives the SAME cdp_consult submit/wait
-    subprocesses the file-spool worker uses (so the proven browser path is unchanged) and returns
-    the small dict cgc_backend.process_round maps to round states."""
+    """The injected CDP driver for the store worker: drives the cdp_consult submit/wait
+    subprocesses (the proven browser path) and returns the small dict cgc_backend.process_round
+    maps to round states."""
     def run_cdp(kind, **kw):
         if kind == "submit":
             cmd = [sys.executable, _CDP, "submit", "--rid", kw["rid"], "--prompt-file", "-",
@@ -102,10 +102,28 @@ def _make_run_cdp():
     return run_cdp
 
 
+def _take_worker_leases(rid):
+    """Every worker's first act: own its round (per-RID exclusive lease) and pin the browser
+    (shared lease) for its whole process lifetime. Both are flocks the OS releases on ANY death, so
+    a replacement daemon can PROVE this worker is gone instead of assuming its own empty children
+    map is global truth. Returns the (rid_lease, browser_lease) handles to keep alive, or None when
+    the round is already owned — by a prior-generation worker this daemon cannot see — in which
+    case this worker must exit without touching the round."""
+    lease = spool.acquire_rid_lease(rid)
+    if lease is None:
+        sys.stderr.write(f"CGC_DAEMON worker {rid}: round already owned by a live worker "
+                         "(prior daemon generation) — exiting without touching it\n")
+        return None
+    return lease, spool.acquire_browser_lease(shared=True)
+
+
 def run_worker_store(rid: str) -> int:
-    """Process ONE claimed (`ready`) store round to a terminal/uncertain state, then exit — the
-    store-backed peer of run_worker(). Isolated in its own process so a hung/crashed send can't take
-    the daemon down; the risky browser work is still in cdp_consult subprocesses."""
+    """Process ONE claimed (`ready`) store round to a terminal/uncertain state, then exit. Isolated
+    in its own process so a hung/crashed send can't take the daemon down; the risky browser work is
+    still in cdp_consult subprocesses."""
+    leases = _take_worker_leases(rid)
+    if leases is None:
+        return 1
     with store_mod.Store() as s:
         r = s.get_round(rid)
         if r is None or r["state"] != store_mod.READY:
@@ -122,6 +140,9 @@ def run_worker_store(rid: str) -> int:
 def run_worker_store_resume(rid: str) -> int:
     """Reattach to an accepted/waiting round and resume polling — the store peer of orphan recovery.
     Never re-sends."""
+    leases = _take_worker_leases(rid)
+    if leases is None:
+        return 1
     with store_mod.Store() as s:
         r = s.get_round(rid)
         if r is None or r["state"] not in (store_mod.ACCEPTED, store_mod.WAITING,
@@ -150,19 +171,25 @@ def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str) -
         sys.stderr.write(f"CGC_DAEMON {tag} {rid} pid={p.pid} ({len(children)}/{concurrency})\n")
         return True
 
+    def _unowned(rids):
+        """Drop rounds a LIVE worker (any daemon generation) still holds — 'no live worker' must be
+        proven by the cross-generation lease, not by absence from THIS daemon's children map. The
+        worker itself re-checks its lease on start, so this filter is anti-churn, not the fence."""
+        return [rid for rid in rids if rid not in children and spool.rid_lease_free(rid)]
+
     # Reattach first: an in-flight round that lost its worker is more urgent than a new send.
     with store_mod.Store() as s:
         rec = s.recover()
-        reattach = [rid for rid in rec["reattach"] if rid not in children]
+        reattach = _unowned(rec["reattach"])
         # possibly_accepted + conversation → one-shot read-only auto-retrieve (never re-sends).
-        retrievable = [rid for rid in rec["retrievable"] if rid not in children]
+        retrievable = _unowned(rec["retrievable"])
         # Ready-orphans: a `ready` round with no live worker — its worker's Popen failed, or the
         # worker/daemon died before begin_send. claim_ready only picks `queued`, and recover() reports
         # these as dispatchable but nothing acted on them, so the round sat `ready` forever. A `ready`
         # round is pre-send (begin_send has not run), so re-running process_round from it is safe.
-        ready_orphans = [r["rid"] for r in
-                         (s.get_round(rid) for rid in rec["dispatchable"])
-                         if r and r["state"] == store_mod.READY and r["rid"] not in children]
+        ready_orphans = _unowned(
+            r["rid"] for r in (s.get_round(rid) for rid in rec["dispatchable"])
+            if r and r["state"] == store_mod.READY)
     for rid in reattach:
         if len(children) >= concurrency:
             return
@@ -183,10 +210,38 @@ def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str) -
         _spawn("--worker-store", rnd["rid"], "dispatched(store)")
 
 
+def _reap_children(children: dict) -> None:
+    """Remove exited workers AND classify what their death left behind — at reap time, not at the
+    caller's timeout. A worker that died while its round was `sending` leaves that row ownerless;
+    without this, the still-live daemon would let it sit `sending` until the awaiter's full budget
+    expired, violating liveness while claiming recovery. Classification per state:
+      - sending           -> possibly_accepted (the click may have landed; never auto-resent)
+      - ready             -> untouched (pre-send; the ready-orphan path re-dispatches it)
+      - accepted/waiting  -> untouched (the reattach path resumes it read-only)
+      - terminal          -> untouched (the worker finished its job)"""
+    for rid in list(children):
+        code = children[rid].poll()
+        if code is None:
+            continue
+        del children[rid]
+        try:
+            with store_mod.Store() as s:
+                r = s.get_round(rid)
+                if r and r["state"] == store_mod.SENDING:
+                    moved = s.promote_sending_to_uncertain(
+                        rids=[rid],
+                        reason=f"worker exited (code {code}) while sending — uncertain, not resent")
+                    if moved:
+                        sys.stderr.write(f"CGC_DAEMON reaped worker {rid} (exit {code}) mid-send — "
+                                         "round marked possibly_accepted\n")
+        except Exception as e:  # classification must never take the daemon down
+            sys.stderr.write(f"CGC_DAEMON reap classification failed for {rid}: {e}\n")
+
+
 def _sweep_tabs() -> int:
-    """Close leftover ChatGPT tabs. CALLER-GUARDED: call only when the daemon has NO live worker
-    children — the daemon's child map is complete knowledge of live store workers, so a tab this
-    sweep sees is by definition unowned.
+    """Close leftover ChatGPT tabs. CALLER-GUARDED: call only under the EXCLUSIVE browser lease —
+    unobtainable while any worker of any daemon generation is alive, so a tab this sweep sees is
+    provably unowned.
 
     Tabs accumulate. Fixing the leaks in submit's failure paths removes the known source, but not
     the one no code path can cover: a worker killed mid-send — by a daemon restart, say — never runs
@@ -273,9 +328,9 @@ def _new_tab_healthy(port=None) -> bool:
 
 
 def _restart_chrome():
-    """Replace the debug Chrome. CALLER-GUARDED: call only when the daemon has NO live worker
-    children — the restart is global (it takes every tab with it), and the child map is complete
-    knowledge of live workers. The daemon owns the browser's lifecycle, so a browser that can no
+    """Replace the debug Chrome. CALLER-GUARDED: call only under the EXCLUSIVE browser lease — the
+    restart is global (it takes every tab with it), and only the lease proves no worker of ANY
+    daemon generation is using the browser. The daemon owns the browser's lifecycle, so a browser that can no
     longer open a usable tab is the daemon's problem to fix, not an errand for a human. Safe to do:
     the profile keeps the login, and a consult whose tab is lost is recoverable read-only.
 
@@ -421,37 +476,49 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
     _singleton = spool.acquire_daemon_singleton()  # noqa: F841 — kept alive for the daemon's lifetime
     if _singleton is None:
         sys.stderr.write("CGC_DAEMON already running (another process holds the daemon singleton) — "
-                         "this one exits so two daemons don't share one spool with independent "
+                         "this one exits so two daemons don't share one store with independent "
                          "concurrency limits.\n")
         return 0
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     spool.heartbeat_write(os.getpid())
     sys.stderr.write(
-        f"CGC_DAEMON up (pid {os.getpid()}) — spool {spool.SPOOL_DIR}, concurrency {concurrency}, "
+        f"CGC_DAEMON up (pid {os.getpid()}) — store {store_mod.db_path()}, concurrency {concurrency}, "
         f"poll {poll}s. This is the user-owned egress gate; the agent only reads/writes local files.\n")
     children = {}  # rid -> Popen
     daemon_instance_id = store_mod.new_daemon_instance_id()
-    # Recovery: a round left `sending` when the daemon died is uncertain, not resendable.
+    # Recovery: a round left `sending` with NO live owner is uncertain, not resendable. "No live
+    # owner" is proven per-rid by the cross-generation lease — a blanket promotion would mutate a
+    # `sending` row a surviving prior-generation worker still owns.
     with store_mod.Store() as _s:
-        moved = _s.promote_sending_to_uncertain()
+        stuck = [row["rid"] for row in _s.db.execute(
+            "SELECT rid FROM rounds WHERE state=?", (store_mod.SENDING,))]
+        moved = _s.promote_sending_to_uncertain(
+            rids=[rid for rid in stuck if spool.rid_lease_free(rid)])
+        identity = {"protocol": 1, "schema_version": store_mod.SCHEMA_VERSION,
+                    "db_path": os.path.abspath(store_mod.db_path()),
+                    "store_uuid": _s.store_uuid(), "daemon_instance_id": daemon_instance_id}
     sys.stderr.write(f"CGC_DAEMON store (instance {daemon_instance_id[:8]}); "
                      f"{len(moved)} interrupted send(s) marked possibly_accepted.\n")
     next_maintenance = 0.0
     last_repair = 0.0
     try:
         while _running:
-            spool.heartbeat_write(os.getpid())
-            # reap
-            for rid in list(children):
-                if children[rid].poll() is not None:
-                    del children[rid]
-            # Idle maintenance — only with NO live children (both actions are browser-global):
-            # sweep unowned tabs, and break the requeue loop of a browser that cannot open tabs.
+            spool.heartbeat_write(os.getpid(), identity)
+            _reap_children(children)
+            # Idle maintenance — both actions are browser-global, so they run only under the
+            # EXCLUSIVE browser lease: unobtainable while any worker (THIS generation's children
+            # or a surviving prior generation's) holds its shared lease.
             if not children and time.time() >= next_maintenance:
-                if websocket is not None:
-                    _sweep_tabs()
-                last_repair = _maybe_repair_browser(children, last_repair)
+                blease = spool.acquire_browser_lease(shared=False)
+                if blease is not None:
+                    try:
+                        if websocket is not None:
+                            _sweep_tabs()
+                        last_repair = _maybe_repair_browser(children, last_repair)
+                    finally:
+                        if hasattr(blease, "close"):
+                            blease.close()
                 next_maintenance = time.time() + 60
             _dispatch_store(children, concurrency, daemon_instance_id)
             if once and not children:

@@ -131,8 +131,22 @@ unambiguous under concurrency, and the agent-documented path. A bare
 `--followup` resolves "the last completed thread" and REFUSES when that is
 ambiguous (another consult in flight, or two threads completed within 30 minutes
 of each other) rather than guessing. `--request-key` makes enqueue logically
-idempotent (same key + same content returns the original receipt), and `cancel`
-is honoured only before the send fence.
+idempotent — the identity is a fingerprint over every caller-side routing field
+(kind, rid-independent prompt, project, model, parent, explicit conversation),
+so the same key with different routing conflicts instead of returning the wrong
+receipt — and `cancel` is honoured only before the send fence.
+
+### Ownership across processes: flock leases + heartbeat identity
+The daemon's in-memory child map only knows workers it spawned, so ownership
+facts that must survive a daemon restart live in OS-enforced flocks (released on
+any process death): each worker holds a per-RID exclusive lease and a shared
+browser lease for its lifetime; browser-global maintenance (tab sweep, Chrome
+restart) requires the exclusive browser lease; startup recovery and re-dispatch
+touch only lease-free rounds. Complementing that, every store file carries a
+`store_uuid`, the daemon heartbeat publishes its identity (protocol,
+schema_version, db_path, store_uuid, instance id), and enqueue fails closed on a
+live daemon whose identity does not match the store the CLI opened — the runtime
+fence against a stale daemon serving a relocated-away or older-schema DB.
 
 ### The auto-mode egress path: why a user-owned daemon, not a bypass
 Claude Code's `auto` permission mode runs a data-exfiltration classifier **above**

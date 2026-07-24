@@ -27,6 +27,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 import re
@@ -36,6 +37,10 @@ import subprocess
 import sys
 import os
 import time
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 # Load persisted CGC_* settings from the user's config file (env still wins) — see
 # cgc_config.py and `cgc set-project`.
@@ -553,6 +558,10 @@ def cmd_prep(a: argparse.Namespace) -> int:
         pathlib.Path(window_js_file).write_text(rendered, encoding="utf-8")
 
     prompt_file = ""
+    # The rid-independent prompt identity: the SAME render with a literal <RID> placeholder. It
+    # feeds the request-key fingerprint, so a re-fire (new rid, identical logical request) matches
+    # without normalizing user text — a rid quoted in task text is never touched.
+    logical_sha = None
     if a.task is not None:
         # Title (before Role) + Role frame the consult and are STEERING levers: a sharp
         # title + a persona matched to the job (security auditor / distributed-systems
@@ -616,6 +625,9 @@ def cmd_prep(a: argparse.Namespace) -> int:
         if a.followup:
             prompt = FOLLOWUP_TEMPLATE.format(title=title, task=a.task, refs_block=refs_block,
                                               context_block=context_block, rid=rid)
+            logical_sha = _sha256(FOLLOWUP_TEMPLATE.format(
+                title=title, task=a.task, refs_block=refs_block,
+                context_block=context_block, rid="<RID>"))
         else:
             output_block = ""
             output_body = DEFAULT_OUTPUT_BODY
@@ -631,6 +643,10 @@ def cmd_prep(a: argparse.Namespace) -> int:
             prompt = PROMPT_TEMPLATE.format(title=title, role=role, task=a.task,
                                             refs_block=refs_block, context_block=context_block,
                                             output_block=output_block, output_body=output_body, rid=rid)
+            logical_sha = _sha256(PROMPT_TEMPLATE.format(
+                title=title, role=role, task=a.task, refs_block=refs_block,
+                context_block=context_block, output_block=output_block,
+                output_body=output_body, rid="<RID>"))
         # Provenance is declared once, concisely, by deliver's "> Source visibility: PUBLIC"
         # stamp inside the refs block — no need to also prepend a verbose scope banner.
         prompt_file = str(scratch / f"prompt_{rid}.md")
@@ -711,6 +727,7 @@ def cmd_prep(a: argparse.Namespace) -> int:
     state = {
         "request_id": rid,
         "prompt_file": prompt_file,
+        "logical_sha": logical_sha,
     }
     # poll_js / preflight_js / the window script / the ScheduleWakeup wake plan exist ONLY for the
     # MCP fallback (Backend B), which pastes them into javascript_tool and paces its own wakes. On
@@ -783,6 +800,7 @@ def cmd_fire(a: argparse.Namespace) -> int:
         project_url=a.project_url, conversation=(a.conversation or "auto"),
         parent=getattr(a, "parent", None), model=a.model,
         request_key=getattr(a, "request_key", None),
+        logical_sha=st.get("logical_sha"),
         out=a.out, poll=spool.POLL_S, timeout=spool.STUCK_AFTER_S, quiet=True)
     if spool.cmd_enqueue(eq) != 0:
         return 2

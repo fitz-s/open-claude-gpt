@@ -142,38 +142,84 @@ def stats_report() -> int:
 
 
 # ---- enqueue -----------------------------------------------------------------
+def _request_fingerprint(a, prompt: str) -> str:
+    """The identity of one LOGICAL request — canonical JSON over every CALLER-side field that
+    routes or shapes it: kind, the rid-independent prompt identity, project, model, and the
+    caller's explicit thread selection (--parent / a concrete --conversation). Same key + a
+    different ANY of these is a conflict, never a silently-returned old receipt.
+
+    Caller-side fields only, deliberately not the enqueue-time RESOLVED conversation: resolution
+    is derived state (and for a bare-auto followup it depends on what is in flight — including the
+    original round a retry is trying to recover, which would deadlock the idempotent re-fire that
+    is this feature's whole point). The prompt identity prefers --logical-sha (the prompt rendered
+    with a literal <RID> placeholder, so user text containing a rid is never normalized away);
+    the fallback substitutes this round's own rid, which cannot appear in caller text (it did not
+    exist when the caller wrote it)."""
+    logical = getattr(a, "logical_sha", None) or store_mod.sha256(
+        (prompt or "").replace(a.rid, "<RID>"))
+    conv = getattr(a, "conversation", None)
+    return store_mod.sha256(json.dumps({
+        "fp": 1, "kind": a.kind, "prompt": logical,
+        "project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
+        "parent": getattr(a, "parent", None),
+        "conversation": None if conv in (None, "auto", "last") else conv,
+    }, sort_keys=True))
+
+
+def _idempotent_receipt(prior: dict, fingerprint: str, rkey: str, out: str) -> int:
+    """Same key seen before: same fingerprint returns the ORIGINAL receipt; anything else is a
+    conflict. Rows from before the structured fingerprint (spec_json carries the old request_sha
+    format or nothing) never silently match — conflict, the safe direction."""
+    pspec = json.loads(prior["spec_json"]) if prior.get("spec_json") else {}
+    if pspec.get("request_fingerprint") == fingerprint:
+        sys.stderr.write(f"CGC_IDEMPOTENT request-key {rkey!r} already enqueued as "
+                         f"{prior['rid']} — returning the original receipt, nothing new "
+                         "queued.\n")
+        print(json.dumps({"queued": True, "rid": prior["rid"],
+                          "out": prior["out_path"] or out, "backend": "store",
+                          "idempotent_repeat": True}))
+        return 0
+    sys.stderr.write(f"CGC_ERROR request_key_conflict: request-key {rkey!r} was already "
+                     f"used by {prior['rid']} with a DIFFERENT logical request (content, "
+                     "kind, parent, conversation, project, or model differ). One key names "
+                     "one logical request — use a new key.\n")
+    return 2
+
+
 def enqueue_round(a, prompt: str, out: str) -> int:
     """Create a queued round from the CLI args. The prompt BYTES live on the round (no pathname to
     drift); project_url/model/conversation/poll/timeout ride in spec_json for the worker.
 
     `--request-key K` makes the enqueue LOGICALLY idempotent: repeating the same key with the same
-    payload returns the ORIGINAL round's receipt (an agent that lost the output of its first call
-    can safely re-run it), while the same key with a DIFFERENT payload is refused — one key, one
-    request. RID uniqueness alone only prevents row collisions, not duplicate intents."""
+    logical request returns the ORIGINAL round's receipt (an agent that lost the output of its
+    first call can safely re-run it), while the same key with a different one is refused — one key,
+    one request. RID uniqueness alone only prevents row collisions, not duplicate intents."""
+    import sqlite3
     conv = getattr(a, "conversation", None)
     parent = getattr(a, "parent", None)
     rkey = getattr(a, "request_key", None)
-    # The idempotency comparator is the prompt with THIS round's rid normalized out: the rendered
-    # bytes embed the rid (sentinel instructions), so raw bytes differ on every re-fire even when
-    # the logical request is identical. Same key + same normalized content = the same request.
-    norm_sha = store_mod.sha256((prompt or "").replace(a.rid, "<RID>"))
+    fingerprint = _request_fingerprint(a, prompt)
     with store_mod.Store() as s:
+        # Writer-identity fence: if a daemon is LIVE, it must be operating THIS store. An old-code
+        # daemon (no identity fields) or one holding a different DB (the pre-cutover /tmp file — the
+        # recorded live split-brain) would accept this row into a store nobody serves, or serve a
+        # store this row never reaches. Refuse now, in seconds, with the fix.
+        import cgc_spool as _spool
+        ident = _spool.daemon_identity()
+        if ident is not None:
+            my_path, my_uuid = os.path.abspath(store_mod.db_path()), s.store_uuid()
+            if ident.get("db_path") != my_path or ident.get("store_uuid") != my_uuid:
+                sys.stderr.write(
+                    "CGC_ERROR store_mismatch: the running daemon is not serving this store "
+                    f"(daemon: db={ident.get('db_path')!r} uuid={ident.get('store_uuid')!r} / "
+                    f"CLI: db={my_path!r} uuid={my_uuid!r}). It is running old code or holding a "
+                    "relocated-away DB. Restart it:\n"
+                    "  launchctl kickstart -k gui/$(id -u)/com.open-claude-gpt.daemon\n")
+                return 2
         if rkey:
             prior = s.round_by_request_key(rkey)
             if prior is not None:
-                pspec = json.loads(prior["spec_json"]) if prior.get("spec_json") else {}
-                if pspec.get("request_sha") == norm_sha:
-                    sys.stderr.write(f"CGC_IDEMPOTENT request-key {rkey!r} already enqueued as "
-                                     f"{prior['rid']} — returning the original receipt, nothing new "
-                                     "queued.\n")
-                    print(json.dumps({"queued": True, "rid": prior["rid"],
-                                      "out": prior["out_path"] or out, "backend": "store",
-                                      "idempotent_repeat": True}))
-                    return 0
-                sys.stderr.write(f"CGC_ERROR request_key_conflict: request-key {rkey!r} was already "
-                                 f"used by {prior['rid']} with DIFFERENT content. One key names one "
-                                 "logical request — use a new key for new content.\n")
-                return 2
+                return _idempotent_receipt(prior, fingerprint, rkey, out)
         if s.get_round(a.rid) is not None:
             sys.stderr.write(f"CGC_ERROR already_enqueued: {a.rid} already exists in the store.\n")
             return 2
@@ -197,10 +243,19 @@ def enqueue_round(a, prompt: str, out: str) -> int:
                     return 2
         spec = {"project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
                 "conversation": conv, "parent_rid": parent, "poll": getattr(a, "poll", None),
-                "timeout": getattr(a, "timeout", None), "request_sha": norm_sha}
+                "timeout": getattr(a, "timeout", None), "request_fingerprint": fingerprint}
         thread = conv if conv not in (None, "auto", "last") else None
-        s.create_round(a.rid, a.kind, thread_id=thread, out_path=out, prompt=prompt,
-                       spec_json=json.dumps(spec), request_key=rkey, parent_rid=parent)
+        try:
+            s.create_round(a.rid, a.kind, thread_id=thread, out_path=out, prompt=prompt,
+                           spec_json=json.dumps(spec), request_key=rkey, parent_rid=parent)
+        except sqlite3.IntegrityError:
+            # Two concurrent enqueues with the same key both saw "no prior row"; the unique index
+            # on request_key made exactly one insert win. The loser resolves DETERMINISTICALLY to
+            # the winner's receipt (or a conflict) instead of surfacing a raw constraint error.
+            prior = s.round_by_request_key(rkey) if rkey else None
+            if prior is not None:
+                return _idempotent_receipt(prior, fingerprint, rkey, out)
+            raise
     import cgc_spool as _spool
     if not _spool.daemon_alive():
         sys.stderr.write("CGC_WARN daemon_down: queued, but nothing will send it until the daemon "
@@ -254,11 +309,20 @@ def cancel_round(rid: str) -> int:
 def _emit(rid, state, *, retryable, human_action=None, next_command=None, answer_path=None,
           parent_rid=None, confidence=None, error=None):
     import cgc_spool as _spool
+    # Envelope invariant: retryable=true must always name the retry — an agent told "retryable"
+    # with no next_command/human_action has a verdict but no move. Enforced structurally so no
+    # future branch can violate it.
+    if retryable and not (next_command or human_action):
+        human_action = "re-run the SAME fire (same --request-key) — the failure was transient"
     log = _spool.log_path(rid)
+    try:
+        has_log = os.path.exists(log)
+    except OSError:
+        has_log = False
     print(json.dumps({
         "schema": 1, "rid": rid, "parent_rid": parent_rid, "state": state,
         "retryable": retryable, "human_action": human_action, "next_command": next_command,
-        "answer_path": answer_path, "log_path": log if os.path.exists(log) else None,
+        "answer_path": answer_path, "log_path": log if has_log else None,
         "confidence": confidence, "error": error,
     }))
 
@@ -274,6 +338,27 @@ _TERMINAL_OK = (store_mod.COMPLETED_VERIFIED,)
 
 
 def await_round(a) -> int:
+    """The public await entry. EVERY termination — including a store that cannot open
+    (SchemaTooNew, a corrupt file) or an answer that cannot materialize (disk full) — emits exactly
+    one JSON envelope on stdout; the traceback goes to stderr. 'Every await exit has an envelope'
+    is a contract, not a happy-path property."""
+    try:
+        return _await_round(a)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        try:
+            _emit(a.rid, "error", retryable=False,
+                  human_action="await itself failed before reaching a round outcome — read the "
+                               "traceback on stderr",
+                  error=f"{type(e).__name__}: {e}")
+        except Exception:
+            print(json.dumps({"schema": 1, "rid": getattr(a, "rid", None), "state": "error",
+                              "retryable": False, "error": f"{type(e).__name__}: {e}"}))
+        return 1
+
+
+def _await_round(a) -> int:
     """Poll the round until terminal, materialize the stored result to --out, and map to the
     three-outcome contract (0 answer / 3 human / 1 broken).
 

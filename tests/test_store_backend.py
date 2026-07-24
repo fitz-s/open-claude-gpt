@@ -541,7 +541,7 @@ class TestStrictFollowupResolution:
         self._complete(store_mod, s, "REQ-20260707-120000-0af001", "conv-A")
         self._complete(store_mod, s, "REQ-20260707-120000-0af002", "conv-B")
         conv, why = s.latest_conversation_strict()
-        assert conv is None and "different" in why and "--parent" in why
+        assert conv is None and "ambiguous" in why and "--parent" in why
 
     def test_old_second_thread_does_not_block_auto(self, env):
         store_mod, backend, s, tmp_path = env
@@ -605,3 +605,167 @@ class TestStats:
         assert rep["completed"] == 3
         assert abs(rep["unverified_rate"] - 1 / 3) < 0.01
         assert rep["latency_s"]["n"] == 3
+
+
+class TestRequestFingerprint:
+    """The idempotency identity covers the LOGICAL request — every caller-side routing field —
+    not just the prompt bytes. Same key + different routing must conflict, never silently return
+    the old receipt (an answer for the wrong causal request is worse than an error)."""
+
+    def _enq(self, backend, tmp_path, rid, key, **over):
+        pf = tmp_path / f"{rid}.md"
+        pf.write_text(f"review https://github.com/acme/w\nwrap in BEGIN_RESPONSE:{rid}\n",
+                      encoding="utf-8")
+        return backend.enqueue_round(_enq_ns(rid, str(pf), request_key=key, **over),
+                                     pf.read_text(), str(tmp_path / f"a_{rid}.txt"))
+
+    @pytest.mark.parametrize("field", [
+        {"model": "5.6-Thinking"},
+        {"project_url": "https://chatgpt.com/g/other/project"},
+        {"parent": "REQ-20260707-110000-aaaaaa"},
+        {"conversation": "conv-explicit-xyz"},
+    ])
+    def test_same_key_different_routing_field_conflicts(self, env, capsys, field):
+        store_mod, backend, s, tmp_path = env
+        if "parent" in field or "conversation" in field:
+            # give the parent/conversation something to resolve to so enqueue reaches the
+            # fingerprint comparison rather than failing resolution first
+            s.create_round(field.get("parent") or "REQ-20260707-110000-aaaaaa", "submit",
+                           thread_id="conv-old", prompt="p")
+            s.db.execute("UPDATE threads SET conversation_id='conv-old' WHERE thread_id='conv-old'")
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0f0001", "kf1") == 0
+        capsys.readouterr()
+        over = dict(field)
+        if "parent" in field or "conversation" in field:
+            over["kind"] = "followup"
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0f0002", "kf1", **over) == 2
+        assert "request_key_conflict" in capsys.readouterr().err
+
+    def test_literal_rid_in_task_text_is_not_normalized_away(self, env, capsys):
+        """A rid QUOTED in caller text (e.g. a followup referencing an earlier consult) is user
+        data. With --logical-sha (placeholder render) the fingerprint never rewrites it; two fires
+        whose only difference is that quoted rid must NOT collide as 'same content'."""
+        store_mod, backend, s, tmp_path = env
+
+        def enq(rid, quoted, logical):
+            pf = tmp_path / f"{rid}.md"
+            pf.write_text(f"re-check {quoted} please\nBEGIN_RESPONSE:{rid}\n", encoding="utf-8")
+            return backend.enqueue_round(
+                _enq_ns(rid, str(pf), request_key="kf2", logical_sha=logical),
+                pf.read_text(), str(tmp_path / f"a_{rid}.txt"))
+
+        # logical_sha models prep's placeholder render: it hashes the quoted rid VERBATIM
+        assert enq("REQ-20260707-120000-0f1001", "REQ-20260707-000000-aaaaaa", "lsha-A") == 0
+        capsys.readouterr()
+        assert enq("REQ-20260707-120000-0f1002", "REQ-20260707-000000-bbbbbb", "lsha-B") == 2
+        assert "request_key_conflict" in capsys.readouterr().err
+
+    def test_concurrent_same_key_resolves_deterministically(self, env, capsys, monkeypatch):
+        """Two enqueues race the same key: both see no prior row, one insert wins the unique index,
+        the loser must return the WINNER's receipt (or a conflict) — never a raw constraint error."""
+        store_mod, backend, s, tmp_path = env
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0f2001", "kf3") == 0
+        rid1 = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["rid"]
+        # simulate the race: the pre-check misses the row that is already there
+        real = store_mod.Store.round_by_request_key
+        calls = {"n": 0}
+
+        def racy(self, key):
+            calls["n"] += 1
+            return None if calls["n"] == 1 else real(self, key)
+
+        monkeypatch.setattr(store_mod.Store, "round_by_request_key", racy)
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0f2002", "kf3") == 0
+        out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert out["rid"] == rid1 and out.get("idempotent_repeat") is True
+        assert calls["n"] >= 2, "the IntegrityError path must re-resolve the winner"
+
+
+class TestStoreIdentityFence:
+    def test_enqueue_refuses_a_daemon_on_a_different_store(self, env, capsys, monkeypatch):
+        """A live daemon whose heartbeat names a different db/uuid (old code, or a relocated-away
+        DB — the recorded live split-brain) must refuse the enqueue in seconds, with the fix."""
+        store_mod, backend, s, tmp_path = env
+        import cgc_spool
+        monkeypatch.setattr(cgc_spool, "daemon_identity",
+                            lambda: {"pid": os.getpid(), "ts": 9e12,
+                                     "db_path": "/somewhere/else.db", "store_uuid": "not-mine"})
+        pf = tmp_path / "p.md"
+        pf.write_text("review https://github.com/acme/w\n", encoding="utf-8")
+        rc = backend.enqueue_round(_enq_ns("REQ-20260707-120000-0f3001", str(pf)),
+                                   pf.read_text(), str(tmp_path / "a.txt"))
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "store_mismatch" in err and "kickstart" in err
+
+    def test_enqueue_accepts_a_matching_daemon(self, env, capsys, monkeypatch):
+        store_mod, backend, s, tmp_path = env
+        import cgc_spool
+        monkeypatch.setattr(cgc_spool, "daemon_identity",
+                            lambda: {"pid": os.getpid(), "ts": 9e12,
+                                     "db_path": os.path.abspath(store_mod.db_path()),
+                                     "store_uuid": s.store_uuid()})
+        pf = tmp_path / "p.md"
+        pf.write_text("review https://github.com/acme/w\n", encoding="utf-8")
+        rc = backend.enqueue_round(_enq_ns("REQ-20260707-120000-0f3002", str(pf)),
+                                   pf.read_text(), str(tmp_path / "a.txt"))
+        assert rc == 0
+
+
+class TestEnvelopeContract:
+    def test_await_emits_an_envelope_even_when_the_store_cannot_open(self, env, capsys, monkeypatch):
+        """'Every await exit has an envelope' includes the exits BEFORE a round outcome: a store
+        that cannot open (SchemaTooNew / corrupt file) must still terminate with one JSON object on
+        stdout, not a bare traceback."""
+        store_mod, backend, s, tmp_path = env
+
+        def boom(*a, **kw):
+            raise store_mod.SchemaTooNew("store schema is v9")
+
+        monkeypatch.setattr(backend.store_mod, "Store", boom)
+        a = types.SimpleNamespace(rid="REQ-20260707-120000-0f4001",
+                                  out=str(tmp_path / "a.txt"), timeout=5, poll=1)
+        assert backend.await_round(a) == 1
+        out = capsys.readouterr().out.strip().splitlines()[-1]
+        env_obj = json.loads(out)
+        assert env_obj["schema"] == 1 and env_obj["state"] == "error"
+        assert "SchemaTooNew" in env_obj["error"]
+
+    def test_retryable_always_names_the_retry(self, env, capsys):
+        """Envelope invariant: retryable=true must carry next_command or human_action — a verdict
+        with no move is not actionable."""
+        store_mod, backend, s, tmp_path = env
+        backend._emit("REQ-20260707-120000-0f5001", "failed", retryable=True)
+        out = json.loads(capsys.readouterr().out.strip())
+        assert out["retryable"] is True
+        assert out["human_action"] or out["next_command"]
+
+
+class TestStrictFollowupEdges:
+    def _complete(self, store_mod, s, rid, conv):
+        s.create_round(rid, "submit", thread_id=conv, prompt="p")
+        s.db.execute("UPDATE threads SET conversation_id=? WHERE thread_id=?", (conv, conv))
+        s.set_state(rid, store_mod.READY)
+        s.begin_send(rid, "p", store_mod.sha256("p"), daemon_instance_id="d")
+        s.mark_accepted(s.get_round(rid)["current_attempt_id"], conv)
+        s.mark_waiting(rid)
+        s.finish(rid, store_mod.COMPLETED_VERIFIED, result_text="x")
+
+    def test_queued_round_makes_bare_auto_ambiguous(self, env):
+        """A consult WAITING TO START is as much a competing target as one mid-send — the
+        in-flight refusal set must include queued/ready."""
+        store_mod, backend, s, tmp_path = env
+        self._complete(store_mod, s, "REQ-20260707-120000-0f6001", "conv-A")
+        s.create_round("REQ-20260707-120000-0f6002", "submit", prompt="p")  # queued, not started
+        conv, why = s.latest_conversation_strict()
+        assert conv is None and "in flight" in why
+
+    def test_busy_thread_cannot_hide_a_near_simultaneous_other_thread(self, env):
+        """Two recent rounds on thread A must not mask that thread B ALSO completed moments ago —
+        the ambiguity comparison is per-THREAD (max completion per distinct conversation)."""
+        store_mod, backend, s, tmp_path = env
+        self._complete(store_mod, s, "REQ-20260707-120000-0f7001", "conv-B")
+        self._complete(store_mod, s, "REQ-20260707-120000-0f7002", "conv-A")
+        self._complete(store_mod, s, "REQ-20260707-120000-0f7003", "conv-A")
+        conv, why = s.latest_conversation_strict()
+        assert conv is None and "ambiguous" in why

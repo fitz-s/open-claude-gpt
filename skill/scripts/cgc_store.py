@@ -66,29 +66,75 @@ def _legacy_db() -> str:
 
 
 def _relocate_legacy_db(target: str) -> None:
-    """One-time move of the store out of the non-durable state dir into the durable data dir.
+    """One-time ATOMIC cutover of the store out of the non-durable state dir into the durable data
+    dir. Runs only when the caller is using the DEFAULT path (no CGC_STORE_DB override) and a legacy
+    /tmp-era DB exists.
 
-    Runs only when the caller is using the DEFAULT path (no CGC_STORE_DB override), the target does
-    not exist yet, and a legacy /tmp-era DB does. The sqlite backup API gives a transactionally
-    consistent copy even if a not-yet-restarted daemon still has the legacy file open; the legacy
-    file is then renamed *.migrated so it can never be re-opened as a second live authority."""
+    Publication protocol (crash-safe at every boundary):
+      1. sqlite-backup the legacy DB into a UNIQUE temp file in the destination dir (never the
+         final name — the final name must only ever hold a COMPLETE copy).
+      2. Validate the copy (PRAGMA integrity_check + the meta table exists), fsync it.
+      3. os.replace(temp, target) — the atomic publication. Target existence now IMPLIES a
+         complete, validated DB; a crash earlier leaves only a uniquely-named temp (cleaned up on
+         the next run), never a half-written target that would suppress retry.
+      4. Rename the legacy file *.migrated — the writer fence. A crash between 3 and 4 leaves two
+         complete files; the next run detects (target AND legacy both present) and finishes the
+         fence instead of returning early with two apparent authorities.
+    The sqlite backup gives a consistent snapshot but is NOT a writer fence for an already-running
+    old daemon holding the legacy inode — that is what the heartbeat identity check (store_uuid /
+    db_path, enforced fail-closed at enqueue) plus install.sh's mandatory daemon restart close."""
     if "CGC_STORE_DB" in os.environ:
         return
     legacy = _legacy_db()
-    if target == legacy or os.path.exists(target) or not os.path.exists(legacy):
+    if target == legacy or not os.path.exists(legacy):
         return
-    d = os.path.dirname(target)
-    if d:
-        os.makedirs(d, mode=0o700, exist_ok=True)
-    os.close(os.open(target, os.O_CREAT | os.O_WRONLY, 0o600))
+    d = os.path.dirname(target) or "."
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    # Sweep temps abandoned by a crash mid-copy — uniquely named, so never a live file.
+    for stale in os.listdir(d):
+        if stale.startswith(".control.db.relocating-"):
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(d, stale))
+    if os.path.exists(target):
+        if os.path.getsize(target) == 0:
+            # A pre-cutover install crashed after pre-creating the final name empty; that stub
+            # must not suppress relocation forever. Only an EMPTY file is provably not a DB.
+            os.remove(target)
+        else:
+            os.replace(legacy, legacy + ".migrated")  # finish the interrupted writer fence
+            return
+    tmp = os.path.join(d, f".control.db.relocating-{uuid.uuid4().hex}")
+    os.close(os.open(tmp, os.O_CREAT | os.O_WRONLY, 0o600))
     src = sqlite3.connect(legacy)
-    dst = sqlite3.connect(target)
+    dst = sqlite3.connect(tmp)
     try:
         with dst:
             src.backup(dst)
-    finally:
+        check = dst.execute("PRAGMA integrity_check").fetchone()[0]
+        has_meta = dst.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
+        if check != "ok" or not has_meta:
+            raise sqlite3.DatabaseError(
+                f"relocated copy failed validation (integrity={check!r}, meta={bool(has_meta)})")
+    except BaseException:
         dst.close()
         src.close()
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+    dst.close()
+    src.close()
+    fd = os.open(tmp, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, target)
+    dfd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
     os.replace(legacy, legacy + ".migrated")
 
 SCHEMA_VERSION = 2
@@ -216,15 +262,20 @@ class Store:
             self.db.executescript(_DDL)
             self.db.execute("INSERT INTO meta(key,value) VALUES('schema_version',?)",
                             (str(SCHEMA_VERSION),))
+            self.db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('store_uuid',?)",
+                            (_new_id(),))
             return
         have = int(row["value"])
-        if have == SCHEMA_VERSION:
-            return
         if have > SCHEMA_VERSION:
             raise SchemaTooNew(
                 f"store schema is v{have}, this code understands up to v{SCHEMA_VERSION} — "
                 f"the DB was written by a newer install. Upgrade the skill (re-run install.sh) "
                 f"instead of running old code against it.")
+        # Older DBs predate the store identity; mint it once (no-op when already present).
+        self.db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('store_uuid',?)",
+                        (_new_id(),))
+        if have == SCHEMA_VERSION:
+            return
         self._backup(f".v{have}.bak")
         for target in range(have + 1, SCHEMA_VERSION + 1):
             with self._tx():
@@ -245,6 +296,13 @@ class Store:
             dst.close()
         with contextlib.suppress(OSError):
             os.chmod(dst_path, 0o600)
+
+    def store_uuid(self) -> str:
+        """The stable identity of THIS database file, minted once at creation/migration. The daemon
+        publishes it in its heartbeat; enqueue refuses when the live daemon's store identity is not
+        the one the CLI opened — the runtime writer fence the relocation copy cannot provide."""
+        row = self.db.execute("SELECT value FROM meta WHERE key='store_uuid'").fetchone()
+        return row["value"] if row else ""
 
     def close(self) -> None:
         with contextlib.suppress(Exception):
@@ -530,36 +588,40 @@ class Store:
         two is set.
 
         Ambiguity rules (an agent must then pass --parent <rid>, which is always unambiguous):
-          - another consult is still IN FLIGHT (sending/accepted/waiting/possibly_accepted): the
-            in-flight one may be the intended target and may complete at any moment — 'latest
-            completed' is a race, not an identity.
-          - the two most recent completions are on DIFFERENT threads AND landed within 30 minutes
-            of each other: two answers that close together make 'the last one' an accident of
-            ordering, not an intent. (Two unrelated consults days apart stay unambiguous.)"""
+          - another consult is anywhere PRE-TERMINAL (queued/ready/sending/accepted/waiting/
+            possibly_accepted): the not-yet-finished one may be the intended target and may
+            complete at any moment — 'latest completed' is a race, not an identity. queued/ready
+            count too: a consult waiting to start is exactly as much a competing target as one
+            mid-send.
+          - the two most recently active DISTINCT threads finished within 30 minutes of each
+            other: two answers that close together make 'the last one' an accident of ordering,
+            not an intent. Compared per-THREAD (MAX(updated_at) per conversation), so a thread
+            with several recent rounds cannot hide a near-simultaneous completion on another."""
         inflight = self.db.execute(
-            "SELECT count(*) c FROM rounds WHERE state IN (?,?,?,?) AND rid != ?",
-            (SENDING, ACCEPTED, WAITING, POSSIBLY_ACCEPTED, exclude_rid or "")).fetchone()["c"]
+            "SELECT count(*) c FROM rounds WHERE state IN (?,?,?,?,?,?) AND rid != ?",
+            (QUEUED, READY, SENDING, ACCEPTED, WAITING, POSSIBLY_ACCEPTED,
+             exclude_rid or "")).fetchone()["c"]
         if inflight:
             return None, (f"ambiguous: {inflight} consult(s) still in flight — 'the last thread' is "
                           "a race. Pass --parent <rid> to name the consult you are continuing.")
         rows = self.db.execute(
-            "SELECT r.rid, r.updated_at u, t.conversation_id c FROM rounds r "
+            "SELECT t.conversation_id c, MAX(r.updated_at) u FROM rounds r "
             "JOIN threads t ON r.thread_id=t.thread_id "
             "WHERE r.state IN (?,?) AND t.conversation_id IS NOT NULL AND r.rid != ? "
-            "ORDER BY r.updated_at DESC LIMIT 2",
+            "GROUP BY t.conversation_id ORDER BY u DESC LIMIT 2",
             (COMPLETED_VERIFIED, COMPLETED_UNVERIFIED, exclude_rid or "")).fetchall()
         if not rows:
             return None, "none: no completed consult exists to continue"
-        if len(rows) == 2 and rows[0]["c"] != rows[1]["c"]:
+        if len(rows) == 2:
             try:
                 dt = abs((datetime.datetime.fromisoformat(rows[0]["u"])
                           - datetime.datetime.fromisoformat(rows[1]["u"])).total_seconds())
             except ValueError:
                 dt = 0.0  # unparsable timestamps: treat as close together, fail toward refusal
             if dt < 1800:
-                return None, (f"ambiguous: the two most recent completed consults are on different "
-                              f"threads and finished within {int(dt)}s of each other "
-                              f"({rows[0]['rid']}, {rows[1]['rid']}). Pass --parent <rid>.")
+                return None, (f"ambiguous: the two most recently completed threads finished within "
+                              f"{int(dt)}s of each other (conversations {rows[0]['c']}, "
+                              f"{rows[1]['c']}). Pass --parent <rid>.")
         return rows[0]["c"], None
 
     def was_auto_retrieved(self, rid: str) -> bool:
@@ -587,20 +649,26 @@ class Store:
             self._event("state", rid=rid, detail=f"{POSSIBLY_ACCEPTED} -> {WAITING} (auto-retrieve)")
         return True
 
-    def promote_sending_to_uncertain(self) -> list[str]:
-        """Recovery step: a round left in `sending` when the daemon restarts means the worker died
-        mid-click. Move it to `possibly_accepted` (durably, so it is never mistaken for dispatchable)
-        and return the affected rids. Idempotent."""
+    def promote_sending_to_uncertain(self, rids: list[str] | None = None,
+                                     reason: str | None = None) -> list[str]:
+        """Recovery step: a round left in `sending` whose worker is DEAD is uncertain. Move it to
+        `possibly_accepted` (durably, so it is never mistaken for dispatchable) and return the
+        affected rids. Idempotent. `rids` narrows the promotion to rounds the caller has PROVEN
+        ownerless (its own reaped child, or a lease-free round at startup) — a blanket promotion
+        would mutate a `sending` row a surviving prior-generation worker still owns."""
         moved = []
         with self._tx():
             for row in self.db.execute("SELECT rid,current_attempt_id FROM rounds WHERE state=?",
                                        (SENDING,)):
                 rid = row["rid"]
+                if rids is not None and rid not in rids:
+                    continue
                 if row["current_attempt_id"]:
                     self.db.execute("UPDATE attempts SET phase=? WHERE attempt_id=?",
                                     (POSSIBLY_ACCEPTED, row["current_attempt_id"]))
-                self._apply_round_fields(rid, state=POSSIBLY_ACCEPTED,
-                                         error_code="daemon died while sending — uncertain, not resent")
+                self._apply_round_fields(
+                    rid, state=POSSIBLY_ACCEPTED,
+                    error_code=reason or "daemon died while sending — uncertain, not resent")
                 self._event("recover_sending", rid=rid, detail="sending -> possibly_accepted")
                 moved.append(rid)
         return moved

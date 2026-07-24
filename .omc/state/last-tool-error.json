@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"python3 -m pytest tests/test_store_backend.py -q 2>&1 | grep -A5 \\\"ERROR at setup\\\" | head -12; grep -n \\\"def backend\\\" tests/test_store_backend.py | head -3; sed -n \\\"$(grep -n 'def backe...",
-  "error": "Exit code 1\n_ ERROR at setup of TestRequestKeyIdempotency.test_same_key_same_content_returns_original_receipt _\nfile /Users/leofitz/chatgpt-consult/tests/test_store_backend.py, line 469\n      def test_same_key_same_content_returns_original_receipt(self, backend, tmp_path, capsys):\nE       fixture 'backend' not found\n>       available fixtures: _isolate_durable_state, anyio_backend, anyio_backend_name, anyio_backend_options, cache, capfd, capfdbinary, caplog, capsys, capsysbinary, capteesys, doct...",
-  "timestamp": "2026-07-24T09:27:23.240Z",
-  "retry_count": 1
-}
