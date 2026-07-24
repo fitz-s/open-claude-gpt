@@ -19,7 +19,7 @@
   },
   "build": {
     "buildCommand": "make build",
-    "testCommand": "python3 -m pytest tests/ -q 2>&1 | tail -2 && make lint 2>&1 | tail -1",
+    "testCommand": "python3 -m pytest \"tests/test_parity.py::test_source_gate_parity[real_code_link]\" -q 2>&1 | grep -B8 Error | head -25; grep -n \"real_code_link\\|_repo_is_public\\|_gh_exists\\|monkeypatch\\|def test_source_gate_parity\" tests/test_parity.py | head",
     "lintCommand": null,
     "devCommand": null,
     "scripts": {}
@@ -116,15 +116,15 @@
   },
   "hotPaths": [
     {
-      "path": "skill/scripts/cgc_store.py",
-      "accessCount": 15,
-      "lastAccessed": 1784885034756,
+      "path": "skill/scripts/cgc_spool.py",
+      "accessCount": 18,
+      "lastAccessed": 1784885379350,
       "type": "file"
     },
     {
-      "path": "skill/scripts/cgc_spool.py",
+      "path": "skill/scripts/cgc_store.py",
       "accessCount": 15,
-      "lastAccessed": 1784885198979,
+      "lastAccessed": 1784885034756,
       "type": "file"
     },
     {
@@ -135,8 +135,8 @@
     },
     {
       "path": "tests/test_spool.py",
-      "accessCount": 8,
-      "lastAccessed": 1784884622169,
+      "accessCount": 9,
+      "lastAccessed": 1784885420527,
       "type": "file"
     },
     {
@@ -221,6 +221,12 @@
       "path": "skill/scripts/cgc_migrate.py",
       "accessCount": 1,
       "lastAccessed": 1784884083333,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_parity.py",
+      "accessCount": 1,
+      "lastAccessed": 1784885485855,
       "type": "file"
     }
   ],

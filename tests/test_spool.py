@@ -31,8 +31,9 @@ def spool(tmp_path, monkeypatch):
     monkeypatch.setenv("CGC_SPOOL_DIR", str(tmp_path / "state" / "spool"))
     monkeypatch.delenv("CGC_GATE_ALLOW_GIST", raising=False)
     m = _load()
-    # Every test stubs this out by default so no test can accidentally shell out to `gh`.
+    # Every test stubs these out by default so no test can accidentally shell out to `gh`.
     monkeypatch.setattr(m, "_repo_is_public", lambda slug: (True, "stub public"))
+    monkeypatch.setattr(m, "_gh_exists", lambda path: (True, "exists"))
     return m
 
 
@@ -427,3 +428,47 @@ def test_allowlist_never_exempts_secrets(spool, monkeypatch):
 # primary-key refusal at enqueue (test_cmd_enqueue_same_rid_twice_refuses above), atomic claim_ready
 # gives a round to exactly one worker (test_daemon), and terminal states are immutable so a
 # superseded worker cannot overwrite an outcome (test_store).
+
+
+# ---- dead-reference detection (the offline-deliver blind spot) ----------------
+#
+# deliver is offline by design, so a typo'd PR number produces syntactically perfect dead links and
+# the failure surfaces 25 minutes later at ChatGPT. The gate has gh anyway — it must catch this in
+# seconds instead.
+
+def test_gate_refuses_a_nonexistent_pr(spool, monkeypatch):
+    monkeypatch.setattr(spool, "_gh_exists",
+                        lambda path: (False, "404") if "/pulls/" in path else (True, "exists"))
+    ok, why = spool.validate_prompt(
+        "review https://github.com/acme/widgets/pull/99999 and https://github.com/acme/widgets")
+    assert ok is False and "does not exist" in why and "re-fire" in why.lower()
+
+
+def test_gate_refuses_a_nonexistent_ref(spool, monkeypatch):
+    monkeypatch.setattr(spool, "_gh_exists",
+                        lambda path: (False, "404") if "/commits/" in path else (True, "exists"))
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/tree/deadbeef00")
+    assert ok is False and "does not exist" in why
+
+
+def test_gate_existence_check_unverified_is_retryable_not_a_verdict(spool, monkeypatch):
+    monkeypatch.setattr(spool, "_gh_exists", lambda path: (None, "unverified: gh timed out"))
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/pull/12")
+    assert ok is False and why.startswith("unverified:")
+
+
+def test_gate_passes_when_all_refs_exist(spool, monkeypatch):
+    monkeypatch.setattr(spool, "_gh_exists", lambda path: (True, "exists"))
+    ok, why = spool.validate_prompt(
+        "review https://github.com/acme/widgets/pull/12 and "
+        "https://github.com/acme/widgets/tree/abc1234/src")
+    assert ok, why
+
+
+def test_gate_existence_only_checks_admitted_repos(spool, monkeypatch):
+    """The visibility pass is the admission control; existence checks must not become a way to probe
+    arbitrary repos gh can see."""
+    probed = []
+    monkeypatch.setattr(spool, "_gh_exists", lambda path: probed.append(path) or (True, "exists"))
+    spool.validate_prompt("review https://github.com/acme/widgets/pull/12")
+    assert all("acme/widgets" in p for p in probed)

@@ -666,6 +666,7 @@ def test_source_gate_parity(name, prompt, expect, monkeypatch):
     cdp = _load("cdp_consult.py")
     spool = _load("cgc_spool.py")
     monkeypatch.setattr(spool, "_repo_is_public", lambda slug: (True, "public"))
+    monkeypatch.setattr(spool, "_gh_exists", lambda path: (True, "exists"))
 
     cdp_sendable = cdp._has_sendable_source(prompt)
     spool_ok, spool_why = spool.validate_prompt(prompt)
