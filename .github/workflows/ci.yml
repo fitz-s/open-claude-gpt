@@ -6,13 +6,23 @@ on:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The claimed floor, the previous single pin, and a current version — on the CI-cheap OS.
+          - { os: ubuntu-latest, python: "3.8" }
+          - { os: ubuntu-latest, python: "3.11" }
+          - { os: ubuntu-latest, python: "3.13" }
+          # The PRIMARY platform (launchd daemon, macOS Chrome paths) was previously never CI-run.
+          - { os: macos-latest, python: "3.13" }
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python }}
 
       - uses: actions/setup-node@v4
         with:
@@ -21,8 +31,8 @@ jobs:
       - name: Node available (required for the sentinel-parser parity tests)
         run: node --version
 
-      - name: Install runtime dep
-        run: pip install websocket-client pyyaml pytest
+      - name: Install runtime deps (pinned range — the install is part of the product)
+        run: pip install "websocket-client>=1.6,<2" pyyaml pytest
 
       - name: Python scripts parse
         run: |
@@ -35,10 +45,13 @@ jobs:
             bash -n "$f" && echo "ok: $f"
           done
 
-      - name: Doctor runs without crashing (no browser in CI is an expected fail)
+      - name: Doctor runs and reports structured checks (no browser in CI is an expected NOT-READY, not a crash)
         run: |
-          out=$(NO_COLOR=1 CGC_HOME="$PWD/skill" python skill/scripts/cgc_doctor.py --json || true)
+          set -o pipefail
+          out=$(NO_COLOR=1 CGC_HOME="$PWD/skill" python skill/scripts/cgc_doctor.py --json) || status=$?
+          # exit != 0 means NOT READY (fine in CI); the failure mode we guard is a crash/empty output.
           echo "$out"
+          test -n "$out" || { echo "::error::doctor produced no output"; exit 1; }
           echo "$out" | python -c "import json,sys; d=json.load(sys.stdin); assert 'ok' in d and d['checks']; print('doctor produced', len(d['checks']), 'checks')"
 
       - name: Test suite (offline; includes cross-implementation sentinel-parser parity)
