@@ -70,19 +70,53 @@ uncertain-round machinery live):
 
 - **`--kind retrieve` could never succeed.** Its waiter pinned the retrieve round's own (fresh)
   rid, which by construction never matches the conversation's actual last request —
-  `rid_mismatch`, exit 2, unconditionally. The advertised recovery flow was broken; retrieve now
-  resolves the rid from the page (`auto`), adopting the conversation's answer as intended.
+  `rid_mismatch`, exit 2, unconditionally. The advertised recovery flow was broken. Retrieve now
+  requires and pins the SOURCE rid of the round being recovered (`--parent`): the waiter locates
+  that exact user turn (not merely the last one) and completes only from a sentinel-verified
+  answer for it; if the thread has advanced past causal attribution it fails
+  `rid_superseded`/`rid_absent` rather than silently committing a later same-thread answer. The
+  envelope reports `source_rid` and the observed remote rid.
 - **The waiter's rid-resolution grace was shorter than a real render lag.** A follow-up on a long
   thread took >2 min before the just-sent user message committed to the DOM; the 120s resolution
   window expired exactly there and burned the round's ONE-SHOT auto-retrieve on a render lag.
   Grace raised to 600s — waiting longer on a wrong tab is free (read-only); giving up early costs
   the recovery.
-- **A pre-send terminal failure releases its request-key.** The envelope's retry contract says
-  "re-run the SAME fire, same `--request-key`" — but a prior round that terminally failed
+- **A provably-unsent terminal failure releases its request-key.** The envelope's retry contract
+  says "re-run the SAME fire, same `--request-key`" — but a prior round that terminally failed
   pre-send (cancelled, no-thread, gate-rejected; nothing ever left the machine) would answer that
-  retry with its own dead receipt, permanently swallowing the request (observed live). Such a
-  prior now releases the key and the retry enqueues fresh; live and completed priors still own
-  their key unchanged.
+  retry with its own dead receipt, permanently swallowing the request (observed live). Release is
+  gated on durable no-send proof — GATE_REJECTED, a FAILED round with no send attempt on record,
+  or an explicit operator `not_sent_proven` reconcile (v3 `send_disposition` column) — because
+  generic FAILED is NOT proof: `possibly_accepted → failed` is a legal operator reconcile of a
+  round that may have been sent. Fingerprints are compared before any release (a different logical
+  request always conflicts), the key transfers to the successor in one transaction (no window
+  where it is free), and the successor inherits the prior's resolved conversation/parent so
+  same-fingerprint retries cannot diverge to different threads.
+
+A second adversarial re-review (same thread, at 39eeb72) confirmed the architecture but found four
+remaining concurrency/causality holes on the trust boundary; all fixed:
+
+- **Ownership decisions happen only under the owned lease.** The reaper and a new periodic
+  ownerless-`sending` sweep (startup and every poll share one path) reclassify a round only while
+  HOLDING its exclusive rid lease; a worker that loses a lease race exits with a distinct code
+  (`EXIT_LEASE_REFUSED`) and is inert at reap, so a losing duplicate can no longer get a live
+  winner's `sending` round misclassified to `possibly_accepted`. Workers require BOTH leases: if
+  the shared browser lease is unavailable (exclusive maintenance), the worker releases its rid
+  lease and exits without touching the round.
+- **Legacy DB relocation is serialized across processes.** The whole decision — stale-temp sweep,
+  inspection, copy, publish, legacy fence — runs under one exclusive flock in the destination dir,
+  closing the two-opener race where the loser's published copy was silently abandoned mid-write
+  with the same store_uuid (undetectable by the identity fence). A pre-existing nonzero target
+  must pass the same validation as a fresh copy (integrity + meta + store_uuid) before it may
+  supersede the legacy DB; a partial/corrupt target is quarantined `.corrupt-*` and the copy redone.
+- **Coordination locks moved to the durable data dir** (`$CGC_DATA_DIR/locks`, beside
+  `control.db`): daemon singleton, browser lock, per-rid leases, and the heartbeat no longer live
+  in deletable scratch where an unlink-while-held would split the fencing namespace; `CGC_SPOOL_DIR`
+  now holds only logs. Without `fcntl` the fences fail CLOSED (startup error) instead of silently
+  granting fake leases.
+- **Low-level `enqueue --request-key` requires `--logical-sha`.** The substring fallback that
+  replaced the rid inside the finished prompt could erase a literal occurrence supplied by a
+  low-level caller and mint a false fingerprint match; refused instead.
 
 ### Added
 - **JSON outcome envelope (schema 1).** Every `await` exit prints one machine-readable stdout line:
