@@ -6,8 +6,12 @@ is testable with a stubbed CDP driver — no browser.
 
 The worker's mapping of a submit outcome to a round state is the load-bearing part. begin_send
 durably commits `sending` before the click, so:
-  - a returned conversation id            -> accepted  (the click landed)
-  - a returned PROVEN-not-sent verdict:
+  - exit 6 (EXIT_NOT_SENT_PRECLICK)        -> failed    (cdp_consult's own pre-click boundary proved
+                                                          the click was never issued; auto-stamped
+                                                          not-sent-proven, key-retry-eligible with no
+                                                          operator step — see mark_send_not_sent)
+  - a returned conversation id             -> accepted  (the click landed)
+  - a returned PROVEN-not-sent verdict (stderr marker):
         login / captcha / rate-limit       -> blocked   (human acts; terminal, never resent)
         model-not-selectable / composer     -> queued    (retry; proven the click never happened)
   - anything else (unknown_send, a crash)  -> possibly_accepted  (uncertain; NEVER auto-resent)
@@ -35,6 +39,12 @@ import cgc_store as store_mod
 _NOT_SENT_BLOCK = ("login_needed", "CGC_LOGIN", "captcha", "rate_limit", "usage")
 _NOT_SENT_RETRY = ("model_not_selectable", "composer_not_ready", "no_page_target",
                    "attach_failed", "new_tab", "wrong_page", "gate_refused")
+
+# cdp_consult.py's EXIT_NOT_SENT_PRECLICK: its pre-click boundary (composer settle/clear/chunked-paste
+# /verify) catches EVERY exception raised inside it, so this exit code is trusted directly by NUMBER,
+# not by matching a stderr string — a raw traceback (the recorded field incident: a websocket read
+# timeout mid-paste) carries no marker text and used to fall through to possibly_accepted uncaught.
+_EXIT_NOT_SENT_PRECLICK = 6
 
 
 def _gate(store, rid: str, prompt: str, validate) -> str | None:
@@ -174,7 +184,9 @@ def _release_eligible(s, prior: dict) -> bool:
       - GATE_REJECTED — pre-send by construction (the gate runs while `ready`, before begin_send).
       - FAILED with no send attempt EVER — has_send_attempt is False, i.e. the round never entered
         `sending`, so nothing could have been sent (cancel-while-queued, no-thread, gate paths).
-      - FAILED carrying an explicit operator not-sent proof (send_disposition).
+      - FAILED carrying a not-sent proof (send_disposition) — an operator's explicit reconcile, OR the
+        CDP driver's own pre-click exit (mark_send_not_sent, exit 6: a paste/verify failure proven to
+        precede the send click) recorded automatically, no operator step needed.
     A FAILED round that DID cross the send fence (an attempt exists) with no such proof is
     post-send-uncertain — possibly_accepted->failed / waiting->failed are legal reconciles that do
     NOT prove no-send — so its key stays owned. FAILED alone is never sufficient."""
@@ -715,6 +727,10 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         # whole ~25-min answer, where a restart would strand it as possibly_accepted.
         send = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt)
         stderr = (send.get("stderr") or "").lower()
+        if send.get("code") == _EXIT_NOT_SENT_PRECLICK:
+            store.mark_send_not_sent(attempt, f"followup failed before the click (exit "
+                                              f"{_EXIT_NOT_SENT_PRECLICK}): {(send.get('stderr') or '').strip()[:300]}")
+            return store_mod.FAILED
         if send.get("code") == 0:
             store.mark_accepted(attempt, conv)       # same thread, confirmed
             store.mark_waiting(rid)
@@ -737,6 +753,11 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                   model=spec.get("model") or "Pro")
     conv = sub.get("conversation")
     stderr = (sub.get("stderr") or "").lower()
+
+    if sub.get("code") == _EXIT_NOT_SENT_PRECLICK:
+        store.mark_send_not_sent(attempt, f"submit failed before the click (exit "
+                                          f"{_EXIT_NOT_SENT_PRECLICK}): {(sub.get('stderr') or '').strip()[:300]}")
+        return store_mod.FAILED
 
     if conv:
         store.mark_accepted(attempt, conv)

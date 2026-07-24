@@ -177,6 +177,28 @@ def test_attach_failure_is_provably_not_sent_requeues(env):
     assert r["rid"] in rec["dispatchable"] and r["rid"] not in rec["uncertain"]
 
 
+def test_preclick_exit_maps_submit_to_failed_not_sent(env):
+    """cdp_consult's EXIT_NOT_SENT_PRECLICK (6) is cdp_consult.py's own proof that the pre-click paste
+    boundary failed — including a crash — strictly before the send click. It must be trusted by exit
+    CODE alone (a raw traceback carries no recognizable stderr marker), map straight to FAILED (not
+    the uncertain possibly_accepted a bare crash used to produce), and stamp send_disposition so the
+    round is release-eligible with no operator reconcile."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+
+    def cdp(kind, **kw):
+        return {"code": 6, "conversation": "",
+                "stderr": "CGC_ERROR not_sent_preclick: TimeoutError during paste: timed out"}
+
+    final = backend.process_round(s, r, cdp, daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.FAILED
+    rr = s.get_round(r["rid"])
+    assert rr["send_disposition"] == store_mod.NOT_SENT_PROVEN
+    rec = s.recover()
+    assert r["rid"] not in rec["uncertain"], "a pre-click-proven failure must never be uncertain"
+    assert s.has_send_attempt(r["rid"]), "begin_send DID write an attempt row before the click"
+
+
 def test_unknown_send_is_possibly_accepted(env):
     store_mod, backend, s, tmp = env
     r = _ready_round(store_mod, s)
@@ -249,6 +271,28 @@ def test_followup_continues_same_conversation_not_new_submit(env):
     assert calls == [("followup", "conv-existing"), ("wait", "conv-existing")], \
         "followup MUST attach to the existing conversation (never submit) and split send from wait"
     assert s.get_round("REQ-20260721-000000-0000ff")["thread_id"] == "conv-existing"
+
+
+def test_preclick_exit_maps_followup_to_failed_not_sent(env):
+    """Regression for the recorded incident: it happened on the FOLLOWUP path specifically (re-opening
+    a heavy conversation server-side, then a paste whose CDP reply outran the read timeout), where the
+    old code only checked _NOT_SENT_BLOCK and fell everything else into possibly_accepted. Exit 6 must
+    map to FAILED + not-sent-proven here too, not just on submit."""
+    store_mod, backend, s, tmp = env
+    s.create_round("REQ-20260721-000000-0000fd", "followup", out_path=str(tmp / "f2.txt"),
+                   prompt="continuing this consult", spec_json=json.dumps({"conversation": "conv-existing"}))
+    s.set_state("REQ-20260721-000000-0000fd", store_mod.READY)
+
+    def cdp(kind, **kw):
+        return {"code": 6, "stderr": "CGC_ERROR not_sent_preclick: composer holds 40 normalized "
+                                     "chars, prompt needs >= 7600 — paste looks truncated"}
+
+    final = backend.process_round(s, s.get_round("REQ-20260721-000000-0000fd"), cdp,
+                                  daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.FAILED
+    rr = s.get_round("REQ-20260721-000000-0000fd")
+    assert rr["send_disposition"] == store_mod.NOT_SENT_PROVEN
+    assert "REQ-20260721-000000-0000fd" not in s.recover()["uncertain"]
 
 
 def test_followup_without_conversation_fails_not_new_thread(env):
@@ -1028,6 +1072,31 @@ class TestKeyReleaseRequiresNoSendProof:
         assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g2002", "kg3") == 0
         out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert out["rid"] == "REQ-20260707-120000-0g2002" and not out.get("idempotent_repeat")
+        assert s.get_round(rid)["request_key"] is None
+
+    def test_preclick_exit_releases_the_key_without_operator_reconcile(self, env, capsys):
+        """Driven end-to-end through process_round (not a manual record_not_sent_proof call, unlike
+        the sibling test above): cdp_consult's EXIT_NOT_SENT_PRECLICK (6) is itself a durable
+        not-sent proof, so the round reaches FAILED+NOT_SENT_PROVEN — and its request-key releases to
+        a retry — with no operator step in between."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0g7001"
+        assert self._enq(backend, tmp_path, rid, "kg9") == 0
+        s.set_state(rid, store_mod.READY)
+
+        def cdp(kind, **kw):
+            return {"code": 6, "conversation": "",
+                    "stderr": "CGC_ERROR not_sent_preclick: TimeoutError during paste: timed out"}
+
+        final = backend.process_round(s, s.get_round(rid), cdp, daemon_instance_id="d1",
+                                      validate=_OK_GATE)
+        assert final == store_mod.FAILED
+        r = s.get_round(rid)
+        assert r["state"] == store_mod.FAILED and r["send_disposition"] == store_mod.NOT_SENT_PROVEN
+        capsys.readouterr()
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g7002", "kg9") == 0
+        out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert out["rid"] == "REQ-20260707-120000-0g7002" and not out.get("idempotent_repeat")
         assert s.get_round(rid)["request_key"] is None
 
     # ---- release is REFUSED (the send may have happened) ---------------------

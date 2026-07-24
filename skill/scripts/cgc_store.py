@@ -265,9 +265,15 @@ class SchemaTooNew(Exception):
     code against a newer schema risks silent corruption of durable consult state."""
 
 # ---- the round state machine -------------------------------------------------
-# Terminal states have no outgoing transitions. `sending` can ONLY go to accepted/possibly_accepted:
-# once the click may have happened, "it failed" is not knowable, so there is no sending→failed edge —
-# an abnormal exit becomes possibly_accepted. Pre-send failures happen while still `ready`.
+# Terminal states have no outgoing transitions. `sending` can ONLY go to accepted/possibly_accepted
+# via this table: once the click may have happened, "it failed" is not knowable through a mere state
+# change, so there is no sending→failed edge IN _LEGAL — an abnormal exit becomes possibly_accepted.
+# The one exception bypasses this table entirely rather than weakening it: mark_send_not_sent goes
+# straight to `failed` (with send_disposition stamped in the same transaction) ONLY when the CDP
+# driver's own pre-click boundary durably proves the click was never issued — a stronger guarantee
+# than any state-machine edge could express, so it is enforced in code (mark_accepted's and
+# mark_possibly_accepted's own state checks, not this dict) rather than added here as a generally
+# reachable sending→failed edge. Pre-send failures happen while still `ready`.
 QUEUED = "queued"
 GATE_REJECTED = "gate_rejected"
 READY = "ready"
@@ -695,6 +701,27 @@ class Store:
                             (POSSIBLY_ACCEPTED, _now(), attempt_id))
             self._apply_round_fields(rid, state=POSSIBLY_ACCEPTED, error_code=reason)
             self._event("possibly_accepted", rid=rid, attempt_id=attempt_id, detail=reason)
+
+    def mark_send_not_sent(self, attempt_id: str, evidence: str) -> None:
+        """A pre-click failure the CDP driver's OWN fail-closed boundary proved preceded the send
+        click (cdp_consult.py's EXIT_NOT_SENT_PRECLICK) — unlike mark_possibly_accepted, this is not
+        uncertain: the driver's control flow guarantees the click was never issued for this attempt.
+        Goes straight to FAILED (the one FAILED edge a `sending` attempt may take) and stamps
+        send_disposition=NOT_SENT_PROVEN in the SAME transaction, so _release_eligible treats it as
+        release-eligible immediately — the driver's proof already IS the reconcile, no operator step
+        needed. Distinct from record_not_sent_proof, which is an OPERATOR act and deliberately refuses
+        a still-`sending` round (it cannot itself prove no race with a live attempt); this method may
+        only be called by the same call stack that owns `attempt_id`, so no such race exists here."""
+        rid = self._attempt_round(attempt_id)
+        with self._tx():
+            r = self.db.execute("SELECT state FROM rounds WHERE rid=?", (rid,)).fetchone()
+            if r["state"] != SENDING:
+                raise IllegalTransition(f"{rid}: mark_send_not_sent from {r['state']!r}")
+            self.db.execute("UPDATE attempts SET phase=?,last_progress_at=? WHERE attempt_id=?",
+                            (FAILED, _now(), attempt_id))
+            self._apply_round_fields(rid, state=FAILED, error_code=evidence,
+                                     send_disposition=NOT_SENT_PROVEN)
+            self._event("send_not_sent", rid=rid, attempt_id=attempt_id, detail=evidence)
 
     def mark_waiting(self, rid: str) -> None:
         self.set_state(rid, WAITING, expect=None)
