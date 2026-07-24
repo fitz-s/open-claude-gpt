@@ -28,12 +28,37 @@ done
 DEST="$SKILLS_DIR/$NAME"
 echo "open-claude-gpt → $DEST  (mode: $MODE)"
 
-# --- dependency preflight (non-fatal warnings; doctor re-checks in detail) ----
+# --- dependency preflight ----------------------------------------------------
+# The SAME pinned range CI tests (websocket-client>=1.6,<2): the installed product must not run a
+# dependency version outside the tested contract. Verified by distribution VERSION, not by an
+# import probe — an old/wrong install can still expose the probed symbol.
+WSC_RANGE='websocket-client>=1.6,<2'
+WSC_CHECK='
+import sys
+try:
+    from importlib.metadata import version
+except ImportError:  # py3.7 fallback never runs (floor is 3.8) but be safe
+    sys.exit(1)
+try:
+    v = version("websocket-client")
+except Exception:
+    sys.exit(1)
+major, minor = (int(x) for x in v.split(".")[:2])
+sys.exit(0 if (major, minor) >= (1, 6) and major < 2 else 1)
+'
 command -v python3 >/dev/null || { echo "ERROR: python3 not found" >&2; exit 1; }
-if ! python3 -c "import websocket; assert hasattr(websocket,'create_connection')" 2>/dev/null; then
-  echo "• installing Python dep: websocket-client"
-  python3 -m pip install --user websocket-client >/dev/null 2>&1 \
-    || echo "  ! could not auto-install; run: pip install websocket-client" >&2
+if ! python3 -c "$WSC_CHECK" 2>/dev/null; then
+  echo "• installing Python dep: $WSC_RANGE"
+  python3 -m pip install --user "$WSC_RANGE" >/dev/null 2>&1 || true
+  if ! python3 -c "$WSC_CHECK" 2>/dev/null; then
+    if [ "$FORCE" = "1" ]; then
+      echo "  ! websocket-client not in the tested range (>=1.6,<2) — --force: continuing anyway" >&2
+    else
+      echo "ERROR: websocket-client is missing or outside the tested range (>=1.6,<2)." >&2
+      echo "       Fix: python3 -m pip install --user '$WSC_RANGE'   (or re-run with --force)" >&2
+      exit 1
+    fi
+  fi
 fi
 command -v gh >/dev/null || echo "  ! gh CLI not found — install from https://cli.github.com (used by deliver)"
 
@@ -54,13 +79,22 @@ chmod +x "$DEST"/scripts/*.sh "$DEST"/scripts/*.py 2>/dev/null || true
 
 # --- restart the egress daemon so it picks up the new code -------------------
 # An upgrade that leaves the OLD daemon running is a version split-brain: the CLI
-# writes through new code while the daemon serves old code. launchd kickstart -k
-# kills + restarts the job; a no-daemon install is untouched.
+# writes through new code while the daemon serves old code (observed live: the old
+# daemon rebuilt an empty pre-relocation store and consults silently stalled). So a
+# failed restart FAILS the upgrade — the daemon's heartbeat identity check would
+# refuse every enqueue anyway; better to say so now than per-consult later.
 DAEMON_LABEL="com.open-claude-gpt.daemon"
 if [ "$(uname -s)" = "Darwin" ] && launchctl print "gui/$(id -u)/$DAEMON_LABEL" >/dev/null 2>&1; then
   echo "• restarting the egress daemon (picks up the upgraded code)"
-  launchctl kickstart -k "gui/$(id -u)/$DAEMON_LABEL" || \
-    echo "  ! could not restart the daemon — run: cgc install-daemon" >&2
+  if ! launchctl kickstart -k "gui/$(id -u)/$DAEMON_LABEL"; then
+    if [ "$FORCE" = "1" ]; then
+      echo "  ! could not restart the daemon — --force: continuing; run: cgc install-daemon" >&2
+    else
+      echo "ERROR: could not restart the egress daemon — the OLD code would keep serving consults." >&2
+      echo "       Fix: launchctl kickstart -k \"gui/\$(id -u)/$DAEMON_LABEL\"   (or: cgc install-daemon)" >&2
+      exit 1
+    fi
+  fi
 fi
 
 echo "• installed. running doctor…"

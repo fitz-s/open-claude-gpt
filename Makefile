@@ -22,7 +22,8 @@ test:            ## run the full offline suite (same set CI runs)
 lint:            ## parse + shell-syntax + no-personal-identity checks
 	@python3 -c "import ast,glob;[ast.parse(open(f).read()) for f in glob.glob('skill/scripts/*.py')];print('py parse ok')"
 	@for f in install.sh uninstall.sh bin/cgc skill/scripts/*.sh; do bash -n $$f && echo "sh ok: $$f"; done
-	@if grep -rniE "leofitz|/Users/[a-z]|g-p-[0-9a-f]{20}" --include='*.py' --include='*.sh' --include='*.md' . ; then \
+	@if git grep -nIiE "leofitz|/Users/[a-z]|/home/[a-z]+/|g-p-[0-9a-f]{20}" \
+	     -- . ':(exclude).github/workflows/ci.yml' ':(exclude)Makefile' ; then \
 	  echo "local identity leaked"; exit 1; else echo "identity clean"; fi
 
 check: lint test doctor  ## everything CI runs

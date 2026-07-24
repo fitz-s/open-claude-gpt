@@ -59,9 +59,11 @@ jobs:
 
       - name: No leaked local identity
         run: |
-          # local machine identity must never ship (repo-owner login in github.com URLs is fine)
-          if grep -rniE "leofitz|/Users/[a-z]|/home/[a-z]+/|g-p-[0-9a-f]{20}" \
-               --include='*.py' --include='*.sh' --include='*.md' . ; then
+          # Local machine identity must never ship (repo-owner login in github.com URLs is fine).
+          # Scanned over EVERY tracked file — a leak through JSON/YAML/config (the .omc telemetry
+          # file that shipped absolute /Users paths) must fail the same as one through code.
+          if git grep -nIiE "leofitz|/Users/[a-z]|/home/[a-z]+/|g-p-[0-9a-f]{20}" \
+               -- . ':(exclude).github/workflows/ci.yml' ':(exclude)Makefile' ; then
             echo "::error::local identity leaked into the repo"; exit 1
           fi
           echo "clean"
