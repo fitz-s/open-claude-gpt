@@ -4,7 +4,7 @@ All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-based
 releases until it stabilizes.
 
-## [Unreleased]
+## [0.2.1] — 2026-07-24
 
 Driven by a first-principles maturity audit (a 25-min GPT-5.6 Pro deep review of a48e3d1 collided
 with in-session user-side measurement). The audit's verdict: a strong anti-duplicate core inside an
@@ -13,9 +13,10 @@ home, one machine-readable contract, honest risk posture.
 
 ### Changed — BREAKING
 - **The file-spool control plane is retired.** The SQLite store is the sole round authority;
-  `CGC_STORE_BACKEND` is gone (no rollback to the spool), and the spool dir now holds only daemon
-  runtime files (heartbeat, singleton lock, per-round logs). Legacy `pending/processing/done`
-  lifecycle, per-rid status files, pid fencing, and `lifecycle_lock` are deleted (~700 lines).
+  `CGC_STORE_BACKEND` is gone (no rollback to the spool), and the spool dir now holds only
+  per-round logs (coordination state — heartbeat, singleton lock, leases — lives in
+  `$CGC_DATA_DIR/locks`, see below). Legacy `pending/processing/done` lifecycle, per-rid status
+  files, pid fencing, and `lifecycle_lock` are deleted (~700 lines).
 - **The store moved out of /tmp.** `control.db` lives in `CGC_DATA_DIR` (default
   `~/.local/state/cgc`) — durable state was living in a directory docs called deletable, making
   `synchronous=FULL` crash-consistency moot across reboots. A legacy `/tmp`-era DB is relocated
