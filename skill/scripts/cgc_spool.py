@@ -583,6 +583,10 @@ def main() -> int:
     c.add_argument("--rid", required=True)
     c.set_defaults(fn=lambda a: __import__("cgc_backend").cancel_round(a.rid))
 
+    st = sub.add_parser("stats", help="reliability metrics: outcome rates + completion latency "
+                                      "percentiles + sentinel-drift alarm")
+    st.set_defaults(fn=lambda a: __import__("cgc_backend").stats_report())
+
     a = p.parse_args()
     return a.fn(a)
 

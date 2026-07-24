@@ -586,3 +586,22 @@ class TestOutcomeEnvelope:
         assert code == 1
         env_json = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert env_json["retryable"] is True, "an unverified: gate failure is transient — re-fireable"
+
+
+class TestStats:
+    def test_stats_reports_rates_and_latency(self, env, capsys):
+        store_mod, backend, s, tmp_path = env
+        for i, final in enumerate([store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_VERIFIED,
+                                   store_mod.COMPLETED_UNVERIFIED]):
+            rid = f"REQ-20260707-120000-0st{i:03d}"
+            s.create_round(rid, "submit", prompt="p")
+            s.set_state(rid, store_mod.READY)
+            aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d")
+            s.mark_accepted(aid, f"conv-{i}")
+            s.mark_waiting(rid)
+            s.finish(rid, final, result_text="a")
+        assert backend.stats_report() == 0
+        rep = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert rep["completed"] == 3
+        assert abs(rep["unverified_rate"] - 1 / 3) < 0.01
+        assert rep["latency_s"]["n"] == 3
