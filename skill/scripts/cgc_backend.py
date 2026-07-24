@@ -47,6 +47,17 @@ _NOT_SENT_RETRY = ("model_not_selectable", "composer_not_ready", "no_page_target
 _EXIT_NOT_SENT_PRECLICK = 6
 
 
+class ConversationLeaseRefused(Exception):
+    """Another worker holds the per-conversation exclusive mutator lease for this follow-up's target
+    thread, so ours may not touch that thread's shared composer. Raised BEFORE begin_send, so the
+    round is untouched (still READY) — nothing was sent and no state moved. The worker catches this
+    and exits EXIT_LEASE_REFUSED, exactly like a lost rid-lease race: the round is redispatched later
+    and the reaper treats the death as inert."""
+    def __init__(self, conversation):
+        super().__init__(conversation)
+        self.conversation = conversation
+
+
 def _gate(store, rid: str, prompt: str, validate) -> str | None:
     """Run the egress gate on a `ready` round. Two failure kinds, two outcomes:
       - `refused:`     — an AUTHORITATIVE denial (secret detected / no public link / repo confirmed
@@ -720,12 +731,26 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         gated = _gate(store, rid, prompt, validate)
         if gated is not None:
             return gated
-        attempt = store.begin_send(rid, prompt, store_mod.sha256(prompt),
-                                   daemon_instance_id=daemon_instance_id)
-        # SEND only (not send+wait): so the round reaches `waiting` promptly and is reattach-able on a
-        # restart, exactly like submit. A combined followup --watch would leave it `sending` for the
-        # whole ~25-min answer, where a restart would strand it as possibly_accepted.
-        send = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt)
+        # Per-conversation exclusive mutator lease. The gate above is store-only (no browser), so the
+        # mutating region is exactly begin_send + the follow-up CDP subprocess (attach -> clear ->
+        # paste -> verify -> click -> landing-rid). Acquire AFTER the conversation is concrete and
+        # BEFORE that subprocess; hold until it returns. A second same-conversation follow-up cannot
+        # enter this region — it refuses (the round is still READY, redispatched later) rather than
+        # racing W1 onto the one shared composer and corrupting the pre-click not-sent proof.
+        import cgc_spool as _spool
+        conv_lease = _spool.acquire_conversation_lease(conv)
+        if conv_lease is None:
+            raise ConversationLeaseRefused(conv)
+        try:
+            attempt = store.begin_send(rid, prompt, store_mod.sha256(prompt),
+                                       daemon_instance_id=daemon_instance_id)
+            # SEND only (not send+wait): so the round reaches `waiting` promptly and is reattach-able on
+            # a restart, exactly like submit. A combined followup --watch would leave it `sending` for
+            # the whole ~25-min answer, where a restart would strand it as possibly_accepted.
+            send = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt)
+        finally:
+            if hasattr(conv_lease, "close"):
+                conv_lease.close()  # mutating region done — the read-only wait below needs no lease
         stderr = (send.get("stderr") or "").lower()
         if send.get("code") == _EXIT_NOT_SENT_PRECLICK:
             store.mark_send_not_sent(attempt, f"followup failed before the click (exit "

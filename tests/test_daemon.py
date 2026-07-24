@@ -407,6 +407,55 @@ def test_worker_refuses_when_browser_is_under_exclusive_maintenance(daemon):
     s.close()
 
 
+# ---- per-conversation exclusive mutator lease (same-thread followup send) ----
+
+def test_worker_refuses_second_same_conversation_followup(daemon, monkeypatch):
+    """S3: two follow-ups pinned to the SAME conversation must not both mutate its one shared
+    composer. With the conversation lease already held (a stand-in for the first worker), the second
+    worker exits EXIT_LEASE_REFUSED WITHOUT invoking any CDP send and WITHOUT touching the round (it
+    stays ready); its rid+browser leases are released; and reaping its EXIT_LEASE_REFUSED death is
+    inert (never a possibly_accepted promotion)."""
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    # any real CDP send would go through _run — assert it is never reached
+    monkeypatch.setattr(daemon, "_run", lambda *a, **k: pytest.fail("no CDP while refused"))
+    rid = _rid("00c001")
+    s = daemon.store_mod.Store()
+    s.create_round(rid, "followup", prompt="continuing this consult",
+                   spec_json=json.dumps({"conversation": "conv-shared"}))
+    s.set_state(rid, daemon.store_mod.READY)
+    held = daemon.spool.acquire_conversation_lease("conv-shared")  # the first worker owns the composer
+    assert held is not None
+    try:
+        assert daemon.run_worker_store(rid) == daemon.EXIT_LEASE_REFUSED
+        assert s.get_round(rid)["state"] == daemon.store_mod.READY, "the round is untouched, still ready"
+        assert s.get_round(rid)["current_attempt_id"] is None, "no send attempt was begun"
+        assert daemon.spool.rid_lease_free(rid) is True, "the rid lease it briefly took was released"
+        # the reaper must treat this refusal death as inert
+        children = {rid: _DeadChild(code=daemon.EXIT_LEASE_REFUSED)}
+        daemon._reap_children(children)
+        assert children == {}
+        assert s.get_round(rid)["state"] == daemon.store_mod.READY, "reaping a refusal never promotes"
+    finally:
+        held.close()
+    s.close()
+
+
+def test_conversation_lease_is_exclusive_and_per_conversation(daemon):
+    """The fence is exclusive AND scoped to one conversation: a held lease blocks a second acquire on
+    the SAME conversation but not on a DIFFERENT one (no false serialization of distinct threads)."""
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    a = daemon.spool.acquire_conversation_lease("conv-1")
+    assert a is not None
+    assert daemon.spool.acquire_conversation_lease("conv-1") is None, "same conversation is exclusive"
+    b = daemon.spool.acquire_conversation_lease("conv-2")
+    assert b is not None, "a different conversation is not blocked"
+    a.close()
+    b.close()
+    assert daemon.spool.acquire_conversation_lease("conv-1") is not None, "freed on release"
+
+
 # ---- cross-generation leases (worker/browser fencing) ------------------------
 
 def test_rid_lease_is_exclusive_and_freed_on_release(daemon):

@@ -295,6 +295,106 @@ def test_preclick_exit_maps_followup_to_failed_not_sent(env):
     assert "REQ-20260721-000000-0000fd" not in s.recover()["uncertain"]
 
 
+def test_followup_holds_conversation_lease_across_the_send(env):
+    """The mutating region (begin_send + the follow-up CDP subprocess) runs UNDER the per-conversation
+    exclusive lease, and the lease is released once the send returns (the read-only wait needs none).
+    We prove both by probing the lease from inside the fake CDP driver and again after."""
+    import cgc_spool
+    store_mod, backend, s, tmp = env
+    if cgc_spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    s.create_round("REQ-20260721-000000-0000f1", "followup", out_path=str(tmp / "f1.txt"),
+                   prompt="continuing this consult", spec_json=json.dumps({"conversation": "conv-lease"}))
+    s.set_state("REQ-20260721-000000-0000f1", store_mod.READY)
+    probed = {}
+
+    def cdp(kind, **kw):
+        if kind == "followup":
+            probed["held_during_send"] = cgc_spool.acquire_conversation_lease("conv-lease") is None
+        if kind == "wait":
+            fh = cgc_spool.acquire_conversation_lease("conv-lease")
+            probed["free_during_wait"] = fh is not None
+            if fh is not None:
+                fh.close()
+            with open(kw["out"], "w") as f:
+                f.write("the answer")
+        return {"code": 0, "out": kw.get("out"), "stderr": ""}
+
+    final = backend.process_round(s, s.get_round("REQ-20260721-000000-0000f1"), cdp,
+                                  daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.COMPLETED_VERIFIED
+    assert probed["held_during_send"] is True, "the conversation lease must be held across the send"
+    assert probed["free_during_wait"] is True, "and released before the read-only wait"
+    assert cgc_spool.acquire_conversation_lease("conv-lease") is not None, "released after process_round"
+
+
+def test_second_same_conversation_followup_refuses_without_sending(env):
+    """Two follow-ups pinned to the SAME conversation. With the lease held by a stand-in for the first
+    worker, the second must raise ConversationLeaseRefused BEFORE any CDP send and BEFORE begin_send —
+    the round stays READY, no attempt exists, no not_sent_proven, nothing to reconcile."""
+    import cgc_spool
+    store_mod, backend, s, tmp = env
+    if cgc_spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    s.create_round("REQ-20260721-000000-0000f2", "followup", out_path=str(tmp / "f2.txt"),
+                   prompt="continuing this consult", spec_json=json.dumps({"conversation": "conv-busy"}))
+    s.set_state("REQ-20260721-000000-0000f2", store_mod.READY)
+    held = cgc_spool.acquire_conversation_lease("conv-busy")   # the first worker owns the composer
+    assert held is not None
+    try:
+        with pytest.raises(backend.ConversationLeaseRefused):
+            backend.process_round(s, s.get_round("REQ-20260721-000000-0000f2"),
+                                  lambda *a, **k: pytest.fail("must not touch the composer"),
+                                  daemon_instance_id="d1", validate=_OK_GATE)
+    finally:
+        held.close()
+    rr = s.get_round("REQ-20260721-000000-0000f2")
+    assert rr["state"] == store_mod.READY, "the refused round is untouched, still ready"
+    assert rr["current_attempt_id"] is None, "no send attempt was ever begun"
+    assert rr["send_disposition"] != store_mod.NOT_SENT_PROVEN
+    assert "REQ-20260721-000000-0000f2" not in s.recover()["uncertain"]
+    # once the first worker releases, the same round proceeds normally
+    calls = []
+
+    def cdp(kind, **kw):
+        calls.append(kind)
+        if kind == "wait":
+            with open(kw["out"], "w") as f:
+                f.write("the answer")
+        return {"code": 0, "out": kw.get("out"), "stderr": ""}
+
+    final = backend.process_round(s, s.get_round("REQ-20260721-000000-0000f2"), cdp,
+                                  daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.COMPLETED_VERIFIED
+    assert calls == ["followup", "wait"]
+
+
+def test_different_conversation_followups_do_not_serialize(env):
+    """A lease held on conversation A must NOT block a follow-up on conversation B — the fence is
+    per-conversation, not global, so distinct threads proceed concurrently (no false serialization)."""
+    import cgc_spool
+    store_mod, backend, s, tmp = env
+    if cgc_spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    s.create_round("REQ-20260721-000000-0000f3", "followup", out_path=str(tmp / "f3.txt"),
+                   prompt="continuing this consult", spec_json=json.dumps({"conversation": "conv-B"}))
+    s.set_state("REQ-20260721-000000-0000f3", store_mod.READY)
+    held_a = cgc_spool.acquire_conversation_lease("conv-A")     # a busy UNRELATED thread
+    assert held_a is not None
+    try:
+        def cdp(kind, **kw):
+            if kind == "wait":
+                with open(kw["out"], "w") as f:
+                    f.write("the answer on B")
+            return {"code": 0, "out": kw.get("out"), "stderr": ""}
+
+        final = backend.process_round(s, s.get_round("REQ-20260721-000000-0000f3"), cdp,
+                                      daemon_instance_id="d1", validate=_OK_GATE)
+    finally:
+        held_a.close()
+    assert final == store_mod.COMPLETED_VERIFIED, "conv-B proceeds while conv-A is held"
+
+
 def test_followup_without_conversation_fails_not_new_thread(env):
     store_mod, backend, s, tmp = env
     s.create_round("REQ-20260721-000000-0000fe", "followup", out_path=str(tmp / "f.txt"),

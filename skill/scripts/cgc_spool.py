@@ -374,6 +374,30 @@ def acquire_browser_lease(shared: bool):
     return _flock(browser_lock_path(), (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) if fcntl else 0)
 
 
+def _conversation_lease_path(conversation):
+    """Same namespace + convention as _lease_path: locks live beside the one control.db, which
+    already scopes them to THIS store, so the conversation id alone keys the file (no store prefix).
+    A conversation id is uuid-like but may arrive as a '/c/<id>' path or carry other URL
+    punctuation, so every non-filename char collapses to '_' — the only ids that can collide already
+    denote the same thread."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", conversation or "")
+    return _lp(f"conv.{safe}")
+
+
+def acquire_conversation_lease(conversation):
+    """EXCLUSIVE per-conversation mutator lease: at most one worker may drive a single ChatGPT
+    conversation's shared composer (attach -> clear -> paste -> verify -> click -> landing-rid) at a
+    time. Two follow-ups pinned to the SAME conversation hold DISTINCT rid leases, so the rid lease
+    cannot serialize them; W1's click can submit W2's freshly-pasted bytes, and W2's post-paste read
+    then sees the cleared composer and exits not-sent-proven though its bytes WERE sent — a retry
+    re-sends them. This lease is what makes the pre-click not-sent proof compositional across workers.
+    Held (open fh) from before any composer mutation through the CDP follow-up subprocess's return.
+    Returns the fh, or None when another worker already holds it (the caller must refuse the round,
+    leaving it READY for redispatch). Fresh submits (new thread) and read-only waits/retrieves never
+    take it."""
+    return _flock(_conversation_lease_path(conversation), fcntl.LOCK_EX if fcntl else 0)
+
+
 # ---- the validating gate (security core) ------------------------------------
 
 # `gh` normally answers in well under a second, but it reads its token from the OS keyring, and a
