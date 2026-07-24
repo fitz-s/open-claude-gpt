@@ -1065,7 +1065,11 @@ class TestSourceTurnMatching:
     plain textContent strings (what a real DOM query would return) it decides whether the source
     round's own turn is present and still the conversation's latest. Per the constraint that
     cdp_consult.py drives a live browser, this is the one piece of its retrieve logic that is
-    unit-testable without CDP — no mock browser harness, just the pure function."""
+    unit-testable without CDP — no mock browser harness, just the pure function.
+
+    Fixture turns now carry a COMPLETE bare-line BEGIN+END pair (matching what the prompt
+    templates actually render — see TestTurnCanonicalRid), since [S3]'s fix requires a turn's own
+    rid to come from a paired sentinel, never a lone/substring BEGIN occurrence."""
 
     @staticmethod
     def _cdp(tmp_path):
@@ -1073,35 +1077,144 @@ class TestSourceTurnMatching:
 
     def test_source_turn_is_last_when_nothing_sent_after(self, tmp_path):
         cdp = self._cdp(tmp_path)
-        turns = ["review https://github.com/x\nBEGIN_RESPONSE:REQ-20260707-120000-0aaa01\n"]
+        turns = ["review https://github.com/x\n"
+                 "BEGIN_RESPONSE:REQ-20260707-120000-0aaa01\nthe answer\nEND_RESPONSE:REQ-20260707-120000-0aaa01\n"]
         loc = cdp._locate_source_turn(turns, "REQ-20260707-120000-0aaa01")
         assert loc == {"present": True, "is_last": True,
-                       "observed_rid": "REQ-20260707-120000-0aaa01"}
+                       "observed_rid": "REQ-20260707-120000-0aaa01", "turn_index": 0}
 
     def test_source_turn_not_last_when_a_later_turn_was_sent(self, tmp_path):
         """The exact shape of the audit's race: R1's turn exists, but R2 was sent afterward —
         is_last must be False, so the caller refuses unwrapped salvage."""
         cdp = self._cdp(tmp_path)
         turns = [
-            "review https://github.com/x\nBEGIN_RESPONSE:REQ-20260707-120000-0aaa01\n",
-            "one more thing\nBEGIN_RESPONSE:REQ-20260707-120500-0bbb01\n",
+            "review https://github.com/x\n"
+            "BEGIN_RESPONSE:REQ-20260707-120000-0aaa01\nthe answer\nEND_RESPONSE:REQ-20260707-120000-0aaa01\n",
+            "one more thing\n"
+            "BEGIN_RESPONSE:REQ-20260707-120500-0bbb01\nthe ask\nEND_RESPONSE:REQ-20260707-120500-0bbb01\n",
         ]
         loc = cdp._locate_source_turn(turns, "REQ-20260707-120000-0aaa01")
         assert loc["present"] is True
         assert loc["is_last"] is False
         assert loc["observed_rid"] == "REQ-20260707-120500-0bbb01"
+        assert loc["turn_index"] == 0
 
     def test_source_turn_absent_reports_observed_latest(self, tmp_path):
         cdp = self._cdp(tmp_path)
-        turns = ["one more thing\nBEGIN_RESPONSE:REQ-20260707-120500-0bbb01\n"]
+        turns = ["one more thing\n"
+                 "BEGIN_RESPONSE:REQ-20260707-120500-0bbb01\nthe ask\nEND_RESPONSE:REQ-20260707-120500-0bbb01\n"]
         loc = cdp._locate_source_turn(turns, "REQ-20260707-120000-0aaa01")
         assert loc == {"present": False, "is_last": False,
-                       "observed_rid": "REQ-20260707-120500-0bbb01"}
+                       "observed_rid": "REQ-20260707-120500-0bbb01", "turn_index": None}
 
     def test_no_turns_at_all(self, tmp_path):
         cdp = self._cdp(tmp_path)
         assert cdp._locate_source_turn([], "REQ-20260707-120000-0aaa01") == \
-            {"present": False, "is_last": False, "observed_rid": None}
+            {"present": False, "is_last": False, "observed_rid": None, "turn_index": None}
+
+    def test_substring_quote_of_an_old_rid_never_steals_its_identity(self, tmp_path):
+        """[S3] audit fixture: R1 is being recovered because no valid sentinel-wrapped R1 answer is
+        available. A later R2 user turn quotes/discusses the literal text 'BEGIN_RESPONSE:R1'
+        before R2's OWN canonical footer — in prose, in a code fence (textContent-flattened), and
+        as a fully quoted BEGIN+END R1 pair. None of these may cause R2's turn to be mistaken for
+        R1's own turn: _locate_source_turn(..., R1) must keep the genuine R1 turn at index 0,
+        is_last=False, and observed_rid must be R2 (R2's own canonical rid), never R1."""
+        cdp = self._cdp(tmp_path)
+        r1 = "REQ-20260707-120000-0aaa01"
+        r2 = "REQ-20260707-120500-0bbb01"
+        r1_turn = f"review https://github.com/x\nBEGIN_RESPONSE:{r1}\nthe R1 answer\nEND_RESPONSE:{r1}\n"
+
+        # (a) quoted in prose
+        r2_prose = (
+            f"Earlier you answered starting with BEGIN_RESPONSE:{r1} but I think that's wrong.\n"
+            f"Here is my real follow-up question.\n"
+            f"BEGIN_RESPONSE:{r2}\nmy real ask\nEND_RESPONSE:{r2}\n"
+        )
+        loc = cdp._locate_source_turn([r1_turn, r2_prose], r1)
+        assert loc["present"] is True and loc["is_last"] is False and loc["turn_index"] == 0
+        assert loc["observed_rid"] == r2
+
+        # (b) quoted inside a code fence (DOM textContent flattens the fence markers to plain lines)
+        r2_fence = (
+            "Here's what you sent me, for reference:\n"
+            "```\n"
+            f"BEGIN_RESPONSE:{r1}\n"
+            "```\n"
+            f"BEGIN_RESPONSE:{r2}\nmy real ask\nEND_RESPONSE:{r2}\n"
+        )
+        loc = cdp._locate_source_turn([r1_turn, r2_fence], r1)
+        assert loc["present"] is True and loc["is_last"] is False and loc["turn_index"] == 0
+        assert loc["observed_rid"] == r2
+
+        # (c) a FULLY quoted BEGIN+END R1 pair, followed by R2's own canonical footer
+        r2_full_pair = (
+            f"You previously wrote:\nBEGIN_RESPONSE:{r1}\nthe R1 answer\nEND_RESPONSE:{r1}\n"
+            "That's the context. Now, my real follow-up:\n"
+            f"BEGIN_RESPONSE:{r2}\nmy real ask\nEND_RESPONSE:{r2}\n"
+        )
+        loc = cdp._locate_source_turn([r1_turn, r2_full_pair], r1)
+        assert loc["present"] is True and loc["is_last"] is False and loc["turn_index"] == 0
+        assert loc["observed_rid"] == r2
+
+
+class TestTurnCanonicalRid:
+    """cdp_consult._turn_canonical_rid — the single canonical parser for a user turn's OWN request
+    rid (SHARED CONTRACT #3, [S3] fix). Pure function, unit-tested without CDP."""
+
+    @staticmethod
+    def _cdp(tmp_path):
+        return _load("cdp_consult", tmp_path / "control.db")
+
+    def test_returns_r2_despite_r1_quoted_in_prose(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        r1, r2 = "REQ-20260707-120000-0aaa01", "REQ-20260707-120500-0bbb01"
+        text = (f"Earlier you answered starting with BEGIN_RESPONSE:{r1} but I think that's wrong.\n"
+                f"Here is my real follow-up question.\n"
+                f"BEGIN_RESPONSE:{r2}\nmy real ask\nEND_RESPONSE:{r2}\n")
+        assert cdp._turn_canonical_rid(text) == r2
+
+    def test_returns_r2_despite_r1_quoted_in_code_fence(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        r1, r2 = "REQ-20260707-120000-0aaa01", "REQ-20260707-120500-0bbb01"
+        text = ("Here's what you sent me, for reference:\n"
+                "```\n"
+                f"BEGIN_RESPONSE:{r1}\n"
+                "```\n"
+                f"BEGIN_RESPONSE:{r2}\nmy real ask\nEND_RESPONSE:{r2}\n")
+        assert cdp._turn_canonical_rid(text) == r2
+
+    def test_returns_r2_despite_full_r1_pair_quoted_first(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        r1, r2 = "REQ-20260707-120000-0aaa01", "REQ-20260707-120500-0bbb01"
+        text = (f"You previously wrote:\nBEGIN_RESPONSE:{r1}\nthe R1 answer\nEND_RESPONSE:{r1}\n"
+                "That's the context. Now, my real follow-up:\n"
+                f"BEGIN_RESPONSE:{r2}\nmy real ask\nEND_RESPONSE:{r2}\n")
+        assert cdp._turn_canonical_rid(text) == r2
+
+    def test_lone_begin_with_no_matching_end_yields_none(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        r1 = "REQ-20260707-120000-0aaa01"
+        assert cdp._turn_canonical_rid(f"just discussing BEGIN_RESPONSE:{r1} with no end\n") is None
+
+    def test_no_sentinel_text_at_all_yields_none(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        assert cdp._turn_canonical_rid("plain unrelated question, no sentinels\n") is None
+        assert cdp._turn_canonical_rid("") is None
+        assert cdp._turn_canonical_rid(None) is None
+
+    def test_simple_single_pair_matches(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        rid = "REQ-20260707-120000-0aaa01"
+        text = f"review https://github.com/x\nBEGIN_RESPONSE:{rid}\nthe answer\nEND_RESPONSE:{rid}\n"
+        assert cdp._turn_canonical_rid(text) == rid
+
+    def test_mismatched_begin_and_end_rid_does_not_pair(self, tmp_path):
+        """A BEGIN for rid A followed by an END for a DIFFERENT rid B must not be treated as a
+        pair for either — only a same-rid BEGIN/END pair counts."""
+        cdp = self._cdp(tmp_path)
+        a, b = "REQ-20260707-120000-0aaa01", "REQ-20260707-120500-0bbb01"
+        text = f"BEGIN_RESPONSE:{a}\nsome text\nEND_RESPONSE:{b}\n"
+        assert cdp._turn_canonical_rid(text) is None
 
 
 class TestKeyReleaseRequiresNoSendProof:
