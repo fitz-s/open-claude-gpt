@@ -128,6 +128,25 @@ remaining concurrency/causality holes on the trust boundary; all fixed:
   replaced the rid inside the finished prompt could erase a literal occurrence supplied by a
   low-level caller and mint a false fingerprint match; refused instead.
 
+A third re-review (at 5537dba) passed every prior gate and narrowed the remaining risk to two
+browser-level schedules; both fixed:
+
+- **Per-conversation exclusive mutator lease.** Two same-thread follow-ups (legal via explicit
+  `--parent`) could interleave on the one composer: W1's click could submit W2's freshly-pasted
+  bytes while W2's verification saw an emptied composer and exited "provably unsent" — a FALSE
+  `not_sent_proven` that would authorize a duplicate send on retry. A follow-up now holds an
+  exclusive per-conversation flock (same durable locks dir) across the whole mutating region
+  (attach→clear→paste→verify→click→landing check); a second same-thread worker exits
+  `EXIT_LEASE_REFUSED` untouched and is redispatched. Fresh submits (new thread) and read-only
+  waits/retrieves take no lease.
+- **Canonical per-turn rid parsing + interval-scoped answers.** A turn's rid was read by substring
+  search, so a later prompt QUOTING `BEGIN_RESPONSE:<old-rid>` (ordinary audit content) could
+  steal the old turn's identity and let a source-pinned retrieve persist the newer turn's answer.
+  A turn's canonical rid is now the LAST complete bare-line BEGIN/END pair (the template's own
+  footer always follows caller text, so a quote can never win); source-pinned waits take answers
+  only from the DOM interval between the source turn and the next user turn, and fail
+  `rid_absent`/`rid_superseded` when the interval can't be resolved — never a global fallback.
+
 ### Added
 - **JSON outcome envelope (schema 1).** Every `await` exit prints one machine-readable stdout line:
   rid, parent_rid, state, retryable, human_action, next_command, answer_path, log_path, confidence,
