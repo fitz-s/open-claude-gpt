@@ -150,12 +150,6 @@ def _new_id() -> str:
     return uuid.uuid4().hex
 
 
-def store_enabled() -> bool:
-    """The backend switch, now DEFAULT ON — the store is the control plane. Set CGC_STORE_BACKEND=0
-    to roll back to the (still-present) file-spool path. One switch, one authority, never both."""
-    return os.environ.get("CGC_STORE_BACKEND", "1").strip().lower() in ("1", "true", "yes", "on")
-
-
 def new_daemon_instance_id() -> str:
     """A fresh identity per daemon process — recorded on attempts so ownership is the daemon
     INSTANCE, not a reusable OS pid."""

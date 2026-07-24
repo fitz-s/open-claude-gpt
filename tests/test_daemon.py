@@ -1,14 +1,12 @@
-# Tests for the consult egress daemon (cgc_daemon.py): run_worker's gate-then-send flow and
-# _finish_from_wait's exit-code -> terminal-status mapping.
+# Tests for the consult egress daemon (cgc_daemon.py) over the SQLite store — dispatch, reattach
+# priority, browser maintenance (sweep/repair), the per-attempt stderr scoping of _run, and the
+# daemon singleton. No network, no real Chrome: subprocess spawns and _run are always monkeypatched.
 #
 # cgc_daemon.py does `import cgc_spool as spool` internally after inserting its own directory on
 # sys.path. Both modules read env (SPOOL_DIR etc.) at import time, so we load cgc_spool FIRST
 # under the test's tmp_path env, register it in sys.modules under the name "cgc_spool", then load
 # cgc_daemon by path so its `import cgc_spool as spool` resolves to that same already-configured
 # instance instead of re-importing (and re-reading env) on its own.
-#
-# No network, no real Chrome/cdp_consult: cgc_spool.validate_prompt and cgc_daemon._run are always
-# monkeypatched.
 import importlib.util
 import json
 import os
@@ -46,259 +44,7 @@ def _rid(suffix="000001"):
     return f"REQ-20260707-120000-{suffix}"
 
 
-def _seed_job(daemon, rid, prompt_text="please review https://github.com/acme/widgets", kind="submit", out=None):
-    prompt_file = daemon.spool.SPOOL_DIR + f"/prompt_{rid}.txt"
-    os.makedirs(os.path.dirname(prompt_file), exist_ok=True)
-    with open(prompt_file, "w", encoding="utf-8") as f:
-        f.write(prompt_text)
-    job = {
-        "rid": rid,
-        "kind": kind,
-        "prompt_file": prompt_file,
-        "out": out or (daemon.spool.CGC_STATE_DIR + f"/answer_{rid}.txt"),
-        "poll": 1,
-        "timeout": 5,
-        "conversation": "auto",
-        "model": "Pro",
-        "project_url": "https://chatgpt.com/",
-    }
-    daemon.spool.enqueue_job(job)
-    return daemon.spool.claim(daemon.spool.pending_path(rid))
-
-
-# ---- run_worker: gate refusal --------------------------------------------------
-
-def test_run_worker_refused_by_gate_returns_2_sets_error_status_never_calls_run(daemon, monkeypatch):
-    rid = _rid()
-    processing_file = _seed_job(daemon, rid)
-
-    monkeypatch.setattr(daemon.spool, "validate_prompt", lambda text: (False, "nope"))
-
-    def _boom(cmd, timeout, rid=None, stdin_text=None):
-        raise AssertionError("_run must not be called when the gate refuses")
-
-    monkeypatch.setattr(daemon, "_run", _boom)
-
-    code = daemon.run_worker(processing_file)
-
-    assert code == 2
-    st = daemon.spool.read_status(rid)
-    assert st["state"] == "error"
-    assert os.path.exists(daemon.spool.done_path(rid))
-    assert not os.path.exists(processing_file)
-
-
-# ---- run_worker: gate passes, submit + wait succeed ---------------------------
-
-def test_run_worker_submit_kind_success_sets_done_status_and_conversation(daemon, monkeypatch):
-    rid = _rid()
-    processing_file = _seed_job(daemon, rid, kind="submit")
-
-    monkeypatch.setattr(daemon.spool, "validate_prompt", lambda text: (True, "ok"))
-
-    calls = []
-
-    def _fake_run(cmd, timeout, rid=None, stdin_text=None):
-        calls.append(cmd)
-        if len(calls) == 1:
-            # submit call
-            return 0, json.dumps({"conversation_id": "conv123"}), ""
-        # wait call
-        return 0, "", ""
-
-    monkeypatch.setattr(daemon, "_run", _fake_run)
-
-    code = daemon.run_worker(processing_file)
-
-    assert code == 0
-    assert len(calls) == 2
-    st = daemon.spool.read_status(rid)
-    assert st["state"] == "done"
-    assert st["conversation"] == "conv123"
-
-
-# ---- _finish_from_wait: exit-code mapping --------------------------------------
-
-@pytest.mark.parametrize("code,expected_state,expected_return", [
-    (0, "done", 0),
-    (3, "blocker", 3),
-    (4, "no_answer", 4),
-    (7, "error", 2),
-])
-def test_finish_from_wait_maps_exit_code_to_terminal_status(daemon, code, expected_state, expected_return):
-    rid = _rid()
-    daemon.spool.enqueue_job({"rid": rid})
-    daemon.spool.claim(daemon.spool.pending_path(rid))
-
-    result = daemon._finish_from_wait(rid, code, "/tmp/out.txt", "some stderr", "conv1")
-
-    assert result == expected_return
-    st = daemon.spool.read_status(rid)
-    assert st["state"] == expected_state
-
-
-# ---- orphan recovery: a claimed job with no worker must not vanish ----
-
-def _job(daemon, rid, age_s, **extra):
-    """Put a job in processing/ as if a previous daemon had claimed it `age_s` ago."""
-    import os
-    import time
-    path = daemon.spool.processing_path(rid)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    body = {"rid": rid, "kind": "submit", "out": f"/tmp/{rid}.txt"}
-    body.update(extra)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(body, f)
-    ts = time.time() - age_s
-    os.utime(path, (ts, ts))
-    return path
-
-
-def test_a_dead_worker_is_detected_immediately_not_after_an_hour(daemon):
-    """Orphanhood is a fact, not a timer. The dispatcher records the worker pid, so a dead worker is
-    known at once — the old age rule had to outwait any possible worker, which once the deadline
-    became a single 60-minute number meant a consult sat dead for 62 minutes before anything looked."""
-    rid = "REQ-20260707-120000-0000a1"
-    _job(daemon, rid, age_s=5)                       # young: the age rule would have skipped it
-    daemon.spool.write_status(rid, "processing", worker_pid=2 ** 22)  # certainly not running
-    assert daemon._recover_orphans() == 1
-    assert not os.path.exists(daemon.spool.processing_path(rid))
-
-
-def test_a_live_worker_is_never_touched(daemon):
-    """The guarantee that matters: never recover a job someone is still working, or the same consult
-    is sent twice and the quota billed twice."""
-    rid = "REQ-20260707-120000-0000a2"
-    _job(daemon, rid, age_s=daemon.spool.STUCK_AFTER_S + 9999)  # ancient — age rule would requeue
-    daemon.spool.write_status(rid, "processing", worker_pid=os.getpid())  # but its worker is alive
-    assert daemon._recover_orphans() == 0
-    assert os.path.exists(daemon.spool.processing_path(rid))
-
-
-def test_orphan_with_a_live_conversation_is_retrieved_not_resent(daemon):
-    """The waiter dying does not stop ChatGPT. Re-sending would open a SECOND conversation, redo the
-    round and bill it twice; attaching reads the answer that is already being written."""
-    rid = "REQ-20260707-120000-0000a3"
-    _job(daemon, rid, age_s=5)
-    daemon.spool.write_status(rid, "processing", worker_pid=2 ** 22, conversation="conv-abc")
-    assert daemon._recover_orphans() == 1
-    queued = daemon.spool._read_json(daemon.spool.pending_path(rid))
-    assert queued["kind"] == "retrieve" and queued["conversation"] == "conv-abc"
-
-
-def test_orphan_without_a_conversation_is_NOT_resent(daemon):
-    """No conversation was recorded, but the worker may have died AFTER the click — so the send may
-    already have reached ChatGPT. Re-sending would duplicate a possible send (the at-most-once
-    violation the store forbids), so recovery marks it a blocker for human reconciliation, NEVER
-    auto-resends. (This also closes the rollback path the diff-review flagged S0.)"""
-    rid = "REQ-20260707-120000-0000a4"
-    _job(daemon, rid, age_s=5)
-    daemon.spool.write_status(rid, "processing", worker_pid=2 ** 22)
-    assert daemon._recover_orphans() == 1
-    assert not os.path.exists(daemon.spool.pending_path(rid)), "must NOT be re-queued for a fresh send"
-    st = daemon.spool.read_status(rid)
-    assert st["state"] == "blocker", "marked for human reconciliation, not auto-resent"
-
-
-def test_a_pre_pid_job_still_falls_back_to_the_age_rule(daemon):
-    """Jobs claimed by an older daemon carry no pid; they must still be recoverable."""
-    rid = "REQ-20260707-120000-0000a5"
-    _job(daemon, rid, age_s=daemon.spool.STUCK_AFTER_S + 600)
-    assert daemon._recover_orphans() == 1
-
-
-# ---- kind=retrieve: recovery must stay on the daemon path --------------------
-
-def test_retrieve_job_sends_nothing_and_skips_the_gate(daemon, monkeypatch, tmp_path):
-    """Retrieval reads an existing conversation. There is no outbound payload, so there is nothing
-    for the gate to validate — and validate_prompt must not even be reached (it would need a prompt
-    file that a retrieve job deliberately does not have)."""
-    called = []
-    monkeypatch.setattr(daemon.spool, "validate_prompt",
-                        lambda t: called.append(t) or (True, "should not run"))
-    seen = {}
-
-    def _fake_run(cmd, timeout, rid=None, stdin_text=None):
-        seen["cmd"] = cmd
-        return 0, "", ""
-
-    monkeypatch.setattr(daemon, "_run", _fake_run)
-    rid = "REQ-20260707-120000-00re01"
-    out = str(tmp_path / "a.txt")
-    path = daemon.spool.processing_path(rid)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"rid": rid, "kind": "retrieve", "conversation": "conv-123", "out": out}, f)
-
-    assert daemon.run_worker(path) == 0
-    assert called == [], "the gate must not run for a job that sends nothing"
-    assert "wait" in seen["cmd"], "retrieve must run wait, never submit/followup"
-    assert "submit" not in seen["cmd"] and "followup" not in seen["cmd"]
-    assert daemon.spool.read_status(rid)["state"] == "done"
-
-
-def test_retrieve_job_carrying_a_prompt_is_refused(daemon, monkeypatch, tmp_path):
-    """The gate is skipped only because a retrieve job structurally cannot carry content. Enforce
-    that, or 'retrieve' becomes a way to send unvalidated text."""
-    def _boom(cmd, timeout, rid=None, stdin_text=None):
-        raise AssertionError("must not run anything")
-
-    monkeypatch.setattr(daemon, "_run", _boom)
-    rid = "REQ-20260707-120000-00re02"
-    path = daemon.spool.processing_path(rid)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"rid": rid, "kind": "retrieve", "conversation": "c1",
-                   "prompt_file": str(tmp_path / "p.md"), "out": str(tmp_path / "a.txt")}, f)
-
-    assert daemon.run_worker(path) == 2
-    assert "must carry no prompt" in daemon.spool.read_status(rid)["msg"]
-
-
-def test_retrieve_job_without_a_conversation_is_refused(daemon, monkeypatch, tmp_path):
-    def _boom(cmd, timeout, rid=None, stdin_text=None):
-        raise AssertionError("must not run anything")
-
-    monkeypatch.setattr(daemon, "_run", _boom)
-    rid = "REQ-20260707-120000-00re03"
-    path = daemon.spool.processing_path(rid)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"rid": rid, "kind": "retrieve", "conversation": "auto",
-                   "out": str(tmp_path / "a.txt")}, f)
-
-    assert daemon.run_worker(path) == 2
-
-
-def test_the_gate_validated_bytes_are_what_get_sent(daemon, monkeypatch, tmp_path):
-    """The gate is the justification for this whole egress design, so it must cover the bytes that
-    actually leave. Passing the CDP child a PATHNAME let it reopen a file any same-user process
-    could rewrite after validation — the prompt that passed the public-repo and secret checks and
-    the prompt that reached ChatGPT were not provably the same object."""
-    calls = []
-
-    def _fake_run(cmd, timeout, rid=None, stdin_text=None):
-        calls.append((cmd, stdin_text))
-        return 0, json.dumps({"conversation_id": "c1"}), ""
-
-    monkeypatch.setattr(daemon, "_run", _fake_run)
-    monkeypatch.setattr(daemon.spool, "validate_prompt", lambda t: (True, "ok"))
-    rid = "REQ-20260707-120000-00b001"
-    pf = tmp_path / "prompt.md"
-    pf.write_text("VALIDATED BYTES https://github.com/acme/widgets", encoding="utf-8")
-    path = daemon.spool.processing_path(rid)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"rid": rid, "kind": "submit", "prompt_file": str(pf),
-                   "out": str(tmp_path / "a.txt")}, f)
-
-    daemon.run_worker(path)
-    send_cmd, send_stdin = calls[0]          # the submit call, not the later wait
-    assert send_stdin == "VALIDATED BYTES https://github.com/acme/widgets"
-    assert send_cmd[send_cmd.index("--prompt-file") + 1] == "-", \
-        "the child must be handed bytes on stdin, never a path it can reopen"
-    assert str(pf) not in send_cmd, "the mutable prompt path must not reach the sender"
-
+# ---- _run: per-attempt stderr scoping ----------------------------------------
 
 def test_run_stderr_is_scoped_to_the_current_attempt_not_the_cumulative_log(daemon):
     """Regression (S0 auto-duplicate): the per-rid log is append-only across every attempt, so a
@@ -309,15 +55,17 @@ def test_run_stderr_is_scoped_to_the_current_attempt_not_the_cumulative_log(daem
     rid = _rid("00c001")
     # attempt 1: a pre-click fail-closed marker, written to the shared per-rid log.
     c1 = [sys.executable, "-c", "import sys; sys.stderr.write('CGC_ERROR composer_not_ready: no input box\\n')"]
-    code1, _so1, se1 = daemon._run(c1, 30, rid)
+    _code1, _so1, se1 = daemon._run(c1, 30, rid)
     assert "composer_not_ready" in se1, "the current attempt's own marker must be returned"
     # attempt 2 on the SAME rid: clicks, then exits ambiguously with a SHORT stderr and no marker.
     c2 = [sys.executable, "-c", "import sys; sys.stderr.write('clicked send; turn schema ambiguous\\n')"]
-    code2, _so2, se2 = daemon._run(c2, 30, rid)
+    _code2, _so2, se2 = daemon._run(c2, 30, rid)
     assert "composer_not_ready" not in se2, \
         "attempt 1's marker must NOT leak into attempt 2 — that leak is the auto-resend duplicate bug"
     assert "ambiguous" in se2, "attempt 2's own stderr must be what is returned"
 
+
+# ---- _dispatch_store ---------------------------------------------------------
 
 def test_ready_orphan_is_redispatched_not_stranded(daemon, monkeypatch):
     """A `ready` round with no live worker (its Popen failed, or the worker died before begin_send)
@@ -391,124 +139,70 @@ def test_dispatch_store_reattach_takes_priority_over_new_sends(daemon, monkeypat
         "the single slot went to the reattach, not a new send"
 
 
-def test_store_mode_skips_legacy_orphan_recovery_and_tab_sweep(daemon, monkeypatch):
-    """In store mode the legacy file-spool maintenance is both redundant and harmful: _recover_orphans
-    rewrites the rollback spool (priming a future rollback to duplicate an uncertain send) and
-    _sweep_tabs decides liveness from file-spool PIDs alone, so it can close an active store round's
-    tab. Store mode has its own recovery; the loop must not call either."""
-    monkeypatch.setattr(daemon.cgc_backend, "store_enabled", lambda: True)
-    monkeypatch.setattr(daemon.spool, "acquire_daemon_singleton", lambda *a, **k: object())
-    monkeypatch.setattr(daemon.store_mod, "new_daemon_instance_id", lambda: "d-test")
-
-    class _S:
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def promote_sending_to_uncertain(self): return []
-        def recover(self): return {"dispatchable": [], "reattach": [], "uncertain": [], "retrievable": []}
-        def claim_ready(self, *a): return None
-    monkeypatch.setattr(daemon.store_mod, "Store", lambda *a, **k: _S())
-
-    called = {"orphans": 0, "sweep": 0}
-    monkeypatch.setattr(daemon, "_recover_orphans", lambda: called.__setitem__("orphans", called["orphans"] + 1))
-    monkeypatch.setattr(daemon, "_sweep_tabs", lambda: called.__setitem__("sweep", called["sweep"] + 1))
-    daemon.run_loop(poll=0.0, concurrency=1, once=True)
-    assert called == {"orphans": 0, "sweep": 0}, "store mode must not run legacy spool maintenance"
-
-
-def test_browser_repair_actually_triggers_on_an_attach_failure(daemon, monkeypatch, tmp_path):
-    """The detection must read THIS invocation's returned stderr — which `_run` now scopes to the
-    current subprocess (log_start..EOF), so the token IS present AND isolated to the attempt that
-    just ran. Reading the whole-file log tail instead would reintroduce the cross-attempt leak the
-    diff-review flagged S0 (a stale marker from an earlier attempt restarting Chrome after a later
-    post-click failure — an automatic resend)."""
-    calls = []
-
-    def _fake_run(cmd, timeout, rid=None, stdin_text=None, env_extra=None):
-        calls.append((cmd, env_extra))
-        if cmd[0] == "bash":                       # the launcher restart
-            return 0, "", ""
-        if len([c for c in calls if c[0][0] != "bash"]) == 1:
-            # first submit: a pre-click attach failure; _run returns this invocation's full stderr.
-            return 1, "", "CGC_ERROR cdp_attach_failed: opened a tab but it never answered Runtime.enable"
-        return 0, json.dumps({"conversation_id": "c1"}), ""
-
-    monkeypatch.setattr(daemon, "_run", _fake_run)
-    monkeypatch.setattr(daemon.spool, "validate_prompt", lambda t: (True, "ok"))
-    rid = "REQ-20260707-120000-00c001"
-    pf = tmp_path / "p.md"
-    pf.write_text("https://github.com/acme/widgets", encoding="utf-8")
-    path = daemon.spool.processing_path(rid)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"rid": rid, "kind": "submit", "prompt_file": str(pf),
-                   "out": str(tmp_path / "a.txt")}, f)
-
-    daemon.run_worker(path)
-    restarts = [c for c in calls if c[0][0] == "bash"]
-    assert len(restarts) == 1, "a browser that cannot open a tab must be restarted, not re-tried"
-    assert restarts[0][1]["CGC_RESTART"] == "1"
-
-
-def test_chrome_is_not_restarted_while_another_consult_is_live(daemon, monkeypatch, tmp_path):
-    """The restart is global — it takes every tab with it. Doing it for one job while another is
-    sending or waiting is how a healthy consult gets reported as broken; observed exactly that."""
-    other = "REQ-20260707-120000-00d001"
-    path = daemon.spool.processing_path(other)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"rid": other, "kind": "submit"}, f)
-    daemon.spool.write_status(other, "processing", worker_pid=os.getpid())  # alive
-
-    ran = []
-    monkeypatch.setattr(daemon, "_run", lambda *a, **k: ran.append(a) or (0, "", ""))
-    ok, why = daemon._restart_chrome("REQ-20260707-120000-00d002")
-    assert ok is False
-    assert "suppressed" in why and "re-enqueue" in why, why  # actionable reason, not opaque failure
-    assert ran == [], "must not have launched anything"
-
-
-def test_chrome_is_restarted_when_nothing_else_is_live(daemon, monkeypatch):
-    ran = []
-
-    def _fake(cmd, timeout, rid=None, stdin_text=None, env_extra=None):
-        ran.append((cmd, env_extra))
-        return 0, "", ""
-
-    monkeypatch.setattr(daemon, "_run", _fake)
-    assert daemon._restart_chrome("REQ-20260707-120000-00d003")[0] is True
-    assert ran[0][1]["CGC_RESTART"] == "1"
-
-
-def test_tab_sweep_never_runs_while_a_job_is_live(daemon, monkeypatch):
-    """A tab the sweep can see must be unowned. The only cheap way to guarantee that is to sweep
-    only when nothing is running — otherwise it would close the tab a live send is using."""
-    other = "REQ-20260707-120000-00e001"
-    path = daemon.spool.processing_path(other)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"rid": other, "kind": "submit"}, f)
-    daemon.spool.write_status(other, "processing", worker_pid=os.getpid())
-
-    touched = []
-    monkeypatch.setattr(daemon.urllib.request, "urlopen",
-                        lambda *a, **k: touched.append(a) or (_ for _ in ()).throw(AssertionError()))
-    assert daemon._sweep_tabs() == 0
-    assert touched == [], "must not even look at the browser while a job is live"
-
+# ---- browser maintenance: sweep + repair -------------------------------------
 
 def test_tab_sweep_is_a_noop_with_one_tab(daemon, monkeypatch):
     """The browser is left with a tab on purpose — a profile with zero windows is a worse state."""
     import io
 
-    class _R:
-        def __init__(self, payload): self._p = json.dumps(payload).encode()
-        def read(self): return self._p
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-
     monkeypatch.setattr(daemon.urllib.request, "urlopen",
                         lambda *a, **k: io.BytesIO(json.dumps([{"type": "page", "id": "A"}]).encode()))
     assert daemon._sweep_tabs() == 0
+
+
+def test_maintenance_only_runs_with_no_live_children(daemon):
+    """Sweep and repair are browser-GLOBAL (they can close/restart the tab a live worker is using).
+    The loop must gate them on an empty child map — the child map is the daemon's complete knowledge
+    of live store workers."""
+    import inspect
+    loop = inspect.getsource(daemon.run_loop)
+    assert "if not children and time.time() >= next_maintenance" in loop, \
+        "maintenance must be guarded by an empty child map"
+
+
+def test_repair_triggers_on_tab_family_queued_rounds(daemon, monkeypatch):
+    """A round whose submit failed pre-click with a tab-family error is requeued (safe — provably
+    unsent). But a browser PERMANENTLY unable to open tabs turns that into an infinite silent loop:
+    dispatched, attach fails, requeued, forever. The daemon must break the loop by restarting Chrome
+    when it sees tab-family errors on queued rounds and has no live children."""
+    with daemon.store_mod.Store() as s:
+        s.create_round(_rid("00r001"), "submit")
+        s.set_state(_rid("00r001"), daemon.store_mod.READY)
+        s.begin_send(_rid("00r001"), "b", "h" * 64, daemon_instance_id="d0")
+        s.set_state(_rid("00r001"), daemon.store_mod.QUEUED,
+                    expect=daemon.store_mod.SENDING, error_code="attach_failed")
+
+    restarts = []
+    monkeypatch.setattr(daemon, "_restart_chrome", lambda: restarts.append(1) or (True, ""))
+    t = daemon._maybe_repair_browser({}, last_repair=0.0)
+    assert restarts == [1], "tab-family queued rounds with no children must trigger a restart"
+    assert t > 0.0, "the repair timestamp must advance (cooldown)"
+
+
+def test_repair_respects_children_and_cooldown(daemon, monkeypatch):
+    import time as _time
+    with daemon.store_mod.Store() as s:
+        s.create_round(_rid("00r002"), "submit")
+        s.set_state(_rid("00r002"), daemon.store_mod.READY)
+        s.begin_send(_rid("00r002"), "b", "h" * 64, daemon_instance_id="d0")
+        s.set_state(_rid("00r002"), daemon.store_mod.QUEUED,
+                    expect=daemon.store_mod.SENDING, error_code="attach_failed")
+
+    monkeypatch.setattr(daemon, "_restart_chrome",
+                        lambda: (_ for _ in ()).throw(AssertionError("must not restart")))
+    # live children → no-op (a restart is global and would break them)
+    assert daemon._maybe_repair_browser({"x": object()}, last_repair=0.0) == 0.0
+    # cooldown not yet elapsed → no-op (a restart that doesn't cure must not loop hot)
+    now = _time.time()
+    assert daemon._maybe_repair_browser({}, last_repair=now) == now
+
+
+def test_repair_is_a_noop_without_tab_family_errors(daemon, monkeypatch):
+    with daemon.store_mod.Store() as s:
+        s.create_round(_rid("00r003"), "submit")   # plain queued, no error
+    monkeypatch.setattr(daemon, "_restart_chrome",
+                        lambda: (_ for _ in ()).throw(AssertionError("must not restart")))
+    assert daemon._maybe_repair_browser({}, last_repair=0.0) == 0.0
 
 
 def test_restart_is_not_reported_successful_until_a_tab_actually_works(daemon, monkeypatch):
@@ -518,13 +212,12 @@ def test_restart_is_not_reported_successful_until_a_tab_actually_works(daemon, m
     with `No such target id`, because the browser was still settling."""
     monkeypatch.setattr(daemon, "_run", lambda *a, **k: (0, "", ""))
     monkeypatch.setattr(daemon.time, "sleep", lambda n: None)
-    monkeypatch.setattr(daemon, "_other_live_jobs", lambda rid: [])
     monkeypatch.setattr(daemon, "_new_tab_healthy", lambda: False)
-    assert daemon._restart_chrome("REQ-20260707-120000-00f001")[0] is False, \
+    assert daemon._restart_chrome()[0] is False, \
         "a browser that still cannot open a tab is not a successful restart"
 
     monkeypatch.setattr(daemon, "_new_tab_healthy", lambda: True)
-    assert daemon._restart_chrome("REQ-20260707-120000-00f002")[0] is True
+    assert daemon._restart_chrome()[0] is True
 
 
 def test_health_check_is_the_real_capability_not_a_ping(daemon):
@@ -544,54 +237,13 @@ def test_health_probe_keeps_the_last_tab(daemon):
     assert "if others:" in src, "the probe must not close the only remaining tab"
 
 
-def test_admission_and_restart_take_the_same_lock(daemon):
-    """The restart guard was check-then-act: _other_live_jobs() is a lock-free snapshot, and the
-    dispatcher can admit a worker between the scan and the restart — so a consult that started a
-    moment later still had its tab torn away. That is how live consults were lost, and how the
-    agents watching them then re-dispatched duplicates."""
-    import inspect
-    loop = inspect.getsource(daemon.run_loop)
-    assert "lifecycle_lock(" in loop, "admission must be serialised"
-    claim_at = loop.index("spool.claim(pf)")
-    lock_at = loop.index("lifecycle_lock(")
-    pid_at = loop.index("worker_pid=p.pid")
-    assert lock_at < claim_at < pid_at, "the lock must span claim through publishing the pid"
-    worker = inspect.getsource(daemon.run_worker)
-    assert "lifecycle_lock(" in worker, "the restart must take the same lock"
-
-
-def test_the_lock_fails_closed_not_open(daemon):
-    """A lock whose body runs unlocked is not a lock. On timeout it must report NOT acquired, and
-    BOTH callers must fail closed (skip + retry) rather than proceed unserialised — the old fail-open
-    is exactly how a global restart tore the tab off a just-admitted worker (the reported bug)."""
-    import inspect
-    lock_src = inspect.getsource(daemon.spool.lifecycle_lock)
-    assert "proceeding unserialised" not in lock_src, "the lock must not run its body unlocked"
-    assert "self.acquired" in lock_src, "the lock must report acquisition so callers can fail closed"
-    loop = inspect.getsource(daemon.run_loop)
-    assert "lk.acquired" in loop, "admission must check acquisition and admit nothing while held"
-    worker = inspect.getsource(daemon.run_worker)
-    assert "lk.acquired" in worker, "restart must check acquisition and skip while held"
-
-
-def test_lifecycle_lock_second_holder_fails_closed(daemon):
-    """Functional proof (not source text): while one holder has the lock, a second acquisition
-    reports acquired is False within its timeout, and becomes acquirable again after release."""
-    LL = daemon.spool.lifecycle_lock
-    with LL() as held:
-        assert held.acquired, "first holder must acquire"
-        with LL(timeout=0.3) as second:
-            assert second.acquired is False, "second holder must fail closed while the lock is held"
-    with LL(timeout=0.3) as after:
-        assert after.acquired, "lock must be acquirable again once released"
-
+# ---- the daemon singleton ----------------------------------------------------
 
 def test_daemon_singleton_refuses_a_second_daemon(daemon):
-    """Two daemons on one spool would each keep their own concurrency count and child map, doubling
+    """Two daemons on one store would each keep their own concurrency count and child map, doubling
     the global cap and racing on the browser. The singleton lock refuses the second and frees on
     release."""
     if daemon.spool.fcntl is None:
-        import pytest
         pytest.skip("no fcntl on this platform")
     first = daemon.spool.acquire_daemon_singleton()
     assert first is not None, "first daemon must acquire the singleton"

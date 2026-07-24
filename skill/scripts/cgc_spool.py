@@ -19,31 +19,22 @@
 # cover: free-text prose the caller put in --task/--context-file. The skill contract already
 # forbids secrets there; the secret-scan below catches the obvious cases and fails closed.
 """
-Local spool + validating-gate helpers for the daemon-backed consult path.
+Egress gate + daemon runtime files for the store-backed consult path.
 
-Layout under $CGC_SPOOL_DIR (default $CGC_STATE_DIR/spool, default /tmp/cgc/spool):
-  pending/<rid>.json      job written by `enqueue`, awaiting the daemon
-  processing/<rid>.json   job claimed by the daemon (atomic rename from pending/)
-  done/<rid>.json         job the daemon finished (kept briefly for debugging)
-  status/<rid>.json       {state, exit, out, ts, msg} — the daemon's live status for `await`
-  daemon.json             {pid, ts} heartbeat the daemon refreshes each loop
+The round LIFECYCLE lives in the SQLite store (cgc_store.py) — the file-spool
+pending/processing/done/status machinery it replaced is gone. What remains here is everything that
+is not lifecycle state:
 
-Agent-facing CLI (dispatched by bin/cgc; both are LOCAL-ONLY, never touch the network):
-  enqueue  --rid R --prompt-file F [--kind submit|followup] [--project-url U]
-           [--conversation C] [--model M] [--out O] [--poll N] [--timeout N]
-           -> writes pending/<rid>.json, prints {rid,out,queued,daemon_up}. Local write only.
-  enqueue  --rid R --kind retrieve --conversation C [--out O]
-           -> read an EXISTING conversation's answer; sends nothing, carries no prompt. Recovers a
-              consult whose waiter died (daemon restart, closed Chrome) WITHOUT leaving the daemon
-              path — otherwise the only recovery is a direct agent-side wait, which auto mode blocks
-              and which the agent cannot hold for a whole round.
-  await    --rid R --out F [--timeout T] [--poll N]
-           -> polls status/<rid>.json until there is something to act on. Local read only — no CDP.
-              Three outcomes, because three things are actionable:
-                0 the answer is on disk, path printed
-                3 a human must act in the ChatGPT window (login/captcha/rate limit/safeguard)
-                1 broken, job-log path printed (includes: nothing after STUCK_AFTER_S)
-              It does NOT exit merely because the consult is still running — waiting is its job.
+  - the VALIDATING GATE (validate_prompt + helpers) — the security core the daemon runs on every
+    round before anything leaves the machine
+  - daemon runtime files under $CGC_SPOOL_DIR (default $CGC_STATE_DIR/spool):
+      daemon.json    {pid, ts} liveness heartbeat the daemon refreshes each loop
+      daemon.lock    the daemon-singleton flock
+      logs/<rid>.log per-round send+wait transcript, streamed live by the daemon
+  - the agent-facing CLI (dispatched by bin/cgc; both LOCAL-ONLY, never touch the network):
+      enqueue  -> create a queued round in the store. Local write only.
+      await    -> poll the round until terminal; three outcomes (0 answer / 3 human / 1 broken).
+      status   -> daemon liveness + round counts by state.
 """
 from __future__ import annotations
 
@@ -51,7 +42,6 @@ import argparse
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import time
@@ -172,14 +162,15 @@ _SECRET_RES = [
 
 # ---- paths / dirs -----------------------------------------------------------
 
-_SUBDIRS = ("pending", "processing", "done", "status", "logs")
+_SUBDIRS = ("logs",)
 
 
 def ensure_dirs():
-    """Create the spool private to this user. The PROMPTS are public by construction — the gate
-    enforces that. The ANSWERS are not: a consult's reply can quote private context, and follow-up
-    rounds carry local results outright. Leaving them at the umask's mercy under a world-traversable
-    /tmp made confidentiality a property of the host's configuration rather than of this tool."""
+    """Create the runtime dirs private to this user. The PROMPTS are public by construction — the
+    gate enforces that. The ANSWERS and logs are not: a consult's reply can quote private context,
+    and follow-up rounds carry local results outright. Leaving them at the umask's mercy under a
+    world-traversable /tmp made confidentiality a property of the host's configuration rather than
+    of this tool."""
     for d in (CGC_STATE_DIR, SPOOL_DIR):
         os.makedirs(d, mode=0o700, exist_ok=True)
         try:
@@ -192,22 +183,6 @@ def ensure_dirs():
 
 def _p(*parts):
     return os.path.join(SPOOL_DIR, *parts)
-
-
-def pending_path(rid):
-    return _p("pending", rid + ".json")
-
-
-def processing_path(rid):
-    return _p("processing", rid + ".json")
-
-
-def done_path(rid):
-    return _p("done", rid + ".json")
-
-
-def status_path(rid):
-    return _p("status", rid + ".json")
 
 
 def log_path(rid):
@@ -264,123 +239,6 @@ def daemon_alive():
     return _pid_alive(d.get("pid"))
 
 
-# ---- job lifecycle ----------------------------------------------------------
-
-def enqueue_job(job: dict) -> str:
-    """Atomically write a job into pending/. rid is required and must be well-formed."""
-    rid = job.get("rid", "")
-    if not _RID_RE.match(rid):
-        raise ValueError(f"bad rid {rid!r} (want REQ-YYYYMMDD-HHMMSS-hhhhhh)")
-    ensure_dirs()
-    job = dict(job)
-    job.setdefault("ts", time.time())
-    return _atomic_write(pending_path(rid), job)
-
-
-def list_pending():
-    try:
-        names = sorted(os.listdir(_p("pending")))
-    except OSError:
-        return []
-    return [_p("pending", n) for n in names if n.endswith(".json")]
-
-
-def claim(pending_file: str):
-    """Atomically move a pending job to processing/ (os.rename is atomic on the same fs). Returns the
-    new processing path, or None if another worker already claimed it (rename raced/failed)."""
-    rid = os.path.basename(pending_file)[:-5]
-    dst = processing_path(rid)
-    try:
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        os.rename(pending_file, dst)
-        return dst
-    except OSError:
-        return None
-
-
-def write_status(rid, state, *, exit=None, out=None, msg=None, conversation=None,
-                 worker_pid=None):
-    """Upsert status/<rid>.json. state in {queued,processing,done,blocker,no_answer,error}."""
-    cur = _read_json(status_path(rid)) or {}
-    cur.update({"rid": rid, "state": state, "ts": time.time()})
-    if exit is not None:
-        cur["exit"] = exit
-    if out is not None:
-        cur["out"] = out
-    if msg is not None:
-        cur["msg"] = msg
-    if conversation is not None:
-        cur["conversation"] = conversation
-    if worker_pid is not None:
-        cur["worker_pid"] = worker_pid
-    _atomic_write(status_path(rid), cur)
-    return cur
-
-
-def read_status(rid):
-    return _read_json(status_path(rid))
-
-
-LIFECYCLE_LOCK = _p("lifecycle.lock")
-
-
-class lifecycle_lock:
-    """Serialises worker ADMISSION against browser RESTART across processes.
-
-    Checking "is anyone else live?" and then restarting Chrome is check-then-act, and the dispatcher
-    can admit a worker in between — so a consult that started a moment after the scan still gets its
-    tab torn away by a restart that believed it was alone. That is not theoretical: it is how live
-    consults were lost, and how the agents watching them then re-dispatched duplicates.
-
-    Both sides take this lock: the dispatcher holds it from claim through publishing the worker pid,
-    so a worker is never invisible while it is being admitted; the restart holds it from the
-    neighbour scan through the restart itself. Degrades to a no-op without fcntl, which only costs
-    the atomicity it never had."""
-
-    def __init__(self, timeout=30):
-        self.timeout = timeout
-        self.fh = None
-        self.acquired = False
-
-    def __enter__(self):
-        if fcntl is None:
-            # The supported deployment (macOS) always has fcntl. This branch only keeps import
-            # working on exotic platforms, where admission and restart cannot be serialised at all
-            # — report acquired so the daemon still runs, accepting the non-atomicity it had before
-            # any lock existed. (A first-principles rebuild fails startup here instead.)
-            self.acquired = True
-            return self
-        ensure_dirs()
-        self.fh = open(LIFECYCLE_LOCK, "a+")
-        deadline = time.time() + self.timeout
-        while True:
-            try:
-                fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self.acquired = True
-                return self
-            except OSError:
-                if time.time() > deadline:
-                    # Could NOT acquire — a browser restart (or a peer admission) holds the lock.
-                    # Return NOT acquired and let the caller fail closed (skip + retry). A lock that
-                    # runs its body unlocked is not a lock: that fail-open is exactly how a restart
-                    # tore the tab off a worker admitted while it was in progress.
-                    sys.stderr.write(f"CGC_WARN lifecycle_lock: not acquired within {self.timeout}s "
-                                     "— caller fails closed (job stays queued, retried)\n")
-                    return self
-                time.sleep(0.2)
-
-    def __exit__(self, *exc):
-        if self.fh is not None:
-            try:
-                if self.acquired and fcntl is not None:
-                    fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
-                self.fh.close()
-            except OSError:
-                pass
-        self.acquired = False
-        return False
-
-
 DAEMON_LOCK = _p("daemon.lock")
 
 
@@ -412,37 +270,6 @@ def acquire_daemon_singleton(timeout=40):
                 fh.close()
                 return None
             time.sleep(0.5)
-
-
-def _live_owner(rid):
-    """The pid currently working this job, or None. Used to stop a second worker being started on an
-    id that already has one, and to stop a superseded worker writing the current one's outcome."""
-    st = read_status(rid) or {}
-    if st.get("state") not in ("processing",):
-        return None
-    pid = st.get("worker_pid")
-    return pid if pid is not None and _pid_alive(pid) else None
-
-
-def finish_job(rid, *, state, exit, out=None, msg=None, conversation=None):
-    """Terminal transition: write the final status and move the job out of processing/ into done/.
-
-    Fenced by worker identity. A worker that has been superseded — its Chrome tab pulled out from
-    under it by a browser restart, say — would otherwise report ITS failure as the job's outcome
-    while the current worker is still succeeding, so a healthy consult reads as `error` while it is
-    happily generating. Observed exactly that."""
-    owner = (read_status(rid) or {}).get("worker_pid")
-    if owner is not None and owner != os.getpid() and _pid_alive(owner):
-        sys.stderr.write(f"CGC_STALE {rid}: not recording '{state}' — pid {os.getpid()} was "
-                         f"superseded by pid {owner}, which still owns this job.\n")
-        return
-    write_status(rid, state, exit=exit, out=out, msg=msg, conversation=conversation)
-    src = processing_path(rid)
-    if os.path.exists(src):
-        try:
-            os.rename(src, done_path(rid))
-        except OSError:
-            pass
 
 
 # ---- the validating gate (security core) ------------------------------------
@@ -565,140 +392,44 @@ def validate_prompt(prompt_text: str) -> tuple:
 # ---- CLI: enqueue -----------------------------------------------------------
 
 def cmd_enqueue(a) -> int:
+    """Create a queued round in the store — a pure LOCAL write. A CHEAP pre-check (secret scan +
+    link presence, no network) gives the agent instant feedback on what the daemon's authoritative
+    gate would reject anyway; the real gate runs in the daemon worker before anything is sent."""
     import cgc_backend
-    if cgc_backend.store_enabled():
-        # Store cutover: submit/followup/retrieve all become rounds. retrieve still carries no
-        # payload (spec_json holds the conversation); the gate runs in the worker, not here.
-        out = a.out or os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
-        if a.kind == "retrieve" and (not a.conversation or a.conversation == "auto"):
-            sys.stderr.write("CGC_ERROR need_conversation: --kind retrieve requires an explicit "
-                             "--conversation <id>.\n")
-            return 2
-        prompt = ""
-        if a.kind != "retrieve":
-            if not a.prompt_file or not os.path.exists(a.prompt_file):
-                sys.stderr.write("CGC_ERROR need_prompt_file: --prompt-file is required.\n")
-                return 2
-            prompt = open(a.prompt_file, encoding="utf-8").read()
-            low = prompt.lower()
-            is_followup = a.kind == "followup" or "continuing this consult" in low
-            for rx, label in _SECRET_RES:
-                if rx.search(prompt):
-                    sys.stderr.write(f"CGC_ERROR gate_secret: prompt looks like it contains a {label} — NOT enqueuing.\n")
-                    return 2
-            if not _CODE_URL_RE.search(prompt) and not is_followup and "references no code" not in low:
-                sys.stderr.write("CGC_ERROR no_code_source: prompt has no public code link — deliver "
-                                 "a link first, or render a no-code question with `prep --no-code`.\n")
-                return 2
-        return cgc_backend.enqueue_round(a, prompt, os.path.abspath(out))
-    if a.kind == "retrieve":
-        # Retrieval attaches to a conversation that already exists and reads its answer. It sends
-        # NOTHING, so there is no payload for the egress gate to validate — and that is guaranteed
-        # structurally, not by trust: a retrieve job carries no prompt at all, and the daemon
-        # refuses one that somehow does. This exists so recovering a consult whose waiter died
-        # (daemon restart, closed Chrome) stays on the daemon path. Without it the only recovery was
-        # a DIRECT agent-side wait, which auto mode blocks by design and which the agent can only
-        # hold for 870s at a time — the recovery path must not be the forbidden path.
-        if not a.conversation or a.conversation == "auto":
-            sys.stderr.write("CGC_ERROR need_conversation: --kind retrieve requires an explicit "
-                             "--conversation <id> (there is no active thread to infer).\n")
-            return 2
-        out = a.out or os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
-        try:
-            enqueue_job({"rid": a.rid, "kind": "retrieve", "conversation": a.conversation,
-                         "out": os.path.abspath(out), "poll": a.poll, "timeout": a.timeout})
-        except ValueError as e:
-            sys.stderr.write(f"CGC_ERROR bad_job: {e}\n")
-            return 2
-        write_status(a.rid, "queued", out=os.path.abspath(out))
-        print(json.dumps({"queued": True, "rid": a.rid, "out": os.path.abspath(out),
-                          "kind": "retrieve", "daemon_up": daemon_alive()}))
-        argv = ["python3", os.path.abspath(__file__), "await", "--rid", a.rid,
-                "--out", os.path.abspath(out)]
-        sys.stderr.write(
-            f"CGC_QUEUED retrieve {a.rid} (attaches to {a.conversation}; sends nothing). Await it:\n"
-            f"  {' '.join(shlex.quote(x) for x in argv)}\n")
-        return 0
-    busy = _live_owner(a.rid)
-    if busy is not None:
-        sys.stderr.write(
-            f"CGC_ERROR already_running: {a.rid} is being worked right now by pid {busy}. Enqueuing "
-            f"it again would put TWO workers on one id — they share a status file, an answer path "
-            f"and a job log, so they overwrite each other's results and the log reads as one "
-            f"incoherent stream. Await the existing one, or use a new rid.\n")
+    if not _RID_RE.match(a.rid or ""):
+        sys.stderr.write(f"CGC_ERROR bad_rid: {a.rid!r} (want REQ-YYYYMMDD-HHMMSS-hhhhhh)\n")
         return 2
-    if not a.prompt_file:
-        sys.stderr.write("CGC_ERROR need_prompt_file: --prompt-file is required "
-                         "(only --kind retrieve may omit it).\n")
-        return 2
-    if not os.path.exists(a.prompt_file):
-        sys.stderr.write(f"CGC_ERROR prompt_file_missing: {a.prompt_file}\n")
-        return 2
-    prompt = open(a.prompt_file, encoding="utf-8").read()
-    # CHEAP local pre-check so the agent gets instant feedback and never enqueues something the
-    # gate will reject. This runs the secret scan + link-presence check WITHOUT network (the
-    # authoritative public-repo re-check happens in the daemon, where a gh call is not an agent
-    # action). Keeping enqueue network-free guarantees it stays a pure local write for the
-    # classifier. A secret or a missing code link is caught here immediately.
-    low = prompt.lower()
-    is_followup = a.kind == "followup" or "continuing this consult" in low
-    for rx, label in _SECRET_RES:
-        if rx.search(prompt):
-            sys.stderr.write(f"CGC_ERROR gate_secret: prompt looks like it contains a {label} — NOT enqueuing.\n")
-            return 2
-    if not _CODE_URL_RE.search(prompt) and not is_followup and "references no code" not in low:
-        sys.stderr.write(
-            "CGC_ERROR no_code_source: prompt has no public code link (github/gist URL) — the daemon "
-            "would refuse it. Deliver a link first (consult.py deliver → prep). If the question has "
-            "no code subject at all (maths/research/writing), render it with `prep --no-code`. "
-            "NOT enqueuing.\n")
-        return 2
-
     out = a.out or os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
-    job = {
-        "rid": a.rid,
-        "kind": a.kind,
-        "prompt_file": os.path.abspath(a.prompt_file),
-        "project_url": a.project_url,
-        "conversation": a.conversation,
-        "model": a.model,
-        "out": os.path.abspath(out),
-        "poll": a.poll,
-        "timeout": a.timeout,
-    }
-    try:
-        enqueue_job(job)
-    except ValueError as e:
-        sys.stderr.write(f"CGC_ERROR bad_job: {e}\n")
+    if a.kind == "retrieve" and (not a.conversation or a.conversation == "auto"):
+        sys.stderr.write("CGC_ERROR need_conversation: --kind retrieve requires an explicit "
+                         "--conversation <id>.\n")
         return 2
-    write_status(a.rid, "queued", out=os.path.abspath(out))
-    up = daemon_alive()
-    if getattr(a, "quiet", False):
-        # Composed into `fire`, which prints the one receipt that matters. Two receipts for one
-        # action is the noise this whole pass is trying to remove.
-        if not up:
-            sys.stderr.write("CGC_WARN daemon_down: queued, but nothing will send it until the "
-                             "daemon runs. Relay: cgc install-daemon\n")
-        return 0
-    print(json.dumps({"queued": True, "rid": a.rid, "out": os.path.abspath(out), "daemon_up": up}))
-    if not up:
-        sys.stderr.write(
-            "CGC_WARN daemon_down: this job sits queued until the daemon runs. Relay ONE line:\n"
-            "  cgc install-daemon    # launchd: starts at login, respawns if it dies\n")
-    else:
-        argv = ["python3", os.path.abspath(__file__), "await", "--rid", a.rid,
-                "--out", os.path.abspath(out)]
-        sys.stderr.write(
-            f"CGC_QUEUED {a.rid}. Await it (LOCAL file poll, run_in_background:true):\n"
-            f"  {' '.join(shlex.quote(x) for x in argv)}\n")
-    return 0
+    prompt = ""
+    if a.kind != "retrieve":
+        if not a.prompt_file or not os.path.exists(a.prompt_file):
+            sys.stderr.write("CGC_ERROR need_prompt_file: --prompt-file is required.\n")
+            return 2
+        prompt = open(a.prompt_file, encoding="utf-8").read()
+        low = prompt.lower()
+        is_followup = a.kind == "followup" or "continuing this consult" in low
+        for rx, label in _SECRET_RES:
+            if rx.search(prompt):
+                sys.stderr.write(f"CGC_ERROR gate_secret: prompt looks like it contains a {label} — "
+                                 "NOT enqueuing. Remove the secret from the prompt/context file, "
+                                 "re-render it, then enqueue again.\n")
+                return 2
+        if not _CODE_URL_RE.search(prompt) and not is_followup and "references no code" not in low:
+            sys.stderr.write("CGC_ERROR no_code_source: prompt has no public code link — deliver "
+                             "a link first, or render a no-code question with `prep --no-code`.\n")
+            return 2
+    return cgc_backend.enqueue_round(a, prompt, os.path.abspath(out))
 
 
 # ---- CLI: await -------------------------------------------------------------
 
 def cmd_await(a) -> int:
-    """Wait for the answer. Pure LOCAL polling of status/<rid>.json — no CDP, no network, which is
-    what keeps it invisible to the auto-mode classifier.
+    """Wait for the answer. Pure LOCAL polling of the store — no CDP, no network, which is what
+    keeps it invisible to the auto-mode classifier.
 
     It exits on exactly three things, because exactly three things are worth acting on:
 
@@ -712,78 +443,7 @@ def cmd_await(a) -> int:
     The only reason it ever stops without an answer is STUCK_AFTER_S — and reaching that does not
     mean the answer is late, it means something is wrong and waiting more cannot fix it."""
     import cgc_backend
-    if cgc_backend.store_enabled():
-        return cgc_backend.await_round(a)
-    start = time.time()
-    deadline = start + a.timeout
-    rid = a.rid
-    out = os.path.abspath(a.out)
-    down_since = None
-    while time.time() < deadline:
-        st = read_status(rid) or {}
-        state = st.get("state")
-        if state == "done":
-            # `done` is the daemon's claim; the file is the evidence. They can disagree — the waiter
-            # writes the answer and the worker marks the status in two separate steps, so a failure
-            # between them leaves one without the other. Reporting success for a missing or empty
-            # file told the caller "answer ready (0 chars)" and returned 0, which is the worst
-            # possible outcome: a confident lie the caller has no reason to check.
-            n = os.path.getsize(out) if os.path.exists(out) else -1
-            if n <= 0:
-                sys.stderr.write(
-                    f"CGC_BROKEN {rid}: the daemon reports this consult done, but its answer file is "
-                    f"{'missing' if n < 0 else 'empty'} ({out}). The status and the artifact "
-                    f"disagree, so the answer was NOT delivered.\n")
-                _point_at_log(rid, out)
-                return 1
-            sys.stderr.write(f"CGC_DONE {rid}: answer ready ({n} bytes). READ IT AT:\n  {out}\n")
-            conv = st.get("conversation")
-            if conv:
-                sys.stderr.write(f"To continue this thread: prep --followup, then "
-                                 f"enqueue --kind followup --conversation {conv}\n")
-            return 0
-        if state == "blocker":
-            sys.stderr.write(
-                f"CGC_BLOCKER {rid}: {st.get('msg') or 'login/captcha/rate-limit'}\n"
-                f"A human must act in the ChatGPT window, then this job can be re-enqueued.\n")
-            return 3
-        if state in ("no_answer", "error"):
-            # One outcome, not two. Both mean the machinery did not deliver an answer and the next
-            # step is identical: read the log. Splitting them made the caller branch on a difference
-            # it could not act on differently.
-            sys.stderr.write(f"CGC_BROKEN {rid}: {st.get('msg') or 'the daemon could not deliver an answer'}\n")
-            _point_at_log(rid, out)
-            return 1
-        # Non-terminal (queued/processing): the job only advances while a daemon is alive to advance
-        # it, so liveness is checked in EVERY state. Checking it only before pickup left a hole with
-        # no exit — a daemon that died mid-consult left the waiter waiting on a job nobody was working.
-        if daemon_alive():
-            down_since = None
-        else:
-            if down_since is None:
-                down_since = time.time()
-                sys.stderr.write("CGC_WAIT no live daemon; holding briefly in case it is restarting…\n")
-            elif time.time() - down_since > DAEMON_GRACE_S:
-                if state == "processing":
-                    sys.stderr.write(
-                        f"CGC_BROKEN {rid}: the daemon stopped while this consult was in flight, so "
-                        f"nothing is working it. launchd normally respawns it; if this persists, "
-                        f"check `cgc queue` and the daemon log.\n")
-                else:
-                    sys.stderr.write(
-                        f"CGC_BROKEN {rid}: never picked up and no live daemon. Relay ONE line to "
-                        f"the user — `cgc install-daemon` (launchd agent: starts at login, respawns "
-                        f"if it dies). The job stays queued and runs as soon as it is up.\n")
-                _point_at_log(rid, out)
-                return 1
-        time.sleep(a.poll)
-    sys.stderr.write(
-        f"CGC_BROKEN {rid}: no answer after {int(time.time()-start)//60} minutes. That is past any "
-        f"time the work itself explains — a GPT-5.6 Pro round reasons ~25 min — so treat this as a "
-        f"malfunction, not a slow answer, and do NOT simply wait again. Read the log below: an "
-        f"`ac=0` heartbeat throughout means ChatGPT never produced an assistant turn.\n")
-    _point_at_log(rid, out)
-    return 1
+    return cgc_backend.await_round(a)
 
 
 def _point_at_log(rid, out=None):
@@ -800,28 +460,15 @@ def _point_at_log(rid, out=None):
 
 def cmd_status(a) -> int:
     ensure_dirs()
-    up = daemon_alive()
     import cgc_backend
-    if cgc_backend.store_enabled():
-        return cgc_backend.store_status(up, a.rid)
-    print(f"daemon: {'UP' if up else 'DOWN'}   spool: {SPOOL_DIR}")
-    for label in ("pending", "processing", "done"):
-        try:
-            names = [n[:-5] for n in sorted(os.listdir(_p(label))) if n.endswith(".json")]
-        except OSError:
-            names = []
-        print(f"  {label:11s} {len(names):3d}  {' '.join(names[:6])}{' …' if len(names) > 6 else ''}")
-    if a.rid:
-        st = read_status(a.rid)
-        print(f"  status[{a.rid}]: {json.dumps(st) if st else '(none)'}")
-    return 0
+    return cgc_backend.store_status(daemon_alive(), a.rid)
 
 
 def main() -> int:
     p = argparse.ArgumentParser(prog="cgc_spool.py")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    e = sub.add_parser("enqueue", help="write a consult job into the local spool (LOCAL write only)")
+    e = sub.add_parser("enqueue", help="create a queued consult round in the store (LOCAL write only)")
     e.add_argument("--rid", required=True)
     e.add_argument("--prompt-file", help="rendered prompt (required except for --kind retrieve)")
     e.add_argument("--kind", choices=("submit", "followup", "retrieve"), default="submit",
@@ -851,7 +498,7 @@ def main() -> int:
                         f"means something is broken, so read the log rather than waiting again.")
     w.set_defaults(fn=cmd_await)
 
-    s = sub.add_parser("status", help="print daemon liveness + spool contents")
+    s = sub.add_parser("status", help="print daemon liveness + round counts by state")
     s.add_argument("--rid", help="also print this job's status record")
     s.set_defaults(fn=cmd_status)
 
