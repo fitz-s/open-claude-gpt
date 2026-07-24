@@ -86,6 +86,61 @@ def store_status(up: bool, rid: str | None = None) -> int:
     return 0
 
 
+def stats_report() -> int:
+    """Aggregate reliability metrics from data the store already holds. The raw material was always
+    there (rounds + timestamps); this makes it a number someone actually looks at — the difference
+    between 'sentinel drift is happening' being an anecdote and being an alarm."""
+    import datetime as _dt
+
+    def _secs(a, b):
+        try:
+            return (_dt.datetime.fromisoformat(b) - _dt.datetime.fromisoformat(a)).total_seconds()
+        except (ValueError, TypeError):
+            return None
+
+    with store_mod.Store() as s:
+        rows = [dict(r) for r in s.db.execute(
+            "SELECT state, created_at, updated_at FROM rounds")]
+    total = len(rows)
+    by = {}
+    for r in rows:
+        by[r["state"]] = by.get(r["state"], 0) + 1
+    ok = by.get(store_mod.COMPLETED_VERIFIED, 0)
+    unv = by.get(store_mod.COMPLETED_UNVERIFIED, 0)
+    fail = by.get(store_mod.FAILED, 0) + by.get(store_mod.GATE_REJECTED, 0)
+    completed = ok + unv
+    durations = sorted(d for r in rows
+                       if r["state"] in (store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED)
+                       for d in [_secs(r["created_at"], r["updated_at"])] if d is not None and d > 0)
+
+    def _pct(p):
+        return durations[min(len(durations) - 1, int(len(durations) * p))] if durations else None
+
+    unv_rate = (unv / completed) if completed else None
+    report = {
+        "rounds": total, "by_state": by,
+        "completed": completed, "failed": fail,
+        "unverified_rate": round(unv_rate, 3) if unv_rate is not None else None,
+        "latency_s": {"p50": _pct(0.50), "p90": _pct(0.90), "n": len(durations)},
+    }
+    print(json.dumps(report))
+    if completed:
+        sys.stderr.write(f"CGC_STATS {completed} completed ({ok} verified / {unv} unverified), "
+                         f"{fail} failed, of {total} rounds.\n")
+        if durations:
+            sys.stderr.write(f"CGC_STATS completion latency p50={int(_pct(0.50))}s "
+                             f"p90={int(_pct(0.90))}s over {len(durations)} rounds.\n")
+        # The drift alarm: the sentinel wrapper failing often is the earliest cheap signal that the
+        # ChatGPT UI or model behavior changed under us.
+        if unv_rate is not None and unv_rate > 0.25 and completed >= 8:
+            sys.stderr.write(
+                f"CGC_ALERT unverified-completion rate is {unv_rate:.0%} — the model is frequently "
+                "skipping the BEGIN/END sentinel wrapper. That is the early signal of UI/model "
+                "drift: check a recent answer file for truncation and consider re-testing the "
+                "prompt template.\n")
+    return 0
+
+
 # ---- enqueue -----------------------------------------------------------------
 def enqueue_round(a, prompt: str, out: str) -> int:
     """Create a queued round from the CLI args. The prompt BYTES live on the round (no pathname to
