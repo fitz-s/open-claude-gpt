@@ -42,8 +42,54 @@ except Exception:
     pass
 
 CGC_STATE_DIR = os.environ.get("CGC_STATE_DIR", "/tmp/cgc")
-# ":memory:" is honoured for tests; the real store lives at a fixed path under the private state dir.
-DB_PATH = os.environ.get("CGC_STORE_DB", os.path.join(CGC_STATE_DIR, "control.db"))
+
+
+def data_dir() -> str:
+    """Durable data dir. The authority (threads, rounds, results) must not live in the scratch dir:
+    CGC_STATE_DIR defaults to /tmp, which reboots wipe and docs call deletable. Scratch files
+    (prompt/refs/answer) stay under CGC_STATE_DIR; the DB lives here. Resolved from the environment
+    at CALL time (not import time) so tests and late-loaded config are honoured."""
+    explicit = os.environ.get("CGC_DATA_DIR")
+    if explicit:
+        return explicit
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "cgc")
+
+
+def db_path() -> str:
+    """Effective store DB path. ":memory:" is honoured for tests."""
+    return os.environ.get("CGC_STORE_DB", os.path.join(data_dir(), "control.db"))
+
+
+def _legacy_db() -> str:
+    return os.path.join(os.environ.get("CGC_STATE_DIR", "/tmp/cgc"), "control.db")
+
+
+def _relocate_legacy_db(target: str) -> None:
+    """One-time move of the store out of the non-durable state dir into the durable data dir.
+
+    Runs only when the caller is using the DEFAULT path (no CGC_STORE_DB override), the target does
+    not exist yet, and a legacy /tmp-era DB does. The sqlite backup API gives a transactionally
+    consistent copy even if a not-yet-restarted daemon still has the legacy file open; the legacy
+    file is then renamed *.migrated so it can never be re-opened as a second live authority."""
+    if "CGC_STORE_DB" in os.environ:
+        return
+    legacy = _legacy_db()
+    if target == legacy or os.path.exists(target) or not os.path.exists(legacy):
+        return
+    d = os.path.dirname(target)
+    if d:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    os.close(os.open(target, os.O_CREAT | os.O_WRONLY, 0o600))
+    src = sqlite3.connect(legacy)
+    dst = sqlite3.connect(target)
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    os.replace(legacy, legacy + ".migrated")
 
 SCHEMA_VERSION = 1
 
@@ -125,8 +171,9 @@ class Store:
     shared across threads by default). Every mutating method commits its own transaction."""
 
     def __init__(self, path: str | None = None):
-        self.path = path or DB_PATH
+        self.path = path or db_path()
         if self.path != ":memory:":
+            _relocate_legacy_db(self.path)
             d = os.path.dirname(self.path)
             if d:
                 os.makedirs(d, mode=0o700, exist_ok=True)

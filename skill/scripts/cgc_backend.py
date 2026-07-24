@@ -72,7 +72,7 @@ def store_status(up: bool, rid: str | None = None) -> int:
         # possibly_accepted is the only bucket that needs a HUMAN; a `sending` round is just in-flight.
         needs_human = [row["rid"] for row in s.db.execute(
             "SELECT rid FROM rounds WHERE state=?", (store_mod.POSSIBLY_ACCEPTED,))]
-        print(f"daemon: {'UP' if up else 'DOWN'}   backend: STORE ({store_mod.DB_PATH})")
+        print(f"daemon: {'UP' if up else 'DOWN'}   backend: STORE ({store_mod.db_path()})")
         for r in rows:
             print(f"  {r['state']:20s} {r['c']:3d}")
         print(f"  active: dispatchable={len(active['dispatchable'])} "
