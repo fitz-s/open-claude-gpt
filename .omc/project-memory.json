@@ -19,7 +19,7 @@
   },
   "build": {
     "buildCommand": "make build",
-    "testCommand": "cat >> tests/test_store_backend.py <<'EOF'\n\n\nclass TestStats:\n    def test_stats_reports_rates_and_latency(self, env, capsys):\n        store_mod, backend, s, tmp_path = env\n        for i, final in enumerate([store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_VERIFIED,\n                                   store_mod.COMPLETED_UNVERIFIED]):\n            rid = f\"REQ-20260707-120000-0st{i:03d}\"\n            s.create_round(rid, \"submit\", prompt=\"p\")\n            s.set_state(rid, store_mod.READY)\n            aid = s.begin_send(rid, \"p\", \"h\" * 64, daemon_instance_id=\"d\")\n            s.mark_accepted(aid, f\"conv-{i}\")\n            s.mark_waiting(rid)\n            s.finish(rid, final, result_text=\"a\")\n        assert backend.stats_report() == 0\n        rep = json.loads(capsys.readouterr().out.strip().splitlines()[-1])\n        assert rep[\"completed\"] == 3\n        assert abs(rep[\"unverified_rate\"] - 1 / 3) < 0.01\n        assert rep[\"latency_s\"][\"n\"] == 3\nEOF\npython3 -m pytest tests/ -q 2>&1 | tail -2 && CGC_STORE_DB=/tmp/cgc/control.db python3 skill/scripts/cgc_spool.py stats 2>&1 | head -6",
+    "testCommand": "grep -n \"CGC_STORE_BACKEND\" .env.example docs/*.md 2>/dev/null; cat >> .env.example <<'EOF'\n\n# Durable data dir holding the consult store (control.db: threads, rounds, results).\n# Default: $XDG_STATE_HOME/cgc or ~/.local/state/cgc. Scratch stays in CGC_STATE_DIR.\n# CGC_DATA_DIR=\"$HOME/.local/state/cgc\"\nEOF\nmake lint 2>&1 | tail -1 && python3 -m pytest tests/ -q 2>&1 | tail -1",
     "lintCommand": null,
     "devCommand": null,
     "scripts": {}
@@ -146,6 +146,12 @@
       "type": "file"
     },
     {
+      "path": "docs/ARCHITECTURE.md",
+      "accessCount": 7,
+      "lastAccessed": 1784885927951,
+      "type": "file"
+    },
+    {
       "path": "tests/test_daemon.py",
       "accessCount": 4,
       "lastAccessed": 1784884492819,
@@ -161,6 +167,12 @@
       "path": "bin/cgc",
       "accessCount": 4,
       "lastAccessed": 1784885547893,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 4,
+      "lastAccessed": 1784885876951,
       "type": "file"
     },
     {
@@ -188,27 +200,21 @@
       "type": "file"
     },
     {
-      "path": "README.md",
-      "accessCount": 2,
-      "lastAccessed": 1784879140309,
-      "type": "file"
-    },
-    {
       "path": "Makefile",
       "accessCount": 2,
       "lastAccessed": 1784879146188,
       "type": "file"
     },
     {
-      "path": "docs/ARCHITECTURE.md",
-      "accessCount": 1,
-      "lastAccessed": 1784875469883,
+      "path": "skill/SKILL.md",
+      "accessCount": 2,
+      "lastAccessed": 1784885788603,
       "type": "file"
     },
     {
-      "path": "skill/SKILL.md",
-      "accessCount": 1,
-      "lastAccessed": 1784875550601,
+      "path": "docs/SECURITY.md",
+      "accessCount": 2,
+      "lastAccessed": 1784885862405,
       "type": "file"
     },
     {
