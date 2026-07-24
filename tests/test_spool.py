@@ -49,12 +49,12 @@ def test_heartbeat_write_then_daemon_alive_is_true(spool):
 
 
 def test_stale_heartbeat_daemon_alive_is_false(spool):
-    spool._atomic_write(spool.DAEMON_PATH, {"pid": os.getpid(), "ts": time.time() - 1000})
+    spool._atomic_write(spool.daemon_path(), {"pid": os.getpid(), "ts": time.time() - 1000})
     assert spool.daemon_alive() is False
 
 
 def test_dead_pid_heartbeat_daemon_alive_is_false(spool):
-    spool._atomic_write(spool.DAEMON_PATH, {"pid": 999999, "ts": time.time()})
+    spool._atomic_write(spool.daemon_path(), {"pid": 999999, "ts": time.time()})
     assert spool.daemon_alive() is False
 
 
