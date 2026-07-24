@@ -313,9 +313,20 @@ def enqueue_round(a, prompt: str, out: str) -> int:
     first call can safely re-run it), while the same key with a different one is refused — one key,
     one request. RID uniqueness alone only prevents row collisions, not duplicate intents."""
     import sqlite3
+    import cgc_spool as _spool
     conv = getattr(a, "conversation", None)
     parent = getattr(a, "parent", None)
     rkey = getattr(a, "request_key", None)
+    # S3-B: an explicit --conversation must ALREADY be a canonical conversation id. A rid/URL/path
+    # alias is resolvable, but it would be stored and locked verbatim while the --parent path resolves
+    # the same thread to its canonical id and locks THAT — two lock files for one composer. Fail
+    # closed (canonical-by-construction): reject the alias here, before it is stored, and name the fix.
+    if conv not in (None, "auto", "last") and not _spool.is_canonical_conversation(conv):
+        sys.stderr.write(
+            "CGC_ERROR conversation_not_canonical: --conversation must be a bare ChatGPT conversation "
+            f"id (uuid), got {conv!r}. To target a consult by its rid use --parent <rid>; otherwise "
+            "pass the bare conversation id.\n")
+        return 2
     # A request-key's idempotency identity is its fingerprint, whose prompt component is --logical-sha
     # (the placeholder render). Without it the low-level enqueue would fall back to hashing the raw
     # prompt — which cannot safely distinguish logical requests when the caller supplies the prompt
@@ -728,6 +739,15 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                          error_code="followup has no pinned thread to continue — pass --parent <rid> "
                                     "or --conversation <id>")
             return store_mod.FAILED
+        import cgc_spool as _spool
+        # S3-B worker boundary: a pre-release queued row may carry a rid-shaped conversation. The lock
+        # key MUST be canonical; a non-canonical resolved conversation is a PRE-SEND terminal failure
+        # (nothing has touched the browser here), never a mis-keyed lock or a send.
+        if not _spool.is_canonical_conversation(conv):
+            store.finish(rid, store_mod.FAILED,
+                         error_code=(f"followup conversation is not a canonical id ({conv!r}) — "
+                                     "re-enqueue with --parent <rid> or a bare conversation id"))
+            return store_mod.FAILED
         gated = _gate(store, rid, prompt, validate)
         if gated is not None:
             return gated
@@ -737,7 +757,6 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         # BEFORE that subprocess; hold until it returns. A second same-conversation follow-up cannot
         # enter this region — it refuses (the round is still READY, redispatched later) rather than
         # racing W1 onto the one shared composer and corrupting the pre-click not-sent proof.
-        import cgc_spool as _spool
         conv_lease = _spool.acquire_conversation_lease(conv)
         if conv_lease is None:
             raise ConversationLeaseRefused(conv)

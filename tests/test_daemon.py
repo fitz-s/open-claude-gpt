@@ -422,9 +422,9 @@ def test_worker_refuses_second_same_conversation_followup(daemon, monkeypatch):
     rid = _rid("00c001")
     s = daemon.store_mod.Store()
     s.create_round(rid, "followup", prompt="continuing this consult",
-                   spec_json=json.dumps({"conversation": "conv-shared"}))
+                   spec_json=json.dumps({"conversation": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}))
     s.set_state(rid, daemon.store_mod.READY)
-    held = daemon.spool.acquire_conversation_lease("conv-shared")  # the first worker owns the composer
+    held = daemon.spool.acquire_conversation_lease("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")  # the first worker owns the composer
     assert held is not None
     try:
         assert daemon.run_worker_store(rid) == daemon.EXIT_LEASE_REFUSED
@@ -446,14 +446,70 @@ def test_conversation_lease_is_exclusive_and_per_conversation(daemon):
     the SAME conversation but not on a DIFFERENT one (no false serialization of distinct threads)."""
     if daemon.spool.fcntl is None:
         pytest.skip("no fcntl on this platform")
-    a = daemon.spool.acquire_conversation_lease("conv-1")
+    a = daemon.spool.acquire_conversation_lease("11111111-1111-4111-8111-111111111111")
     assert a is not None
-    assert daemon.spool.acquire_conversation_lease("conv-1") is None, "same conversation is exclusive"
-    b = daemon.spool.acquire_conversation_lease("conv-2")
+    assert daemon.spool.acquire_conversation_lease("11111111-1111-4111-8111-111111111111") is None, "same conversation is exclusive"
+    b = daemon.spool.acquire_conversation_lease("22222222-2222-4222-8222-222222222222")
     assert b is not None, "a different conversation is not blocked"
     a.close()
     b.close()
-    assert daemon.spool.acquire_conversation_lease("conv-1") is not None, "freed on release"
+    assert daemon.spool.acquire_conversation_lease("11111111-1111-4111-8111-111111111111") is not None, "freed on release"
+
+
+# ---- Fix S3-A: live-lease fd registry + inheritance into mutating CDP subprocesses ----
+
+def test_live_lease_fds_registers_on_acquire_and_deregisters_on_close(daemon):
+    """The registry is the source of truth for which fds a mutating subprocess must inherit: every
+    lease-acquire helper registers its fd, and .close() de-registers it (before closing, so a reused
+    fd number is never left falsely marked inheritable)."""
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    spool = daemon.spool
+    assert spool.live_lease_fds() == (), "no leases held yet"
+    rid_l = spool.acquire_rid_lease(_rid("00d001"))
+    brow_l = spool.acquire_browser_lease(shared=True)
+    conv_l = spool.acquire_conversation_lease("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    rid_fd, brow_fd, conv_fd = rid_l.fileno(), brow_l.fileno(), conv_l.fileno()
+    assert set(spool.live_lease_fds()) == {rid_fd, brow_fd, conv_fd}, "acquire registers each fd"
+    conv_l.close()
+    assert conv_fd not in spool.live_lease_fds(), "close de-registers the fd"
+    assert set(spool.live_lease_fds()) == {rid_fd, brow_fd}
+    rid_l.close()
+    brow_l.close()
+    assert spool.live_lease_fds() == (), "every lease de-registered on close"
+
+
+def test_mutating_cdp_subprocess_inherits_exactly_the_live_lease_fds(daemon, monkeypatch):
+    """S3-A: the daemon hands every browser-mutating cdp_consult subprocess the live lease fds via
+    subprocess pass_fds, so the inherited open file descriptions keep the rid/browser/conversation
+    flocks held until the CDP child also exits — the backend dying mid-click can no longer release
+    ownership out from under the running mutation."""
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    spool = daemon.spool
+    rid = _rid("00d101")
+    # a worker holds its rid + shared-browser leases, plus (followup mutating region) the conv lease
+    rid_l = spool.acquire_rid_lease(rid)
+    brow_l = spool.acquire_browser_lease(shared=True)
+    conv_l = spool.acquire_conversation_lease("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    expected = set(spool.live_lease_fds())
+    captured = {}
+
+    class _R:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake_run(cmd, **kw):
+        captured["pass_fds"] = kw.get("pass_fds")
+        return _R()
+
+    monkeypatch.setattr(daemon.subprocess, "run", fake_run)
+    daemon._make_run_cdp()("followup", rid=rid,
+                           conversation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                           prompt="continuing this consult")
+    assert set(captured["pass_fds"]) == expected, \
+        "the followup subprocess must inherit exactly the held rid+browser+conversation lease fds"
+    for lease in (conv_l, brow_l, rid_l):
+        lease.close()
 
 
 # ---- cross-generation leases (worker/browser fencing) ------------------------
