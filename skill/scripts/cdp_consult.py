@@ -487,7 +487,7 @@ class CDP:
 # layout/rendering, which Chrome throttles for a BACKGROUND tab — and the detached waiter polls
 # while the user's foreground tab is elsewhere, so innerText there collapses to ~empty: the
 # answer reads as "1 char", `done` never fires, and wait only returns on timeout. textContent
-# and childNodes are populated regardless of tab visibility. (_user_rid_js already used
+# and childNodes are populated regardless of tab visibility. (_last_user_text_js already used
 # textContent, which is exactly why rid-resolution worked while answer-extraction silently
 # failed on the same backgrounded tab.)
 
@@ -513,18 +513,37 @@ _ROLE_FN = ("function __cgcRole(el){return el.getAttribute('data-message-author-
 
 _NODE_FN = (
     _ROLE_FN +
-    "function __cgcNode(BG){"
-    "var all=document.querySelectorAll(" + _JS_A + ");"
-    # 1) exact: any assistant node containing our (unique) BEGIN sentinel — global search.
-    "for(var i=all.length-1;i>=0;i--){if((all[i].textContent||'').indexOf(BG)>=0)return all[i];}"
-    # 2) fallback (no sentinel yet): the LARGEST assistant node of the CURRENT turn (after the
-    #    last user message). NOT a[last] — that is often a 1-char trailing streaming placeholder,
-    #    so the waiter saw len=1 for 25 min while the model was actually producing content in
-    #    sibling nodes. NOT a global max either — that would read a PRIOR round's big answer.
+    # __cgcNode(BG, turnIndex): turnIndex is OPTIONAL. Omitted/undefined/negative -> UNSCOPED,
+    # the legacy 'auto' behavior (step 1 searches the whole document; step 2 falls back to only
+    # AFTER the last user node). Given (0-based ordinal of a user turn, DOM order, among
+    # querySelectorAll(_JS_ANY)'s user-role matches) -> SCOPED to the interval strictly between
+    # that turn and the NEXT user turn (or end of conversation): this is the [S3] fix — a
+    # source-pinned retrieve's answer may come ONLY from assistant nodes inside its own turn's
+    # interval, never from a later round's nodes, even when they happen to contain the same BEGIN
+    # token (e.g. the model echoing/quoting it). Returns null when turnIndex is scoped but that
+    # ordinal's user node is not currently in the DOM (virtualized away) — the caller must fail
+    # closed rather than search outside the (unresolvable) interval.
+    "function __cgcNode(BG,turnIndex){"
     "var nx=document.querySelectorAll(" + _JS_ANY + ");"
-    "var lu=-1;for(var j=0;j<nx.length;j++){if(__cgcRole(nx[j])==='user')lu=j;}"
+    "var scoped=(turnIndex!==undefined&&turnIndex!==null&&turnIndex>=0);"
+    "var lo=-1,hi=nx.length;"
+    "if(scoped){"
+    "var seen=-1;lo=-1;hi=nx.length;"
+    "for(var j=0;j<nx.length;j++){if(__cgcRole(nx[j])==='user'){seen++;"
+    "if(seen===turnIndex){lo=j;}else if(seen===turnIndex+1){hi=j;break;}}}"
+    "if(lo<0)return null;"
+    "}"
+    # 1) exact: any assistant node containing our (unique) BEGIN sentinel, newest-first. Scoped ->
+    #    within [lo,hi) only. Unscoped -> the whole document (lo=-1,hi=nx.length), matching the
+    #    original global search.
+    "for(var i=hi-1;i>lo;i--){if(__cgcRole(nx[i])==='assistant'&&(nx[i].textContent||'').indexOf(BG)>=0)return nx[i];}"
+    # 2) fallback (no sentinel yet): the LARGEST assistant node in the interval. Scoped -> the same
+    #    [lo,hi). Unscoped -> only AFTER the last user node (NOT a[last], which is often a 1-char
+    #    trailing streaming placeholder; NOT a global max, which would read a PRIOR round's answer).
+    "var flo=lo,fhi=hi;"
+    "if(!scoped){flo=-1;for(var m=0;m<nx.length;m++){if(__cgcRole(nx[m])==='user')flo=m;}}"
     "var best=null,bl=-1;"
-    "for(var k=lu+1;k<nx.length;k++){if(__cgcRole(nx[k])==='assistant'){"
+    "for(var k=flo+1;k<fhi;k++){if(__cgcRole(nx[k])==='assistant'){"
     "var L=(nx[k].textContent||'').length;if(L>bl){bl=L;best=nx[k];}}}"
     "return best;}"
 )
@@ -647,22 +666,28 @@ def _sentinel_js(rid: str, text_expr: str) -> str:
     )
 
 
-def _detect_js(rid: str) -> str:
+def _detect_js(rid: str, turn_index=None) -> str:
     """Returns JSON {generating,done,blocker,len,begin,end,ac} for the answer node.
     done comes from the canonical bare-line _sentinel_js parser (SHARED CONTRACT #1) — a line
     merely CONTAINING BEGIN/END_RESPONSE:<rid> (quoted in prose or a code block) never counts,
     only a bare standalone sentinel line does. This is NOT stop-button driven: the model writes
     END_RESPONSE only as its final line, so its presence == complete + extractable. Depending on
     the stop-button was fragile — if that UI selector ever persists, done would never fire and
-    wait would only return on timeout. begin/end/ac are diagnostics for the heartbeat."""
+    wait would only return on timeout. begin/end/ac are diagnostics for the heartbeat.
+
+    turn_index: when given (a source-pinned wait — see cmd_wait/_locate_source_turn), the answer
+    node is looked up SCOPED to that turn's interval via __cgcNode's turnIndex ([S3] fix: an
+    answer may only come from its own source turn's interval, never a later round's). Omitted
+    (None) keeps the legacy unscoped 'auto' lookup."""
     begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
     end = json.dumps(f"END_RESPONSE:{rid}")
     sentinel = _sentinel_js(rid, "__cgcText(node)")
+    node_call = f"__cgcNode({begin})" if turn_index is None else f"__cgcNode({begin},{int(turn_index)})"
     return (
         "(function(){" + _NODE_FN + _TEXT_FN +
         "var a=document.querySelectorAll(" + _JS_A + ");"
         "var BG=" + begin + ",EN=" + end + ";"
-        "var node=__cgcNode(BG);"
+        "var node=" + node_call + ";"
         "var rawT=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
         "var res=" + sentinel + ";"
         "var hasB=rawT.indexOf(BG)>=0,hasE=rawT.indexOf(EN)>=0;"
@@ -676,24 +701,64 @@ def _detect_js(rid: str) -> str:
     )
 
 
-def _user_rid_js() -> str:
-    """Read the request id from the LAST user message's `BEGIN_RESPONSE:<rid>` echo.
-    Lets `wait`/`status` watch the rid that was actually submitted in THIS conversation,
-    making a submit/wait rid mismatch structurally impossible."""
-    # Exact rid shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) so a missing whitespace boundary in
-    # concatenated text can't make the capture swallow trailing characters.
+# ---- SHARED CONTRACT #3: canonical per-turn request-rid parser ([S3] fix) --------------------
+# The rid regex shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) shared by every rid-reading regex in this file.
+_RID_RE_SRC = r"REQ-\d{8}-\d{6}-[0-9a-f]{6}"
+_TURN_BEGIN_LINE_RE = re.compile(rf"^BEGIN_RESPONSE:({_RID_RE_SRC})$")
+_TURN_END_LINE_RE = re.compile(rf"^END_RESPONSE:({_RID_RE_SRC})$")
+
+
+def _turn_canonical_rid(turn_text):
+    """The ONE canonical parser for a user turn's OWN request rid ([S3] audit fix). Returns the
+    rid string, or None if the turn carries no complete pair.
+
+    Template-order evidence (consult.py): PROMPT_TEMPLATE embeds caller-supplied task text early
+    ('# Goal\\n{task}') and FOLLOWUP_TEMPLATE likewise ('# What I'm asking now\\n{task}'); BOTH
+    templates then emit their own BEGIN_RESPONSE:{rid} / END_RESPONSE:{rid} pair together, as the
+    LAST thing in the render ('# Final output format', the fixed closing block). So any
+    sentinel-shaped text a caller's task happens to quote or discuss — in prose, inside a code
+    fence, or even as a fully quoted BEGIN+END pair for some OTHER rid — necessarily sits BEFORE
+    the template's genuine pair. The canonical rid is therefore the rid of the LAST complete,
+    in-order BEGIN_RESPONSE:<rid>/END_RESPONSE:<rid> pair in the turn text (same rid on both
+    lines, BEGIN before END): a lone BEGIN with no matching END never wins, and an earlier pair
+    never beats a later one — exactly the [S3] fixture (an R2 turn that quotes 'BEGIN_RESPONSE:R1'
+    before its own footer must still resolve to R2, never R1).
+
+    Matched as whole (trimmed) lines — 'bare line' here means line-anchored after trim() on the
+    text split by '\\n', the same convention _sentinel_parse uses for the assistant-side wrapper
+    (DOM textContent flattens markdown, so this is the only structure available to match on;
+    fence-awareness is unnecessary here because picking the LAST pair already defeats an earlier
+    fenced/prose quote regardless of whether it's inside a fence).
+    """
+    canonical = None
+    open_begin = set()
+    for line in (turn_text or "").replace("\r\n", "\n").split("\n"):
+        s = line.strip()
+        mb = _TURN_BEGIN_LINE_RE.match(s)
+        if mb:
+            open_begin.add(mb.group(1))
+            continue
+        me = _TURN_END_LINE_RE.match(s)
+        if me and me.group(1) in open_begin:
+            canonical = me.group(1)  # scanning in order: the last completed pair wins
+    return canonical
+
+
+def _last_user_text_js() -> str:
+    """textContent of the LAST user turn only. DOM extraction stays JS's only job here — parsing
+    the rid out of it is Python's (via _turn_canonical_rid, pure and unit-tested)."""
     return ("(function(){var u=document.querySelectorAll(" + _JS_U + ");"
-            "var n=u[u.length-1];var t=n?n.textContent:'';"
-            "var m=t.match(/BEGIN_RESPONSE:(REQ-\\d{8}-\\d{6}-[0-9a-f]{6})/);return m?m[1]:'';})()")
+            "var n=u[u.length-1];return n?n.textContent:'';})()")
 
 
 def _resolve_rid(c, rid):
-    """Resolve + VERIFY the rid against the attached conversation.
+    """Resolve + VERIFY the rid against the attached conversation, via the canonical per-turn
+    parser (SHARED CONTRACT #3) — never a first-regex-match/substring read.
     - rid=='auto': read it from the page's last user message.
     - explicit rid: confirm the page actually holds THAT request — if the page's rid
       differs, the wrong tab/conversation is attached → fail loudly (prevents one
       request from receiving another's answer)."""
-    page_rid = c.eval(_user_rid_js()) or ""
+    page_rid = _turn_canonical_rid(c.eval(_last_user_text_js()) or "") or ""
     if rid == "auto":
         if not page_rid:
             raise SystemExit("CGC_ERROR rid_autodetect_failed: no BEGIN_RESPONSE:<rid> in the last "
@@ -707,75 +772,103 @@ def _resolve_rid(c, rid):
 
 
 def _all_user_texts_js() -> str:
-    """textContent of EVERY user turn, DOM order — unlike _user_rid_js (last turn only), this lets
-    a retrieve locate a SOURCE rid's own turn anywhere in the conversation, even when later turns
-    were sent after it."""
+    """textContent of EVERY user turn, DOM order — unlike _last_user_text_js (last turn only), this
+    lets a retrieve locate a SOURCE rid's own turn anywhere in the conversation, even when later
+    turns were sent after it."""
     return ("(function(){var u=document.querySelectorAll(" + _JS_U + ");"
             "return Array.prototype.map.call(u, function(n){return n.textContent||'';});})()")
-
-
-_RID_ECHO_RE = re.compile(r"BEGIN_RESPONSE:(REQ-\d{8}-\d{6}-[0-9a-f]{6})")
 
 
 def _locate_source_turn(user_texts, source_rid):
     """Pure, CDP-free turn-matching helper (unit-tested without a browser — see tests/
     test_store_backend.py): given every user turn's textContent in DOM order and the rid a retrieve
-    is recovering, find whether/where its own BEGIN_RESPONSE:<rid> echo lives.
+    is recovering, find whether/where its own turn lives — using _turn_canonical_rid (SHARED
+    CONTRACT #3), never substring containment of 'BEGIN_RESPONSE:<rid>'.
+
+    [S3] fix: substring containment used to let a LATER turn that merely quotes/discusses an OLDER
+    rid (in prose, a code fence, or even a fully quoted BEGIN+END pair) be mistaken for that rid's
+    own turn — and, if it also looked 'latest', for the SOURCE turn's identity, which then let
+    unwrapped salvage adopt the later turn's answer under the earlier rid's name. Matching on each
+    turn's OWN canonical rid closes this: only the turn whose LAST complete sentinel pair equals
+    source_rid can ever match.
 
     present=False: the source turn is nowhere in the conversation -> rid_absent, refuse outright.
     present=True, is_last=True: no user turn was sent after it -> the conversation has not advanced
-      past it, so the existing unwrapped-salvage fallback (last assistant node, no sentinel) is as
-      safe here as it is for a normal submit/followup wait.
+      past it, so the existing unwrapped-salvage fallback (largest assistant node in this turn's
+      interval, no sentinel) is as safe here as it is for a normal submit/followup wait.
     present=True, is_last=False: at least one later turn exists -> only a sentinel-WRAPPED answer
-      (its own END_RESPONSE:<rid> anchor, extracted via the rid-scoped _detect_js/_extract_js) can
-      still be safely attributed to the source turn; unwrapped salvage must be refused
-      (rid_superseded/ambiguous) since 'the last assistant node' may now belong to that later turn.
+      (its own END_RESPONSE:<rid> anchor, extracted via the rid-and-interval-scoped
+      _detect_js/_extract_js) can still be safely attributed to the source turn; unwrapped salvage
+      must be refused (rid_superseded/ambiguous) since a later turn's own interval now exists.
 
-    observed_rid is the rid echoed by the LAST user turn, if any/parseable — 'what the conversation
-    is actually on now', surfaced in error text and the outcome envelope so a refusal is legible,
-    not just silent.
+    turn_index: the 0-based ordinal (DOM order) of the located turn among ALL user turns, or None
+    when absent. The caller threads this into __cgcNode's turnIndex so assistant-answer selection
+    is scoped to the exact interval between this turn and the next user turn — an answer may never
+    come from outside it (see _detect_js/_extract_js/_last_assistant_js).
+
+    observed_rid is the CANONICAL rid of the LAST user turn, if any — 'what the conversation is
+    actually on now', surfaced in error text and the outcome envelope so a refusal is legible, not
+    just silent.
     """
-    tok = f"BEGIN_RESPONSE:{source_rid}"
     idx = None
     for i, t in enumerate(user_texts):
-        if tok in (t or ""):
-            idx = i  # keep the LAST match — the most recent send of this exact content, if ever duplicated
-    observed = None
-    if user_texts:
-        m = _RID_ECHO_RE.search(user_texts[-1] or "")
-        observed = m.group(1) if m else None
+        if _turn_canonical_rid(t) == source_rid:
+            idx = i  # keep the LAST turn whose OWN canonical rid is source_rid (a legitimate resend)
+    observed = _turn_canonical_rid(user_texts[-1]) if user_texts else None
     if idx is None:
-        return {"present": False, "is_last": False, "observed_rid": observed}
-    return {"present": True, "is_last": idx == len(user_texts) - 1, "observed_rid": observed}
+        return {"present": False, "is_last": False, "observed_rid": observed, "turn_index": None}
+    return {"present": True, "is_last": idx == len(user_texts) - 1,
+            "observed_rid": observed, "turn_index": idx}
 
 
 def _salvage_allowed(c, rid):
     """Re-check, AT THE MOMENT unwrapped salvage is considered (not just once at wait-start),
     whether rid's own turn is still the conversation's LAST — a later turn can land WHILE the wait
     is in progress, which is exactly the race a retrieve recovery must close. Returns
-    (allowed: bool, observed_rid). Cheap (one DOM query), so re-checking on every salvage attempt
-    costs nothing against a poll loop measured in seconds."""
+    (allowed: bool, observed_rid, turn_index, present). Cheap (one DOM query), so re-checking on
+    every salvage attempt costs nothing against a poll loop measured in seconds. turn_index/present
+    are the fresh (this-instant) values from _locate_source_turn — the caller should use THIS
+    turn_index (not a cached one) for the salvage extraction that immediately follows, since the
+    DOM composition may have shifted since the wait started."""
     loc = _locate_source_turn(c.eval(_all_user_texts_js()) or [], rid)
-    return loc["is_last"] and loc["present"], loc["observed_rid"]
+    return loc["is_last"] and loc["present"], loc["observed_rid"], loc["turn_index"], loc["present"]
 
 
-def _last_assistant_js(rid: str) -> str:
-    """Reconstructed text of the answer node (no sentinel slicing) — for the stall raw dump."""
+def _last_assistant_js(rid: str, turn_index=None) -> str:
+    """Reconstructed text of the answer node (no sentinel slicing) — for the stall raw dump.
+    turn_index: see _detect_js — scopes the lookup to the source turn's interval when given."""
     begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
+    node_call = f"__cgcNode({begin})" if turn_index is None else f"__cgcNode({begin},{int(turn_index)})"
     return ("(function(){" + _NODE_FN + _TEXT_FN +
-            "return __cgcText(__cgcNode(" + begin + "));})()")
+            "return __cgcText(" + node_call + ");})()")
 
 
-def _extract_js(rid: str) -> str:
+def _extract_js(rid: str, turn_index=None) -> str:
     """Returns the answer text BETWEEN the bare-line sentinels of the answer node (SHARED
-    CONTRACT #1, via the canonical _sentinel_js parser), or '' if no valid wrapper is present."""
+    CONTRACT #1, via the canonical _sentinel_js parser), or '' if no valid wrapper is present.
+    turn_index: see _detect_js — scopes the lookup to the source turn's interval when given."""
     begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
-    sentinel = _sentinel_js(rid, "__cgcText(__cgcNode(" + begin + "))")
+    node_call = f"__cgcNode({begin})" if turn_index is None else f"__cgcNode({begin},{int(turn_index)})"
+    sentinel = _sentinel_js(rid, f"__cgcText({node_call})")
     return (
         "(function(){" + _NODE_FN + _TEXT_FN +
         "var res=" + sentinel + ";"
         "return res.done?res.body:'';})()"
     )
+
+
+def _scoped_raw(c, rid, strict, turn_index):
+    """Fetch unwrapped-salvage raw text via _last_assistant_js, honoring the [S3] interval
+    guarantee. STRICT (source-pinned) mode: the answer may come ONLY from the source turn's own
+    interval — if turn_index is None (that turn is no longer resolvable in the current DOM, e.g.
+    virtualized away), refuse outright rather than falling back to an unscoped 'current turn'
+    search that could read a LATER round's answer. Non-strict ('auto') mode keeps the legacy
+    unscoped lookup, since there is no pinned source turn to violate."""
+    if strict:
+        if turn_index is None:
+            return ""
+        return c.eval(_last_assistant_js(rid, turn_index)) or ""
+    return c.eval(_last_assistant_js(rid)) or ""
 
 
 # ChatGPT VIRTUALIZES message nodes on a backgrounded/inactive tab: the completed answer node
@@ -1634,7 +1727,7 @@ def cmd_followup(a) -> int:
         # from the prompt file itself (_extract_rid_from_prompt_file, which fails closed before
         # send if the file has zero or multiple distinct rids) — so this check always runs.
         if rid:
-            echoed = c.eval(_user_rid_js()) or ""
+            echoed = _turn_canonical_rid(c.eval(_last_user_text_js()) or "") or ""
             if echoed != rid:
                 print(json.dumps({"ok": False, "userMsgs": n, "conversation_id": conv,
                                   "rid": rid, "followup": True, "echoedRid": echoed}))
@@ -1713,6 +1806,11 @@ def cmd_wait(a) -> int:
         strict = a.rid != "auto"
         rid = None
         observed_rid = None
+        # Set only in the strict branch, from _locate_source_turn's turn_index: the ordinal (DOM
+        # order) of the source turn among user turns, threaded into every _detect_js/_extract_js/
+        # _last_assistant_js call below so the answer can only come from THAT turn's interval
+        # ([S3] fix). Stays None for 'auto' — the legacy unscoped lookup.
+        turn_index = None
         rdl = time.time() + min(600, a.timeout)
         while time.time() < rdl:
             if strict:
@@ -1726,6 +1824,7 @@ def cmd_wait(a) -> int:
                 observed_rid = loc["observed_rid"]
                 if loc["present"]:
                     rid = a.rid
+                    turn_index = loc["turn_index"]
                     break
                 sys.stderr.write(f"CGC_WAIT resolving source turn… (not yet visible; observed "
                                  f"latest {observed_rid or 'none'})\n")
@@ -1760,7 +1859,7 @@ def cmd_wait(a) -> int:
             except Exception:
                 pass
             try:
-                st = json.loads(c.eval(_detect_js(rid)) or "{}")
+                st = json.loads(c.eval(_detect_js(rid, turn_index)) or "{}")
             except Exception as e:
                 # transient CDP/eval hiccup — log and keep waiting, don't die
                 sys.stderr.write(f"CGC_WAIT eval-retry: {e}\n")
@@ -1775,7 +1874,7 @@ def cmd_wait(a) -> int:
                 sys.stderr.write(f"CGC_BLOCKER {st['blocker']}\n")
                 return 3
             if st.get("done"):
-                ans = c.eval(_extract_js(rid)) or ""
+                ans = c.eval(_extract_js(rid, turn_index)) or ""
                 _write_private(a.out, ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
                 sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out}\n")
                 conv = conv or c.conversation_id()
@@ -1812,19 +1911,21 @@ def cmd_wait(a) -> int:
                 if settle_start is None:
                     settle_start = time.time()
                 elif time.time() - settle_start >= a.settle_seconds:
-                    ans = c.eval(_extract_js(rid)) or ""
+                    ans = c.eval(_extract_js(rid, turn_index)) or ""
                     if ans:
                         _write_private(a.out, ans)
                         sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out} (recovered at settle)\n")
                         if not a.keep_tab:
                             c.close_tab()
                         return 0
-                    # No sentinel wrapper yet. Unwrapped salvage grabs 'the last assistant node' with
-                    # no rid anchor at all — re-check RIGHT NOW whether rid's turn is still the
-                    # conversation's latest (a later turn may have landed while we waited): if not,
-                    # that last node could belong to it instead, so salvage must be refused.
-                    allowed, observed_rid = _salvage_allowed(c, rid)
-                    raw = c.eval(_last_assistant_js(rid)) or ""
+                    # No sentinel wrapper yet. Unwrapped salvage grabs the largest assistant node in
+                    # the source turn's interval with no rid anchor at all — re-check RIGHT NOW
+                    # whether rid's turn is still the conversation's latest (a later turn may have
+                    # landed while we waited): if not, that later turn now owns its own interval, so
+                    # salvage must be refused. Use the FRESH turn_index from this check (DOM
+                    # composition may have shifted since the wait started), not the cached one.
+                    allowed, observed_rid, fresh_turn_index, _present = _salvage_allowed(c, rid)
+                    raw = _scoped_raw(c, rid, strict, fresh_turn_index)
                     if allowed and len(raw) >= a.min_unwrapped:
                         _write_private(a.out, raw)
                         _write_private(a.out + ".raw", raw)
@@ -1871,7 +1972,7 @@ def cmd_wait(a) -> int:
         #   present answer).
         # - empty / only short streaming stubs → exit 4, a genuine no-answer timeout, DISTINCT from
         #   the salvage case above (they do not conflict).
-        rescue = c.eval(_extract_js(rid)) or ""
+        rescue = c.eval(_extract_js(rid, turn_index)) or ""
         if rescue:
             _write_private(a.out, rescue)
             sys.stderr.write(f"CGC_DONE wrote {len(rescue)} chars to {a.out} (rescued at timeout)\n")
@@ -1881,8 +1982,13 @@ def cmd_wait(a) -> int:
         # No sentinel wrapper. Re-check (see the settle-time comment above) whether rid's turn is
         # still the conversation's latest before considering unwrapped salvage — a later turn may
         # have landed anywhere during the whole wait, not just at the settle instant.
-        allowed, observed_rid = _salvage_allowed(c, rid)
-        raw = c.eval(_last_assistant_js(rid)) or ""
+        allowed, observed_rid, fresh_turn_index, present = _salvage_allowed(c, rid)
+        raw = _scoped_raw(c, rid, strict, fresh_turn_index)
+        if not present and strict:
+            sys.stderr.write(
+                f"CGC_WAIT interval_unresolved: source_rid={rid}'s own turn could no longer be "
+                f"located in the DOM at timeout (observed_rid={observed_rid or 'none'}) — its "
+                "answer interval cannot be identified; not falling back outside it.\n")
         if allowed and len(raw) >= a.min_unwrapped:
             _write_private(a.out, raw)
             _write_private(a.out + ".raw", raw)
