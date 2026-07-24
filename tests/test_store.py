@@ -255,6 +255,46 @@ def test_events_are_appended(store):
     assert "created" in kinds and "state" in kinds and "begin_send" in kinds
 
 
+def _mp_relocation_worker(state_dir, data_dir_path, counter_path, barrier, result_queue):
+    """multiprocessing target for the two-process relocation race test. Must be module-level (not
+    a closure/method) so it is picklable under the 'spawn' start method. Runs in its own
+    interpreter: reloads cgc_store fresh and patches sqlite3.connect to bump a shared counter file
+    whenever it connects to the legacy DB path — the copy branch of relocation is the only place
+    that happens, so the counter tells us how many processes actually performed the copy."""
+    import os as _os
+    import sqlite3 as _real_sqlite3
+    import importlib.util as _ilu
+
+    _os.environ["CGC_STATE_DIR"] = state_dir
+    _os.environ["CGC_DATA_DIR"] = data_dir_path
+    _os.environ.pop("CGC_STORE_DB", None)
+    legacy_path = _os.path.realpath(_os.path.join(state_dir, "control.db"))
+    orig_connect = _real_sqlite3.connect
+
+    def counting_connect(path, *a, **kw):
+        if _os.path.realpath(str(path)) == legacy_path:
+            fd = _os.open(counter_path, _os.O_WRONLY | _os.O_APPEND | _os.O_CREAT, 0o600)
+            try:
+                _os.write(fd, b"1\n")
+            finally:
+                _os.close(fd)
+        return orig_connect(path, *a, **kw)
+
+    _real_sqlite3.connect = counting_connect
+    try:
+        spec = _ilu.spec_from_file_location("cgc_store_mp_race", _os.path.join(SCRIPTS, "cgc_store.py"))
+        m = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        barrier.wait(timeout=15)
+        s = m.Store()
+        ino = _os.stat(s.path).st_ino
+        store_uuid = s.store_uuid()
+        s.close()
+        result_queue.put((ino, store_uuid, None))
+    except Exception as exc:  # surface to the parent instead of hanging its join()
+        result_queue.put((None, None, repr(exc)))
+
+
 class TestLegacyRelocation:
     """The one-time /tmp→durable relocation of the store DB."""
 
@@ -342,6 +382,90 @@ class TestLegacyRelocation:
         s = cgc_store.Store()
         assert u1 and s.store_uuid() == u1, "the store identity must be stable across opens"
         s.close()
+
+    def test_truncated_target_is_quarantined_and_republished_from_legacy(self, tmp_path, monkeypatch):
+        """A nonzero but partial/corrupt target (e.g. left by an older relocation implementation)
+        must not be trusted just because it's nonempty: it gets quarantined aside, and a valid DB
+        is republished from the still-intact legacy DB, preserving legacy's identity."""
+        cgc_store, legacy = self._mk_legacy(tmp_path, monkeypatch)
+        legacy_store = cgc_store.Store(str(legacy))
+        legacy_uuid = legacy_store.store_uuid()
+        legacy_store.close()
+
+        target = tmp_path / "data" / "control.db"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"SQLite format 3\x00" + b"\x00" * 64)  # nonzero, truncated garbage
+
+        s = cgc_store.Store()
+        assert s.get_round("REQ-RELOC-1") is not None            # legacy data survived
+        assert s.store_uuid() == legacy_uuid                     # republished FROM legacy, not target
+        s.close()
+
+        data_dir = tmp_path / "data"
+        corrupt = [p for p in data_dir.iterdir() if p.name.startswith(".corrupt-")]
+        assert len(corrupt) == 1, "the invalid target must be quarantined, not deleted or trusted"
+        assert not legacy.exists()
+
+    def test_lock_file_created_and_never_unlinked(self, tmp_path, monkeypatch):
+        cgc_store, legacy = self._mk_legacy(tmp_path, monkeypatch)
+        s = cgc_store.Store()
+        s.close()
+        lock_path = tmp_path / "data" / ".relocation.lock"
+        assert lock_path.exists(), "relocation must create a dedicated lock file in the data dir"
+        # Nothing left to relocate on the second open — the lock file must still survive it.
+        s2 = cgc_store.Store()
+        s2.close()
+        assert lock_path.exists(), \
+            "the lock file must never be unlinked — unlink-while-held defeats flock"
+
+    def test_two_process_race_serializes_and_publishes_once(self, tmp_path, monkeypatch):
+        """Two processes constructing Store() concurrently must not both copy or both publish: the
+        flock serializes them, so exactly one performs the copy and both end up looking at the
+        SAME published inode — never a split-brain where one process writes an orphaned copy
+        while every later opener uses a different one."""
+        import multiprocessing
+
+        cgc_store, legacy = self._mk_legacy(tmp_path, monkeypatch)
+        state_dir = str(tmp_path / "state")
+        data_dir_path = str(tmp_path / "data")
+        counter_path = str(tmp_path / "copy_counter.txt")
+        with open(counter_path, "wb"):
+            pass
+
+        ctx = multiprocessing.get_context("spawn")
+        barrier = ctx.Barrier(2)
+        result_queue = ctx.Queue()
+        procs = [
+            ctx.Process(target=_mp_relocation_worker,
+                        args=(state_dir, data_dir_path, counter_path, barrier, result_queue))
+            for _ in range(2)
+        ]
+        for p in procs:
+            p.start()
+        try:
+            for p in procs:
+                p.join(timeout=30)
+                assert not p.is_alive(), "relocation race did not complete in time"
+        finally:
+            for p in procs:
+                if p.is_alive():
+                    p.terminate()
+                    p.join()
+
+        results = [result_queue.get(timeout=5) for _ in procs]
+        for ino, store_uuid, err in results:
+            assert err is None, f"relocation worker raised: {err}"
+
+        inos = {r[0] for r in results}
+        uuids = {r[1] for r in results}
+        assert len(inos) == 1, "both processes must end up opening the SAME published inode"
+        assert len(uuids) == 1, "both processes must observe the same store identity"
+
+        with open(counter_path, "rb") as f:
+            copies = f.read().count(b"1\n")
+        assert copies == 1, "exactly one process must perform the legacy-DB copy"
+        assert not legacy.exists()
+        assert (tmp_path / "state" / "control.db.migrated").exists()
 
 
 class TestSchemaMigrations:

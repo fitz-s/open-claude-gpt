@@ -65,44 +65,140 @@ def _legacy_db() -> str:
     return os.path.join(os.environ.get("CGC_STATE_DIR", "/tmp/cgc"), "control.db")
 
 
+class _RelocationValidationError(Exception):
+    """A candidate DB file is not a complete, trustworthy store — partial, truncated, or foreign."""
+
+
+def _validate_relocated_db(conn: sqlite3.Connection) -> None:
+    """Raise _RelocationValidationError unless `conn` points at a complete store DB: integrity check
+    passes, the meta table exists, and store_uuid is present and non-empty. Shared by the
+    post-copy check and the pre-existing-target check — the same bar either way, because either
+    file is about to become (or remain) the one authority every later opener trusts."""
+    check = conn.execute("PRAGMA integrity_check").fetchone()
+    check = check[0] if check else None
+    has_meta = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
+    store_uuid = None
+    if has_meta:
+        row = conn.execute("SELECT value FROM meta WHERE key='store_uuid'").fetchone()
+        store_uuid = row[0] if row else None
+    if check != "ok" or not has_meta or not store_uuid:
+        raise _RelocationValidationError(
+            f"relocation candidate failed validation (integrity={check!r}, "
+            f"meta={bool(has_meta)}, store_uuid={bool(store_uuid)})")
+
+
+def _validate_target_db(path: str) -> None:
+    """Open `path` fresh and run the same validation a relocated copy must pass. A file that isn't
+    even a readable SQLite database (truncated/partial, e.g. left by an older relocation
+    implementation) raises sqlite3.Error before PRAGMA runs at all — that counts as invalid too."""
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            _validate_relocated_db(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise _RelocationValidationError(f"{path}: {exc}") from exc
+
+
+def _acquire_relocation_lock(d: str) -> int:
+    """Exclusive, blocking flock on a dedicated file in the destination data dir (`d`), meant to be
+    held for the WHOLE relocation decision — sweep, inspection, copy, publish, and legacy fence.
+    This is the ONLY inter-process serialization relocation has: without it, two processes can each
+    pass the "legacy exists, target doesn't" check, each copy to a different temp, and race to
+    publish over `target` — the loser's copy is silently abandoned mid-write by every later opener.
+    A blocking acquire is fine; relocation is rare and finishes in well under a second.
+
+    fcntl is POSIX-only. Rather than run unserialized on a platform without it, fail closed: an
+    unserialized relocation is exactly the bug this function exists to prevent."""
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise RuntimeError(
+            "legacy DB relocation requires fcntl for inter-process serialization; this platform "
+            "has none, so relocation is refused rather than run unserialized") from exc
+    lock_path = os.path.join(d, ".relocation.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
 def _relocate_legacy_db(target: str) -> None:
     """One-time ATOMIC cutover of the store out of the non-durable state dir into the durable data
-    dir. Runs only when the caller is using the DEFAULT path (no CGC_STORE_DB override) and a legacy
-    /tmp-era DB exists.
+    dir. Runs only when the caller is using the DEFAULT path (no CGC_STORE_DB override).
+
+    Every step below — the stale-temp sweep, inspecting either DB, copying, publishing, and fencing
+    the legacy file — happens under a single exclusive flock (`_acquire_relocation_lock`), so at
+    most one process is ever inside this function's body at a time. That is what makes a stale-temp
+    sweep safe (nothing else can be mid-copy) and what prevents two processes from independently
+    publishing over `target`. State is re-read after the lock is acquired, since a peer may have
+    finished the whole relocation while this process was blocked waiting for it.
 
     Publication protocol (crash-safe at every boundary):
       1. sqlite-backup the legacy DB into a UNIQUE temp file in the destination dir (never the
-         final name — the final name must only ever hold a COMPLETE copy).
-      2. Validate the copy (PRAGMA integrity_check + the meta table exists), fsync it.
+         final name — the final name must only ever hold a COMPLETE, validated copy).
+      2. Validate the copy (PRAGMA integrity_check + meta table + store_uuid), fsync it.
       3. os.replace(temp, target) — the atomic publication. Target existence now IMPLIES a
          complete, validated DB; a crash earlier leaves only a uniquely-named temp (cleaned up on
          the next run), never a half-written target that would suppress retry.
       4. Rename the legacy file *.migrated — the writer fence. A crash between 3 and 4 leaves two
          complete files; the next run detects (target AND legacy both present) and finishes the
          fence instead of returning early with two apparent authorities.
+    A pre-existing nonzero target is validated the same way before it is trusted to supersede an
+    intact legacy DB: a partial/corrupt target (e.g. left by an older relocation implementation) is
+    quarantined aside, never fenced against, and the copy is redone from legacy.
     The sqlite backup gives a consistent snapshot but is NOT a writer fence for an already-running
     old daemon holding the legacy inode — that is what the heartbeat identity check (store_uuid /
     db_path, enforced fail-closed at enqueue) plus install.sh's mandatory daemon restart close."""
     if "CGC_STORE_DB" in os.environ:
         return
     legacy = _legacy_db()
-    if target == legacy or not os.path.exists(legacy):
+    if target == legacy:
         return
     d = os.path.dirname(target) or "."
     os.makedirs(d, mode=0o700, exist_ok=True)
-    # Sweep temps abandoned by a crash mid-copy — uniquely named, so never a live file.
+    lock_fd = _acquire_relocation_lock(d)
+    try:
+        _relocate_legacy_db_locked(target, legacy, d)
+    finally:
+        # Release the flock by closing the fd. The lock FILE itself is never unlinked: flock's
+        # exclusion is tied to the underlying inode via the open file description, so unlinking it
+        # while a peer holds (or is about to open) that same path would let a third process create
+        # a fresh inode of the same name and acquire an independent, non-serializing lock.
+        os.close(lock_fd)
+
+
+def _relocate_legacy_db_locked(target: str, legacy: str, d: str) -> None:
+    # Sweep runs only under the lock: no other process can be mid-copy right now, so any
+    # `.relocating-*` temp found here is provably abandoned, never a live peer file.
     for stale in os.listdir(d):
         if stale.startswith(".control.db.relocating-"):
             with contextlib.suppress(OSError):
                 os.remove(os.path.join(d, stale))
+
+    # Re-check now that the lock is held: a peer may have relocated (and fenced legacy) while this
+    # process was blocked waiting.
+    if not os.path.exists(legacy):
+        return
+
     if os.path.exists(target):
         if os.path.getsize(target) == 0:
             # A pre-cutover install crashed after pre-creating the final name empty; that stub
             # must not suppress relocation forever. Only an EMPTY file is provably not a DB.
             os.remove(target)
         else:
-            os.replace(legacy, legacy + ".migrated")  # finish the interrupted writer fence
-            return
+            try:
+                _validate_target_db(target)
+            except _RelocationValidationError:
+                # A nonempty target that fails validation is a partial/corrupt file — quarantine it
+                # rather than either trusting it or deleting it, then fall through and republish
+                # from the still-intact legacy DB below.
+                os.replace(target, os.path.join(d, f".corrupt-{uuid.uuid4().hex}"))
+            else:
+                os.replace(legacy, legacy + ".migrated")  # finish/redo the writer fence
+                return
+
     tmp = os.path.join(d, f".control.db.relocating-{uuid.uuid4().hex}")
     os.close(os.open(tmp, os.O_CREAT | os.O_WRONLY, 0o600))
     src = sqlite3.connect(legacy)
@@ -110,12 +206,7 @@ def _relocate_legacy_db(target: str) -> None:
     try:
         with dst:
             src.backup(dst)
-        check = dst.execute("PRAGMA integrity_check").fetchone()[0]
-        has_meta = dst.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
-        if check != "ok" or not has_meta:
-            raise sqlite3.DatabaseError(
-                f"relocated copy failed validation (integrity={check!r}, meta={bool(has_meta)})")
+        _validate_relocated_db(dst)
     except BaseException:
         dst.close()
         src.close()
