@@ -147,6 +147,32 @@ browser-level schedules; both fixed:
   only from the DOM interval between the source turn and the next user turn, and fail
   `rid_absent`/`rid_superseded` when the interval can't be resolved — never a global fallback.
 
+A fourth re-review (at 9bbc738) passed both round-three fixes and every earlier gate, and bounded
+the remaining risk to two mechanical at-most-once holes; both fixed, plus two more field defects
+the release's own consult traffic exposed:
+
+- **Lease fds ride into the browser mutator.** The backend held the rid/browser/conversation
+  flocks, but the CDP subprocess doing the actual clear/paste/click inherited none of them — a
+  backend death mid-click released every fence while the orphan child could still submit another
+  worker's bytes. Mutating CDP subprocesses now inherit the live lease fds (`pass_fds`); flock
+  binds to the open file description, so ownership survives until BOTH processes exit. The Chrome
+  relauncher deliberately does NOT inherit them (a restarted browser would pin the exclusive lease
+  forever).
+- **Conversation lock keys are canonical, fail-closed.** `--conversation <rid>` and
+  `--parent <rid>` could reach the same thread under DIFFERENT lock files (raw string vs resolved
+  id), defeating the mutator lease. An explicit `--conversation` must now be a bare canonical
+  conversation id (rejected otherwise, with `--parent` named as the rid-targeting path); the
+  worker revalidates before locking and fails a non-canonical row pre-send.
+- **Turn text is read with line structure.** The composer pastes a prompt as one `<p>` per line;
+  raw `textContent` concatenates them with NO newlines, so the line-anchored canonical parser
+  could not see any rid in a live turn — a LANDED send was classified `possibly_accepted` because
+  its own echo was unparseable. All user-turn reads now use the block-aware text walk (`__cgcText`,
+  already used for answers) rather than raw textContent.
+- **Landed-detection works on virtualized threads.** A long thread renders only the newest turns,
+  so "user-turn count increased" can stay false forever after a real send; the count is now only a
+  fast path, and the authoritative landed signal is the last rendered turn echoing OUR rid
+  (canonical parse, 30s window) — with the wait phase's 600s grace still behind it.
+
 ### Added
 - **JSON outcome envelope (schema 1).** Every `await` exit prints one machine-readable stdout line:
   rid, parent_rid, state, retryable, human_action, next_command, answer_path, log_path, confidence,
