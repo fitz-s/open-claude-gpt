@@ -91,7 +91,24 @@ def _relocate_legacy_db(target: str) -> None:
         src.close()
     os.replace(legacy, legacy + ".migrated")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Ordered, transactional migrations: _MIGRATIONS[n] upgrades a version-(n-1) DB to version n.
+# A fresh DB is created at SCHEMA_VERSION directly by _DDL, so each migration must produce exactly
+# the same shape _DDL creates. Never edit a shipped migration — append the next version instead.
+_MIGRATIONS = {
+    2: [
+        "ALTER TABLE rounds ADD COLUMN request_key TEXT",
+        "ALTER TABLE rounds ADD COLUMN parent_rid TEXT",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_rounds_request_key "
+        "ON rounds(request_key) WHERE request_key IS NOT NULL",
+    ],
+}
+
+
+class SchemaTooNew(Exception):
+    """The DB was written by a NEWER version of this tool. Refuse rather than guess: running old
+    code against a newer schema risks silent corruption of durable consult state."""
 
 # ---- the round state machine -------------------------------------------------
 # Terminal states have no outgoing transitions. `sending` can ONLY go to accepted/possibly_accepted:
@@ -185,13 +202,49 @@ class Store:
 
     # ---- schema / migration --------------------------------------------------
     def _migrate(self) -> None:
-        self.db.executescript(_DDL)
-        cur = self.db.execute("SELECT value FROM meta WHERE key='schema_version'")
-        row = cur.fetchone()
+        """Bring the DB to SCHEMA_VERSION. Fresh DB: _DDL creates the current shape and the version
+        row is stamped directly. Older DB: the file is backed up (control.db.v<n>.bak, via the
+        sqlite backup API — consistent even under WAL), then each pending migration runs in ONE
+        transaction with its version bump, so a crash mid-migration leaves a coherent version-(n-1)
+        DB plus a backup, never a half-migrated hybrid. Newer DB: refuse (SchemaTooNew)."""
+        # Read the version BEFORE running the current DDL: on an older DB the DDL's newer indexes
+        # reference columns only a migration adds, so DDL-first would fail on the very DB that
+        # needs migrating.
+        self.db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        row = self.db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         if row is None:
+            self.db.executescript(_DDL)
             self.db.execute("INSERT INTO meta(key,value) VALUES('schema_version',?)",
                             (str(SCHEMA_VERSION),))
-        # future: if int(row['value']) < SCHEMA_VERSION: run ordered migrations in one transaction.
+            return
+        have = int(row["value"])
+        if have == SCHEMA_VERSION:
+            return
+        if have > SCHEMA_VERSION:
+            raise SchemaTooNew(
+                f"store schema is v{have}, this code understands up to v{SCHEMA_VERSION} — "
+                f"the DB was written by a newer install. Upgrade the skill (re-run install.sh) "
+                f"instead of running old code against it.")
+        self._backup(f".v{have}.bak")
+        for target in range(have + 1, SCHEMA_VERSION + 1):
+            with self._tx():
+                for stmt in _MIGRATIONS[target]:
+                    self.db.execute(stmt)
+                self.db.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(target),))
+
+    def _backup(self, suffix: str) -> None:
+        """Consistent point-in-time copy of the DB file (skipped for :memory:)."""
+        if self.path == ":memory:":
+            return
+        dst_path = self.path + suffix
+        dst = sqlite3.connect(dst_path)
+        try:
+            with dst:
+                self.db.backup(dst)
+        finally:
+            dst.close()
+        with contextlib.suppress(OSError):
+            os.chmod(dst_path, 0o600)
 
     def close(self) -> None:
         with contextlib.suppress(Exception):
@@ -544,11 +597,15 @@ CREATE TABLE IF NOT EXISTS rounds (
   completion_confidence TEXT,
   current_attempt_id    TEXT,
   out_path              TEXT,
+  request_key           TEXT,
+  parent_rid            TEXT,
   created_at            TEXT NOT NULL,
   updated_at            TEXT NOT NULL,
   schema_version        INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_rounds_state ON rounds(state);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rounds_request_key
+  ON rounds(request_key) WHERE request_key IS NOT NULL;
 CREATE TABLE IF NOT EXISTS attempts (
   attempt_id          TEXT PRIMARY KEY,
   rid                 TEXT NOT NULL REFERENCES rounds(rid),

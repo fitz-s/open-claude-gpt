@@ -19,7 +19,7 @@
   },
   "build": {
     "buildCommand": "make build",
-    "testCommand": "python3 -m pytest tests/ -q 2>&1 | tail -2 && make lint 2>&1 | tail -1 && wc -l skill/scripts/cgc_spool.py skill/scripts/cgc_daemon.py",
+    "testCommand": "python3 - <<'EOF'\nimport re\np = \"tests/test_store.py\"\nsrc = open(p).read()\nsrc = src.replace(\n    'assert s.db.execute(\"SELECT value FROM meta WHERE key=\\'schema_version\\'\").fetchone()[0] == \"1\"',\n    'assert s.db.execute(\"SELECT value FROM meta WHERE key=\\'schema_version\\'\").fetchone()[0] == str(m.SCHEMA_VERSION)')\n# my new class: fix module access\nsrc = src.replace('''    def test_v1_db_migrates_to_current_with_backup(self, tmp_path):\n        p = str(tmp_path / \"old.db\")\n        self._make_v1(p)\n        s = store.Store(p)''', '''    def test_v1_db_migrates_to_current_with_backup(self, tmp_path):\n        m = _load(tmp_path / \"unused.db\")\n        p = str(tmp_path / \"old.db\")\n        self._make_v1(p)\n        s = m.Store(p)''')\nsrc = src.replace('''        assert s.db.execute(\"SELECT value FROM meta WHERE key='schema_version'\").fetchone()[0] == \\\\\n            str(store.SCHEMA_VERSION)''', '''        assert s.db.execute(\"SELECT value FROM meta WHERE key='schema_version'\").fetchone()[0] == \\\\\n            str(m.SCHEMA_VERSION)''')\nsrc = src.replace('''    def test_request_key_unique_after_migration(self, tmp_path):\n        p = str(tmp_path / \"old2.db\")\n        self._make_v1(p)\n        s = store.Store(p)''', '''    def test_request_key_unique_after_migration(self, tmp_path):\n        m = _load(tmp_path / \"unused.db\")\n        p = str(tmp_path / \"old2.db\")\n        self._make_v1(p)\n        s = m.Store(p)''')\nsrc = src.replace('''        db.commit(); db.close()\n        with pytest.raises(store.SchemaTooNew):\n            store.Store(p)''', '''        db.commit(); db.close()\n        m = _load(tmp_path / \"unused.db\")\n        with pytest.raises(m.SchemaTooNew):\n            m.Store(p)''')\nopen(p, \"w\").write(src)\nprint(\"patched\")\nEOF\npython3 -m pytest tests/test_store.py -q 2>&1 | tail -2",
     "lintCommand": null,
     "devCommand": null,
     "scripts": {}
@@ -122,6 +122,12 @@
       "type": "file"
     },
     {
+      "path": "skill/scripts/cgc_store.py",
+      "accessCount": 11,
+      "lastAccessed": 1784884859651,
+      "type": "file"
+    },
+    {
       "path": "tests/test_spool.py",
       "accessCount": 8,
       "lastAccessed": 1784884622169,
@@ -131,12 +137,6 @@
       "path": "skill/scripts/cgc_backend.py",
       "accessCount": 8,
       "lastAccessed": 1784884749953,
-      "type": "file"
-    },
-    {
-      "path": "skill/scripts/cgc_store.py",
-      "accessCount": 7,
-      "lastAccessed": 1784884259833,
       "type": "file"
     },
     {

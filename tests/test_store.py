@@ -31,7 +31,7 @@ def test_schema_and_file_mode(store, tmp_path):
     m, s = store
     # WAL journal + a schema_version row
     assert s.db.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
-    assert s.db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "1"
+    assert s.db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == str(m.SCHEMA_VERSION)
     mode = stat.S_IMODE(os.stat(tmp_path / "control.db").st_mode)
     assert mode == 0o600, oct(mode)
 
@@ -288,3 +288,72 @@ class TestLegacyRelocation:
         s = cgc_store.Store()
         s.close()
         assert legacy.exists()                                 # untouched
+
+
+class TestSchemaMigrations:
+    """Ordered transactional migrations: v1 → v2 with a pre-migration backup; newer-schema refusal."""
+
+    _V1_DDL = """
+    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE threads (thread_id TEXT PRIMARY KEY, conversation_id TEXT, model TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE rounds (rid TEXT PRIMARY KEY, thread_id TEXT REFERENCES threads(thread_id),
+      kind TEXT NOT NULL, source_mode TEXT, spec_json TEXT, rendered_prompt TEXT,
+      prompt_sha256 TEXT, state TEXT NOT NULL, result_text TEXT, error_code TEXT,
+      completion_confidence TEXT, current_attempt_id TEXT, out_path TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      schema_version INTEGER NOT NULL DEFAULT 1);
+    CREATE INDEX idx_rounds_state ON rounds(state);
+    CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY, rid TEXT NOT NULL REFERENCES rounds(rid),
+      daemon_instance_id TEXT, browser_epoch INTEGER, phase TEXT NOT NULL,
+      started_at TEXT NOT NULL, last_progress_at TEXT, remote_evidence_json TEXT);
+    CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, rid TEXT, attempt_id TEXT,
+      kind TEXT NOT NULL, detail TEXT, at TEXT NOT NULL);
+    """
+
+    def _make_v1(self, path):
+        import sqlite3 as _sq
+        db = _sq.connect(path)
+        db.executescript(self._V1_DDL)
+        db.execute("INSERT INTO meta(key,value) VALUES('schema_version','1')")
+        db.execute("INSERT INTO rounds(rid,kind,state,created_at,updated_at) "
+                   "VALUES('REQ-MIG-1','submit','queued','t','t')")
+        db.commit()
+        db.close()
+
+    def test_v1_db_migrates_to_current_with_backup(self, tmp_path):
+        m = _load(tmp_path / "unused.db")
+        p = str(tmp_path / "old.db")
+        self._make_v1(p)
+        s = m.Store(p)
+        assert s.db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == \
+            str(m.SCHEMA_VERSION)
+        # migrated columns exist and old data survived
+        r = s.get_round("REQ-MIG-1")
+        assert r is not None and "request_key" in r and "parent_rid" in r
+        s.close()
+        import os as _os
+        assert _os.path.exists(p + ".v1.bak"), "a pre-migration backup must exist"
+
+    def test_request_key_unique_after_migration(self, tmp_path):
+        m = _load(tmp_path / "unused.db")
+        p = str(tmp_path / "old2.db")
+        self._make_v1(p)
+        s = m.Store(p)
+        s.db.execute("UPDATE rounds SET request_key='k1' WHERE rid='REQ-MIG-1'")
+        s.create_round("REQ-MIG-2", "submit", prompt="p")
+        import sqlite3 as _sq
+        with pytest.raises(_sq.IntegrityError):
+            s.db.execute("UPDATE rounds SET request_key='k1' WHERE rid='REQ-MIG-2'")
+        s.close()
+
+    def test_newer_schema_is_refused(self, tmp_path):
+        p = str(tmp_path / "future.db")
+        self._make_v1(p)
+        import sqlite3 as _sq
+        db = _sq.connect(p)
+        db.execute("UPDATE meta SET value='999' WHERE key='schema_version'")
+        db.commit(); db.close()
+        m = _load(tmp_path / "unused.db")
+        with pytest.raises(m.SchemaTooNew):
+            m.Store(p)
