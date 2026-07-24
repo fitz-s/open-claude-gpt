@@ -64,6 +64,20 @@ S3 correctness holes on the core trust guarantees; all are fixed below.
   every tracked file (was .py/.sh/.md only); install.sh installs the same pinned
   `websocket-client>=1.6,<2` range CI tests and verifies the installed version.
 
+Dogfooding this release's own re-review then exposed two recovery-path defects in the field
+(the fix-verification consult hit a post-click WebSocket timeout and exercised the whole
+uncertain-round machinery live):
+
+- **`--kind retrieve` could never succeed.** Its waiter pinned the retrieve round's own (fresh)
+  rid, which by construction never matches the conversation's actual last request —
+  `rid_mismatch`, exit 2, unconditionally. The advertised recovery flow was broken; retrieve now
+  resolves the rid from the page (`auto`), adopting the conversation's answer as intended.
+- **The waiter's rid-resolution grace was shorter than a real render lag.** A follow-up on a long
+  thread took >2 min before the just-sent user message committed to the DOM; the 120s resolution
+  window expired exactly there and burned the round's ONE-SHOT auto-retrieve on a render lag.
+  Grace raised to 600s — waiting longer on a wrong tab is free (read-only); giving up early costs
+  the recovery.
+
 ### Added
 - **JSON outcome envelope (schema 1).** Every `await` exit prints one machine-readable stdout line:
   rid, parent_rid, state, retryable, human_action, next_command, answer_path, log_path, confidence,
