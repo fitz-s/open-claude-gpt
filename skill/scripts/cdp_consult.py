@@ -745,10 +745,14 @@ def _turn_canonical_rid(turn_text):
 
 
 def _last_user_text_js() -> str:
-    """textContent of the LAST user turn only. DOM extraction stays JS's only job here — parsing
-    the rid out of it is Python's (via _turn_canonical_rid, pure and unit-tested)."""
-    return ("(function(){var u=document.querySelectorAll(" + _JS_U + ");"
-            "var n=u[u.length-1];return n?n.textContent:'';})()")
+    """Block-aware text of the LAST user turn only (__cgcText, NOT raw textContent: the composer
+    pastes the prompt as one <p> per line, and raw textContent concatenates those paragraphs with
+    NO newlines — the line-anchored canonical parser then sees one giant line and finds nothing;
+    observed live: a landed send classified possibly_accepted because its own echo was unparseable).
+    DOM extraction stays JS's only job here — parsing the rid out of it is Python's (via
+    _turn_canonical_rid, pure and unit-tested)."""
+    return ("(function(){" + _TEXT_FN + "var u=document.querySelectorAll(" + _JS_U + ");"
+            "var n=u[u.length-1];return n?__cgcText(n):'';})()")
 
 
 def _resolve_rid(c, rid):
@@ -772,11 +776,12 @@ def _resolve_rid(c, rid):
 
 
 def _all_user_texts_js() -> str:
-    """textContent of EVERY user turn, DOM order — unlike _last_user_text_js (last turn only), this
-    lets a retrieve locate a SOURCE rid's own turn anywhere in the conversation, even when later
-    turns were sent after it."""
-    return ("(function(){var u=document.querySelectorAll(" + _JS_U + ");"
-            "return Array.prototype.map.call(u, function(n){return n.textContent||'';});})()")
+    """Block-aware text (__cgcText — see _last_user_text_js for why raw textContent breaks the
+    line-anchored parser) of EVERY user turn, DOM order — unlike _last_user_text_js (last turn
+    only), this lets a retrieve locate a SOURCE rid's own turn anywhere in the conversation, even
+    when later turns were sent after it."""
+    return ("(function(){" + _TEXT_FN + "var u=document.querySelectorAll(" + _JS_U + ");"
+            "return Array.prototype.map.call(u, function(n){return __cgcText(n);});})()")
 
 
 def _locate_source_turn(user_texts, source_rid):
@@ -1685,13 +1690,23 @@ def cmd_followup(a) -> int:
             "if(b&&!b.disabled){b.click();return true;}return false;})()")
         if not clicked:
             c.key("Enter", "Enter", 13)
+        # Landed-confirmation: on a long thread the DOM virtualizes older turns, so the rendered
+        # user-turn COUNT can stay flat forever after a real send (observed live: a landed follow-up
+        # returned ok:false because the render window kept its size). Count-increase is only the
+        # fast path; the authoritative signal is the LAST rendered user turn echoing OUR rid.
         n = u_before
-        for _ in range(10):
+        echoed = ""
+        _sdl = time.time() + 30
+        while time.time() < _sdl:
             time.sleep(0.5)
             n = c.eval("document.querySelectorAll(" + _JS_U + ").length") or 0
             if n > u_before:
                 break
-        ok = bool(n > u_before)
+            if rid:
+                echoed = _turn_canonical_rid(c.eval(_last_user_text_js()) or "") or ""
+                if echoed == rid:
+                    break
+        ok = bool(n > u_before) or bool(rid and echoed == rid)
         # CONVERSATION-INTEGRITY GUARD (after send): require the EXACT same conversation still
         # holds — do NOT silently adopt whatever conv the page now reports (that would let a
         # mid-send navigation/redirect to a DIFFERENT thread pass unnoticed, with the follow-up
