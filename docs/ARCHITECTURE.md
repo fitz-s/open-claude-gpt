@@ -217,9 +217,13 @@ Round lifecycle state lives in ONE place: the SQLite store at
 `$CGC_DATA_DIR/control.db` (durable — deliberately NOT under `/tmp`), with an
 explicit legal-transition table, `synchronous=FULL`, immutable terminal states,
 and the at-most-once invariant (`sending`/`possibly_accepted` are never
-auto-resent). `CGC_SPOOL_DIR` now holds only daemon runtime files: the liveness
-heartbeat `cgc queue`/`doctor` read, the daemon-singleton lock, and per-round
-send+wait logs.
+auto-resent). The coordination state beside it — the liveness heartbeat
+`cgc queue`/`doctor` read, the daemon-singleton lock, and per-round leases — lives
+under `$CGC_DATA_DIR/locks`, anchored to the same durable, generation-stable
+directory as the store it fences; unlinking one of these out from under a live
+holder defeats the flock fencing, so this is NOT safe to delete while a daemon or
+worker may be alive. `CGC_SPOOL_DIR` now holds only per-round send+wait logs —
+that remains deletable scratch.
 
 ### Link-first delivery
 `deliver` resolves a commit to its associated PR (`commits/<sha>/pulls`) and leads
