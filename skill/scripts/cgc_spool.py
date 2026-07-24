@@ -337,16 +337,59 @@ def _lease_path(rid):
     return _lp(f"lease.{rid}")
 
 
+# Live-lease fd registry (Fix S3-A). flock is bound to the OPEN FILE DESCRIPTION, not the process,
+# so a mutating CDP subprocess that INHERITS a lease fd keeps that exact lock alive until BOTH the
+# backend worker and the CDP child have closed it — the backend dying mid-click no longer releases
+# ownership out from under the running mutation. The daemon reads this set to hand the precise fds to
+# each mutating subprocess via subprocess pass_fds. Per-process (a module global): each backend
+# worker is its own process and holds only its own leases.
+_LIVE_LEASE_FDS: set[int] = set()
+
+
+class _Lease:
+    """A held flock lease: the open file handle whose open file description carries the lock, with
+    its fd tracked in _LIVE_LEASE_FDS for the lease's lifetime. Every lease-acquire helper returns
+    one of these; `.close()` releases the flock (closing the fd) and de-registers it. Exposes only
+    the surface the call sites use — truthiness (never None on success), `.fileno()`, `.close()`."""
+    __slots__ = ("_fh",)
+
+    def __init__(self, fh):
+        self._fh = fh
+        _LIVE_LEASE_FDS.add(fh.fileno())
+
+    def fileno(self) -> int:
+        return self._fh.fileno()
+
+    def close(self) -> None:
+        if self._fh is None:
+            return
+        # De-register BEFORE close: once the fd is closed fileno() raises, and a closed fd may be
+        # reused by a later open(), so a stale number left in the set would falsely mark that fd
+        # inheritable.
+        _LIVE_LEASE_FDS.discard(self._fh.fileno())
+        self._fh.close()
+        self._fh = None
+
+
+def live_lease_fds() -> tuple:
+    """The fds of every lease held IN THIS PROCESS right now (per-RID, shared-browser, and — during a
+    followup's mutating region — the conversation lease). The daemon passes these to each browser-
+    mutating cdp_consult subprocess as pass_fds so the inherited descriptors preserve the already-
+    established flock ownership continuously across the backend->CDP boundary (see _Lease)."""
+    return tuple(sorted(_LIVE_LEASE_FDS))
+
+
 def _flock(path, flags):
-    """Non-blocking flock on `path`. Returns the open file handle (caller keeps it alive for the
-    lease's lifetime) or None if the lock is held elsewhere. Fails CLOSED (raises) when fcntl is
-    unavailable — a fake lease would silently defeat the fence it exists to provide."""
+    """Non-blocking flock on `path`. Returns a _Lease wrapping the open file handle (caller keeps it
+    alive for the lease's lifetime; its fd is registered in _LIVE_LEASE_FDS) or None if the lock is
+    held elsewhere. Fails CLOSED (raises) when fcntl is unavailable — a fake lease would silently
+    defeat the fence it exists to provide."""
     _require_fcntl()
     ensure_dirs()
     fh = open(path, "a+")
     try:
         fcntl.flock(fh.fileno(), flags | fcntl.LOCK_NB)
-        return fh
+        return _Lease(fh)
     except OSError:
         fh.close()
         return None
@@ -374,12 +417,28 @@ def acquire_browser_lease(shared: bool):
     return _flock(browser_lock_path(), (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) if fcntl else 0)
 
 
+# A canonical ChatGPT conversation id: the bare uuid (8-4-4-4-12 hex) that sits at /c/<id>, and the
+# ONLY shape allowed to key a conversation lease. A consult RID (REQ-…), a '/c/<id>' path, or a full
+# URL are ALIASES: resolvable to this via the store / CDP registry, but they MUST be canonicalized
+# (or rejected) before touching a lock key. Locking on a raw alias is exactly S3-B — an explicit
+# --conversation REQ-R0 locks conv.REQ-R0 while --parent R0 resolves to C and locks conv.C, so two
+# handles for one thread drive its one composer under two different files.
+_CONV_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def is_canonical_conversation(conversation) -> bool:
+    """True iff `conversation` is a bare canonical ChatGPT conversation id (see _CONV_ID_RE). The
+    single source of truth for 'this value may key a conversation lease'; every lease-taking and
+    lease-locking path gates on it so equivalent-but-differently-spelled handles cannot split the
+    lock namespace."""
+    return bool(_CONV_ID_RE.match(conversation or ""))
+
+
 def _conversation_lease_path(conversation):
     """Same namespace + convention as _lease_path: locks live beside the one control.db, which
     already scopes them to THIS store, so the conversation id alone keys the file (no store prefix).
-    A conversation id is uuid-like but may arrive as a '/c/<id>' path or carry other URL
-    punctuation, so every non-filename char collapses to '_' — the only ids that can collide already
-    denote the same thread."""
+    Callers guarantee a canonical id (is_canonical_conversation), which is already filename-safe; the
+    sanitize is a belt-and-braces no-op for that shape."""
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", conversation or "")
     return _lp(f"conv.{safe}")
 
@@ -392,9 +451,17 @@ def acquire_conversation_lease(conversation):
     then sees the cleared composer and exits not-sent-proven though its bytes WERE sent — a retry
     re-sends them. This lease is what makes the pre-click not-sent proof compositional across workers.
     Held (open fh) from before any composer mutation through the CDP follow-up subprocess's return.
-    Returns the fh, or None when another worker already holds it (the caller must refuse the round,
+    Returns the lease, or None when another worker already holds it (the caller must refuse the round,
     leaving it READY for redispatch). Fresh submits (new thread) and read-only waits/retrieves never
-    take it."""
+    take it.
+
+    Defense in depth (S3-B): every legal caller now guarantees `conversation` is a canonical id —
+    enqueue rejects aliases, the worker revalidates before locking — so a non-canonical key here is a
+    caller bug, not input to sanitize. Assert and RAISE rather than lock a mis-keyed file."""
+    if not is_canonical_conversation(conversation):
+        raise ValueError(
+            f"acquire_conversation_lease: {conversation!r} is not a canonical ChatGPT conversation id "
+            "(uuid) — the lock key must be canonicalized upstream (enqueue/worker), never here")
     return _flock(_conversation_lease_path(conversation), fcntl.LOCK_EX if fcntl else 0)
 
 

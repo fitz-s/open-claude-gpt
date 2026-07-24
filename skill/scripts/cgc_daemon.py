@@ -77,10 +77,19 @@ def _make_run_cdp():
     subprocesses (the proven browser path) and returns the small dict cgc_backend.process_round
     maps to round states."""
     def run_cdp(kind, **kw):
+        # Hand every cdp_consult subprocess the leases THIS worker holds (per-RID + shared-browser,
+        # plus the conversation lease during a followup's mutating region). flock is bound to the
+        # OPEN FILE DESCRIPTION, so an inherited fd keeps the exact same lock alive until BOTH this
+        # backend worker and the CDP child have closed it — the worker dying mid-click can no longer
+        # release ownership out from under the running mutation (Fix S3-A). Passed to the read-only
+        # wait too: harmless (the child never touches them) and a killed-parent/surviving-wait keeps
+        # the round legitimately owned while its read-only poll finishes. NOT passed to the browser
+        # restart (a non-CDP call) — a restarted Chrome must never inherit and pin the browser lease.
+        fds = spool.live_lease_fds()
         if kind == "submit":
             cmd = [sys.executable, _CDP, "submit", "--rid", kw["rid"], "--prompt-file", "-",
                    "--project-url", kw["project_url"], "--model", kw["model"]]
-            code, so, se = _run(cmd, 240, kw["rid"], stdin_text=kw["prompt"])
+            code, so, se = _run(cmd, 240, kw["rid"], stdin_text=kw["prompt"], pass_fds=fds)
             conv = ""
             try:
                 conv = (json.loads(so.strip().splitlines()[-1]) if so.strip() else {}).get(
@@ -95,14 +104,14 @@ def _make_run_cdp():
             # thread.
             cmd = [sys.executable, _CDP, "followup", "--conversation", kw["conversation"],
                    "--prompt-file", "-", "--rid", kw["rid"]]
-            code, _so, se = _run(cmd, 240, kw["rid"], stdin_text=kw["prompt"])
+            code, _so, se = _run(cmd, 240, kw["rid"], stdin_text=kw["prompt"], pass_fds=fds)
             return {"code": code, "stderr": se}
         if kind == "wait":
             poll = str(kw.get("poll") or spool.POLL_S)
             timeout = int(kw.get("timeout") or spool.STUCK_AFTER_S)
             cmd = [sys.executable, _CDP, "wait", "--rid", kw["rid"], "--conversation", kw["conversation"],
                    "--out", kw["out"], "--poll", poll, "--timeout", str(timeout)]
-            code, _so, se = _run(cmd, timeout + 40, kw["rid"])
+            code, _so, se = _run(cmd, timeout + 40, kw["rid"], pass_fds=fds)
             return {"code": code, "out": kw["out"], "stderr": se}
         raise ValueError(f"unknown cdp kind {kind!r}")
     return run_cdp
@@ -483,8 +492,12 @@ def _tail_file(path, n=240):
         return ""
 
 
-def _run(cmd, timeout, rid=None, stdin_text=None, env_extra=None):
+def _run(cmd, timeout, rid=None, stdin_text=None, env_extra=None, pass_fds=()):
     """Run a cdp_consult.py subcommand; return (exit, stdout, stderr). Never raises on non-zero.
+
+    `pass_fds` are lease descriptors the child must INHERIT (Fix S3-A): subprocess marks them
+    inheritable and excludes them from the close_fds sweep, so the child holds the exact same flock
+    (bound to the open file description) until it too exits. Empty for non-mutating/non-CDP calls.
 
     stderr streams LIVE into the job's log instead of being captured and discarded. Both halves of
     that matter. It used to be captured and thrown away except for a 240-char tail folded into the
@@ -509,7 +522,8 @@ def _run(cmd, timeout, rid=None, stdin_text=None, env_extra=None):
         r = subprocess.run(cmd, input=stdin_text, stdout=subprocess.PIPE,
                            stderr=(log or subprocess.PIPE),
                            text=True, timeout=timeout,
-                           env={**os.environ, **(env_extra or {})})
+                           env={**os.environ, **(env_extra or {})},
+                           pass_fds=tuple(pass_fds))
         code, so, se = r.returncode, r.stdout, (r.stderr or "")
     except subprocess.TimeoutExpired as e:
         code, so, se = 124, "", f"subprocess timeout: {e}"

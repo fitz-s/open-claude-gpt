@@ -252,7 +252,7 @@ def test_followup_continues_same_conversation_not_new_submit(env):
     store_mod, backend, s, tmp = env
     s.create_round("REQ-20260721-000000-0000ff", "followup", out_path=str(tmp / "f.txt"),
                    prompt="continuing this consult; the next question",
-                   spec_json=json.dumps({"conversation": "conv-existing"}))
+                   spec_json=json.dumps({"conversation": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"}))
     s.set_state("REQ-20260721-000000-0000ff", store_mod.READY)
     calls = []
 
@@ -268,9 +268,9 @@ def test_followup_continues_same_conversation_not_new_submit(env):
     assert final == store_mod.COMPLETED_VERIFIED
     # send via followup (attach to the existing conversation), THEN a separate wait — so the round
     # reaches `waiting` and is reattach-able, never a 25-min `sending`.
-    assert calls == [("followup", "conv-existing"), ("wait", "conv-existing")], \
+    assert calls == [("followup", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"), ("wait", "cccccccc-cccc-4ccc-8ccc-cccccccccccc")], \
         "followup MUST attach to the existing conversation (never submit) and split send from wait"
-    assert s.get_round("REQ-20260721-000000-0000ff")["thread_id"] == "conv-existing"
+    assert s.get_round("REQ-20260721-000000-0000ff")["thread_id"] == "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 
 
 def test_preclick_exit_maps_followup_to_failed_not_sent(env):
@@ -280,7 +280,7 @@ def test_preclick_exit_maps_followup_to_failed_not_sent(env):
     map to FAILED + not-sent-proven here too, not just on submit."""
     store_mod, backend, s, tmp = env
     s.create_round("REQ-20260721-000000-0000fd", "followup", out_path=str(tmp / "f2.txt"),
-                   prompt="continuing this consult", spec_json=json.dumps({"conversation": "conv-existing"}))
+                   prompt="continuing this consult", spec_json=json.dumps({"conversation": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"}))
     s.set_state("REQ-20260721-000000-0000fd", store_mod.READY)
 
     def cdp(kind, **kw):
@@ -304,15 +304,15 @@ def test_followup_holds_conversation_lease_across_the_send(env):
     if cgc_spool.fcntl is None:
         pytest.skip("no fcntl on this platform")
     s.create_round("REQ-20260721-000000-0000f1", "followup", out_path=str(tmp / "f1.txt"),
-                   prompt="continuing this consult", spec_json=json.dumps({"conversation": "conv-lease"}))
+                   prompt="continuing this consult", spec_json=json.dumps({"conversation": "dddddddd-dddd-4ddd-8ddd-dddddddddddd"}))
     s.set_state("REQ-20260721-000000-0000f1", store_mod.READY)
     probed = {}
 
     def cdp(kind, **kw):
         if kind == "followup":
-            probed["held_during_send"] = cgc_spool.acquire_conversation_lease("conv-lease") is None
+            probed["held_during_send"] = cgc_spool.acquire_conversation_lease("dddddddd-dddd-4ddd-8ddd-dddddddddddd") is None
         if kind == "wait":
-            fh = cgc_spool.acquire_conversation_lease("conv-lease")
+            fh = cgc_spool.acquire_conversation_lease("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
             probed["free_during_wait"] = fh is not None
             if fh is not None:
                 fh.close()
@@ -325,7 +325,7 @@ def test_followup_holds_conversation_lease_across_the_send(env):
     assert final == store_mod.COMPLETED_VERIFIED
     assert probed["held_during_send"] is True, "the conversation lease must be held across the send"
     assert probed["free_during_wait"] is True, "and released before the read-only wait"
-    assert cgc_spool.acquire_conversation_lease("conv-lease") is not None, "released after process_round"
+    assert cgc_spool.acquire_conversation_lease("dddddddd-dddd-4ddd-8ddd-dddddddddddd") is not None, "released after process_round"
 
 
 def test_second_same_conversation_followup_refuses_without_sending(env):
@@ -337,9 +337,9 @@ def test_second_same_conversation_followup_refuses_without_sending(env):
     if cgc_spool.fcntl is None:
         pytest.skip("no fcntl on this platform")
     s.create_round("REQ-20260721-000000-0000f2", "followup", out_path=str(tmp / "f2.txt"),
-                   prompt="continuing this consult", spec_json=json.dumps({"conversation": "conv-busy"}))
+                   prompt="continuing this consult", spec_json=json.dumps({"conversation": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"}))
     s.set_state("REQ-20260721-000000-0000f2", store_mod.READY)
-    held = cgc_spool.acquire_conversation_lease("conv-busy")   # the first worker owns the composer
+    held = cgc_spool.acquire_conversation_lease("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")   # the first worker owns the composer
     assert held is not None
     try:
         with pytest.raises(backend.ConversationLeaseRefused):
@@ -377,9 +377,9 @@ def test_different_conversation_followups_do_not_serialize(env):
     if cgc_spool.fcntl is None:
         pytest.skip("no fcntl on this platform")
     s.create_round("REQ-20260721-000000-0000f3", "followup", out_path=str(tmp / "f3.txt"),
-                   prompt="continuing this consult", spec_json=json.dumps({"conversation": "conv-B"}))
+                   prompt="continuing this consult", spec_json=json.dumps({"conversation": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}))
     s.set_state("REQ-20260721-000000-0000f3", store_mod.READY)
-    held_a = cgc_spool.acquire_conversation_lease("conv-A")     # a busy UNRELATED thread
+    held_a = cgc_spool.acquire_conversation_lease("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")     # a busy UNRELATED thread
     assert held_a is not None
     try:
         def cdp(kind, **kw):
@@ -409,7 +409,7 @@ def test_followup_without_conversation_fails_not_new_thread(env):
 def test_retrieve_attaches_without_sending(env):
     store_mod, backend, s, tmp = env
     s.create_round("REQ-20260721-000000-00000r", "retrieve", out_path="/tmp/r.txt", parent_rid="REQ-20260721-000000-src001",
-                   spec_json=json.dumps({"conversation": "conv-existing", "parent_rid": "REQ-20260721-000000-src001"}))
+                   spec_json=json.dumps({"conversation": "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "parent_rid": "REQ-20260721-000000-src001"}))
     s.set_state("REQ-20260721-000000-00000r", store_mod.READY)
     r = s.get_round("REQ-20260721-000000-00000r")
     calls = []
@@ -488,16 +488,16 @@ def test_followup_parent_resolves_causally_not_to_global_latest(env):
     completed more recently. Global 'last completed' would attach to the wrong thread under concurrent
     consults (diff-review S1); causal parent resolution does not."""
     store_mod, backend, s, tmp = env
-    _complete_a_consult(store_mod, s, rid="REQ-20260721-000000-000AAA", conv="conv-A")
-    _complete_a_consult(store_mod, s, rid="REQ-20260721-000000-000BBB", conv="conv-B")  # globally latest
-    assert s.latest_conversation() == "conv-B"
+    _complete_a_consult(store_mod, s, rid="REQ-20260721-000000-000AAA", conv="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    _complete_a_consult(store_mod, s, rid="REQ-20260721-000000-000BBB", conv="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")  # globally latest
+    assert s.latest_conversation() == "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     a = types.SimpleNamespace(rid="REQ-20260721-000000-000fp1", kind="followup",
                               parent="REQ-20260721-000000-000AAA", project_url="https://chatgpt.com/",
                               model="Pro", conversation="auto", poll=1, timeout=1)
     assert backend.enqueue_round(a, "continuing A specifically", str(tmp / "f.txt")) == 0
     r = s.get_round("REQ-20260721-000000-000fp1")
-    assert json.loads(r["spec_json"])["conversation"] == "conv-A", "parent pins causally, not latest"
-    assert r["thread_id"] == "conv-A"
+    assert json.loads(r["spec_json"])["conversation"] == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "parent pins causally, not latest"
+    assert r["thread_id"] == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 
 def test_stale_raw_sidecar_does_not_downgrade_a_verified_answer(env):
@@ -679,13 +679,13 @@ class TestStrictFollowupResolution:
 
     def test_single_completed_thread_resolves(self, env):
         store_mod, backend, s, tmp_path = env
-        self._complete(store_mod, s, "REQ-20260707-120000-0ad001", "conv-A")
+        self._complete(store_mod, s, "REQ-20260707-120000-0ad001", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         conv, why = s.latest_conversation_strict()
-        assert conv == "conv-A" and why is None
+        assert conv == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" and why is None
 
     def test_inflight_consult_makes_auto_ambiguous(self, env):
         store_mod, backend, s, tmp_path = env
-        self._complete(store_mod, s, "REQ-20260707-120000-0ae001", "conv-A")
+        self._complete(store_mod, s, "REQ-20260707-120000-0ae001", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         s.create_round("REQ-20260707-120000-0ae002", "submit", prompt="p")
         s.set_state("REQ-20260707-120000-0ae002", store_mod.READY)
         s.begin_send("REQ-20260707-120000-0ae002", "p", "h" * 64, daemon_instance_id="d")
@@ -694,20 +694,20 @@ class TestStrictFollowupResolution:
 
     def test_two_recent_completions_on_different_threads_are_ambiguous(self, env):
         store_mod, backend, s, tmp_path = env
-        self._complete(store_mod, s, "REQ-20260707-120000-0af001", "conv-A")
-        self._complete(store_mod, s, "REQ-20260707-120000-0af002", "conv-B")
+        self._complete(store_mod, s, "REQ-20260707-120000-0af001", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        self._complete(store_mod, s, "REQ-20260707-120000-0af002", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
         conv, why = s.latest_conversation_strict()
         assert conv is None and "ambiguous" in why and "--parent" in why
 
     def test_old_second_thread_does_not_block_auto(self, env):
         store_mod, backend, s, tmp_path = env
-        self._complete(store_mod, s, "REQ-20260707-120000-0ag001", "conv-A")
-        self._complete(store_mod, s, "REQ-20260707-120000-0ag002", "conv-B")
+        self._complete(store_mod, s, "REQ-20260707-120000-0ag001", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        self._complete(store_mod, s, "REQ-20260707-120000-0ag002", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
         # age the first completion far beyond the ambiguity window
         s.db.execute("UPDATE rounds SET updated_at='2020-01-01T00:00:00+00:00' "
                      "WHERE rid='REQ-20260707-120000-0ag001'")
         conv, why = s.latest_conversation_strict()
-        assert conv == "conv-B" and why is None
+        assert conv == "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" and why is None
 
 
 class TestOutcomeEnvelope:
@@ -781,7 +781,7 @@ class TestRequestFingerprint:
         {"model": "5.6-Thinking"},
         {"project_url": "https://chatgpt.com/g/other/project"},
         {"parent": "REQ-20260707-110000-aaaaaa"},
-        {"conversation": "conv-explicit-xyz"},
+        {"conversation": "ffffffff-ffff-4fff-8fff-ffffffffffff"},
     ])
     def test_same_key_different_routing_field_conflicts(self, env, capsys, field):
         store_mod, backend, s, tmp_path = env
@@ -913,7 +913,7 @@ class TestStrictFollowupEdges:
         """A consult WAITING TO START is as much a competing target as one mid-send — the
         in-flight refusal set must include queued/ready."""
         store_mod, backend, s, tmp_path = env
-        self._complete(store_mod, s, "REQ-20260707-120000-0f6001", "conv-A")
+        self._complete(store_mod, s, "REQ-20260707-120000-0f6001", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         s.create_round("REQ-20260707-120000-0f6002", "submit", prompt="p")  # queued, not started
         conv, why = s.latest_conversation_strict()
         assert conv is None and "in flight" in why
@@ -922,9 +922,9 @@ class TestStrictFollowupEdges:
         """Two recent rounds on thread A must not mask that thread B ALSO completed moments ago —
         the ambiguity comparison is per-THREAD (max completion per distinct conversation)."""
         store_mod, backend, s, tmp_path = env
-        self._complete(store_mod, s, "REQ-20260707-120000-0f7001", "conv-B")
-        self._complete(store_mod, s, "REQ-20260707-120000-0f7002", "conv-A")
-        self._complete(store_mod, s, "REQ-20260707-120000-0f7003", "conv-A")
+        self._complete(store_mod, s, "REQ-20260707-120000-0f7001", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        self._complete(store_mod, s, "REQ-20260707-120000-0f7002", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        self._complete(store_mod, s, "REQ-20260707-120000-0f7003", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         conv, why = s.latest_conversation_strict()
         assert conv is None and "ambiguous" in why
 
@@ -1438,3 +1438,76 @@ class TestKeyReleaseRequiresNoSendProof:
         assert rc == 2
         assert "request_key_needs_logical_sha" in capsys.readouterr().err
         assert s.get_round("REQ-20260707-120000-0h9001") is None
+
+
+# ---- Fix S3-B: canonical conversation identity (fail-closed) -----------------
+
+def test_enqueue_rejects_rid_shaped_conversation_and_accepts_canonical(env, capsys):
+    """An explicit --conversation must be a bare canonical conversation id. A rid-shaped alias is
+    rejected AT ENQUEUE (never stored, never locked) with the guidance to use --parent; a canonical id
+    is accepted and stored as-is."""
+    store_mod, backend, s, tmp = env
+    rid_shape = "REQ-20260721-000000-00ab01"
+    a = types.SimpleNamespace(rid="REQ-20260721-000000-00rj01", kind="followup",
+                              project_url="https://chatgpt.com/", model="Pro",
+                              conversation=rid_shape, poll=1, timeout=1)
+    assert backend.enqueue_round(a, "continuing this consult", str(tmp / "r.txt")) == 2
+    assert "conversation_not_canonical" in capsys.readouterr().err
+    assert s.get_round("REQ-20260721-000000-00rj01") is None, "the rejected round is never created"
+
+    canon = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    b = types.SimpleNamespace(rid="REQ-20260721-000000-00rj02", kind="followup",
+                              project_url="https://chatgpt.com/", model="Pro",
+                              conversation=canon, poll=1, timeout=1)
+    assert backend.enqueue_round(b, "continuing this consult", str(tmp / "r2.txt")) == 0
+    assert json.loads(s.get_round("REQ-20260721-000000-00rj02")["spec_json"])["conversation"] == canon
+
+
+def test_alias_and_parent_target_the_same_conversation_lock(env):
+    """The audit's contention recipe: a follow-up pinned by canonical --conversation C and a follow-up
+    pinned by --parent R0 (seeded R0->C) resolve to the SAME conversation and therefore the SAME lease
+    file — the two handles for one thread can never lock different files and both drive its composer."""
+    import cgc_spool
+    store_mod, backend, s, tmp = env
+    conv = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    _complete_a_consult(store_mod, s, rid="REQ-20260721-000000-00R000", conv=conv)  # R0 -> C
+    a = types.SimpleNamespace(rid="REQ-20260721-000000-00e001", kind="followup",
+                              project_url="https://chatgpt.com/", model="Pro",
+                              conversation=conv, poll=1, timeout=1)             # explicit canonical C
+    b = types.SimpleNamespace(rid="REQ-20260721-000000-00e002", kind="followup",
+                              parent="REQ-20260721-000000-00R000", project_url="https://chatgpt.com/",
+                              model="Pro", conversation="auto", poll=1, timeout=1)   # via --parent R0
+    assert backend.enqueue_round(a, "continuing this consult", str(tmp / "a.txt")) == 0
+    assert backend.enqueue_round(b, "continuing this consult", str(tmp / "b.txt")) == 0
+    ca = json.loads(s.get_round("REQ-20260721-000000-00e001")["spec_json"])["conversation"]
+    cb = json.loads(s.get_round("REQ-20260721-000000-00e002")["spec_json"])["conversation"]
+    assert ca == cb == conv, "alias and --parent resolve to the one conversation"
+    assert cgc_spool._conversation_lease_path(ca) == cgc_spool._conversation_lease_path(cb), \
+        "one conversation, one lease file"
+    if cgc_spool.fcntl is not None:  # and it is REAL lock contention, not just an equal path string
+        held = cgc_spool.acquire_conversation_lease(ca)
+        assert held is not None
+        assert cgc_spool.acquire_conversation_lease(cb) is None, "same lock — the second acquire refuses"
+        held.close()
+
+
+def test_worker_fails_presend_on_noncanonical_conversation_without_locking_or_sending(env):
+    """Worker boundary: a pre-release queued row carrying a rid-shaped conversation fails PRE-SEND
+    (terminal FAILED) — no conversation lease taken, no CDP call, no attempt begun."""
+    import cgc_spool
+    store_mod, backend, s, tmp = env
+    rid_shape = "REQ-20260721-000000-00ab01"
+    s.create_round("REQ-20260721-000000-00w001", "followup", out_path=str(tmp / "w.txt"),
+                   prompt="continuing this consult", spec_json=json.dumps({"conversation": rid_shape}))
+    s.set_state("REQ-20260721-000000-00w001", store_mod.READY)
+    final = backend.process_round(
+        s, s.get_round("REQ-20260721-000000-00w001"),
+        lambda *a, **k: pytest.fail("no browser call on a non-canonical conversation"),
+        daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.FAILED
+    rr = s.get_round("REQ-20260721-000000-00w001")
+    assert rr["current_attempt_id"] is None, "no send attempt begun — pre-send by construction"
+    assert "not a canonical id" in (rr["error_code"] or "")
+    # no lease was taken for the alias: acquire_conversation_lease is the only opener of that file and
+    # it returned before reaching it, so the lock file was never even created.
+    assert not os.path.exists(cgc_spool._conversation_lease_path(rid_shape)), "no lock file was created"
