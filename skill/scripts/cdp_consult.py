@@ -44,6 +44,8 @@ Subcommands:
            keeping its context + model). Attaches to an existing tab if one is still
            open, or reopens the conversation at /c/<conversation_id> otherwise —
            --keep-tab is an optional convenience, not a requirement.
+  Both submit and followup share one PRE-CLICK paste boundary (_paste_prompt): a failure there —
+  including a crash — exits EXIT_NOT_SENT_PRECLICK (6), proving the send click was never issued.
   wait    --rid R --out F [--port P] [--poll S] [--timeout S]
           poll until the answer is complete, extract it between the bare-line BEGIN/END
           sentinels, write to --out, exit 0. Run as a detached background Bash;
@@ -445,9 +447,10 @@ class CDP:
                 return msg.get("result", {})
         raise RuntimeError(f"CDP {method} timeout")
 
-    def eval(self, expr):
+    def eval(self, expr, timeout=None):
         r = self.call("Runtime.evaluate",
-                      {"expression": expr, "returnByValue": True, "awaitPromise": True})
+                      {"expression": expr, "returnByValue": True, "awaitPromise": True},
+                      timeout=timeout)
         return r.get("result", {}).get("value")
 
     def key(self, key_name, code, keycode):
@@ -1132,6 +1135,103 @@ def _read_prompt(path):
     return open(path, encoding="utf-8").read()
 
 
+# ---- paste + submit (shared by cmd_submit and cmd_followup) -----------------
+# FIELD INCIDENT (recorded twice): a single-shot Runtime.evaluate pasting a multi-KB prompt into a
+# composer sitting atop a heavy, freshly-rehydrated DOM (~30KB of prior turns) can have its CDP reply
+# outrun the websocket read timeout in call() even though the page-side execCommand('insertText')
+# itself completed — the exception then killed the worker BEFORE any click code ran, yet the round
+# was classified possibly_accepted (uncertain), forcing a manual reconcile even though the send
+# provably never happened. Fix: paste in bounded CHUNKS (no single reply is at the mercy of a heavy-
+# DOM stall) inside one explicit PRE-CLICK region (_paste_prompt) whose only failure mode is
+# _PreClickFailure — the caller's unambiguous signal that the click was never issued.
+EXIT_NOT_SENT_PRECLICK = 6  # cdp_consult's own pre-click boundary proved the send click never fired
+_PASTE_CHUNK_CHARS = 2000
+_WS_RUN_RE = re.compile(r"\s+")
+
+
+class _PreClickFailure(Exception):
+    """Raised only for a failure PROVEN to precede the send click — never after it."""
+
+
+def _composer_get_js():
+    return "document.querySelector(" + json.dumps(_COMPOSER_SEL) + ")"
+
+
+def _settle_composer(c, seconds=5):
+    """Best-effort bounded wait past the composer's first appearance: on a server-side reopen of a
+    heavy conversation the composer node can exist before the surrounding page finishes hydrating, so
+    give it a beat to report ready before the first paste chunk races it. Timing out here is not
+    itself a failure — the chunked paste + length verification below is the real backstop."""
+    js = ("(function(){var d=" + _composer_get_js() + ";return !!d && !d.disabled && "
+          "!d.getAttribute('aria-disabled') && document.readyState==='complete';})()")
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            if c.eval(js):
+                return
+        except Exception:
+            pass
+        time.sleep(0.3)
+
+
+def _clear_composer_js():
+    return ("(function(){var d=" + _composer_get_js() + ";if(!d)return -1;d.focus();"
+            "document.execCommand('selectAll',false,null);"
+            "document.execCommand('delete',false,null);"
+            "return (d.innerText||'').length;})()")
+
+
+def _paste_chunk_js(chunk):
+    return ("(function(){var d=" + _composer_get_js() + ";if(!d)return -1;d.focus();"
+            "document.execCommand('insertText',false," + json.dumps(chunk) + ");"
+            "return (d.innerText||'').length;})()")
+
+
+def _composer_text_js():
+    return "(function(){var d=" + _composer_get_js() + ";return d?(d.innerText||''):null;})()"
+
+
+def _paste_prompt(c, prompt: str) -> None:
+    """Clear the composer and paste `prompt` in bounded chunks via execCommand('insertText') — kept
+    (never a raw textContent/value assignment, which would not drive ChatGPT's React composer state)
+    so a leftover draft from a previous failed attempt can never be PREPENDED to this paste. Every
+    step here runs strictly BEFORE the send click; any failure — a raised exception or a failed
+    length verification — is raised as _PreClickFailure so the caller can report the distinct
+    provably-not-sent exit code instead of the uncertain unknown_send/crash path."""
+    try:
+        _settle_composer(c)
+        cleared = c.eval(_clear_composer_js(), timeout=45)
+        if cleared is None or cleared < 0:
+            raise _PreClickFailure("composer not found while clearing it")
+        if cleared != 0:
+            raise _PreClickFailure(f"composer still holds {cleared} chars after clear — refusing to "
+                                   "paste onto a leftover draft")
+        for i in range(0, len(prompt), _PASTE_CHUNK_CHARS):
+            chunk = prompt[i:i + _PASTE_CHUNK_CHARS]
+            got = c.eval(_paste_chunk_js(chunk), timeout=45)
+            if got is None or got < 0:
+                raise _PreClickFailure(f"composer disappeared mid-paste (chunk offset {i})")
+        got_text = c.eval(_composer_text_js(), timeout=45)
+    except _PreClickFailure:
+        raise
+    except Exception as e:
+        # Anything else here — including the recorded websocket read TimeoutError — is still, by
+        # construction, strictly pre-click: no code past this function has run yet.
+        raise _PreClickFailure(f"{type(e).__name__} during paste: {e}") from e
+    if got_text is None:
+        raise _PreClickFailure("composer not found for post-paste verification")
+    # Length, not equality: ChatGPT's contenteditable composer normalizes newline runs (observed to
+    # collapse/expand \n differently than a plain textarea would), so collapse all whitespace on both
+    # sides and require the composer to hold AT LEAST as much content as the prompt — a shortfall is
+    # exactly the truncated-by-a-DOM-stall signature this whole helper exists to catch.
+    want_len = len(_WS_RUN_RE.sub(" ", prompt).strip())
+    got_len = len(_WS_RUN_RE.sub(" ", got_text).strip())
+    if got_len < want_len:
+        raise _PreClickFailure(
+            f"composer holds {got_len} normalized chars, prompt needs >= {want_len} — paste "
+            "looks truncated by a DOM stall")
+
+
 def cmd_submit(a) -> int:
     prompt = _read_prompt(a.prompt_file)
     # Backstop (prep already hard-blocks at render; the spool gate re-checks): refuse to send a
@@ -1212,15 +1312,21 @@ def cmd_submit(a) -> int:
                 sys.stderr.write(f"CGC_WARN proceeding on '{model_now}' not '{target}' "
                                  f"(--allow-model-mismatch)\n")
             time.sleep(0.3)
-        # Focus composer + insert text via execCommand (typed newlines would submit early).
-        c.call("Runtime.evaluate", {"expression":
-            "(function(){var d=document.querySelector('div[role=\"textbox\"][contenteditable=\"true\"]')"
-            "||document.querySelector('#prompt-textarea');d.focus();"
-            "document.execCommand('selectAll',false,null);"
-            "document.execCommand('insertText',false," + json.dumps(prompt) + ");"
-            "return d.innerText.length;})()", "returnByValue": True})
+        # PRE-CLICK boundary: everything up to and including paste verification is provably pre-send.
+        # Any failure here — including a crash — proves the click was never issued, so it is caught
+        # and reported via the distinct not-sent exit code, never the uncertain unknown_send path (the
+        # recorded field incident: an insertText's CDP reply outran the websocket read timeout and the
+        # resulting exception used to be indistinguishable from a post-click crash).
+        try:
+            _paste_prompt(c, prompt)
+        except _PreClickFailure as e:
+            c.close_tab()   # nothing was sent; don't leak the tab
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: {e} — NOT submitted; safe to retry with "
+                             "the same --request-key.\n")
+            return EXIT_NOT_SENT_PRECLICK
         time.sleep(0.3)
-        # Submit. Prefer the send button; fall back to Enter.
+        # Submit. Prefer the send button; fall back to Enter. (POST-click from here: a failure past
+        # this point is uncertain, never provably-not-sent.)
         clicked = c.eval(
             "(function(){var b=document.querySelector('button[data-testid=\"send-button\"],"
             "button[aria-label*=\"Send\" i],button[aria-label*=\"\\u53d1\\u9001\"]');"
@@ -1466,13 +1572,17 @@ def cmd_followup(a) -> int:
         # Count user messages BEFORE sending so we can confirm a NEW one landed (the
         # thread already has >=1 user message, so an absolute >0 check would false-pass).
         u_before = c.eval("document.querySelectorAll(" + _JS_U + ").length") or 0
-        # Insert via execCommand (typed newlines submit early). Model already gated above.
-        c.call("Runtime.evaluate", {"expression":
-            "(function(){var d=document.querySelector('div[role=\"textbox\"][contenteditable=\"true\"]')"
-            "||document.querySelector('#prompt-textarea');d.focus();"
-            "document.execCommand('selectAll',false,null);"
-            "document.execCommand('insertText',false," + json.dumps(prompt) + ");"
-            "return d.innerText.length;})()", "returnByValue": True})
+        # PRE-CLICK boundary (see _paste_prompt) — a failure here is provable proof the follow-up was
+        # never sent, so it is reported via the distinct not-sent exit code instead of falling into
+        # possibly_accepted (the recorded field incident happened on exactly this path: re-opening a
+        # heavy conversation server-side, then a paste whose CDP reply outran the read timeout).
+        # Model already gated above.
+        try:
+            _paste_prompt(c, prompt)
+        except _PreClickFailure as e:
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: {e} — NOT sent; safe to retry with the "
+                             "same --request-key.\n")
+            return EXIT_NOT_SENT_PRECLICK
         time.sleep(0.3)
         clicked = c.eval(
             "(function(){var b=document.querySelector('button[data-testid=\"send-button\"],"
