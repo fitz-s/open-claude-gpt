@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -260,6 +261,16 @@ def enqueue_round(a, prompt: str, out: str) -> int:
                 if not conv:
                     sys.stderr.write(f"CGC_ERROR followup_no_thread: {why}\n")
                     return 2
+        # A retrieve round recovers ANOTHER round's answer read-only. It must pin THAT round's rid
+        # (via --parent) as the source to verify against on the page — never resolve "whatever the
+        # conversation's latest turn is" (auto), which silently adopts a later same-thread send's
+        # answer if one lands before/during recovery (the causal-substitution bug this fixes).
+        if a.kind == "retrieve" and not parent:
+            sys.stderr.write(
+                "CGC_ERROR retrieve_needs_source_rid: --kind retrieve requires --parent <rid> (the "
+                "rid of the uncertain round being recovered) — the recovery path must never "
+                "auto-adopt the conversation's latest turn.\n")
+            return 2
         spec = {"project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
                 "conversation": conv, "parent_rid": parent, "poll": getattr(a, "poll", None),
                 "timeout": getattr(a, "timeout", None), "request_fingerprint": fingerprint}
@@ -332,7 +343,7 @@ def cancel_round(rid: str) -> int:
 # Every await exit prints ONE machine-readable JSON line on stdout (prose stays on stderr): an
 # agent should never have to infer state by scraping prose. schema=1 is the envelope's version.
 def _emit(rid, state, *, retryable, human_action=None, next_command=None, answer_path=None,
-          parent_rid=None, confidence=None, error=None):
+          parent_rid=None, confidence=None, error=None, source_rid=None, observed_rid=None):
     import cgc_spool as _spool
     # Envelope invariant: retryable=true must always name the retry — an agent told "retryable"
     # with no next_command/human_action has a verdict but no move. Enforced structurally so no
@@ -349,7 +360,36 @@ def _emit(rid, state, *, retryable, human_action=None, next_command=None, answer
         "retryable": retryable, "human_action": human_action, "next_command": next_command,
         "answer_path": answer_path, "log_path": log if has_log else None,
         "confidence": confidence, "error": error,
+        # source_rid: for a retrieve round, the rid of the round it recovers (transparency — a
+        # retrieve's own rid is fresh and means nothing on its own). observed_rid: on a rid-mismatch
+        # failure, the rid the CDP layer actually found on the page instead, so a human/agent can
+        # see WHAT it refused to substitute, not just that it refused.
+        "source_rid": source_rid, "observed_rid": observed_rid,
     }))
+
+
+_OBSERVED_RID_RE = re.compile(r"observed_rid=(\S+)")
+
+
+def _parse_observed_rid(error_code: str | None) -> str | None:
+    """Pull the 'observed_rid=<rid>' token cdp_consult embeds in a retrieve's rid_absent/
+    rid_superseded stderr line (see cdp_consult._locate_source_turn) back out of the error_code
+    the round stored it under, for the outcome envelope. 'none' means the CDP layer itself found
+    nothing to report."""
+    if not error_code:
+        return None
+    m = _OBSERVED_RID_RE.search(error_code)
+    if not m or m.group(1) in ("none", "None"):
+        return None
+    return m.group(1)
+
+
+def _stderr_error_line(stderr: str) -> str | None:
+    """The last CGC_ERROR line in a CDP subprocess's stderr — the actionable verdict (rid_absent,
+    rid_superseded, ...), not the CGC_WAIT heartbeat noise around it. None if the subprocess never
+    printed one (e.g. a plain timeout)."""
+    lines = [ln for ln in (stderr or "").splitlines() if ln.startswith("CGC_ERROR")]
+    return lines[-1] if lines else None
 
 
 # ---- await -------------------------------------------------------------------
@@ -403,6 +443,10 @@ def _await_round(a) -> int:
             return 1
         state = r["state"]
         parent = r.get("parent_rid")
+        # A retrieve round stores the rid it is RECOVERING in the same parent_rid column (its own
+        # rid is fresh and means nothing on its own) — surface it in the envelope as source_rid so
+        # a human/agent never has to guess which round a retrieve was for.
+        src_rid = parent if r.get("kind") == "retrieve" else None
         if state not in (store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED,
                          store_mod.BLOCKED, store_mod.POSSIBLY_ACCEPTED, store_mod.FAILED,
                          store_mod.GATE_REJECTED):
@@ -442,7 +486,7 @@ def _await_round(a) -> int:
                 f"  {followup_cmd}\n"
                 f"  (--parent {a.rid} pins THIS consult's thread causally; add --refs-file for a fresh diff link.)\n")
             _emit(a.rid, state, retryable=False, parent_rid=parent, answer_path=out,
-                  confidence="verified", next_command=followup_cmd)
+                  confidence="verified", next_command=followup_cmd, source_rid=src_rid)
             return 0
         if state == store_mod.COMPLETED_UNVERIFIED:
             text = r["result_text"] or ""
@@ -456,7 +500,7 @@ def _await_round(a) -> int:
                 "on the same thread. Do NOT auto-chain a follow-up on it; re-run the consult if in "
                 "doubt.\n")
             _emit(a.rid, state, retryable=False, parent_rid=parent, answer_path=out,
-                  confidence="unverified",
+                  confidence="unverified", source_rid=src_rid,
                   human_action="verify the salvaged answer is complete and belongs to this round")
             return 3
         if state == store_mod.BLOCKED:
@@ -467,13 +511,17 @@ def _await_round(a) -> int:
             with store_mod.Store() as _s:
                 conv = _s.conversation_of(a.rid)
             if conv:
+                # --parent pins the SOURCE rid the retrieve must verify on the page — never let it
+                # auto-adopt whatever the conversation's latest turn happens to be by the time a
+                # human clears the blocker and runs this.
                 retrieve = (f"python3 {_spool.__file__} enqueue --rid <new-rid> --kind retrieve "
-                            f"--conversation {conv}")
+                            f"--conversation {conv} --parent {a.rid}")
                 sys.stderr.write(
                     f"CGC_BLOCKER {a.rid} (post-send): {r['error_code'] or 'login/captcha/rate-limit'}\n"
                     f"The consult was already sent to conversation {conv}. Clear the blocker in the "
                     "ChatGPT window, then RETRIEVE it (enqueue --kind retrieve --conversation "
-                    f"{conv}) — do NOT re-enqueue a fresh consult, it would duplicate this one.\n")
+                    f"{conv} --parent {a.rid}) — do NOT re-enqueue a fresh consult, it would "
+                    "duplicate this one.\n")
                 _emit(a.rid, state, retryable=False, parent_rid=parent,
                       human_action="clear the blocker in the ChatGPT window",
                       next_command=retrieve, error=r["error_code"])
@@ -486,20 +534,31 @@ def _await_round(a) -> int:
                       error=r["error_code"])
             return 3
         if state == store_mod.POSSIBLY_ACCEPTED:
+            # The recovery instruction: a fresh kind=retrieve round, read-only, pinned to THIS
+            # round's rid via --parent — never auto-adopt whatever the conversation's latest turn
+            # is by the time a human/agent runs it (a later same-thread send would otherwise be
+            # mistaken for this round's answer).
+            with store_mod.Store() as _s:
+                conv = _s.conversation_of(a.rid)
+            retrieve = (f"python3 {_spool.__file__} enqueue --rid <new-rid> --kind retrieve "
+                       f"--conversation {conv} --parent {a.rid}") if conv else None
             sys.stderr.write(
                 f"CGC_UNCERTAIN {a.rid}: the send may have reached ChatGPT but was not confirmed "
                 f"({r['error_code'] or 'unknown'}). NOT auto-resent to avoid a duplicate consult — "
-                f"check the ChatGPT window / retrieve by conversation before re-sending.\n")
+                + (f"retrieve it:\n  {retrieve}\n" if retrieve else
+                   "check the ChatGPT window before re-sending (no conversation was recorded to "
+                   "retrieve from).\n"))
             _emit(a.rid, state, retryable=False, parent_rid=parent,
                   human_action="check the ChatGPT window; retrieve by conversation before re-sending",
-                  error=r["error_code"])
+                  next_command=retrieve, error=r["error_code"])
             return 1
         if state in (store_mod.FAILED, store_mod.GATE_REJECTED):
             err = r["error_code"] or "the daemon could not deliver an answer"
             sys.stderr.write(f"CGC_BROKEN {a.rid}: {err}\n")
             _spool._point_at_log(a.rid, out)
             # `unverified:` gate failures are transient (gh outage) — the round is re-fireable.
-            _emit(a.rid, state, retryable=err.startswith("unverified:"), parent_rid=parent, error=err)
+            _emit(a.rid, state, retryable=err.startswith("unverified:"), parent_rid=parent, error=err,
+                  source_rid=src_rid, observed_rid=_parse_observed_rid(err) if src_rid else None)
             return 1
         time.sleep(getattr(a, "poll", None) or store_mod.__dict__.get("POLL_S", 20) or 20)
     sys.stderr.write(f"CGC_STUCK {a.rid}: no terminal state within {a.timeout}s — read the daemon log.\n")
@@ -533,16 +592,25 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
     spec = json.loads(r["spec_json"]) if r.get("spec_json") else {}
 
     # retrieve: attach to an existing conversation and wait — no gate, no send (nothing leaves).
-    # The waiter resolves the rid FROM the page (wait_rid="auto"): a retrieve round's own rid is
-    # fresh by construction, so pinning it would always rid_mismatch against the conversation's
-    # actual last request — the exact failure that made the advertised recovery path exit 2.
+    # It pins the SOURCE round's rid (spec["parent_rid"], from --parent at enqueue) and hands it to
+    # the waiter as the exact turn to verify + extract. Auto-adopting whatever the conversation's
+    # LATEST turn happens to be (the earlier design here) silently commits a later same-thread
+    # send's answer as this recovery's result if one lands before/during it — per-rid leases don't
+    # serialize a conversation, and an explicit-parent caller can legitimately fire more than one
+    # round on the same thread. Fail closed instead: no source_rid, no retrieve.
     if r["kind"] == "retrieve":
         conv = spec.get("conversation")
         if not conv or conv == "auto":
             store.finish(rid, store_mod.FAILED, error_code="retrieve needs an explicit conversation id")
             return store_mod.FAILED
+        source_rid = spec.get("parent_rid") or r.get("parent_rid")
+        if not source_rid:
+            store.finish(rid, store_mod.FAILED,
+                        error_code="retrieve needs an explicit source_rid (--parent <rid>) — the "
+                                  "recovery path must never auto-adopt the conversation's latest turn")
+            return store_mod.FAILED
         store.set_state(rid, store_mod.WAITING, expect=store_mod.READY)
-        return _wait_phase(store, rid, conv, spec, run_cdp, wait_rid="auto")
+        return _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=source_rid, is_retrieve=True)
 
     # followup: CONTINUE the same thread — attach to its conversation and send there, never open a
     # new one (a fresh submit would silently lose the thread's context, the worst kind of bug).
@@ -656,7 +724,7 @@ def _read_answer(path) -> str:
         return ""
 
 
-def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None) -> str:
+def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=False) -> str:
     out_tmp = os.path.join(store_mod.CGC_STATE_DIR, f"_wait_{rid}.txt")
     # Clear any stale answer + .raw sidecar from a PRIOR wait on this rid (e.g. a timed-out first
     # wait, before an auto-retrieve). _wait_phase decides completed_verified vs _unverified purely
@@ -680,6 +748,18 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None) -> str:
     if code == 3:
         store.set_state(rid, store_mod.BLOCKED, error_code=(res.get("stderr") or "blocker")[:200])
         return store_mod.BLOCKED
+    if is_retrieve:
+        # retrieve never sends anything, so a wait that cannot confirm/attribute the SOURCE turn's
+        # answer (rid_absent — the turn was never sent here; rid_superseded/ambiguous — the thread
+        # has since advanced past it and no sentinel-wrapped answer anchors it) is a plain, retryable
+        # FAILURE — not "possibly accepted", which would wrongly imply a click that might need
+        # reconciling. cdp_consult's CGC_ERROR line (if any) carries the actionable detail, including
+        # 'observed_rid=' — the rid it actually found instead, for the envelope.
+        detail = _stderr_error_line(res.get("stderr") or "")
+        store.finish(rid, store_mod.FAILED,
+                    error_code=detail or f"retrieve could not confirm source_rid={wait_rid or rid} "
+                                         f"(exit {code})")
+        return store_mod.FAILED
     # a wait that returns nothing usable, while the send WAS accepted, is not a clean failure: the
     # answer may still exist in the conversation. Leave it uncertain so it is retrieved, not resent.
     store.set_state(rid, store_mod.POSSIBLY_ACCEPTED,

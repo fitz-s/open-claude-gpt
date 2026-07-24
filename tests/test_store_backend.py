@@ -264,14 +264,16 @@ def test_followup_without_conversation_fails_not_new_thread(env):
 
 def test_retrieve_attaches_without_sending(env):
     store_mod, backend, s, tmp = env
-    s.create_round("REQ-20260721-000000-00000r", "retrieve", out_path="/tmp/r.txt",
-                   spec_json=json.dumps({"conversation": "conv-existing"}))
+    s.create_round("REQ-20260721-000000-00000r", "retrieve", out_path="/tmp/r.txt", parent_rid="REQ-20260721-000000-src001",
+                   spec_json=json.dumps({"conversation": "conv-existing", "parent_rid": "REQ-20260721-000000-src001"}))
     s.set_state("REQ-20260721-000000-00000r", store_mod.READY)
     r = s.get_round("REQ-20260721-000000-00000r")
     calls = []
+    seen = {}
 
     def cdp(kind, **kw):
         calls.append(kind)
+        seen[kind] = kw
         with open(kw["out"], "w") as f:
             f.write("the retrieved answer")
         return {"code": 0, "out": kw["out"], "stderr": ""}
@@ -279,6 +281,8 @@ def test_retrieve_attaches_without_sending(env):
     final = backend.process_round(s, r, cdp, daemon_instance_id="d1", validate=_OK_GATE)
     assert final == store_mod.COMPLETED_VERIFIED
     assert calls == ["wait"], "retrieve must only wait — it must never submit/send"
+    assert seen["wait"]["rid"] == "REQ-20260721-000000-src001", \
+        "the wait must be pinned to the SOURCE round's rid, never the retrieve round's own"
 
 
 def test_resume_reattaches_and_never_resends(env):
@@ -772,15 +776,16 @@ class TestStrictFollowupEdges:
 
 
 class TestRetrieveRidSemantics:
-    def test_retrieve_waits_with_auto_rid_not_its_own(self, env):
-        """A retrieve round's own rid is fresh by construction — pinning it would always
-        rid_mismatch against the conversation's actual last request, making the advertised
-        recovery path (`enqueue --kind retrieve --conversation <id>`) exit 2 unconditionally
-        (observed live). The waiter must resolve the rid FROM the page (auto)."""
+    def test_retrieve_pins_the_source_rid_not_its_own(self, env):
+        """A retrieve round's own rid is fresh by construction and means nothing to the page — it
+        must pin the SOURCE round's rid (its --parent at enqueue, carried in spec/parent_rid) as
+        the wait rid: never its own fresh rid, and never 'auto' (which silently adopts whatever the
+        conversation's LATEST turn happens to be — the causal-substitution bug this fixes)."""
         store_mod, backend, s, tmp_path = env
         rid = "REQ-20260707-120000-0f8001"
-        s.create_round(rid, "retrieve", thread_id="conv-r", prompt=None,
-                       spec_json=json.dumps({"conversation": "conv-r"}))
+        source_rid = "REQ-20260707-115000-0f7000"
+        s.create_round(rid, "retrieve", thread_id="conv-r", prompt=None, parent_rid=source_rid,
+                       spec_json=json.dumps({"conversation": "conv-r", "parent_rid": source_rid}))
         s.db.execute("UPDATE threads SET conversation_id='conv-r' WHERE thread_id='conv-r'")
         s.set_state(rid, store_mod.READY)
         seen = {}
@@ -794,8 +799,155 @@ class TestRetrieveRidSemantics:
         final = backend.process_round(s, s.get_round(rid), cdp,
                                       daemon_instance_id="d1", validate=lambda p: (True, "ok"))
         assert final == store_mod.COMPLETED_VERIFIED
-        assert seen["wait"]["rid"] == "auto", \
-            "retrieve must adopt the conversation's rid, never pin its own fresh one"
+        assert seen["wait"]["rid"] == source_rid, \
+            "retrieve must pin the SOURCE round's rid, never its own fresh rid or 'auto'"
+
+    def test_retrieve_without_a_source_rid_fails_closed(self, env):
+        """Belt-and-suspenders: even if a retrieve round somehow reaches process_round with no
+        source_rid (spec/parent_rid both empty — enqueue_round refuses this earlier), the worker
+        itself must still refuse rather than falling back to an unpinned/auto wait."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0f8002"
+        s.create_round(rid, "retrieve", thread_id="conv-nosrc",
+                       spec_json=json.dumps({"conversation": "conv-nosrc"}))
+        s.db.execute("UPDATE threads SET conversation_id='conv-nosrc' WHERE thread_id='conv-nosrc'")
+        s.set_state(rid, store_mod.READY)
+        final = backend.process_round(s, s.get_round(rid), lambda *a, **k: pytest.fail("must not wait"),
+                                      daemon_instance_id="d1", validate=lambda p: (True, "ok"))
+        assert final == store_mod.FAILED
+        assert "source_rid" in s.get_round(rid)["error_code"]
+
+    def test_retrieve_never_adopts_a_later_same_thread_answer(self, env):
+        """R1 (source) then R2 are both sent to the same conversation before/during recovery. A
+        retrieve created for R1 must never complete with R2's answer. The fake CDP layer here
+        stands in for cdp_consult's rid-scoped turn matching (cdp_consult._locate_source_turn is
+        unit-tested directly, CDP-free, in TestSourceTurnMatching below): it reports the same
+        refusal a real superseded/absent turn-match would — no usable answer, a CGC_ERROR line
+        naming the mismatch. process_round must turn that into a plain FAILED, never a success
+        carrying R2's content."""
+        store_mod, backend, s, tmp_path = env
+        source_rid = "REQ-20260707-120000-0aaa01"    # R1 — the uncertain round being recovered
+        later_rid = "REQ-20260707-120500-0bbb01"     # R2 — sent to the same conversation afterward
+        retrieve_rid = "REQ-20260707-121000-0ccc01"
+        s.create_round(retrieve_rid, "retrieve", thread_id="conv-adv", parent_rid=source_rid,
+                       spec_json=json.dumps({"conversation": "conv-adv", "parent_rid": source_rid}))
+        s.db.execute("UPDATE threads SET conversation_id='conv-adv' WHERE thread_id='conv-adv'")
+        s.set_state(retrieve_rid, store_mod.READY)
+
+        def cdp(kind, **kw):
+            assert kind == "wait"
+            assert kw["rid"] == source_rid, "must ask cdp_consult to verify R1, never R2 or 'auto'"
+            # No answer written to --out — cdp_consult refused to attribute one, exactly like a
+            # live rid_superseded/rid_absent exit.
+            return {"code": 5, "out": kw["out"],
+                    "stderr": f"CGC_ERROR rid_superseded: source_rid={source_rid} is not the "
+                             f"conversation's latest turn observed_rid={later_rid} and no "
+                             "sentinel-wrapped answer for it was found — refusing to attribute "
+                             "the latest message to it."}
+
+        final = backend.process_round(s, s.get_round(retrieve_rid), cdp,
+                                      daemon_instance_id="d1", validate=lambda p: (True, "ok"))
+        assert final == store_mod.FAILED, "never a success carrying a later round's answer"
+        r = s.get_round(retrieve_rid)
+        assert not r["result_text"], "R2's answer must never be persisted as this retrieve's result"
+        assert "rid_superseded" in r["error_code"]
+        assert f"observed_rid={later_rid}" in r["error_code"]
+
+    def test_retrieve_returns_the_source_answer_when_attributable(self, env):
+        """The counterpart to the refusal above: when cdp_consult CAN attribute an answer to R1
+        (its own sentinel-wrapped extract, regardless of R2 also existing on the thread), the
+        retrieve still completes normally with R1's answer."""
+        store_mod, backend, s, tmp_path = env
+        source_rid = "REQ-20260707-120000-0aaa02"
+        retrieve_rid = "REQ-20260707-121000-0ccc02"
+        s.create_round(retrieve_rid, "retrieve", thread_id="conv-ok", parent_rid=source_rid,
+                       spec_json=json.dumps({"conversation": "conv-ok", "parent_rid": source_rid}))
+        s.db.execute("UPDATE threads SET conversation_id='conv-ok' WHERE thread_id='conv-ok'")
+        s.set_state(retrieve_rid, store_mod.READY)
+
+        def cdp(kind, **kw):
+            assert kw["rid"] == source_rid
+            with open(kw["out"], "w") as f:
+                f.write("R1's own sentinel-wrapped answer")
+            return {"code": 0, "out": kw["out"], "stderr": ""}
+
+        final = backend.process_round(s, s.get_round(retrieve_rid), cdp,
+                                      daemon_instance_id="d1", validate=lambda p: (True, "ok"))
+        assert final == store_mod.COMPLETED_VERIFIED
+        assert s.get_round(retrieve_rid)["result_text"] == "R1's own sentinel-wrapped answer"
+
+    def test_failed_retrieve_envelope_carries_source_and_observed_rid(self, env, capsys):
+        """Envelope transparency: awaiting a failed retrieve must surface WHICH round it was
+        recovering (source_rid) and WHAT the CDP layer found instead (observed_rid) — not just
+        that it failed."""
+        store_mod, backend, s, tmp_path = env
+        source_rid = "REQ-20260707-120000-0ddd01"
+        later_rid = "REQ-20260707-120500-0eee01"
+        retrieve_rid = "REQ-20260707-121000-0fff01"
+        s.create_round(retrieve_rid, "retrieve", thread_id="conv-env", parent_rid=source_rid,
+                       spec_json=json.dumps({"conversation": "conv-env", "parent_rid": source_rid}))
+        s.db.execute("UPDATE threads SET conversation_id='conv-env' WHERE thread_id='conv-env'")
+        s.set_state(retrieve_rid, store_mod.READY)
+
+        def cdp(kind, **kw):
+            return {"code": 5, "out": kw["out"],
+                    "stderr": f"CGC_ERROR rid_superseded: source_rid={source_rid} "
+                             f"observed_rid={later_rid}"}
+
+        final = backend.process_round(s, s.get_round(retrieve_rid), cdp,
+                                      daemon_instance_id="d1", validate=lambda p: (True, "ok"))
+        assert final == store_mod.FAILED
+        capsys.readouterr()
+        code = backend.await_round(types.SimpleNamespace(
+            rid=retrieve_rid, out=str(tmp_path / "r.txt"), poll=0.01, timeout=2))
+        assert code == 1
+        env_json = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert env_json["source_rid"] == source_rid
+        assert env_json["observed_rid"] == later_rid
+
+
+class TestSourceTurnMatching:
+    """cdp_consult._locate_source_turn is the CDP-free core of retrieve's turn verification: given
+    plain textContent strings (what a real DOM query would return) it decides whether the source
+    round's own turn is present and still the conversation's latest. Per the constraint that
+    cdp_consult.py drives a live browser, this is the one piece of its retrieve logic that is
+    unit-testable without CDP — no mock browser harness, just the pure function."""
+
+    @staticmethod
+    def _cdp(tmp_path):
+        return _load("cdp_consult", tmp_path / "control.db")
+
+    def test_source_turn_is_last_when_nothing_sent_after(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        turns = ["review https://github.com/x\nBEGIN_RESPONSE:REQ-20260707-120000-0aaa01\n"]
+        loc = cdp._locate_source_turn(turns, "REQ-20260707-120000-0aaa01")
+        assert loc == {"present": True, "is_last": True,
+                       "observed_rid": "REQ-20260707-120000-0aaa01"}
+
+    def test_source_turn_not_last_when_a_later_turn_was_sent(self, tmp_path):
+        """The exact shape of the audit's race: R1's turn exists, but R2 was sent afterward —
+        is_last must be False, so the caller refuses unwrapped salvage."""
+        cdp = self._cdp(tmp_path)
+        turns = [
+            "review https://github.com/x\nBEGIN_RESPONSE:REQ-20260707-120000-0aaa01\n",
+            "one more thing\nBEGIN_RESPONSE:REQ-20260707-120500-0bbb01\n",
+        ]
+        loc = cdp._locate_source_turn(turns, "REQ-20260707-120000-0aaa01")
+        assert loc["present"] is True
+        assert loc["is_last"] is False
+        assert loc["observed_rid"] == "REQ-20260707-120500-0bbb01"
+
+    def test_source_turn_absent_reports_observed_latest(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        turns = ["one more thing\nBEGIN_RESPONSE:REQ-20260707-120500-0bbb01\n"]
+        loc = cdp._locate_source_turn(turns, "REQ-20260707-120000-0aaa01")
+        assert loc == {"present": False, "is_last": False,
+                       "observed_rid": "REQ-20260707-120500-0bbb01"}
+
+    def test_no_turns_at_all(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        assert cdp._locate_source_turn([], "REQ-20260707-120000-0aaa01") == \
+            {"present": False, "is_last": False, "observed_rid": None}
 
 
 class TestKeyReleaseOnPreSendFailure:
