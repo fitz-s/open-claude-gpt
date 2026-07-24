@@ -218,6 +218,12 @@
       "type": "file"
     },
     {
+      "path": "CHANGELOG.md",
+      "accessCount": 2,
+      "lastAccessed": 1784886026492,
+      "type": "file"
+    },
+    {
       "path": "skill/scripts/cgc_config.py",
       "accessCount": 1,
       "lastAccessed": 1784883794023,
