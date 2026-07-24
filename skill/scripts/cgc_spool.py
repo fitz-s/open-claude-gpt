@@ -216,8 +216,15 @@ def _read_json(path):
 
 # ---- heartbeat / liveness ---------------------------------------------------
 
-def heartbeat_write(pid=None):
-    _atomic_write(DAEMON_PATH, {"pid": pid if pid is not None else os.getpid(), "ts": time.time()})
+def heartbeat_write(pid=None, identity=None):
+    """`identity` (dict) is the daemon's self-description — protocol, schema_version, db_path,
+    store_uuid, daemon_instance_id. enqueue compares it against the store IT opened and refuses on
+    mismatch, so an old-code or wrong-store daemon (the live split-brain failure) is caught at the
+    first write, not 25 minutes later."""
+    d = {"pid": pid if pid is not None else os.getpid(), "ts": time.time()}
+    if identity:
+        d.update(identity)
+    _atomic_write(DAEMON_PATH, d)
 
 
 def _pid_alive(pid):
@@ -228,15 +235,20 @@ def _pid_alive(pid):
         return False
 
 
-def daemon_alive():
-    """True iff the heartbeat file is fresh AND its pid is a live process. A stale heartbeat (daemon
-    crashed / was killed) reads as down even though the file lingers."""
+def daemon_identity():
+    """The live daemon's heartbeat dict (pid, ts + its identity fields), or None when no live
+    daemon. A stale heartbeat (daemon crashed / was killed) reads as down even though the file
+    lingers."""
     d = _read_json(DAEMON_PATH)
     if not isinstance(d, dict):
-        return False
+        return None
     if (time.time() - d.get("ts", 0)) > HEARTBEAT_STALE_S:
-        return False
-    return _pid_alive(d.get("pid"))
+        return None
+    return d if _pid_alive(d.get("pid")) else None
+
+
+def daemon_alive():
+    return daemon_identity() is not None
 
 
 DAEMON_LOCK = _p("daemon.lock")
@@ -270,6 +282,63 @@ def acquire_daemon_singleton(timeout=40):
                 fh.close()
                 return None
             time.sleep(0.5)
+
+
+# ---- worker / browser leases (cross-generation fencing) ---------------------
+# The daemon's in-memory children map only knows workers THIS daemon generation spawned. A worker
+# that outlives its parent (shutdown waits 30s then forgets) is invisible to the replacement daemon,
+# which would otherwise sweep its tab, restart its Chrome, spawn a duplicate waiter for its round,
+# or promote its in-progress `sending` row. These flock leases are the cross-generation truth: held
+# for the holder's process lifetime, released by the OS on ANY death (the same mechanism as the
+# daemon singleton above them).
+#   - per-RID lease (exclusive): a worker owns its round. Anyone else must prove the lease is FREE
+#     before touching that round's in-flight state.
+#   - browser lease: workers hold SHARED; browser-global actions (tab sweep, Chrome restart) need
+#     EXCLUSIVE — impossible while any worker of any generation is alive.
+
+BROWSER_LOCK = _p("browser.lock")
+
+
+def _lease_path(rid):
+    return _p(f"lease.{rid}")
+
+
+def _flock(path, flags):
+    """Non-blocking flock on `path`. Returns the open file handle (caller keeps it alive for the
+    lease's lifetime) or None if the lock is held elsewhere. Best-effort object() when fcntl is
+    unavailable (never on macOS/Linux)."""
+    if fcntl is None:
+        return object()
+    ensure_dirs()
+    fh = open(path, "a+")
+    try:
+        fcntl.flock(fh.fileno(), flags | fcntl.LOCK_NB)
+        return fh
+    except OSError:
+        fh.close()
+        return None
+
+
+def acquire_rid_lease(rid):
+    """Exclusive ownership of one round, for a worker's whole process lifetime."""
+    return _flock(_lease_path(rid), fcntl.LOCK_EX if fcntl else 0)
+
+
+def rid_lease_free(rid) -> bool:
+    """Is NO process (of any daemon generation) working this round? Probes by briefly taking the
+    exclusive lease and releasing it."""
+    fh = acquire_rid_lease(rid)
+    if fh is None:
+        return False
+    if fcntl is not None:
+        fh.close()  # closing the fd releases the flock
+    return True
+
+
+def acquire_browser_lease(shared: bool):
+    """SHARED while a worker uses the browser; EXCLUSIVE for browser-global maintenance
+    (tab sweep / Chrome restart). Exclusive is unobtainable while any worker lives."""
+    return _flock(BROWSER_LOCK, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) if fcntl else 0)
 
 
 # ---- the validating gate (security core) ------------------------------------
@@ -557,6 +626,11 @@ def main() -> int:
     e.add_argument("--request-key",
                    help="caller-chosen logical-request id — same key + same content returns the "
                         "original receipt (idempotent retry); same key + different content refuses")
+    e.add_argument("--logical-sha",
+                   help="sha256 of the prompt rendered with the <RID> placeholder (from prep) — the "
+                        "rid-independent content identity used in the request-key fingerprint. "
+                        "Without it, the fingerprint falls back to normalizing this round's rid "
+                        "out of the rendered bytes.")
     e.add_argument("--out", help="answer file (default $CGC_STATE_DIR/answer_<rid>.txt)")
     e.add_argument("--poll", type=int, default=POLL_S)
     e.add_argument("--timeout", type=int, default=STUCK_AFTER_S,

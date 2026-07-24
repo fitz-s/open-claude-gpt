@@ -262,3 +262,124 @@ def test_run_loop_takes_the_singleton_and_exits_if_held(daemon):
     loop = inspect.getsource(daemon.run_loop)
     assert "acquire_daemon_singleton()" in loop, "run_loop must acquire the daemon singleton"
     assert "return 0" in loop and "already running" in loop, "and exit if another daemon holds it"
+
+
+# ---- reap classification (worker crash recovery) -----------------------------
+
+class _DeadChild:
+    def __init__(self, code=1):
+        self.code = code
+        self.pid = 99999
+
+    def poll(self):
+        return self.code
+
+
+def _sending_round(daemon, rid):
+    s = daemon.store_mod.Store()
+    s.create_round(rid, "submit", prompt="p")
+    s.set_state(rid, daemon.store_mod.READY)
+    s.begin_send(rid, "p", daemon.store_mod.sha256("p"), daemon_instance_id="d1")
+    return s
+
+
+def test_reap_classifies_dead_sending_worker_as_possibly_accepted(daemon):
+    """A worker that dies mid-send leaves its round `sending` with no owner. The still-live daemon
+    must classify it AT REAP TIME — possibly_accepted within one loop — not leave it `sending`
+    until the awaiter's full timeout (the liveness half of the recovery promise)."""
+    rid = _rid("00d001")
+    s = _sending_round(daemon, rid)
+    children = {rid: _DeadChild(code=137)}
+    daemon._reap_children(children)
+    assert children == {}, "the dead child must be reaped"
+    assert s.get_round(rid)["state"] == daemon.store_mod.POSSIBLY_ACCEPTED
+    assert "worker exited" in (s.get_round(rid)["error_code"] or "")
+    s.close()
+
+
+def test_reap_leaves_non_sending_states_untouched(daemon):
+    """ready stays dispatchable (the ready-orphan path re-runs it: pre-send, safe); waiting stays
+    reattachable (read-only resume). Only `sending` is uncertain."""
+    s = daemon.store_mod.Store()
+    r_ready, r_wait = _rid("00d002"), _rid("00d003")
+    s.create_round(r_ready, "submit", prompt="p")
+    s.set_state(r_ready, daemon.store_mod.READY)
+    s.create_round(r_wait, "submit", thread_id="t-w", prompt="p")
+    s.set_state(r_wait, daemon.store_mod.READY)
+    s.begin_send(r_wait, "p", daemon.store_mod.sha256("p"), daemon_instance_id="d1")
+    a = s.get_round(r_wait)["current_attempt_id"]
+    s.mark_accepted(a, "conv-w")
+    s.mark_waiting(r_wait)
+    children = {r_ready: _DeadChild(), r_wait: _DeadChild()}
+    daemon._reap_children(children)
+    assert s.get_round(r_ready)["state"] == daemon.store_mod.READY
+    assert s.get_round(r_wait)["state"] == daemon.store_mod.WAITING
+    s.close()
+
+
+# ---- cross-generation leases (worker/browser fencing) ------------------------
+
+def test_rid_lease_is_exclusive_and_freed_on_release(daemon):
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    rid = _rid("00e001")
+    held = daemon.spool.acquire_rid_lease(rid)
+    assert held is not None
+    assert daemon.spool.rid_lease_free(rid) is False, "a held lease must read as owned"
+    held.close()
+    assert daemon.spool.rid_lease_free(rid) is True
+
+
+def test_worker_refuses_a_round_owned_by_a_live_worker(daemon):
+    """A replacement daemon may spawn a worker for a round an OLD-generation worker still owns.
+    The new worker's first act is taking the per-RID lease; refused means exit WITHOUT touching
+    the round — the fence against duplicate waiters."""
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    rid = _rid("00e002")
+    held = daemon.spool.acquire_rid_lease(rid)
+    assert daemon.run_worker_store(rid) == 1
+    assert daemon.run_worker_store_resume(rid) == 1
+    held.close()
+
+
+def test_browser_exclusive_is_unobtainable_while_a_worker_holds_shared(daemon):
+    """Tab sweep / Chrome restart are browser-global; the exclusive browser lease must be refused
+    while ANY worker (any daemon generation) holds its shared lease."""
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    worker = daemon.spool.acquire_browser_lease(shared=True)
+    assert worker is not None
+    assert daemon.spool.acquire_browser_lease(shared=False) is None
+    worker.close()
+    excl = daemon.spool.acquire_browser_lease(shared=False)
+    assert excl is not None
+    excl.close()
+
+
+def test_dispatch_skips_rounds_whose_lease_is_held(daemon, monkeypatch):
+    """An accepted/waiting round owned by a surviving prior-generation worker must NOT get a second
+    (duplicate) waiter from the new daemon."""
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    rid = _rid("00e003")
+    s = daemon.store_mod.Store()
+    s.create_round(rid, "submit", thread_id="t-l", prompt="p")
+    s.set_state(rid, daemon.store_mod.READY)
+    s.begin_send(rid, "p", daemon.store_mod.sha256("p"), daemon_instance_id="d1")
+    a = s.get_round(rid)["current_attempt_id"]
+    s.mark_accepted(a, "conv-l")
+    s.mark_waiting(rid)
+    s.close()
+    spawned = []
+    monkeypatch.setattr(daemon.subprocess, "Popen",
+                        lambda cmd, **kw: spawned.append(cmd) or _DeadChild())
+    held = daemon.spool.acquire_rid_lease(rid)
+    children = {}
+    daemon._dispatch_store(children, 3, "gen2")
+    assert not any(rid in " ".join(map(str, c)) for c in spawned), \
+        "a leased round must not be re-dispatched"
+    held.close()
+    daemon._dispatch_store(children, 3, "gen2")
+    assert any(rid in " ".join(map(str, c)) for c in spawned), \
+        "once the lease frees, the round is reattached"

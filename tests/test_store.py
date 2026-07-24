@@ -289,6 +289,60 @@ class TestLegacyRelocation:
         s.close()
         assert legacy.exists()                                 # untouched
 
+    # ---- failpoint drills: the publication protocol must survive a crash at every boundary ----
+
+    def test_empty_target_stub_does_not_suppress_relocation(self, tmp_path, monkeypatch):
+        """Old-code crash window: the final path was pre-created EMPTY before the copy. Target
+        existence must not be read as 'relocation done' — the stub is removed and the relocation
+        redone, instead of the legacy data being silently orphaned forever."""
+        cgc_store, legacy = self._mk_legacy(tmp_path, monkeypatch)
+        target = tmp_path / "data" / "control.db"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.touch()                                          # the empty stub
+        s = cgc_store.Store()
+        assert s.get_round("REQ-RELOC-1") is not None           # data survived — stub redone
+        s.close()
+        assert not legacy.exists()
+
+    def test_interrupted_fence_is_finished_not_left_split_brain(self, tmp_path, monkeypatch):
+        """Crash between atomic publication and the legacy rename leaves TWO complete files. The
+        next open must finish the writer fence (rename legacy *.migrated), never return early with
+        two apparent authorities."""
+        cgc_store, legacy = self._mk_legacy(tmp_path, monkeypatch)
+        s = cgc_store.Store()                                   # full relocation
+        s.close()
+        migrated = tmp_path / "state" / "control.db.migrated"
+        assert migrated.exists()
+        migrated.rename(legacy)                                 # simulate: fence never ran
+        s = cgc_store.Store()
+        s.close()
+        assert not legacy.exists(), "the interrupted fence must be finished on the next open"
+        assert migrated.exists()
+
+    def test_crash_mid_copy_leaves_only_a_temp_that_is_cleaned_up(self, tmp_path, monkeypatch):
+        """A temp abandoned mid-copy must never be mistaken for the store, and must be swept."""
+        cgc_store, legacy = self._mk_legacy(tmp_path, monkeypatch)
+        d = tmp_path / "data"
+        d.mkdir(parents=True, exist_ok=True)
+        stale = d / ".control.db.relocating-deadbeef"
+        stale.write_bytes(b"partial garbage")
+        s = cgc_store.Store()
+        assert s.get_round("REQ-RELOC-1") is not None
+        s.close()
+        assert not stale.exists(), "abandoned relocation temps must be swept"
+        assert not legacy.exists()
+
+    def test_target_and_legacy_have_a_store_uuid(self, tmp_path, monkeypatch):
+        """Every opened store mints a stable store_uuid — the identity the daemon heartbeat
+        publishes and enqueue verifies (the runtime writer fence)."""
+        cgc_store, _legacy = self._mk_legacy(tmp_path, monkeypatch)
+        s = cgc_store.Store()
+        u1 = s.store_uuid()
+        s.close()
+        s = cgc_store.Store()
+        assert u1 and s.store_uuid() == u1, "the store identity must be stable across opens"
+        s.close()
+
 
 class TestSchemaMigrations:
     """Ordered transactional migrations: v1 → v2 with a pre-migration backup; newer-schema refusal."""

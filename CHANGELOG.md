@@ -24,6 +24,46 @@ home, one machine-readable contract, honest risk posture.
   daemon recreated an empty /tmp DB while new CLI code used the durable one, stranding another
   session's consult for 30 min).
 
+The pre-tag adversarial re-review (same GPT-5.6 Pro thread, at 356cf7d) returned BLOCK with four
+S3 correctness holes on the core trust guarantees; all are fixed below.
+
+### Fixed — re-review release blockers
+- **Worker crash recovery at reap time.** A worker that died mid-`sending` used to leave the round
+  `sending` until the awaiter's full timeout (the daemon only classified at its own restart). The
+  daemon now classifies on reap: `sending` → `possibly_accepted` within one loop; ready/waiting
+  stay on their existing re-dispatch/reattach paths.
+- **Cross-generation worker & browser fencing (flock leases).** The daemon's in-memory children
+  map is only THIS generation's knowledge; a worker surviving its parent was invisible to a
+  replacement daemon, which could sweep its tab, restart its Chrome, spawn a duplicate waiter, or
+  promote its live `sending` row. Workers now hold a per-RID exclusive lease + a shared browser
+  lease for their process lifetime (OS-released on any death); tab sweep / Chrome restart require
+  the exclusive browser lease; startup promotion and re-dispatch touch only lease-free rounds.
+- **Relocation is an atomic, fenced cutover.** The one-time /tmp→durable move now copies to a
+  uniquely-named temp, validates (`PRAGMA integrity_check` + schema), fsyncs, then atomically
+  publishes via rename — target existence now implies a complete DB; an interrupted fence
+  (both files present) is finished on the next open; an old empty stub no longer suppresses
+  relocation forever. The runtime writer fence: every store carries a `store_uuid`, the daemon
+  heartbeat publishes its identity (protocol, schema_version, db_path, store_uuid, instance), and
+  enqueue REFUSES (`store_mismatch`) when a live daemon is serving a different store or running
+  identity-less old code. install.sh now FAILS an upgrade whose daemon restart fails (was a
+  warning) — `--force` overrides.
+- **Request-key fingerprint covers the logical request.** The idempotency identity is now a
+  canonical fingerprint over kind + rid-independent prompt identity + project + model + `--parent`
+  + explicit `--conversation`: the same key with different routing now CONFLICTS instead of
+  silently returning the old receipt (an answer for the wrong causal request). The prompt identity
+  comes from a `<RID>`-placeholder render (`prep` → `--logical-sha`), so a rid quoted in user text
+  is never normalized away. Concurrent same-key enqueues resolve deterministically through the
+  unique index (the loser returns the winner's receipt, never a raw constraint error).
+- **Envelope contract hardened.** `await` now emits its one-JSON-line envelope on EVERY exit,
+  including a store that cannot open (SchemaTooNew, corruption) and answer-materialization
+  failures; `retryable:true` structurally always carries `next_command` or `human_action`.
+- **Bare-auto follow-up edges.** The ambiguity refusal now counts queued/ready consults as
+  in-flight, and compares the two most recently active DISTINCT threads (a busy thread can no
+  longer hide a near-simultaneous completion on another).
+- **Release hygiene.** `.omc/` local tool state untracked + ignored; the CI identity scan covers
+  every tracked file (was .py/.sh/.md only); install.sh installs the same pinned
+  `websocket-client>=1.6,<2` range CI tests and verifies the installed version.
+
 ### Added
 - **JSON outcome envelope (schema 1).** Every `await` exit prints one machine-readable stdout line:
   rid, parent_rid, state, retryable, human_action, next_command, answer_path, log_path, confidence,
