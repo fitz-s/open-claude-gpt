@@ -55,7 +55,11 @@ Subcommands:
             3 blocker (login/captcha/rate-limit)
             4 timeout with NO usable answer at all (empty / only short streaming stubs) —
               a genuine no-answer timeout, distinct from the exit-0 salvage case above
-            2 usage error
+            2 usage error, or (a concrete, non-'auto' --rid) rid_absent: that turn was never
+              found among the conversation's user turns within the grace window
+            5 rid_superseded/ambiguous: a concrete --rid's turn exists but is no longer the
+              conversation's latest (a later turn landed before/during the wait) and no
+              sentinel-wrapped answer anchors it — refused rather than guessing
   status  --rid R [--port P]   one-shot JSON {generating,done,blocker,len}
 """
 from __future__ import annotations
@@ -697,6 +701,59 @@ def _resolve_rid(c, rid):
         raise SystemExit(f"CGC_ERROR rid_mismatch: attached conversation is for '{page_rid}', "
                          f"not the expected '{rid}' — wrong tab. Pin with --conversation <id>.")
     return rid
+
+
+def _all_user_texts_js() -> str:
+    """textContent of EVERY user turn, DOM order — unlike _user_rid_js (last turn only), this lets
+    a retrieve locate a SOURCE rid's own turn anywhere in the conversation, even when later turns
+    were sent after it."""
+    return ("(function(){var u=document.querySelectorAll(" + _JS_U + ");"
+            "return Array.prototype.map.call(u, function(n){return n.textContent||'';});})()")
+
+
+_RID_ECHO_RE = re.compile(r"BEGIN_RESPONSE:(REQ-\d{8}-\d{6}-[0-9a-f]{6})")
+
+
+def _locate_source_turn(user_texts, source_rid):
+    """Pure, CDP-free turn-matching helper (unit-tested without a browser — see tests/
+    test_store_backend.py): given every user turn's textContent in DOM order and the rid a retrieve
+    is recovering, find whether/where its own BEGIN_RESPONSE:<rid> echo lives.
+
+    present=False: the source turn is nowhere in the conversation -> rid_absent, refuse outright.
+    present=True, is_last=True: no user turn was sent after it -> the conversation has not advanced
+      past it, so the existing unwrapped-salvage fallback (last assistant node, no sentinel) is as
+      safe here as it is for a normal submit/followup wait.
+    present=True, is_last=False: at least one later turn exists -> only a sentinel-WRAPPED answer
+      (its own END_RESPONSE:<rid> anchor, extracted via the rid-scoped _detect_js/_extract_js) can
+      still be safely attributed to the source turn; unwrapped salvage must be refused
+      (rid_superseded/ambiguous) since 'the last assistant node' may now belong to that later turn.
+
+    observed_rid is the rid echoed by the LAST user turn, if any/parseable — 'what the conversation
+    is actually on now', surfaced in error text and the outcome envelope so a refusal is legible,
+    not just silent.
+    """
+    tok = f"BEGIN_RESPONSE:{source_rid}"
+    idx = None
+    for i, t in enumerate(user_texts):
+        if tok in (t or ""):
+            idx = i  # keep the LAST match — the most recent send of this exact content, if ever duplicated
+    observed = None
+    if user_texts:
+        m = _RID_ECHO_RE.search(user_texts[-1] or "")
+        observed = m.group(1) if m else None
+    if idx is None:
+        return {"present": False, "is_last": False, "observed_rid": observed}
+    return {"present": True, "is_last": idx == len(user_texts) - 1, "observed_rid": observed}
+
+
+def _salvage_allowed(c, rid):
+    """Re-check, AT THE MOMENT unwrapped salvage is considered (not just once at wait-start),
+    whether rid's own turn is still the conversation's LAST — a later turn can land WHILE the wait
+    is in progress, which is exactly the race a retrieve recovery must close. Returns
+    (allowed: bool, observed_rid). Cheap (one DOM query), so re-checking on every salvage attempt
+    costs nothing against a poll loop measured in seconds."""
+    loc = _locate_source_turn(c.eval(_all_user_texts_js()) or [], rid)
+    return loc["is_last"] and loc["present"], loc["observed_rid"]
 
 
 def _last_assistant_js(rid: str) -> str:
@@ -1535,9 +1592,33 @@ def cmd_wait(a) -> int:
         # rid), and the 120s window expired exactly there — burning the round's one-shot
         # auto-retrieve on a render lag. Waiting longer on a wrong tab costs nothing
         # (read-only); giving up early costs the recovery.
+        # 'auto' means "adopt whatever the conversation's latest turn is" — a legitimate mode for a
+        # freshly-sent submit/followup (this round's own turn IS the latest one) or an explicitly
+        # named debug lookup (`status --rid auto`). A CONCRETE rid, however, names one turn among
+        # possibly several — most notably a retrieve's --parent source_rid, which must be located
+        # and verified, never assumed to be the latest (that is the causal-substitution bug this
+        # closes: a later same-thread send must never be mistaken for an earlier round's answer).
+        strict = a.rid != "auto"
         rid = None
+        observed_rid = None
         rdl = time.time() + min(600, a.timeout)
         while time.time() < rdl:
+            if strict:
+                try:
+                    texts = c.eval(_all_user_texts_js()) or []
+                except Exception as e:
+                    sys.stderr.write(f"CGC_WAIT resolving source turn… ({e})\n")
+                    time.sleep(5)
+                    continue
+                loc = _locate_source_turn(texts, a.rid)
+                observed_rid = loc["observed_rid"]
+                if loc["present"]:
+                    rid = a.rid
+                    break
+                sys.stderr.write(f"CGC_WAIT resolving source turn… (not yet visible; observed "
+                                 f"latest {observed_rid or 'none'})\n")
+                time.sleep(5)
+                continue
             try:
                 rid = _resolve_rid(c, a.rid)
                 break
@@ -1545,6 +1626,13 @@ def cmd_wait(a) -> int:
                 sys.stderr.write(f"CGC_WAIT resolving rid… ({e})\n")
                 time.sleep(5)
         if rid is None:
+            if strict:
+                sys.stderr.write(
+                    f"CGC_ERROR rid_absent: source_rid={a.rid} was never found among the "
+                    f"conversation's user turns within the grace window observed_rid={observed_rid or 'none'} "
+                    "— wrong --conversation, or the source round was never sent here. The recovery "
+                    "path never falls back to the conversation's latest turn.\n")
+                return 2
             sys.stderr.write("CGC_ERROR rid_unresolved: could not resolve/verify the rid in the "
                              "attached conversation within the grace window — wrong tab or no "
                              "submitted prompt. Pass --conversation <id> from submit.\n")
@@ -1619,8 +1707,13 @@ def cmd_wait(a) -> int:
                         if not a.keep_tab:
                             c.close_tab()
                         return 0
+                    # No sentinel wrapper yet. Unwrapped salvage grabs 'the last assistant node' with
+                    # no rid anchor at all — re-check RIGHT NOW whether rid's turn is still the
+                    # conversation's latest (a later turn may have landed while we waited): if not,
+                    # that last node could belong to it instead, so salvage must be refused.
+                    allowed, observed_rid = _salvage_allowed(c, rid)
                     raw = c.eval(_last_assistant_js(rid)) or ""
-                    if len(raw) >= a.min_unwrapped:
+                    if allowed and len(raw) >= a.min_unwrapped:
                         _write_private(a.out, raw)
                         _write_private(a.out + ".raw", raw)
                         sys.stderr.write(
@@ -1630,12 +1723,21 @@ def cmd_wait(a) -> int:
                         if not a.keep_tab:
                             c.close_tab()
                         return 0
-                    # tiny + stable + no sentinel → stub/gap, not a dead answer. Keep polling.
-                    _write_private(a.out + ".raw", raw)
-                    sys.stderr.write(
-                        f"CGC_WAIT stub-stable: last assistant only {len(raw)} chars, no sentinel — "
-                        f"likely a thinking/streaming gap; still waiting (raw saved to {a.out}.raw).\n")
-                    settle_start = None
+                    if not allowed and len(raw) >= a.min_unwrapped:
+                        _write_private(a.out + ".raw", raw)
+                        sys.stderr.write(
+                            f"CGC_WAIT ambiguous-stable: source_rid={rid} is no longer the "
+                            f"conversation's latest turn (observed_rid={observed_rid or 'none'}) and no "
+                            "sentinel-wrapped answer for it was found — refusing to attribute the "
+                            "latest message to it; still waiting for a properly wrapped answer.\n")
+                        settle_start = None
+                    else:
+                        # tiny + stable + no sentinel → stub/gap, not a dead answer. Keep polling.
+                        _write_private(a.out + ".raw", raw)
+                        sys.stderr.write(
+                            f"CGC_WAIT stub-stable: last assistant only {len(raw)} chars, no sentinel — "
+                            f"likely a thinking/streaming gap; still waiting (raw saved to {a.out}.raw).\n")
+                        settle_start = None
             else:
                 settle_start = None
                 last_len = cur_len
@@ -1664,8 +1766,12 @@ def cmd_wait(a) -> int:
             if not a.keep_tab:
                 c.close_tab()
             return 0
+        # No sentinel wrapper. Re-check (see the settle-time comment above) whether rid's turn is
+        # still the conversation's latest before considering unwrapped salvage — a later turn may
+        # have landed anywhere during the whole wait, not just at the settle instant.
+        allowed, observed_rid = _salvage_allowed(c, rid)
         raw = c.eval(_last_assistant_js(rid)) or ""
-        if len(raw) >= a.min_unwrapped:
+        if allowed and len(raw) >= a.min_unwrapped:
             _write_private(a.out, raw)
             _write_private(a.out + ".raw", raw)
             sys.stderr.write(
@@ -1675,6 +1781,15 @@ def cmd_wait(a) -> int:
             if not a.keep_tab:
                 c.close_tab()
             return 0
+        if not allowed and len(raw) >= a.min_unwrapped:
+            _write_private(a.out + ".raw", raw)
+            sys.stderr.write(
+                f"CGC_ERROR rid_superseded: source_rid={rid} is not the conversation's latest turn "
+                f"observed_rid={observed_rid or 'none'} and no sentinel-wrapped answer for it was "
+                "found — refusing to attribute the latest message to it.\n")
+            if not a.keep_tab:
+                c.close_tab()
+            return 5
         # Genuinely empty / only short streaming stubs — no usable answer at all.
         _write_private(a.out + ".raw", raw)
         sys.stderr.write(
