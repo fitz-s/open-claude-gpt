@@ -480,6 +480,9 @@ def main() -> int:
                                     "ITS conversation (causal, unambiguous under concurrency). "
                                     "Preferred over --conversation auto.")
     e.add_argument("--model", default=os.environ.get("CGC_MODEL", "Pro"))
+    e.add_argument("--request-key",
+                   help="caller-chosen logical-request id — same key + same content returns the "
+                        "original receipt (idempotent retry); same key + different content refuses")
     e.add_argument("--out", help="answer file (default $CGC_STATE_DIR/answer_<rid>.txt)")
     e.add_argument("--poll", type=int, default=POLL_S)
     e.add_argument("--timeout", type=int, default=STUCK_AFTER_S,
@@ -501,6 +504,10 @@ def main() -> int:
     s = sub.add_parser("status", help="print daemon liveness + round counts by state")
     s.add_argument("--rid", help="also print this job's status record")
     s.set_defaults(fn=cmd_status)
+
+    c = sub.add_parser("cancel", help="cancel a round BEFORE it sends (queued/ready only; idempotent)")
+    c.add_argument("--rid", required=True)
+    c.set_defaults(fn=lambda a: __import__("cgc_backend").cancel_round(a.rid))
 
     a = p.parse_args()
     return a.fn(a)
