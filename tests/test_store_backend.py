@@ -444,3 +444,145 @@ def test_enqueue_and_await_roundtrip(env, monkeypatch):
     aw = types.SimpleNamespace(rid="REQ-20260721-000000-00000b", out=out, timeout=2, poll=1)
     assert backend.await_round(aw) == 0
     assert open(out).read() == "here is the answer"
+
+
+# ---- Phase C: idempotency, cancel, strict followup, outcome envelope ---------
+
+def _enq_ns(rid, prompt_file, **over):
+    import argparse
+    d = dict(rid=rid, prompt_file=prompt_file, kind="submit",
+             project_url="https://chatgpt.com/", conversation="auto", parent=None,
+             request_key=None, model="Pro", out=None, poll=1, timeout=5, quiet=False)
+    d.update(over)
+    return argparse.Namespace(**d)
+
+
+class TestRequestKeyIdempotency:
+    def _enqueue(self, backend, tmp_path, rid, key, body="review https://github.com/acme/w"):
+        pf = tmp_path / f"{rid}.md"
+        # the rendered prompt embeds its rid (sentinel instructions) — reproduce that
+        pf.write_text(f"{body}\nwrap in BEGIN_RESPONSE:{rid}\n", encoding="utf-8")
+        prompt = pf.read_text()
+        return backend.enqueue_round(_enq_ns(rid, str(pf), request_key=key), prompt,
+                                     str(tmp_path / f"a_{rid}.txt"))
+
+    def test_same_key_same_content_returns_original_receipt(self, env, capsys):
+        store_mod, backend, s, tmp_path = env
+        assert self._enqueue(backend, tmp_path, "REQ-20260707-120000-0aa001", "k1") == 0
+        rid1 = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["rid"]
+        # retry with a NEW rid (as a re-fire does) but the same key + logical content
+        assert self._enqueue(backend, tmp_path, "REQ-20260707-120000-0aa002", "k1") == 0
+        out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert out["rid"] == rid1 and out.get("idempotent_repeat") is True
+        assert s.get_round("REQ-20260707-120000-0aa002") is None, "no duplicate round created"
+
+    def test_same_key_different_content_refuses(self, env, capsys):
+        store_mod, backend, s, tmp_path = env
+        assert self._enqueue(backend, tmp_path, "REQ-20260707-120000-0ab001", "k2") == 0
+        capsys.readouterr()
+        assert self._enqueue(backend, tmp_path, "REQ-20260707-120000-0ab002", "k2",
+                             body="review https://github.com/acme/OTHER") == 2
+        assert "request_key_conflict" in capsys.readouterr().err
+
+
+class TestCancel:
+    def test_cancel_queued_round(self, env, capsys):
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0ac001"
+        s.create_round(rid, "submit", prompt="p")
+        assert backend.cancel_round(rid) == 0
+        r = s.get_round(rid)
+        assert r["state"] == store_mod.FAILED
+        assert r["error_code"].startswith("cancelled")
+        # idempotent repeat
+        assert backend.cancel_round(rid) == 0
+
+    def test_cancel_after_send_fence_refuses(self, env, capsys):
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0ac002"
+        s.create_round(rid, "submit", prompt="p")
+        s.set_state(rid, store_mod.READY)
+        s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d")
+        assert backend.cancel_round(rid) == 2
+        assert "not_cancellable" in capsys.readouterr().err
+
+    def test_cancel_missing_round(self, env, capsys):
+        store_mod, backend, s, tmp_path = env
+        assert backend.cancel_round("REQ-20260707-120000-0ac003") == 2
+        assert "no_such_round" in capsys.readouterr().err
+
+
+class TestStrictFollowupResolution:
+    def _complete(self, store_mod, s, rid, conv):
+        s.create_round(rid, "submit", thread_id=conv, prompt="p")
+        s.set_state(rid, store_mod.READY)
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d")
+        s.mark_accepted(aid, conv)
+        s.mark_waiting(rid)
+        s.finish(rid, store_mod.COMPLETED_VERIFIED, result_text="ans")
+
+    def test_single_completed_thread_resolves(self, env):
+        store_mod, backend, s, tmp_path = env
+        self._complete(store_mod, s, "REQ-20260707-120000-0ad001", "conv-A")
+        conv, why = s.latest_conversation_strict()
+        assert conv == "conv-A" and why is None
+
+    def test_inflight_consult_makes_auto_ambiguous(self, env):
+        store_mod, backend, s, tmp_path = env
+        self._complete(store_mod, s, "REQ-20260707-120000-0ae001", "conv-A")
+        s.create_round("REQ-20260707-120000-0ae002", "submit", prompt="p")
+        s.set_state("REQ-20260707-120000-0ae002", store_mod.READY)
+        s.begin_send("REQ-20260707-120000-0ae002", "p", "h" * 64, daemon_instance_id="d")
+        conv, why = s.latest_conversation_strict()
+        assert conv is None and "in flight" in why
+
+    def test_two_recent_completions_on_different_threads_are_ambiguous(self, env):
+        store_mod, backend, s, tmp_path = env
+        self._complete(store_mod, s, "REQ-20260707-120000-0af001", "conv-A")
+        self._complete(store_mod, s, "REQ-20260707-120000-0af002", "conv-B")
+        conv, why = s.latest_conversation_strict()
+        assert conv is None and "different" in why and "--parent" in why
+
+    def test_old_second_thread_does_not_block_auto(self, env):
+        store_mod, backend, s, tmp_path = env
+        self._complete(store_mod, s, "REQ-20260707-120000-0ag001", "conv-A")
+        self._complete(store_mod, s, "REQ-20260707-120000-0ag002", "conv-B")
+        # age the first completion far beyond the ambiguity window
+        s.db.execute("UPDATE rounds SET updated_at='2020-01-01T00:00:00+00:00' "
+                     "WHERE rid='REQ-20260707-120000-0ag001'")
+        conv, why = s.latest_conversation_strict()
+        assert conv == "conv-B" and why is None
+
+
+class TestOutcomeEnvelope:
+    def test_await_verified_emits_schema_1_envelope(self, env, capsys):
+        import argparse
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0ah001"
+        s.create_round(rid, "submit", prompt="p")
+        s.set_state(rid, store_mod.READY)
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d")
+        s.mark_accepted(aid, "conv-E")
+        s.mark_waiting(rid)
+        s.finish(rid, store_mod.COMPLETED_VERIFIED, result_text="answer!")
+        out = tmp_path / "a.txt"
+        code = backend.await_round(argparse.Namespace(rid=rid, out=str(out), poll=0.01, timeout=2))
+        assert code == 0
+        env_json = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert env_json["schema"] == 1 and env_json["rid"] == rid
+        assert env_json["state"] == "completed_verified" and env_json["confidence"] == "verified"
+        assert env_json["answer_path"] == str(out)
+        assert "fire --followup --parent" in env_json["next_command"]
+
+    def test_await_failed_envelope_carries_retryability(self, env, capsys):
+        import argparse
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0ah002"
+        s.create_round(rid, "submit", prompt="p")
+        s.set_state(rid, store_mod.READY)
+        s.gate_reject(rid, "unverified: gh timed out")
+        code = backend.await_round(argparse.Namespace(rid=rid, out=str(tmp_path / "a.txt"),
+                                                      poll=0.01, timeout=2))
+        assert code == 1
+        env_json = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert env_json["retryable"] is True, "an unverified: gate failure is transient — re-fireable"

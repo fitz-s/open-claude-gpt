@@ -782,6 +782,7 @@ def cmd_fire(a: argparse.Namespace) -> int:
         kind="followup" if a.followup else "submit",
         project_url=a.project_url, conversation=(a.conversation or "auto"),
         parent=getattr(a, "parent", None), model=a.model,
+        request_key=getattr(a, "request_key", None),
         out=a.out, poll=spool.POLL_S, timeout=spool.STUCK_AFTER_S, quiet=True)
     if spool.cmd_enqueue(eq) != 0:
         return 2
@@ -887,6 +888,11 @@ def main() -> int:
                     help="with --followup, the rid of the consult being continued — resolves to ITS "
                          "conversation (causal, unambiguous when other consults ran in between). "
                          "Prefer this over bare --followup whenever you ran interleaved consults.")
+    pf.add_argument("--request-key",
+                    help="caller-chosen logical-request id: re-firing the SAME key with the same "
+                         "content returns the original receipt instead of queuing a duplicate; the "
+                         "same key with different content is refused. Use it whenever a retry after "
+                         "lost output must not double-send.")
     pf.set_defaults(fn=cmd_fire)
 
     pp = _add_prep_args(sub.add_parser("prep"))

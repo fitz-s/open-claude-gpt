@@ -16,6 +16,7 @@
 #   cgc prep    <args…>               render the consult prompt            (consult.py prep)
 #   cgc enqueue <args…>               queue a job for the daemon (LOCAL write) (cgc_spool.py enqueue)
 #   cgc await   <args…>               poll the local answer file for a queued job (cgc_spool.py await)
+#   cgc cancel  --rid R               cancel a round BEFORE it sends (queued/ready only; idempotent)
 #   cgc queue   [--rid R]             show daemon liveness + spool contents (cgc_spool.py status)
 #   cgc submit / followup             RETIRED — the store daemon's send_round is the sole send path
 #                                     (use `cgc fire` / `prep --followup` + `enqueue --kind followup`)
@@ -131,7 +132,7 @@ PYEOF
       echo "cgc up: daemon started (pid $!), logging to $logf"
     fi
     exec python3 "$S/cgc_spool.py" status ;;
-  enqueue|await) exec python3 "$S/cgc_spool.py" "$cmd" "$@" ;;
+  enqueue|await|cancel) exec python3 "$S/cgc_spool.py" "$cmd" "$@" ;;
   queue)    exec python3 "$S/cgc_spool.py" status "$@" ;;
   deliver)  # human-driven: allowed to verify provenance over the network up front. The AGENT
             # path calls consult.py directly and stays offline (see consult.py _GH_ALLOWED).

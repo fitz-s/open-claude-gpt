@@ -274,10 +274,13 @@ class Store:
     def create_round(self, rid: str, kind: str, *, thread_id: str | None = None,
                      source_mode: str | None = None, out_path: str | None = None,
                      spec_json: str | None = None, prompt: str | None = None,
+                     request_key: str | None = None, parent_rid: str | None = None,
                      state: str = QUEUED) -> None:
         """Insert a new round. `prompt` (the exact rendered bytes to send) is stored on the round at
         enqueue, so the CLI receipt is just the rid and there is no prompt PATHNAME whose contents
-        could drift before the gate reads them — the store row is the one copy."""
+        could drift before the gate reads them — the store row is the one copy. `request_key` is the
+        caller's logical-request identity (unique where set — the idempotency anchor); `parent_rid`
+        records which consult a follow-up causally continues."""
         if state not in _LEGAL:
             raise ValueError(f"unknown initial state {state!r}")
         now = _now()
@@ -289,11 +292,15 @@ class Store:
                     (thread_id, now, now))
             self.db.execute(
                 "INSERT INTO rounds(rid,thread_id,kind,source_mode,spec_json,rendered_prompt,"
-                "prompt_sha256,out_path,state,created_at,updated_at,schema_version) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (rid, thread_id, kind, source_mode, spec_json, prompt, psha, out_path, state,
-                 now, now, SCHEMA_VERSION))
+                "prompt_sha256,out_path,request_key,parent_rid,state,created_at,updated_at,"
+                "schema_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (rid, thread_id, kind, source_mode, spec_json, prompt, psha, out_path,
+                 request_key, parent_rid, state, now, now, SCHEMA_VERSION))
             self._event("created", rid=rid, detail=f"kind={kind} state={state}")
+
+    def round_by_request_key(self, key: str) -> dict | None:
+        row = self.db.execute("SELECT * FROM rounds WHERE request_key=?", (key,)).fetchone()
+        return dict(row) if row else None
 
     def import_round(self, rid: str, kind: str, state: str, *, thread_id: str | None = None,
                      conversation_id: str | None = None, source_mode: str | None = None,
@@ -516,6 +523,44 @@ class Store:
             "ORDER BY r.updated_at DESC LIMIT 1",
             (COMPLETED_VERIFIED, COMPLETED_UNVERIFIED, exclude_rid or "")).fetchone()
         return row["c"] if row else None
+
+    def latest_conversation_strict(self, exclude_rid: str | None = None):
+        """The 'active thread' for a bare `--conversation auto` follow-up — but REFUSED when the
+        causal target is genuinely ambiguous. Returns (conversation_id, reason): exactly one of the
+        two is set.
+
+        Ambiguity rules (an agent must then pass --parent <rid>, which is always unambiguous):
+          - another consult is still IN FLIGHT (sending/accepted/waiting/possibly_accepted): the
+            in-flight one may be the intended target and may complete at any moment — 'latest
+            completed' is a race, not an identity.
+          - the two most recent completions are on DIFFERENT threads AND landed within 30 minutes
+            of each other: two answers that close together make 'the last one' an accident of
+            ordering, not an intent. (Two unrelated consults days apart stay unambiguous.)"""
+        inflight = self.db.execute(
+            "SELECT count(*) c FROM rounds WHERE state IN (?,?,?,?) AND rid != ?",
+            (SENDING, ACCEPTED, WAITING, POSSIBLY_ACCEPTED, exclude_rid or "")).fetchone()["c"]
+        if inflight:
+            return None, (f"ambiguous: {inflight} consult(s) still in flight — 'the last thread' is "
+                          "a race. Pass --parent <rid> to name the consult you are continuing.")
+        rows = self.db.execute(
+            "SELECT r.rid, r.updated_at u, t.conversation_id c FROM rounds r "
+            "JOIN threads t ON r.thread_id=t.thread_id "
+            "WHERE r.state IN (?,?) AND t.conversation_id IS NOT NULL AND r.rid != ? "
+            "ORDER BY r.updated_at DESC LIMIT 2",
+            (COMPLETED_VERIFIED, COMPLETED_UNVERIFIED, exclude_rid or "")).fetchall()
+        if not rows:
+            return None, "none: no completed consult exists to continue"
+        if len(rows) == 2 and rows[0]["c"] != rows[1]["c"]:
+            try:
+                dt = abs((datetime.datetime.fromisoformat(rows[0]["u"])
+                          - datetime.datetime.fromisoformat(rows[1]["u"])).total_seconds())
+            except ValueError:
+                dt = 0.0  # unparsable timestamps: treat as close together, fail toward refusal
+            if dt < 1800:
+                return None, (f"ambiguous: the two most recent completed consults are on different "
+                              f"threads and finished within {int(dt)}s of each other "
+                              f"({rows[0]['rid']}, {rows[1]['rid']}). Pass --parent <rid>.")
+        return rows[0]["c"], None
 
     def was_auto_retrieved(self, rid: str) -> bool:
         row = self.db.execute(

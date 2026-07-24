@@ -89,19 +89,45 @@ def store_status(up: bool, rid: str | None = None) -> int:
 # ---- enqueue -----------------------------------------------------------------
 def enqueue_round(a, prompt: str, out: str) -> int:
     """Create a queued round from the CLI args. The prompt BYTES live on the round (no pathname to
-    drift); project_url/model/conversation/poll/timeout ride in spec_json for the worker."""
+    drift); project_url/model/conversation/poll/timeout ride in spec_json for the worker.
+
+    `--request-key K` makes the enqueue LOGICALLY idempotent: repeating the same key with the same
+    payload returns the ORIGINAL round's receipt (an agent that lost the output of its first call
+    can safely re-run it), while the same key with a DIFFERENT payload is refused — one key, one
+    request. RID uniqueness alone only prevents row collisions, not duplicate intents."""
     conv = getattr(a, "conversation", None)
     parent = getattr(a, "parent", None)
+    rkey = getattr(a, "request_key", None)
+    # The idempotency comparator is the prompt with THIS round's rid normalized out: the rendered
+    # bytes embed the rid (sentinel instructions), so raw bytes differ on every re-fire even when
+    # the logical request is identical. Same key + same normalized content = the same request.
+    norm_sha = store_mod.sha256((prompt or "").replace(a.rid, "<RID>"))
     with store_mod.Store() as s:
+        if rkey:
+            prior = s.round_by_request_key(rkey)
+            if prior is not None:
+                pspec = json.loads(prior["spec_json"]) if prior.get("spec_json") else {}
+                if pspec.get("request_sha") == norm_sha:
+                    sys.stderr.write(f"CGC_IDEMPOTENT request-key {rkey!r} already enqueued as "
+                                     f"{prior['rid']} — returning the original receipt, nothing new "
+                                     "queued.\n")
+                    print(json.dumps({"queued": True, "rid": prior["rid"],
+                                      "out": prior["out_path"] or out, "backend": "store",
+                                      "idempotent_repeat": True}))
+                    return 0
+                sys.stderr.write(f"CGC_ERROR request_key_conflict: request-key {rkey!r} was already "
+                                 f"used by {prior['rid']} with DIFFERENT content. One key names one "
+                                 "logical request — use a new key for new content.\n")
+                return 2
         if s.get_round(a.rid) is not None:
             sys.stderr.write(f"CGC_ERROR already_enqueued: {a.rid} already exists in the store.\n")
             return 2
         # Resolve the follow-up's thread NOW, while the agent's intent is fresh (pinning at enqueue,
         # not at process time, keeps a concurrent consult from stealing the selection). Prefer CAUSAL
         # identity — an explicit --parent <rid> resolves to THAT consult's conversation — over the
-        # global "last completed" heuristic (diff-review S1: under concurrent consults, global-latest
-        # can attach a follow-up to an unrelated thread). Either way FAIL CLOSED: if nothing resolves,
-        # refuse — never silently open a fresh conversation and lose the thread's context.
+        # "last completed" heuristic, which under concurrency or near-simultaneous completions is
+        # refused as ambiguous (latest_conversation_strict). Either way FAIL CLOSED: if nothing
+        # resolves, refuse — never silently open a fresh conversation and lose the thread's context.
         if a.kind == "followup":
             if parent:
                 conv = s.conversation_of(parent)
@@ -110,18 +136,16 @@ def enqueue_round(a, prompt: str, out: str) -> int:
                                      "recorded conversation to continue.\n")
                     return 2
             elif conv in (None, "auto", "last"):
-                conv = s.latest_conversation(exclude_rid=a.rid)
+                conv, why = s.latest_conversation_strict(exclude_rid=a.rid)
                 if not conv:
-                    sys.stderr.write("CGC_ERROR followup_no_thread: --followup continues a thread, but "
-                                     "no completed consult exists to continue. Run a consult first, or "
-                                     "pass --parent <rid> / --conversation <id>.\n")
+                    sys.stderr.write(f"CGC_ERROR followup_no_thread: {why}\n")
                     return 2
         spec = {"project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
                 "conversation": conv, "parent_rid": parent, "poll": getattr(a, "poll", None),
-                "timeout": getattr(a, "timeout", None)}
+                "timeout": getattr(a, "timeout", None), "request_sha": norm_sha}
         thread = conv if conv not in (None, "auto", "last") else None
         s.create_round(a.rid, a.kind, thread_id=thread, out_path=out, prompt=prompt,
-                       spec_json=json.dumps(spec))
+                       spec_json=json.dumps(spec), request_key=rkey, parent_rid=parent)
     import cgc_spool as _spool
     if not _spool.daemon_alive():
         sys.stderr.write("CGC_WARN daemon_down: queued, but nothing will send it until the daemon "
@@ -136,6 +160,52 @@ def enqueue_round(a, prompt: str, out: str) -> int:
     import shlex
     sys.stderr.write(f"CGC_QUEUED {a.rid} (store). Await it:\n  {' '.join(shlex.quote(x) for x in argv)}\n")
     return 0
+
+
+# ---- cancel ------------------------------------------------------------------
+def cancel_round(rid: str) -> int:
+    """Cancel a round BEFORE it sends. Only queued/ready are cancellable — past begin_send the click
+    may have reached ChatGPT, and cancelling a possible send is indistinguishable from ignoring its
+    answer, so it is refused with the states that explain themselves. Idempotent: cancelling an
+    already-cancelled round is a no-op success."""
+    with store_mod.Store() as s:
+        r = s.get_round(rid)
+        if r is None:
+            sys.stderr.write(f"CGC_ERROR no_such_round: {rid}\n")
+            return 2
+        if r["state"] in (store_mod.FAILED,) and (r["error_code"] or "").startswith("cancelled"):
+            sys.stderr.write(f"CGC_CANCELLED {rid} (already cancelled — idempotent no-op).\n")
+            return 0
+        if r["state"] not in (store_mod.QUEUED, store_mod.READY):
+            sys.stderr.write(
+                f"CGC_ERROR not_cancellable: {rid} is '{r['state']}' — past the send fence, the "
+                "click may already have reached ChatGPT, so cancel would not undo anything. Await "
+                "it, or reconcile via `cgc queue --rid` if it is uncertain.\n")
+            return 2
+        try:
+            s.set_state(rid, store_mod.FAILED, expect=r["state"],
+                        error_code="cancelled by caller before send")
+        except store_mod.IllegalTransition:
+            sys.stderr.write(f"CGC_ERROR cancel_raced: {rid} changed state while cancelling — "
+                             "it is being dispatched. Await it instead.\n")
+            return 2
+    sys.stderr.write(f"CGC_CANCELLED {rid}: cancelled before send.\n")
+    return 0
+
+
+# ---- the outcome envelope ----------------------------------------------------
+# Every await exit prints ONE machine-readable JSON line on stdout (prose stays on stderr): an
+# agent should never have to infer state by scraping prose. schema=1 is the envelope's version.
+def _emit(rid, state, *, retryable, human_action=None, next_command=None, answer_path=None,
+          parent_rid=None, confidence=None, error=None):
+    import cgc_spool as _spool
+    log = _spool.log_path(rid)
+    print(json.dumps({
+        "schema": 1, "rid": rid, "parent_rid": parent_rid, "state": state,
+        "retryable": retryable, "human_action": human_action, "next_command": next_command,
+        "answer_path": answer_path, "log_path": log if os.path.exists(log) else None,
+        "confidence": confidence, "error": error,
+    }))
 
 
 # ---- await -------------------------------------------------------------------
@@ -164,8 +234,10 @@ def await_round(a) -> int:
             r = s.get_round(a.rid)
         if r is None:
             sys.stderr.write(f"CGC_BROKEN {a.rid}: no such round in the store.\n")
+            _emit(a.rid, "missing", retryable=False, error="no such round in the store")
             return 1
         state = r["state"]
+        parent = r.get("parent_rid")
         if state not in (store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED,
                          store_mod.BLOCKED, store_mod.POSSIBLY_ACCEPTED, store_mod.FAILED,
                          store_mod.GATE_REJECTED):
@@ -181,22 +253,31 @@ def await_round(a) -> int:
                         "Relay ONE line to the user — `cgc install-daemon` (launchd agent: starts at "
                         "login, respawns if it dies). The round stays in the store and runs as soon "
                         "as the daemon is up.\n")
+                    _emit(a.rid, state, retryable=True, parent_rid=parent,
+                          human_action="run `cgc install-daemon` (the daemon is not running)",
+                          next_command=f"python3 {_spool.__file__} await --rid {a.rid} --out {out}",
+                          error="daemon down")
                     return 1
         if state == store_mod.COMPLETED_VERIFIED:
             text = r["result_text"] or ""
             if not text:
                 sys.stderr.write(f"CGC_BROKEN {a.rid}: round is {state} but its result_text is empty.\n")
+                _emit(a.rid, state, retryable=False, parent_rid=parent,
+                      error="completed but result_text empty")
                 return 1
             _materialize(out, text)
             n = len(text.encode("utf-8"))
             consult = os.path.join(os.path.dirname(os.path.abspath(__file__)), "consult.py")
+            followup_cmd = (f"python3 {consult} fire --followup --parent {a.rid} --no-code "
+                            "--task \"<local results + the next question>\" --title \"<what's new>\"")
             sys.stderr.write(
                 f"CGC_DONE {a.rid}: answer ready ({n} bytes). READ IT AT:\n  {out}\n"
                 "CGC_NEXT to CONTINUE this thread (re-review after your changes, re-check a fix, next "
                 "phase) — a FOLLOW-UP keeps ChatGPT's context; a fresh consult throws it away:\n"
-                f"  python3 {consult} fire --followup --parent {a.rid} --no-code "
-                "--task \"<the diff I applied / local results + the next question>\" --title \"<what's new>\"\n"
+                f"  {followup_cmd}\n"
                 f"  (--parent {a.rid} pins THIS consult's thread causally; add --refs-file for a fresh diff link.)\n")
+            _emit(a.rid, state, retryable=False, parent_rid=parent, answer_path=out,
+                  confidence="verified", next_command=followup_cmd)
             return 0
         if state == store_mod.COMPLETED_UNVERIFIED:
             text = r["result_text"] or ""
@@ -209,6 +290,9 @@ def await_round(a) -> int:
                 "answer — an unwrapped salvage can pick up a different message if another consult ran "
                 "on the same thread. Do NOT auto-chain a follow-up on it; re-run the consult if in "
                 "doubt.\n")
+            _emit(a.rid, state, retryable=False, parent_rid=parent, answer_path=out,
+                  confidence="unverified",
+                  human_action="verify the salvaged answer is complete and belongs to this round")
             return 3
         if state == store_mod.BLOCKED:
             # A blocker BEFORE the send (login/model/composer at submit) is safely re-enqueued; a
@@ -218,29 +302,45 @@ def await_round(a) -> int:
             with store_mod.Store() as _s:
                 conv = _s.conversation_of(a.rid)
             if conv:
+                retrieve = (f"python3 {_spool.__file__} enqueue --rid <new-rid> --kind retrieve "
+                            f"--conversation {conv}")
                 sys.stderr.write(
                     f"CGC_BLOCKER {a.rid} (post-send): {r['error_code'] or 'login/captcha/rate-limit'}\n"
                     f"The consult was already sent to conversation {conv}. Clear the blocker in the "
                     "ChatGPT window, then RETRIEVE it (enqueue --kind retrieve --conversation "
                     f"{conv}) — do NOT re-enqueue a fresh consult, it would duplicate this one.\n")
+                _emit(a.rid, state, retryable=False, parent_rid=parent,
+                      human_action="clear the blocker in the ChatGPT window",
+                      next_command=retrieve, error=r["error_code"])
             else:
                 sys.stderr.write(
                     f"CGC_BLOCKER {a.rid} (pre-send): {r['error_code'] or 'login/captcha/rate-limit'}\n"
                     "Nothing was sent. A human must clear it in the ChatGPT window, then re-enqueue.\n")
+                _emit(a.rid, state, retryable=True, parent_rid=parent,
+                      human_action="clear the blocker in the ChatGPT window, then re-fire",
+                      error=r["error_code"])
             return 3
         if state == store_mod.POSSIBLY_ACCEPTED:
             sys.stderr.write(
                 f"CGC_UNCERTAIN {a.rid}: the send may have reached ChatGPT but was not confirmed "
                 f"({r['error_code'] or 'unknown'}). NOT auto-resent to avoid a duplicate consult — "
                 f"check the ChatGPT window / retrieve by conversation before re-sending.\n")
+            _emit(a.rid, state, retryable=False, parent_rid=parent,
+                  human_action="check the ChatGPT window; retrieve by conversation before re-sending",
+                  error=r["error_code"])
             return 1
         if state in (store_mod.FAILED, store_mod.GATE_REJECTED):
-            sys.stderr.write(f"CGC_BROKEN {a.rid}: {r['error_code'] or 'the daemon could not deliver an answer'}\n")
+            err = r["error_code"] or "the daemon could not deliver an answer"
+            sys.stderr.write(f"CGC_BROKEN {a.rid}: {err}\n")
             _spool._point_at_log(a.rid, out)
+            # `unverified:` gate failures are transient (gh outage) — the round is re-fireable.
+            _emit(a.rid, state, retryable=err.startswith("unverified:"), parent_rid=parent, error=err)
             return 1
         time.sleep(getattr(a, "poll", None) or store_mod.__dict__.get("POLL_S", 20) or 20)
     sys.stderr.write(f"CGC_STUCK {a.rid}: no terminal state within {a.timeout}s — read the daemon log.\n")
     _spool._point_at_log(a.rid, out)
+    _emit(a.rid, "stuck", retryable=False, error=f"no terminal state within {a.timeout}s",
+          human_action="read the job log; the consult is broken, not slow")
     return 1
 
 
