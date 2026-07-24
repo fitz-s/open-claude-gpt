@@ -52,6 +52,17 @@ else
 fi
 chmod +x "$DEST"/scripts/*.sh "$DEST"/scripts/*.py 2>/dev/null || true
 
+# --- restart the egress daemon so it picks up the new code -------------------
+# An upgrade that leaves the OLD daemon running is a version split-brain: the CLI
+# writes through new code while the daemon serves old code. launchd kickstart -k
+# kills + restarts the job; a no-daemon install is untouched.
+DAEMON_LABEL="com.open-claude-gpt.daemon"
+if [ "$(uname -s)" = "Darwin" ] && launchctl print "gui/$(id -u)/$DAEMON_LABEL" >/dev/null 2>&1; then
+  echo "• restarting the egress daemon (picks up the upgraded code)"
+  launchctl kickstart -k "gui/$(id -u)/$DAEMON_LABEL" || \
+    echo "  ! could not restart the daemon — run: cgc install-daemon" >&2
+fi
+
 echo "• installed. running doctor…"
 echo
 DOCTOR_STATUS=0

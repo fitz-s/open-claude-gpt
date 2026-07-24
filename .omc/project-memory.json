@@ -1,0 +1,192 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1784875262751,
+  "projectRoot": "/Users/leofitz/chatgpt-consult",
+  "techStack": {
+    "languages": [
+      {
+        "name": "C/C++",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Makefile"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "make build",
+    "testCommand": "cat >> tests/test_store.py <<'EOF'\n\n\nclass TestLegacyRelocation:\n    \"\"\"The one-time /tmp→durable relocation of the store DB.\"\"\"\n\n    def _mk_legacy(self, tmp_path, monkeypatch):\n        import importlib, cgc_store\n        importlib.reload(cgc_store)\n        state = tmp_path / \"state\"\n        state.mkdir()\n        monkeypatch.setenv(\"CGC_STATE_DIR\", str(state))\n        monkeypatch.setenv(\"CGC_DATA_DIR\", str(tmp_path / \"data\"))\n        monkeypatch.delenv(\"CGC_STORE_DB\", raising=False)\n        legacy = state / \"control.db\"\n        s = cgc_store.Store(str(legacy))\n        s.create_round(\"REQ-RELOC-1\", \"submit\", prompt=\"p\")\n        s.close()\n        return cgc_store, legacy\n\n    def test_relocates_when_default_path_used(self, tmp_path, monkeypatch):\n        cgc_store, legacy = self._mk_legacy(tmp_path, monkeypatch)\n        s = cgc_store.Store()          # no explicit path → default → triggers relocation\n        assert s.path == str(tmp_path / \"data\" / \"control.db\")\n        assert s.get_round(\"REQ-RELOC-1\") is not None          # data survived the move\n        s.close()\n        assert not legacy.exists()                             # never a second live authority\n        assert (tmp_path / \"state\" / \"control.db.migrated\").exists()\n\n    def test_no_relocation_with_explicit_override(self, tmp_path, monkeypatch):\n        cgc_store, legacy = self._mk_legacy(tmp_path, monkeypatch)\n        override = tmp_path / \"elsewhere.db\"\n        monkeypatch.setenv(\"CGC_STORE_DB\", str(override))\n        s = cgc_store.Store()\n        s.close()\n        assert legacy.exists()                                 # untouched\nEOF\npython3 -m pytest tests/ -q 2>&1 | tail -3",
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "bin",
+      "docs",
+      "examples",
+      "tests"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "bin": {
+      "path": "bin",
+      "purpose": "Executable scripts",
+      "fileCount": 1,
+      "lastAccessed": 1784875262742,
+      "keyFiles": [
+        "cgc"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 5,
+      "lastAccessed": 1784875262742,
+      "keyFiles": [
+        "ARCHITECTURE.md",
+        "CONFIGURATION.md",
+        "INSTALL.md",
+        "SECURITY.md",
+        "TROUBLESHOOTING.md"
+      ]
+    },
+    "examples": {
+      "path": "examples",
+      "purpose": "Example code",
+      "fileCount": 7,
+      "lastAccessed": 1784875262742,
+      "keyFiles": [
+        "architecture-decision.md",
+        "config-recipes.md",
+        "debug-second-opinion.md",
+        "hard-reasoning.md",
+        "plan-a-feature.md"
+      ]
+    },
+    "skill": {
+      "path": "skill",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1784875262742,
+      "keyFiles": [
+        "ACTIVATION.md",
+        "SKILL-NOTES.md",
+        "SKILL.md"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 15,
+      "lastAccessed": 1784875262742,
+      "keyFiles": [
+        "conftest.py",
+        "test_config.py",
+        "test_daemon.py",
+        "test_deliver.py",
+        "test_egress_gate.py"
+      ]
+    },
+    "skill/scripts": {
+      "path": "skill/scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 12,
+      "lastAccessed": 1784875262743,
+      "keyFiles": [
+        "cdp_consult.py",
+        "cdp_launch.sh",
+        "cgc_backend.py"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "skill/scripts/cgc_store.py",
+      "accessCount": 6,
+      "lastAccessed": 1784883898495,
+      "type": "file"
+    },
+    {
+      "path": "uninstall.sh",
+      "accessCount": 3,
+      "lastAccessed": 1784879132760,
+      "type": "file"
+    },
+    {
+      "path": "docs/CONFIGURATION.md",
+      "accessCount": 3,
+      "lastAccessed": 1784883958677,
+      "type": "file"
+    },
+    {
+      "path": "install.sh",
+      "accessCount": 3,
+      "lastAccessed": 1784883984543,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 2,
+      "lastAccessed": 1784879140309,
+      "type": "file"
+    },
+    {
+      "path": "Makefile",
+      "accessCount": 2,
+      "lastAccessed": 1784879146188,
+      "type": "file"
+    },
+    {
+      "path": "tests/conftest.py",
+      "accessCount": 2,
+      "lastAccessed": 1784883867304,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_daemon.py",
+      "accessCount": 2,
+      "lastAccessed": 1784883912386,
+      "type": "file"
+    },
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "accessCount": 1,
+      "lastAccessed": 1784875469883,
+      "type": "file"
+    },
+    {
+      "path": "skill/SKILL.md",
+      "accessCount": 1,
+      "lastAccessed": 1784875550601,
+      "type": "file"
+    },
+    {
+      "path": "skill/scripts/cgc_config.py",
+      "accessCount": 1,
+      "lastAccessed": 1784883794023,
+      "type": "file"
+    },
+    {
+      "path": "skill/scripts/cgc_backend.py",
+      "accessCount": 1,
+      "lastAccessed": 1784883909492,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

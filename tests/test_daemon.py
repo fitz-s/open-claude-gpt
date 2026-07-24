@@ -37,9 +37,8 @@ def daemon(tmp_path, monkeypatch):
 
     d = _load_module("cgc_daemon", "cgc_daemon.py")
     d.spool.ensure_dirs()
-    # cgc_store caches DB_PATH at import; the module is shared across tests, so pin it to THIS test's
-    # tmp dir or a leaked round from a prior test bleeds into this one's store.
-    d.store_mod.DB_PATH = str(tmp_path / "state" / "control.db")
+    # db_path() resolves from the environment at call time; the conftest _isolate_durable_state
+    # fixture already pins CGC_STORE_DB into this test's tmp dir, so nothing bleeds across tests.
     return d
 
 

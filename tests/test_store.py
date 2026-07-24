@@ -253,3 +253,38 @@ def test_events_are_appended(store):
     s.begin_send("R", "b", "h" * 64, daemon_instance_id="d1")
     kinds = [e["kind"] for e in s.events("R")]
     assert "created" in kinds and "state" in kinds and "begin_send" in kinds
+
+
+class TestLegacyRelocation:
+    """The one-time /tmp→durable relocation of the store DB."""
+
+    def _mk_legacy(self, tmp_path, monkeypatch):
+        import importlib, cgc_store
+        importlib.reload(cgc_store)
+        state = tmp_path / "state"
+        state.mkdir()
+        monkeypatch.setenv("CGC_STATE_DIR", str(state))
+        monkeypatch.setenv("CGC_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.delenv("CGC_STORE_DB", raising=False)
+        legacy = state / "control.db"
+        s = cgc_store.Store(str(legacy))
+        s.create_round("REQ-RELOC-1", "submit", prompt="p")
+        s.close()
+        return cgc_store, legacy
+
+    def test_relocates_when_default_path_used(self, tmp_path, monkeypatch):
+        cgc_store, legacy = self._mk_legacy(tmp_path, monkeypatch)
+        s = cgc_store.Store()          # no explicit path → default → triggers relocation
+        assert s.path == str(tmp_path / "data" / "control.db")
+        assert s.get_round("REQ-RELOC-1") is not None          # data survived the move
+        s.close()
+        assert not legacy.exists()                             # never a second live authority
+        assert (tmp_path / "state" / "control.db.migrated").exists()
+
+    def test_no_relocation_with_explicit_override(self, tmp_path, monkeypatch):
+        cgc_store, legacy = self._mk_legacy(tmp_path, monkeypatch)
+        override = tmp_path / "elsewhere.db"
+        monkeypatch.setenv("CGC_STORE_DB", str(override))
+        s = cgc_store.Store()
+        s.close()
+        assert legacy.exists()                                 # untouched
