@@ -139,15 +139,27 @@ def run_worker_store(rid: str) -> int:
     leases = _take_worker_leases(rid)
     if leases is None:
         return EXIT_LEASE_REFUSED
-    with store_mod.Store() as s:
-        r = s.get_round(rid)
-        if r is None or r["state"] != store_mod.READY:
-            sys.stderr.write(f"CGC_DAEMON store worker: {rid} not in 'ready' ({r and r['state']})\n")
-            return 1
-        final = cgc_backend.process_round(
-            s, r, _make_run_cdp(),
-            daemon_instance_id=os.environ.get("CGC_DAEMON_INSTANCE", "d"),
-            validate=spool.validate_prompt)
+    try:
+        with store_mod.Store() as s:
+            r = s.get_round(rid)
+            if r is None or r["state"] != store_mod.READY:
+                sys.stderr.write(f"CGC_DAEMON store worker: {rid} not in 'ready' ({r and r['state']})\n")
+                return 1
+            final = cgc_backend.process_round(
+                s, r, _make_run_cdp(),
+                daemon_instance_id=os.environ.get("CGC_DAEMON_INSTANCE", "d"),
+                validate=spool.validate_prompt)
+    except cgc_backend.ConversationLeaseRefused as e:
+        # Another worker is mutating this follow-up's target conversation. Ours never sent and never
+        # moved the round (still READY). Release our rid+browser leases (as _take_worker_leases does
+        # on refusal) and exit EXIT_LEASE_REFUSED so the reaper treats this death as inert.
+        for fh in reversed(leases):
+            if hasattr(fh, "close"):
+                fh.close()
+        sys.stderr.write(f"CGC_DAEMON worker {rid}: conversation {e.conversation} is under an exclusive "
+                         "mutator lease (another same-thread followup is sending) — exiting without "
+                         "touching the round (it stays ready, redispatched)\n")
+        return EXIT_LEASE_REFUSED
     sys.stderr.write(f"CGC_DAEMON store worker {rid} -> {final}\n")
     return 0
 
