@@ -60,13 +60,29 @@ Every wait is bounded so nothing can hang. A GPT-5.6 Pro consult reasons for ~25
 - **A ChatGPT account you log into by hand** — **Pro recommended** (that's the point: use the tier you pay for)
 - **[`gh` CLI](https://cli.github.com)** — optional but recommended; `deliver` uses it to resolve PRs + repo visibility
 
+## Know the risks before installing
+
+Two things you accept by using this, stated plainly (details: [docs/SECURITY.md](docs/SECURITY.md)):
+
+1. **Account/ToS risk is yours.** This tool programmatically drives your ChatGPT session and reads
+   its output. OpenAI's consumer terms prohibit automatic/programmatic extraction of output, and
+   accounts can be suspended for violations. The tool hides nothing (visible browser, no hidden
+   endpoints, never bypasses login/CAPTCHA/rate limits), but that limits blast radius — it does not
+   create permission. If the account matters to you beyond this tool, weigh that first.
+2. **The gate guarantees exactly what it checks.** The daemon refuses secrets it can recognize,
+   non-public repo links, and dead refs — fail-closed. It cannot semantically vet arbitrary prose
+   you (or an agent) put in a task or context file. Keep secrets out of those fields; the scan is a
+   backstop, not a reader.
+
 ## Install
 
 ```bash
 git clone https://github.com/fitz-s/open-claude-gpt
 cd open-claude-gpt
 ./install.sh            # copy the skill into ~/.claude/skills, check deps, run doctor
-# or: ./install.sh --link   (symlink — edits in the clone go live; good for hacking)
+# or: ./install.sh --link   (symlink — edits in the clone go live; good for hacking.
+#     NOTE: with --link, code changes are live for daemon workers immediately — restart the
+#     daemon after pulling control-plane changes: launchctl kickstart -k gui/$(id -u)/com.open-claude-gpt.daemon)
 ```
 
 Then start the dedicated debug Chrome and log into ChatGPT Pro **once**:
@@ -152,8 +168,9 @@ It persists in the tool's own config (`~/.config/cgc/config`); a `CGC_PROJECT_UR
 | `CGC_PORT` | `9333` | remote-debugging port for the dedicated Chrome |
 | `CGC_PROFILE` | `~/.cgc-chrome` | dedicated Chrome profile dir |
 | `CGC_CHROME` | auto-detect | explicit browser binary |
-| `CGC_STATE_DIR` | `/tmp/cgc` | scratch dir for prompt/refs/answer files |
-| `CGC_SPOOL_DIR` | `$CGC_STATE_DIR/spool` | spool dir for the `enqueue`/`await`/`watch` daemon path |
+| `CGC_STATE_DIR` | `/tmp/cgc` | scratch dir for prompt/refs/answer files (not durable) |
+| `CGC_DATA_DIR` | `~/.local/state/cgc` | durable data dir holding the consult store (`control.db`) |
+| `CGC_SPOOL_DIR` | `$CGC_STATE_DIR/spool` | daemon runtime files (heartbeat, singleton lock, per-round logs) |
 | `CGC_GATE_ALLOW_GIST` | `0` | let the daemon's egress gate accept gist links (it can't cheaply prove one is public) |
 
 Full reference + prompt customization: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).

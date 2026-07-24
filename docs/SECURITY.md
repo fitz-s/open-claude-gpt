@@ -4,6 +4,60 @@
 It is designed so the agent never touches your credentials and so consults ship
 *links to already-public code*, not private content.
 
+## Read this before installing: account and Terms-of-Service risk
+
+This tool **programmatically drives your ChatGPT session and programmatically
+reads its output**. OpenAI's consumer Terms of Use (Rest-of-World individual
+terms at the time of writing) prohibit using the services to "automatically or
+programmatically extract data or Output", and OpenAI reserves the right to
+suspend or terminate accounts for terms violations. Different regional,
+business, or negotiated agreements may apply to you; **this project takes no
+position on whether your use is permitted** — that is between you and OpenAI.
+
+What that means concretely:
+
+- **The account risk is yours and is real.** The worst plausible outcome is
+  suspension or loss of the ChatGPT account you log in with. If that account
+  matters to you beyond this tool, weigh that before installing.
+- The tool deliberately does nothing to hide itself: it drives a visible
+  browser session at human-plausible interaction rates, never touches hidden
+  endpoints, and never bypasses login, CAPTCHA, or rate limits. That limits the
+  blast radius; it does not create permission.
+- If OpenAI offers a plan or written permission that covers automation of your
+  session, that changes this calculus — check what your agreement actually says.
+
+## Local threat boundary — what loopback does and does not give you
+
+The DevTools port is bound to loopback and origin-restricted, which keeps it
+unreachable **off-box**. It is NOT process authentication: **any process running
+as your user on this machine can attach to the debug port** and, through it,
+drive the dedicated Chrome — including its logged-in ChatGPT session — with far
+broader capability than "read one answer". The dedicated profile bounds what
+that session can reach (it holds only the ChatGPT login you gave it, not your
+normal browsing identity). If your threat model includes hostile same-user
+processes, do not run this tool on that machine.
+
+## What the egress gate does and does not guarantee
+
+The daemon re-validates every prompt before sending, fail-closed: every cited
+repo must be gh-confirmed public (or user-allowlisted), cited PRs/refs must
+exist, and known secret shapes are refused. What it **cannot** do is vet
+arbitrary free-text prose: a `--task`, `--context-file`, or `--no-code` consult
+can carry any sentence the caller wrote, and no pattern scan proves a sentence
+is not sensitive. The guarantee is exactly "no recognized secret, no private
+repo link, no dead ref" — not "arbitrary-content safe". The skill contract
+forbids putting secrets in those fields; the scan is a backstop, not a reader.
+
+## Local data retention
+
+The store (`$CGC_DATA_DIR/control.db`, default `~/.local/state/cgc/`) durably
+keeps every rendered prompt and every answer, 0600, indefinitely — that is what
+makes follow-ups and crash recovery work. Answers are also materialized under
+`$CGC_STATE_DIR` (default `/tmp/cgc`, wiped on reboot). If a consult's content
+should not persist on disk, delete the store (`rm ~/.local/state/cgc/control.db`
+— this also deletes all thread history) or point `CGC_DATA_DIR` at an encrypted
+volume. Nothing is ever uploaded anywhere except the prompt you sent to ChatGPT.
+
 ## What it does and does not do
 
 - **Does:** open a tab in a Chrome profile you logged into, type a prompt, read

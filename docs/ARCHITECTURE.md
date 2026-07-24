@@ -9,8 +9,12 @@ uses a dedicated Chrome profile, CDP, sentinels, and a detached waiter.
 
 | File | Role |
 | --- | --- |
-| `skill/scripts/consult.py` | **Prep plane.** `deliver` (resolve GitHub links + repo visibility + PR association) and `prep` (render the prompt from templates, add sentinels). Pure local, no browser. |
-| `skill/scripts/cdp_consult.py` | **Control plane.** External CDP client: `submit`, `followup`, `wait`, `status`. Opens tabs, selects model, types + sends, polls to completion. |
+| `skill/scripts/consult.py` | **Prep plane.** `fire` (deliver+prep+enqueue in one call — the normal path), `deliver` (build GitHub links from local git, offline), `prep` (render the prompt from templates, add sentinels). Pure local, no browser. |
+| `skill/scripts/cgc_store.py` | **The authority.** SQLite transactional store (durable, `$CGC_DATA_DIR/control.db`): threads, rounds, attempts, events; the explicit round state machine; ordered schema migrations. |
+| `skill/scripts/cgc_backend.py` | **Round logic.** enqueue (idempotent via `--request-key`), await (JSON outcome envelope), cancel, stats, and the worker's outcome→state mapping. |
+| `skill/scripts/cgc_spool.py` | **Egress gate + CLI.** The validating gate (public repos, existing refs, secret scan), daemon heartbeat/singleton, per-round logs, and the agent-facing enqueue/await/status/cancel/stats CLI. |
+| `skill/scripts/cgc_daemon.py` | **The egress daemon.** User-owned (launchd); claims rounds, runs the gate, drives CDP subprocesses, maintains the browser (sweep/repair). |
+| `skill/scripts/cdp_consult.py` | **Browser adapter.** External CDP client: submit, followup, wait. Opens tabs, selects model, types + sends, polls to completion. |
 | `skill/scripts/cdp_launch.sh` | **Setup plane.** Starts the dedicated debug Chrome, probes login, exit-code gate for self-healing. |
 | `skill/scripts/cgc_doctor.py` | Health check / preflight. |
 | `skill/scripts/retrieval_window.js` | Answer-windowing helper for the MCP fallback backend. |
@@ -121,10 +125,14 @@ signal to the agent. It is bounded (`timeout`/`--timeout`) so it can never hang 
 turn, and it holds no agent context so polling is free.
 
 ### State + follow-up
-`submit`/`followup` record the live conversation in `$CGC_STATE_DIR/active.json`
-(with a recent-threads list) so `followup --conversation auto` resolves the right
-thread with zero bookkeeping, and refuses ambiguously when several consults are
-active rather than guessing.
+The store records every round's thread and conversation, so `fire --followup
+--parent <rid>` continues exactly THAT consult's conversation — causal identity,
+unambiguous under concurrency, and the agent-documented path. A bare
+`--followup` resolves "the last completed thread" and REFUSES when that is
+ambiguous (another consult in flight, or two threads completed within 30 minutes
+of each other) rather than guessing. `--request-key` makes enqueue logically
+idempotent (same key + same content returns the original receipt), and `cancel`
+is honoured only before the send fence.
 
 ### The auto-mode egress path: why a user-owned daemon, not a bypass
 Claude Code's `auto` permission mode runs a data-exfiltration classifier **above**
@@ -141,21 +149,23 @@ tool's good intent.
 The actual fix moves egress **off the agent's call path entirely**:
 
 ```
-agent ─▶ cgc enqueue  ─▶ local spool job file          (local write only)
+agent ─▶ cgc fire / enqueue ─▶ a queued ROUND in the SQLite store   (local write only)
                               │
-                    (user-started, out-of-band)
+                    (user-installed, launchd-kept-alive)
                               ▼
-                        cgc watch (daemon)
-                              │  validate_prompt: re-check every repo ref
-                              │  is gh-confirmed PUBLIC + scan for secrets
+                        cgc daemon
+                              │  the gate: every repo gh-confirmed PUBLIC,
+                              │  every PR/ref EXISTS, no secret shapes
                               │  (fail-closed)
                               ▼
                         cdp_consult.py submit/wait  ─▶ ChatGPT Pro tab
                               │
                               ▼
-                        local answer file + status file
+                        result committed to the store (one transaction)
                               │
-agent ─▶ cgc await ◀──────────┘                          (local read only)
+agent ─▶ cgc await ◀──────────┘   polls the store, materializes the answer
+                                  file, prints a JSON outcome envelope
+                                  (local read only)
 ```
 
 `cgc enqueue` and `cgc await` are pure local file I/O — they never open a socket to
@@ -189,10 +199,13 @@ phrase a secret as prose that doesn't match a known secret pattern. The skill
 contract already forbids putting secrets in those fields; the gate's scan is a
 backstop against the obvious cases, not a semantic read of every sentence.
 
-The spool directory (`CGC_SPOOL_DIR`, default `$CGC_STATE_DIR/spool`) holds one job
-file per stage the job passes through — `pending/`, `processing/`, `done/` — plus a
-`status` file the caller polls and a daemon **heartbeat** file `cgc queue` and
-`cgc doctor` read to report the daemon as up or down.
+Round lifecycle state lives in ONE place: the SQLite store at
+`$CGC_DATA_DIR/control.db` (durable — deliberately NOT under `/tmp`), with an
+explicit legal-transition table, `synchronous=FULL`, immutable terminal states,
+and the at-most-once invariant (`sending`/`possibly_accepted` are never
+auto-resent). `CGC_SPOOL_DIR` now holds only daemon runtime files: the liveness
+heartbeat `cgc queue`/`doctor` read, the daemon-singleton lock, and per-round
+send+wait logs.
 
 ### Link-first delivery
 `deliver` resolves a commit to its associated PR (`commits/<sha>/pulls`) and leads
