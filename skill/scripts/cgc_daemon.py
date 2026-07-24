@@ -65,6 +65,12 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _CDP = os.path.join(_HERE, "cdp_consult.py")
 _LAUNCH = os.path.join(_HERE, "cdp_launch.sh")
 
+# A worker exits with THIS code (not the generic 1) when it refused a round it could not fence — it
+# lost the rid-lease race, or the browser was under exclusive maintenance. It is a distinct signal
+# to the reaper: a lease-refused worker never owned the round, so its death says NOTHING about that
+# round's send state and must never trigger a possibly_accepted promotion.
+EXIT_LEASE_REFUSED = 86
+
 
 def _make_run_cdp():
     """The injected CDP driver for the store worker: drives the cdp_consult submit/wait
@@ -107,14 +113,23 @@ def _take_worker_leases(rid):
     (shared lease) for its whole process lifetime. Both are flocks the OS releases on ANY death, so
     a replacement daemon can PROVE this worker is gone instead of assuming its own empty children
     map is global truth. Returns the (rid_lease, browser_lease) handles to keep alive, or None when
-    the round is already owned — by a prior-generation worker this daemon cannot see — in which
-    case this worker must exit without touching the round."""
+    the worker must exit (with EXIT_LEASE_REFUSED) WITHOUT touching the round:
+      - the rid lease is held — a prior-generation worker this daemon cannot see already owns it;
+      - the shared browser lease is unobtainable — browser-global maintenance holds it EXCLUSIVE, so
+        the worker must not use Chrome mid-restart. The round stays READY and is redispatched."""
     lease = spool.acquire_rid_lease(rid)
     if lease is None:
         sys.stderr.write(f"CGC_DAEMON worker {rid}: round already owned by a live worker "
                          "(prior daemon generation) — exiting without touching it\n")
         return None
-    return lease, spool.acquire_browser_lease(shared=True)
+    browser = spool.acquire_browser_lease(shared=True)
+    if browser is None:
+        if hasattr(lease, "close"):
+            lease.close()  # release the round we just claimed; we are not going to run it
+        sys.stderr.write(f"CGC_DAEMON worker {rid}: browser under exclusive maintenance — "
+                         "exiting without touching the round (it stays ready, redispatched)\n")
+        return None
+    return lease, browser
 
 
 def run_worker_store(rid: str) -> int:
@@ -123,7 +138,7 @@ def run_worker_store(rid: str) -> int:
     still in cdp_consult subprocesses."""
     leases = _take_worker_leases(rid)
     if leases is None:
-        return 1
+        return EXIT_LEASE_REFUSED
     with store_mod.Store() as s:
         r = s.get_round(rid)
         if r is None or r["state"] != store_mod.READY:
@@ -142,7 +157,7 @@ def run_worker_store_resume(rid: str) -> int:
     Never re-sends."""
     leases = _take_worker_leases(rid)
     if leases is None:
-        return 1
+        return EXIT_LEASE_REFUSED
     with store_mod.Store() as s:
         r = s.get_round(rid)
         if r is None or r["state"] not in (store_mod.ACCEPTED, store_mod.WAITING,
@@ -218,24 +233,72 @@ def _reap_children(children: dict) -> None:
       - sending           -> possibly_accepted (the click may have landed; never auto-resent)
       - ready             -> untouched (pre-send; the ready-orphan path re-dispatches it)
       - accepted/waiting  -> untouched (the reattach path resumes it read-only)
-      - terminal          -> untouched (the worker finished its job)"""
+      - terminal          -> untouched (the worker finished its job)
+
+    The `sending` promotion is only sound when THIS reaper actually owns the round. Two live
+    processes can hold the same rid: a losing duplicate worker (exit EXIT_LEASE_REFUSED) that never
+    touched it, and the winner that owns the lease and reached `sending`. Reaping the loser must not
+    move the winner's live round. So: a lease-refused death is inert, and any other death only
+    reclassifies while HOLDING the round's exclusive rid lease — if acquisition fails, another live
+    process owns the round and it is left `sending`."""
     for rid in list(children):
         code = children[rid].poll()
         if code is None:
             continue
         del children[rid]
+        if code == EXIT_LEASE_REFUSED:
+            continue  # a losing duplicate — it never owned the round; its death says nothing
         try:
             with store_mod.Store() as s:
                 r = s.get_round(rid)
-                if r and r["state"] == store_mod.SENDING:
+            if not (r and r["state"] == store_mod.SENDING):
+                continue
+            lease = spool.acquire_rid_lease(rid)
+            if lease is None:
+                sys.stderr.write(f"CGC_DAEMON reaped worker {rid} (exit {code}) mid-send, but another "
+                                 "live process owns its rid lease — leaving it sending\n")
+                continue
+            try:
+                with store_mod.Store() as s:
                     moved = s.promote_sending_to_uncertain(
                         rids=[rid],
                         reason=f"worker exited (code {code}) while sending — uncertain, not resent")
-                    if moved:
-                        sys.stderr.write(f"CGC_DAEMON reaped worker {rid} (exit {code}) mid-send — "
-                                         "round marked possibly_accepted\n")
+                if moved:
+                    sys.stderr.write(f"CGC_DAEMON reaped worker {rid} (exit {code}) mid-send — "
+                                     "round marked possibly_accepted\n")
+            finally:
+                if hasattr(lease, "close"):
+                    lease.close()
         except Exception as e:  # classification must never take the daemon down
             sys.stderr.write(f"CGC_DAEMON reap classification failed for {rid}: {e}\n")
+
+
+def _sweep_ownerless_sending(children: dict, reason: str) -> list:
+    """Promote every `sending` round whose owner is DEAD to possibly_accepted — the periodic peer of
+    the reaper, catching rounds no child of THIS daemon ever owned (a prior-generation worker that
+    already held a `sending` round at our startup and died later; the reaper never sees it because it
+    is not in `children`). Ownership is proven per-rid the only sound way: acquire the exclusive rid
+    lease. Held -> a live worker (any generation) owns it, skip. Acquired -> the owner is gone, so
+    promote UNDER the held lease (no probe-then-promote TOCTOU) and release. A round in `children`
+    has a live worker this generation, so it is skipped without a lease probe. Returns promoted rids.
+    Shared by daemon startup and every poll iteration so both use exactly this fencing."""
+    with store_mod.Store() as s:
+        stuck = [row["rid"] for row in s.db.execute(
+            "SELECT rid FROM rounds WHERE state=?", (store_mod.SENDING,))]
+    promoted = []
+    for rid in stuck:
+        if rid in children:
+            continue
+        lease = spool.acquire_rid_lease(rid)
+        if lease is None:
+            continue  # a live worker (prior generation) still owns it — not ownerless
+        try:
+            with store_mod.Store() as s:
+                promoted.extend(s.promote_sending_to_uncertain(rids=[rid], reason=reason))
+        finally:
+            if hasattr(lease, "close"):
+                lease.close()
+    return promoted
 
 
 def _sweep_tabs() -> int:
@@ -488,13 +551,12 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
     children = {}  # rid -> Popen
     daemon_instance_id = store_mod.new_daemon_instance_id()
     # Recovery: a round left `sending` with NO live owner is uncertain, not resendable. "No live
-    # owner" is proven per-rid by the cross-generation lease — a blanket promotion would mutate a
-    # `sending` row a surviving prior-generation worker still owns.
+    # owner" is proven per-rid by the cross-generation lease, held THROUGH the promotion — the same
+    # fence the per-poll sweep uses, so a `sending` row a surviving prior-generation worker still
+    # owns is never mutated.
+    moved = _sweep_ownerless_sending(
+        children, reason="daemon startup: sending round found ownerless — uncertain, not resent")
     with store_mod.Store() as _s:
-        stuck = [row["rid"] for row in _s.db.execute(
-            "SELECT rid FROM rounds WHERE state=?", (store_mod.SENDING,))]
-        moved = _s.promote_sending_to_uncertain(
-            rids=[rid for rid in stuck if spool.rid_lease_free(rid)])
         identity = {"protocol": 1, "schema_version": store_mod.SCHEMA_VERSION,
                     "db_path": os.path.abspath(store_mod.db_path()),
                     "store_uuid": _s.store_uuid(), "daemon_instance_id": daemon_instance_id}
@@ -506,6 +568,11 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
         while _running:
             spool.heartbeat_write(os.getpid(), identity)
             _reap_children(children)
+            # A `sending` round whose owner died WITHOUT this daemon ever spawning it (a prior
+            # generation's worker that outlived our startup) is invisible to _reap_children. Sweep
+            # for it every poll — same per-rid lease fence, so a live owner is never disturbed.
+            _sweep_ownerless_sending(
+                children, reason="periodic sweep: sending round found ownerless — uncertain, not resent")
             # Idle maintenance — both actions are browser-global, so they run only under the
             # EXCLUSIVE browser lease: unobtainable while any worker (THIS generation's children
             # or a surviving prior generation's) holds its shared lease.

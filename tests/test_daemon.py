@@ -317,6 +317,96 @@ def test_reap_leaves_non_sending_states_untouched(daemon):
     s.close()
 
 
+def test_reap_of_lease_refused_duplicate_leaves_winners_sending_untouched(daemon):
+    """S3 losing-duplicate race. Daemon A spawns worker A and dies before A takes its rid lease;
+    daemon B sees the lease free and spawns worker B; worker A then WINS the lease and reaches
+    `sending`, worker B loses and exits EXIT_LEASE_REFUSED. When daemon B reaps its own losing
+    worker B, it must NOT move worker A's live `sending` round to possibly_accepted — a lease-refused
+    death is inert. We model 'worker A alive and owning the round' by holding the rid lease here."""
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    rid = _rid("00d010")
+    s = _sending_round(daemon, rid)                     # round is `sending`
+    winner = daemon.spool.acquire_rid_lease(rid)        # worker A owns it
+    children = {rid: _DeadChild(code=daemon.EXIT_LEASE_REFUSED)}  # worker B (the loser) exits
+    daemon._reap_children(children)
+    assert children == {}, "the reaped duplicate is removed from the child map"
+    assert s.get_round(rid)["state"] == daemon.store_mod.SENDING, \
+        "the winner's live sending round must be untouched by the loser's reap"
+    winner.close()
+    s.close()
+
+
+def test_reap_of_crashed_worker_skips_promotion_when_another_process_owns_the_lease(daemon):
+    """Even a NON-refusal death (a crash exit code) must not promote a `sending` round while another
+    live process holds the rid lease — that process is the real owner. Only the lease holder may
+    reclassify; a reaper that cannot take the lease leaves the round `sending`."""
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    rid = _rid("00d011")
+    s = _sending_round(daemon, rid)
+    owner = daemon.spool.acquire_rid_lease(rid)         # a live process owns the round
+    children = {rid: _DeadChild(code=139)}              # a crash, not a lease refusal
+    daemon._reap_children(children)
+    assert s.get_round(rid)["state"] == daemon.store_mod.SENDING, \
+        "no promotion while another live process holds the lease"
+    owner.close()
+    s.close()
+
+
+# ---- periodic ownerless-sending sweep ----------------------------------------
+
+def test_periodic_sweep_promotes_a_dead_prior_generation_owners_sending_round(daemon):
+    """S3 second half: a prior-generation worker owned a `sending` round at daemon-B startup and then
+    died. It is not in daemon B's children, so the reaper never sees it; without a periodic sweep the
+    row sits `sending` until the full await timeout. One sweep pass — rid not in children, lease free
+    (owner dead) — must promote it to possibly_accepted, no daemon restart needed."""
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    rid = _rid("00d012")
+    s = _sending_round(daemon, rid)                     # `sending`, no live owner (lease free)
+    promoted = daemon._sweep_ownerless_sending({}, reason="periodic sweep test")
+    assert rid in promoted
+    assert s.get_round(rid)["state"] == daemon.store_mod.POSSIBLY_ACCEPTED
+    s.close()
+
+
+def test_periodic_sweep_leaves_a_live_owners_sending_round_untouched(daemon):
+    """The sweep's fence is the per-rid lease: a `sending` round whose owner is still alive (lease
+    held) is skipped, never promoted. A round in `children` is skipped without even probing."""
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    rid = _rid("00d013")
+    s = _sending_round(daemon, rid)
+    owner = daemon.spool.acquire_rid_lease(rid)         # a live prior-generation worker owns it
+    promoted = daemon._sweep_ownerless_sending({}, reason="periodic sweep test")
+    assert rid not in promoted
+    assert s.get_round(rid)["state"] == daemon.store_mod.SENDING
+    owner.close()
+    s.close()
+
+
+# ---- worker requires BOTH leases (rid + shared browser) ----------------------
+
+def test_worker_refuses_when_browser_is_under_exclusive_maintenance(daemon):
+    """A worker must hold the rid lease AND the shared browser lease. If browser-global maintenance
+    holds the browser EXCLUSIVE, the shared acquire returns None; the worker must release the rid
+    lease it just took and exit EXIT_LEASE_REFUSED WITHOUT touching the round (it stays ready)."""
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    rid = _rid("00d014")
+    s = daemon.store_mod.Store()
+    s.create_round(rid, "submit", prompt="p")
+    s.set_state(rid, daemon.store_mod.READY)            # dispatchable, pre-send
+    excl = daemon.spool.acquire_browser_lease(shared=False)  # maintenance holds the browser
+    assert excl is not None
+    assert daemon.run_worker_store(rid) == daemon.EXIT_LEASE_REFUSED
+    assert s.get_round(rid)["state"] == daemon.store_mod.READY, "the round is untouched, still ready"
+    assert daemon.spool.rid_lease_free(rid) is True, "the rid lease it briefly took was released"
+    excl.close()
+    s.close()
+
+
 # ---- cross-generation leases (worker/browser fencing) ------------------------
 
 def test_rid_lease_is_exclusive_and_freed_on_release(daemon):
@@ -338,8 +428,8 @@ def test_worker_refuses_a_round_owned_by_a_live_worker(daemon):
         pytest.skip("no fcntl on this platform")
     rid = _rid("00e002")
     held = daemon.spool.acquire_rid_lease(rid)
-    assert daemon.run_worker_store(rid) == 1
-    assert daemon.run_worker_store_resume(rid) == 1
+    assert daemon.run_worker_store(rid) == daemon.EXIT_LEASE_REFUSED
+    assert daemon.run_worker_store_resume(rid) == daemon.EXIT_LEASE_REFUSED
     held.close()
 
 
@@ -383,3 +473,48 @@ def test_dispatch_skips_rounds_whose_lease_is_held(daemon, monkeypatch):
     daemon._dispatch_store(children, 3, "gen2")
     assert any(rid in " ".join(map(str, c)) for c in spawned), \
         "once the lease frees, the round is reattached"
+
+
+# ---- lock namespace: durable data dir + fail-closed fcntl --------------------
+
+def test_lock_files_live_under_the_data_dir_not_the_spool_dir(daemon, tmp_path, monkeypatch):
+    """S2: coordination files (daemon singleton, browser lock, per-rid leases, heartbeat) must live
+    beside control.db in the durable data dir, NEVER under SPOOL_DIR — which config documents as
+    deletable scratch and which is overridable per generation. The lock dir must not move when
+    CGC_SPOOL_DIR is overridden."""
+    if daemon.spool.fcntl is None:
+        pytest.skip("no fcntl on this platform")
+    data_dir = daemon.store_mod.data_dir()
+    spool_dir = daemon.spool.SPOOL_DIR
+    lock_dir = daemon.spool._lock_dir()
+    assert lock_dir == os.path.join(os.path.dirname(daemon.store_mod.db_path()), "locks"), \
+        "the lock dir sits beside control.db"
+    assert not lock_dir.startswith(spool_dir), "locks must not live under the spool/scratch dir"
+
+    rid = _rid("00f0a1")
+    lease = daemon.spool.acquire_rid_lease(rid)
+    daemon.spool.heartbeat_write(pid=os.getpid())
+    singleton = daemon.spool.acquire_daemon_singleton(timeout=0)
+    browser = daemon.spool.acquire_browser_lease(shared=True)
+    try:
+        for p in (daemon.spool._lease_path(rid), daemon.spool.DAEMON_PATH,
+                  daemon.spool.DAEMON_LOCK, daemon.spool.BROWSER_LOCK):
+            assert p.startswith(data_dir), f"{p} must live under the durable data dir"
+            assert os.path.exists(p), f"{p} was created under the lock dir"
+            assert not p.startswith(spool_dir), f"{p} must not live under the spool dir"
+    finally:
+        lease.close()
+        singleton.close()
+        browser.close()
+
+
+def test_flock_fails_closed_when_fcntl_is_unavailable(daemon, monkeypatch):
+    """On a platform without fcntl there is no advisory lock; granting a fake lease would silently
+    defeat every fence. The lease primitives must raise a clear error, not return a fake handle."""
+    monkeypatch.setattr(daemon.spool, "fcntl", None)
+    with pytest.raises(RuntimeError, match="fcntl"):
+        daemon.spool.acquire_rid_lease(_rid("00f0b1"))
+    with pytest.raises(RuntimeError, match="fcntl"):
+        daemon.spool.acquire_browser_lease(shared=True)
+    with pytest.raises(RuntimeError, match="fcntl"):
+        daemon.spool.acquire_daemon_singleton(timeout=0)

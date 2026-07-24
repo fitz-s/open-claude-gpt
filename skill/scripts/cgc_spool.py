@@ -59,6 +59,8 @@ try:
 except Exception:
     pass
 
+import cgc_store as _store  # noqa: E402 — the durable data dir that anchors the lock namespace
+
 CGC_STATE_DIR = os.environ.get("CGC_STATE_DIR", "/tmp/cgc")
 SPOOL_DIR = os.environ.get("CGC_SPOOL_DIR", os.path.join(CGC_STATE_DIR, "spool"))
 
@@ -165,13 +167,29 @@ _SECRET_RES = [
 _SUBDIRS = ("logs",)
 
 
+def _lock_dir():
+    """The coordination namespace: daemon singleton, browser lock, per-rid leases, and the heartbeat
+    live HERE — under the durable data dir beside control.db, never under SPOOL_DIR. SPOOL_DIR
+    (CGC_STATE_DIR/spool) is documented deletable scratch and is overridable per generation; a lock
+    file that can be unlinked or moved out from under a holder splits the fencing namespace (the old
+    inode stays locked while a new process locks a fresh inode at the same path), defeating the
+    singleton and ownership fences. Anchoring locks to the same durable, generation-stable directory
+    as the store they fence removes both failure modes. Resolved at call time (like the store's own
+    path helpers) so tests and late-loaded config are honoured."""
+    db = _store.db_path()
+    d = os.path.dirname(db)
+    if not d or db == ":memory:":
+        d = _store.data_dir()
+    return os.path.join(d, "locks")
+
+
 def ensure_dirs():
     """Create the runtime dirs private to this user. The PROMPTS are public by construction — the
     gate enforces that. The ANSWERS and logs are not: a consult's reply can quote private context,
     and follow-up rounds carry local results outright. Leaving them at the umask's mercy under a
     world-traversable /tmp made confidentiality a property of the host's configuration rather than
-    of this tool."""
-    for d in (CGC_STATE_DIR, SPOOL_DIR):
+    of this tool. The lock dir sits under the durable data dir, not spool (see _lock_dir)."""
+    for d in (CGC_STATE_DIR, SPOOL_DIR, _lock_dir()):
         os.makedirs(d, mode=0o700, exist_ok=True)
         try:
             os.chmod(d, 0o700)
@@ -185,6 +203,10 @@ def _p(*parts):
     return os.path.join(SPOOL_DIR, *parts)
 
 
+def _lp(*parts):
+    return os.path.join(_lock_dir(), *parts)
+
+
 def log_path(rid):
     """Everything the daemon's worker saw while running this job. A failed consult used to leave
     only a 240-char tail inside a status file, which is not enough to tell a login lapse from a
@@ -192,7 +214,7 @@ def log_path(rid):
     return _p("logs", rid + ".log")
 
 
-DAEMON_PATH = _p("daemon.json")
+DAEMON_PATH = _lp("daemon.json")
 
 
 def _atomic_write(path, obj):
@@ -251,7 +273,17 @@ def daemon_alive():
     return daemon_identity() is not None
 
 
-DAEMON_LOCK = _p("daemon.lock")
+DAEMON_LOCK = _lp("daemon.lock")
+
+
+def _require_fcntl():
+    """Fencing is a hard requirement, not a nicety: the daemon singleton, per-round ownership, and
+    browser-maintenance exclusion all rest on real flocks. On a platform without fcntl there is no
+    advisory lock to take, so granting a fake lease would silently defeat every fence at once. Fail
+    closed — the caller (daemon startup) treats this as fatal."""
+    if fcntl is None:
+        raise RuntimeError("this platform lacks fcntl.flock — cross-process fencing is unavailable; "
+                           "refusing to run without it")
 
 
 def acquire_daemon_singleton(timeout=40):
@@ -268,8 +300,7 @@ def acquire_daemon_singleton(timeout=40):
     lock through a ~30s drain, and a supervised respawn that gave up immediately left a no-daemon
     window until the next respawn. Waiting past the drain lets the respawn take over cleanly, with no
     two-daemon overlap. Pass timeout=0 for an immediate, non-blocking check."""
-    if fcntl is None:
-        return object()  # can't enforce; single-host macOS always has fcntl, so this never runs there
+    _require_fcntl()
     ensure_dirs()
     fh = open(DAEMON_LOCK, "a+")
     deadline = time.time() + timeout
@@ -296,19 +327,18 @@ def acquire_daemon_singleton(timeout=40):
 #   - browser lease: workers hold SHARED; browser-global actions (tab sweep, Chrome restart) need
 #     EXCLUSIVE — impossible while any worker of any generation is alive.
 
-BROWSER_LOCK = _p("browser.lock")
+BROWSER_LOCK = _lp("browser.lock")
 
 
 def _lease_path(rid):
-    return _p(f"lease.{rid}")
+    return _lp(f"lease.{rid}")
 
 
 def _flock(path, flags):
     """Non-blocking flock on `path`. Returns the open file handle (caller keeps it alive for the
-    lease's lifetime) or None if the lock is held elsewhere. Best-effort object() when fcntl is
-    unavailable (never on macOS/Linux)."""
-    if fcntl is None:
-        return object()
+    lease's lifetime) or None if the lock is held elsewhere. Fails CLOSED (raises) when fcntl is
+    unavailable — a fake lease would silently defeat the fence it exists to provide."""
+    _require_fcntl()
     ensure_dirs()
     fh = open(path, "a+")
     try:
