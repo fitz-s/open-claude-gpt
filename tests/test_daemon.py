@@ -497,8 +497,8 @@ def test_lock_files_live_under_the_data_dir_not_the_spool_dir(daemon, tmp_path, 
     singleton = daemon.spool.acquire_daemon_singleton(timeout=0)
     browser = daemon.spool.acquire_browser_lease(shared=True)
     try:
-        for p in (daemon.spool._lease_path(rid), daemon.spool.DAEMON_PATH,
-                  daemon.spool.DAEMON_LOCK, daemon.spool.BROWSER_LOCK):
+        for p in (daemon.spool._lease_path(rid), daemon.spool.daemon_path(),
+                  daemon.spool.daemon_lock_path(), daemon.spool.browser_lock_path()):
             assert p.startswith(data_dir), f"{p} must live under the durable data dir"
             assert os.path.exists(p), f"{p} was created under the lock dir"
             assert not p.startswith(spool_dir), f"{p} must not live under the spool dir"

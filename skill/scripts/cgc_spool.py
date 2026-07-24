@@ -214,7 +214,8 @@ def log_path(rid):
     return _p("logs", rid + ".log")
 
 
-DAEMON_PATH = _lp("daemon.json")
+def daemon_path():
+    return _lp("daemon.json")
 
 
 def _atomic_write(path, obj):
@@ -246,7 +247,7 @@ def heartbeat_write(pid=None, identity=None):
     d = {"pid": pid if pid is not None else os.getpid(), "ts": time.time()}
     if identity:
         d.update(identity)
-    _atomic_write(DAEMON_PATH, d)
+    _atomic_write(daemon_path(), d)
 
 
 def _pid_alive(pid):
@@ -261,7 +262,7 @@ def daemon_identity():
     """The live daemon's heartbeat dict (pid, ts + its identity fields), or None when no live
     daemon. A stale heartbeat (daemon crashed / was killed) reads as down even though the file
     lingers."""
-    d = _read_json(DAEMON_PATH)
+    d = _read_json(daemon_path())
     if not isinstance(d, dict):
         return None
     if (time.time() - d.get("ts", 0)) > HEARTBEAT_STALE_S:
@@ -273,7 +274,8 @@ def daemon_alive():
     return daemon_identity() is not None
 
 
-DAEMON_LOCK = _lp("daemon.lock")
+def daemon_lock_path():
+    return _lp("daemon.lock")
 
 
 def _require_fcntl():
@@ -302,7 +304,7 @@ def acquire_daemon_singleton(timeout=40):
     two-daemon overlap. Pass timeout=0 for an immediate, non-blocking check."""
     _require_fcntl()
     ensure_dirs()
-    fh = open(DAEMON_LOCK, "a+")
+    fh = open(daemon_lock_path(), "a+")
     deadline = time.time() + timeout
     while True:
         try:
@@ -327,7 +329,8 @@ def acquire_daemon_singleton(timeout=40):
 #   - browser lease: workers hold SHARED; browser-global actions (tab sweep, Chrome restart) need
 #     EXCLUSIVE — impossible while any worker of any generation is alive.
 
-BROWSER_LOCK = _lp("browser.lock")
+def browser_lock_path():
+    return _lp("browser.lock")
 
 
 def _lease_path(rid):
@@ -368,7 +371,7 @@ def rid_lease_free(rid) -> bool:
 def acquire_browser_lease(shared: bool):
     """SHARED while a worker uses the browser; EXCLUSIVE for browser-global maintenance
     (tab sweep / Chrome restart). Exclusive is unobtainable while any worker lives."""
-    return _flock(BROWSER_LOCK, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) if fcntl else 0)
+    return _flock(browser_lock_path(), (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) if fcntl else 0)
 
 
 # ---- the validating gate (security core) ------------------------------------

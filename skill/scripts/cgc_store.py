@@ -156,6 +156,11 @@ def _relocate_legacy_db(target: str) -> None:
     legacy = _legacy_db()
     if target == legacy:
         return
+    # Fast path: no legacy file means no relocation work is possible (a loser of the publication
+    # race never even starts a copy, so a fenced legacy leaves no temps behind either) — skip the
+    # per-open flock. Racy by itself, but the locked body re-checks everything under the lock.
+    if not os.path.exists(legacy):
+        return
     d = os.path.dirname(target) or "."
     os.makedirs(d, mode=0o700, exist_ok=True)
     lock_fd = _acquire_relocation_lock(d)

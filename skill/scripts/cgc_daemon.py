@@ -603,8 +603,8 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
                     pass
     finally:
         try:
-            if os.path.exists(spool.DAEMON_PATH):
-                os.remove(spool.DAEMON_PATH)  # so `daemon_alive()` flips to false immediately
+            if os.path.exists(spool.daemon_path()):
+                os.remove(spool.daemon_path())  # so `daemon_alive()` flips to false immediately
         except OSError:
             pass
     sys.stderr.write("CGC_DAEMON stopped.\n")
