@@ -19,7 +19,7 @@
   },
   "build": {
     "buildCommand": "make build",
-    "testCommand": "cat >> tests/test_store.py <<'EOF'\n\n\nclass TestLegacyRelocation:\n    \"\"\"The one-time /tmp→durable relocation of the store DB.\"\"\"\n\n    def _mk_legacy(self, tmp_path, monkeypatch):\n        import importlib, cgc_store\n        importlib.reload(cgc_store)\n        state = tmp_path / \"state\"\n        state.mkdir()\n        monkeypatch.setenv(\"CGC_STATE_DIR\", str(state))\n        monkeypatch.setenv(\"CGC_DATA_DIR\", str(tmp_path / \"data\"))\n        monkeypatch.delenv(\"CGC_STORE_DB\", raising=False)\n        legacy = state / \"control.db\"\n        s = cgc_store.Store(str(legacy))\n        s.create_round(\"REQ-RELOC-1\", \"submit\", prompt=\"p\")\n        s.close()\n        return cgc_store, legacy\n\n    def test_relocates_when_default_path_used(self, tmp_path, monkeypatch):\n        cgc_store, legacy = self._mk_legacy(tmp_path, monkeypatch)\n        s = cgc_store.Store()          # no explicit path → default → triggers relocation\n        assert s.path == str(tmp_path / \"data\" / \"control.db\")\n        assert s.get_round(\"REQ-RELOC-1\") is not None          # data survived the move\n        s.close()\n        assert not legacy.exists()                             # never a second live authority\n        assert (tmp_path / \"state\" / \"control.db.migrated\").exists()\n\n    def test_no_relocation_with_explicit_override(self, tmp_path, monkeypatch):\n        cgc_store, legacy = self._mk_legacy(tmp_path, monkeypatch)\n        override = tmp_path / \"elsewhere.db\"\n        monkeypatch.setenv(\"CGC_STORE_DB\", str(override))\n        s = cgc_store.Store()\n        s.close()\n        assert legacy.exists()                                 # untouched\nEOF\npython3 -m pytest tests/ -q 2>&1 | tail -3",
+    "testCommand": "python3 -m pytest tests/ -q 2>&1 | tail -2 && make lint 2>&1 | tail -1 && wc -l skill/scripts/cgc_spool.py skill/scripts/cgc_daemon.py",
     "lintCommand": null,
     "devCommand": null,
     "scripts": {}
@@ -116,9 +116,39 @@
   },
   "hotPaths": [
     {
+      "path": "skill/scripts/cgc_spool.py",
+      "accessCount": 13,
+      "lastAccessed": 1784884742957,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_spool.py",
+      "accessCount": 8,
+      "lastAccessed": 1784884622169,
+      "type": "file"
+    },
+    {
+      "path": "skill/scripts/cgc_backend.py",
+      "accessCount": 8,
+      "lastAccessed": 1784884749953,
+      "type": "file"
+    },
+    {
       "path": "skill/scripts/cgc_store.py",
-      "accessCount": 6,
-      "lastAccessed": 1784883898495,
+      "accessCount": 7,
+      "lastAccessed": 1784884259833,
+      "type": "file"
+    },
+    {
+      "path": "skill/scripts/cgc_daemon.py",
+      "accessCount": 7,
+      "lastAccessed": 1784884377853,
+      "type": "file"
+    },
+    {
+      "path": "tests/test_daemon.py",
+      "accessCount": 4,
+      "lastAccessed": 1784884492819,
       "type": "file"
     },
     {
@@ -140,6 +170,12 @@
       "type": "file"
     },
     {
+      "path": "tests/conftest.py",
+      "accessCount": 3,
+      "lastAccessed": 1784884728998,
+      "type": "file"
+    },
+    {
       "path": "README.md",
       "accessCount": 2,
       "lastAccessed": 1784879140309,
@@ -149,18 +185,6 @@
       "path": "Makefile",
       "accessCount": 2,
       "lastAccessed": 1784879146188,
-      "type": "file"
-    },
-    {
-      "path": "tests/conftest.py",
-      "accessCount": 2,
-      "lastAccessed": 1784883867304,
-      "type": "file"
-    },
-    {
-      "path": "tests/test_daemon.py",
-      "accessCount": 2,
-      "lastAccessed": 1784883912386,
       "type": "file"
     },
     {
@@ -182,9 +206,15 @@
       "type": "file"
     },
     {
-      "path": "skill/scripts/cgc_backend.py",
+      "path": "skill/scripts/cgc_migrate.py",
       "accessCount": 1,
-      "lastAccessed": 1784883909492,
+      "lastAccessed": 1784884083333,
+      "type": "file"
+    },
+    {
+      "path": "bin/cgc",
+      "accessCount": 1,
+      "lastAccessed": 1784884096295,
       "type": "file"
     }
   ],

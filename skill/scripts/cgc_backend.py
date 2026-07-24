@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Store-backed control plane — the enqueue / await / worker logic that runs when CGC_STORE_BACKEND
-is on. Kept in ONE module so the cutover is a single delegation point from cgc_spool (enqueue/await)
-and cgc_daemon (the worker loop), and so the whole round lifecycle is testable with a stubbed CDP
-driver — no browser.
+"""Store-backed control plane — the enqueue / await / worker logic over the SQLite store, the SOLE
+round authority (the file-spool control plane it replaced is gone). Kept in ONE module so cgc_spool
+(enqueue/await CLI) and cgc_daemon (the worker loop) delegate here, and so the whole round lifecycle
+is testable with a stubbed CDP driver — no browser.
 
 The worker's mapping of a submit outcome to a round state is the load-bearing part. begin_send
 durably commits `sending` before the click, so:
@@ -34,10 +34,6 @@ import cgc_store as store_mod
 _NOT_SENT_BLOCK = ("login_needed", "CGC_LOGIN", "captcha", "rate_limit", "usage")
 _NOT_SENT_RETRY = ("model_not_selectable", "composer_not_ready", "no_page_target",
                    "attach_failed", "new_tab", "wrong_page", "gate_refused")
-
-
-def store_enabled() -> bool:
-    return store_mod.store_enabled()
 
 
 def _gate(store, rid: str, prompt: str, validate) -> str | None:
@@ -126,6 +122,14 @@ def enqueue_round(a, prompt: str, out: str) -> int:
         thread = conv if conv not in (None, "auto", "last") else None
         s.create_round(a.rid, a.kind, thread_id=thread, out_path=out, prompt=prompt,
                        spec_json=json.dumps(spec))
+    import cgc_spool as _spool
+    if not _spool.daemon_alive():
+        sys.stderr.write("CGC_WARN daemon_down: queued, but nothing will send it until the daemon "
+                         "runs. Relay ONE line to the user: cgc install-daemon\n")
+    if getattr(a, "quiet", False):
+        # Composed into `fire`, which prints the one receipt that matters. Two receipts for one
+        # action is pure noise.
+        return 0
     print(json.dumps({"queued": True, "rid": a.rid, "out": out, "backend": "store"}))
     argv = ["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgc_spool.py"),
             "await", "--rid", a.rid, "--out", out]
@@ -145,10 +149,16 @@ _TERMINAL_OK = (store_mod.COMPLETED_VERIFIED,)
 
 
 def await_round(a) -> int:
-    """Poll the round until terminal, materialize the stored result to --out, and map to the same
-    three-outcome contract as the file-spool await (0 answer / 3 human / 1 broken)."""
+    """Poll the round until terminal, materialize the stored result to --out, and map to the
+    three-outcome contract (0 answer / 3 human / 1 broken).
+
+    Liveness is checked in EVERY non-terminal state: the round only advances while a daemon is
+    alive to advance it, so a dead daemon must surface as broken-with-next-step promptly — not as
+    90 silent minutes of polling a row nobody is working."""
+    import cgc_spool as _spool
     out = os.path.abspath(a.out)
     deadline = time.time() + a.timeout
+    down_since = None
     while time.time() < deadline:
         with store_mod.Store() as s:
             r = s.get_round(a.rid)
@@ -156,6 +166,22 @@ def await_round(a) -> int:
             sys.stderr.write(f"CGC_BROKEN {a.rid}: no such round in the store.\n")
             return 1
         state = r["state"]
+        if state not in (store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED,
+                         store_mod.BLOCKED, store_mod.POSSIBLY_ACCEPTED, store_mod.FAILED,
+                         store_mod.GATE_REJECTED):
+            if _spool.daemon_alive():
+                down_since = None
+            else:
+                if down_since is None:
+                    down_since = time.time()
+                    sys.stderr.write("CGC_WAIT no live daemon; holding briefly in case it is restarting…\n")
+                elif time.time() - down_since > _spool.DAEMON_GRACE_S:
+                    sys.stderr.write(
+                        f"CGC_BROKEN {a.rid}: round is '{state}' but no daemon is alive to work it. "
+                        "Relay ONE line to the user — `cgc install-daemon` (launchd agent: starts at "
+                        "login, respawns if it dies). The round stays in the store and runs as soon "
+                        "as the daemon is up.\n")
+                    return 1
         if state == store_mod.COMPLETED_VERIFIED:
             text = r["result_text"] or ""
             if not text:
@@ -210,9 +236,11 @@ def await_round(a) -> int:
             return 1
         if state in (store_mod.FAILED, store_mod.GATE_REJECTED):
             sys.stderr.write(f"CGC_BROKEN {a.rid}: {r['error_code'] or 'the daemon could not deliver an answer'}\n")
+            _spool._point_at_log(a.rid, out)
             return 1
         time.sleep(getattr(a, "poll", None) or store_mod.__dict__.get("POLL_S", 20) or 20)
     sys.stderr.write(f"CGC_STUCK {a.rid}: no terminal state within {a.timeout}s — read the daemon log.\n")
+    _spool._point_at_log(a.rid, out)
     return 1
 
 

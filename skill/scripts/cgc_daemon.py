@@ -24,15 +24,14 @@ The consult egress daemon. Start it ONCE (the user, not the agent):
   cgc up                    # convenience: start the debug Chrome AND this daemon detached
   python3 cgc_daemon.py     # equivalent to `cgc watch`
 
-It polls $CGC_SPOOL_DIR/pending for jobs written by `cgc enqueue`, validates each through the
-egress gate, then drives the existing `cdp_consult.py` submit/followup + wait against the debug
-Chrome, writing the answer to the job's --out (which `cgc await` is polling locally).
+It claims queued rounds from the SQLite store (written by `cgc enqueue`), validates each through
+the egress gate, then drives `cdp_consult.py` submit/followup + wait against the debug Chrome,
+committing the answer to the store (which `cgc await` polls locally).
 
 Flags:
-  --poll N          seconds between spool scans (default 2)
-  --concurrency N   max jobs sent in parallel (default 3; each gets its own Chrome tab)
-  --once            process whatever is pending, then exit (for tests / cron-style runs)
-  --worker PATH     internal: process a single claimed job file, then exit
+  --poll N          seconds between store scans (default 2)
+  --concurrency N   max rounds sent in parallel (default 3; each gets its own Chrome tab)
+  --once            process whatever is dispatchable, then exit (for tests / cron-style runs)
 """
 from __future__ import annotations
 
@@ -184,36 +183,17 @@ def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str) -
         _spawn("--worker-store", rnd["rid"], "dispatched(store)")
 
 
-def _other_live_jobs(rid) -> list:
-    """Other rids currently being worked. Restarting Chrome is GLOBAL — it takes every tab with it —
-    so it must not be done while someone else's consult is mid-flight."""
-    out = []
-    try:
-        names = os.listdir(spool._p("processing"))
-    except OSError:
-        return out
-    for n in names:
-        if not n.endswith(".json") or n[:-5] == rid:
-            continue
-        if spool._live_owner(n[:-5]) is not None:
-            out.append(n[:-5])
-    return out
-
-
 def _sweep_tabs() -> int:
-    """Close leftover ChatGPT tabs when nothing is running.
+    """Close leftover ChatGPT tabs. CALLER-GUARDED: call only when the daemon has NO live worker
+    children — the daemon's child map is complete knowledge of live store workers, so a tab this
+    sweep sees is by definition unowned.
 
     Tabs accumulate. Fixing the leaks in submit's failure paths removes the known source, but not
     the one no code path can cover: a worker killed mid-send — by a daemon restart, say — never runs
     its cleanup at all, and its tab stays. Each one holds a renderer, and a browser carrying enough
     of them stops being able to start new ones, which is the failure that ends every consult (a
-    freshly created tab that never answers Runtime.enable).
-
-    Guarded by the same rule as the restart: only when NO job is live, so a tab this sweep sees is
-    by definition unowned. One tab is kept, because the profile with zero windows is a worse state
-    to leave the browser in than one with a spare."""
-    if _other_live_jobs(None):
-        return 0
+    freshly created tab that never answers Runtime.enable). One tab is kept, because the profile
+    with zero windows is a worse state to leave the browser in than one with a spare."""
     try:
         base = f"http://127.0.0.1:{os.environ.get('CGC_PORT', '9333')}"
         info = json.load(urllib.request.urlopen(f"{base}/json", timeout=5))
@@ -292,43 +272,59 @@ def _new_tab_healthy(port=None) -> bool:
             pass
 
 
-def _restart_chrome(rid=None):
-    """Replace the debug Chrome. Call inside spool.lifecycle_lock(). The daemon owns the browser's lifecycle, so a browser that can no
-    longer open a usable tab is the daemon's problem to fix, not an errand for a human — the whole
-    point of running it under launchd was to stop consults stalling on people. Safe to do: the
-    profile keeps the login, and a consult whose tab is lost is recoverable via `--kind retrieve`.
+def _restart_chrome():
+    """Replace the debug Chrome. CALLER-GUARDED: call only when the daemon has NO live worker
+    children — the restart is global (it takes every tab with it), and the child map is complete
+    knowledge of live workers. The daemon owns the browser's lifecycle, so a browser that can no
+    longer open a usable tab is the daemon's problem to fix, not an errand for a human. Safe to do:
+    the profile keeps the login, and a consult whose tab is lost is recoverable read-only.
 
-    Not safe to do BLINDLY, though: the restart is global. Doing it for one job while others are
-    sending or waiting would tear their tabs away too, which is how a healthy consult ends up
-    reported as broken.
-
-    Returns (ok, reason): ok True only on a verified-working restart. On failure, reason is the
-    ACTIONABLE explanation for the caller to persist to job status — some causes are transient
-    (neighbours live), so the message tells the caller to re-enqueue rather than reporting the
-    opaque attach failure that triggered the repair."""
-    # Held across the scan AND the restart: without it the dispatcher can admit a worker between
-    # the two, and that worker's tab is destroyed by a restart that believed it was alone.
-    others = _other_live_jobs(rid)
-    if others:
-        why = (f"chrome restart suppressed: {len(others)} other consult(s) live "
-               f"({', '.join(others[:3])}) — a restart is global and would break them; "
-               f"re-enqueue once they finish")
-        sys.stderr.write(f"CGC_DAEMON {rid}: NOT restarting Chrome — {why}\n")
-        return False, why
-    code, _so, _se = _run(["bash", _LAUNCH], 120, rid,
+    Returns (ok, reason): ok True only on a verified-working restart."""
+    code, _so, _se = _run(["bash", _LAUNCH], 120, None,
                           env_extra={"CGC_RESTART": "1", "CGC_GATE": "1"})
     if code != 0:
         return False, f"chrome restart failed: launcher exit {code}"
     # The launcher proves the PORT is up and the session is logged in. Neither is the thing that
     # broke: what fails is opening a working tab, and a browser that has just restarted also needs a
     # moment before its target list is stable — a retry 3s after a "successful" restart failed with
-    # `No such target id`. So confirm the actual capability before handing the job back.
+    # `No such target id`. So confirm the actual capability before handing work back.
     for _ in range(15):
         if _new_tab_healthy():
             return True, ""
         time.sleep(2.0)
-    sys.stderr.write(f"CGC_DAEMON {rid}: Chrome restarted but still cannot open a working tab\n")
+    sys.stderr.write("CGC_DAEMON Chrome restarted but still cannot open a working tab\n")
     return False, "chrome restarted but still cannot open a working tab"
+
+
+# The browser-repair escalation. A round whose submit failed pre-click with a tab-family error
+# (attach_failed / new_tab*) is requeued by the worker — safe, it provably never sent. But if the
+# browser is PERMANENTLY unable to open a tab, requeue alone is an infinite silent loop: dispatched,
+# attach fails, requeued, forever. The daemon breaks that loop by watching for queued rounds whose
+# last error is tab-family and, when it has no live children (restart is global), restarting Chrome
+# — at most once per cooldown, so a restart that doesn't cure the browser cannot itself loop hot.
+_TAB_ERRORS = ("attach_failed", "new_tab", "no_page_target")
+_REPAIR_COOLDOWN_S = 600
+
+
+def _maybe_repair_browser(children: dict, last_repair: float) -> float:
+    """If tab-family failures are blocking queued rounds and no worker is live, restart Chrome.
+    Returns the new last-repair timestamp (unchanged when nothing was done)."""
+    if children or (time.time() - last_repair) < _REPAIR_COOLDOWN_S:
+        return last_repair
+    with store_mod.Store() as s:
+        row = s.db.execute(
+            "SELECT rid, error_code FROM rounds WHERE state=? AND error_code IS NOT NULL",
+            (store_mod.QUEUED,)).fetchall()
+    hit = [r["rid"] for r in row if any(t in (r["error_code"] or "") for t in _TAB_ERRORS)]
+    if not hit:
+        return last_repair
+    sys.stderr.write(f"CGC_DAEMON {len(hit)} queued round(s) blocked by tab failures "
+                     f"({', '.join(hit[:3])}) — restarting the debug Chrome\n")
+    ok, why = _restart_chrome()
+    if not ok:
+        sys.stderr.write(f"CGC_DAEMON browser repair failed: {why}\n")
+    return time.time()
+
 
 _running = True
 
@@ -415,213 +411,7 @@ def _run(cmd, timeout, rid=None, stdin_text=None, env_extra=None):
     return code, so, se
 
 
-def run_worker(processing_file: str) -> int:
-    job = spool._read_json(processing_file)
-    if not isinstance(job, dict) or not job.get("rid"):
-        sys.stderr.write(f"CGC_DAEMON bad job file {processing_file}\n")
-        return 2
-    rid = job["rid"]
-    out = job.get("out") or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt")
-    kind = job.get("kind", "submit")
-    poll = str(job.get("poll", 20))
-    timeout = int(job.get("timeout", spool.STUCK_AFTER_S))  # enqueue always writes it
-
-    if kind == "retrieve":
-        # Attach to an existing conversation and read its answer. NOTHING is sent, so there is no
-        # payload for the gate to validate. That is enforced structurally rather than trusted: a
-        # retrieve job that carries a prompt is refused outright, so this branch can never become a
-        # way to send unvalidated content. It exists so that recovering a consult whose waiter died
-        # stays on the daemon path instead of forcing the agent onto the direct one.
-        if job.get("prompt_file"):
-            spool.finish_job(rid, state="error", exit=2, out=out,
-                             msg="refused: a retrieve job must carry no prompt (it sends nothing)")
-            return 2
-        conv = job.get("conversation") or ""
-        if not conv or conv == "auto":
-            spool.finish_job(rid, state="error", exit=2, out=out,
-                             msg="refused: retrieve needs an explicit conversation id")
-            return 2
-        spool.write_status(rid, "processing", out=out, conversation=conv,
-                           msg=f"attaching to {conv} to read its answer (nothing sent)")
-        rcmd = [sys.executable, _CDP, "wait", "--rid", rid, "--conversation", conv,
-                "--out", out, "--poll", poll, "--timeout", str(timeout)]
-        rcode, _rso, rse = _run(rcmd, timeout + 40, rid)
-        return _finish_from_wait(rid, rcode, out, rse, conv)
-
-    # --- the gate: re-validate independently before ANY external send --------
-    try:
-        prompt = open(job["prompt_file"], encoding="utf-8").read()
-    except OSError as e:
-        spool.finish_job(rid, state="error", exit=2, out=out, msg=f"prompt unreadable: {e}")
-        return 2
-    ok, reason = spool.validate_prompt(prompt)  # `prompt` is now the ONLY copy that matters
-    if not ok:
-        sys.stderr.write(f"CGC_DAEMON GATE REFUSED {rid}: {reason}\n")
-        spool.finish_job(rid, state="error", exit=2, out=out, msg=reason)
-        return 2
-    sys.stderr.write(f"CGC_DAEMON gate ok {rid}: {reason}\n")
-    spool.write_status(rid, "processing", out=out, msg=reason)
-
-    # The daemon is the supervisor, so give the child a slightly wider wall-clock budget than its
-    # own --timeout and let cdp_consult's timeout do the graceful salvage first.
-    child_budget = timeout + 40
-
-    if kind == "followup":
-        conv = job.get("conversation") or "auto"
-        # Same rule as submit: the validated bytes go over stdin, never a reopenable path.
-        cmd = [sys.executable, _CDP, "followup",
-               "--conversation", conv, "--prompt-file", "-",
-               "--rid", rid, "--model", job.get("model", "Pro"),
-               "--watch", "--out", out, "--poll", poll, "--timeout", str(timeout)]
-        code, so, se = _run(cmd, child_budget, rid, stdin_text=prompt)
-        return _finish_from_wait(rid, code, out, se, conv)
-
-    # kind == submit: send, capture the conversation id, then wait.
-    # Hand the CDP child the VALIDATED BYTES over stdin, not the pathname. Passing the path let the
-    # child reopen a file any same-user process could have rewritten after validation, so what got
-    # sent to ChatGPT need not be what passed the public-repo and secret checks. The gate is the
-    # justification for this whole egress design; it has to cover the bytes that actually leave.
-    _sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-    cmd = [sys.executable, _CDP, "submit",
-           "--rid", rid, "--prompt-file", "-",
-           "--project-url", job.get("project_url", "https://chatgpt.com/"),
-           "--model", job.get("model", "Pro")]
-    code, so, se = _run(cmd, 240, rid, stdin_text=prompt)
-    # Match THIS invocation's stderr (`se`), never the whole-file tail. `_run` now returns the full
-    # current-invocation stderr (log_start..EOF), so the START-of-message token is present AND the
-    # match is isolated to the attempt that just ran. Using _tail_file here would reintroduce the
-    # exact cross-attempt leak the diff-review flagged S0: a stale `cdp_attach_failed` from an
-    # EARLIER attempt could match after THIS attempt clicked-then-failed, restarting Chrome and
-    # automatically re-running submit — a resend of a possibly-clicked send.
-    if code != 0 and "cdp_attach_failed" in se:
-        # The browser can still serve its existing tabs but cannot produce a working new one, and
-        # every send needs a new one. Retrying the job changes nothing; replacing Chrome does.
-        sys.stderr.write(f"CGC_DAEMON {rid}: debug Chrome cannot open a usable tab — restarting it\n")
-        with spool.lifecycle_lock() as lk:
-            if lk.acquired:
-                repaired, why = _restart_chrome(rid)
-            else:
-                # Fail closed: a peer admission/restart holds the lock; a global restart now could
-                # tear tabs from workers being admitted under it. Skip the repair (job re-enqueues).
-                repaired, why = False, ("chrome restart suppressed: browser lifecycle busy "
-                                        "(a peer admission or restart holds the lock) — re-enqueue")
-        if repaired:
-            code, so, se = _run(cmd, 240, rid, stdin_text=prompt)
-        else:
-            # Persist the ACTIONABLE reason, not the opaque attach failure that triggered the repair.
-            # Nothing was sent; several causes are transient, so the message says to re-enqueue.
-            spool.finish_job(rid, state="error", exit=2, out=out,
-                             msg=f"{why}; log {spool.log_path(rid)}")
-            return 2
-    spool.write_status(rid, "processing", msg=f"{reason}; sent sha256={_sha[:16]}")
-    conv = ""
-    try:
-        conv = (json.loads(so.strip().splitlines()[-1]) if so.strip() else {}).get("conversation_id", "") or ""
-    except Exception:
-        conv = ""
-    if code == 3:
-        spool.finish_job(rid, state="blocker", exit=3, out=out, msg=_tail(se) or "login/model blocker at submit")
-        return 3
-    if code != 0 or not conv:
-        spool.finish_job(rid, state="error", exit=2, out=out,
-                         msg=_tail(se) or f"submit failed (exit {code}, conv {conv or 'none'})")
-        return 2
-    spool.write_status(rid, "processing", out=out, conversation=conv, msg="sent; waiting for answer")
-    wcmd = [sys.executable, _CDP, "wait", "--rid", rid, "--conversation", conv,
-            "--out", out, "--poll", poll, "--timeout", str(timeout)]
-    wcode, wso, wse = _run(wcmd, child_budget, rid)
-    return _finish_from_wait(rid, wcode, out, wse, conv)
-
-
-def _finish_from_wait(rid, code, out, stderr, conv):
-    """Map a cdp_consult.py wait/followup exit code to a terminal spool status."""
-    if code == 0:
-        spool.finish_job(rid, state="done", exit=0, out=out, conversation=conv,
-                         msg="answer retrieved")
-        return 0
-    if code == 3:
-        spool.finish_job(rid, state="blocker", exit=3, out=out, conversation=conv,
-                         msg=_tail(stderr) or "login/captcha/rate-limit")
-        return 3
-    if code == 4:
-        spool.finish_job(rid, state="no_answer", exit=4, out=out, conversation=conv,
-                         msg=_tail(stderr) or "timeout with no usable answer")
-        return 4
-    spool.finish_job(rid, state="error", exit=2, out=out, conversation=conv,
-                     msg=_tail(stderr) or f"wait failed (exit {code})")
-    return 2
-
-
 # ---- the loop ---------------------------------------------------------------
-
-def _recover_orphans() -> int:
-    """Recover jobs left in processing/ with no worker running them.
-
-    Workers are children of the daemon, so a crash or a launchd restart leaves the job claimed but
-    unowned, and nothing ever re-scans processing/ — the consult is lost silently while `await`
-    still reports it healthy.
-
-    Orphanhood is DETERMINED, not guessed. The dispatcher records the worker's pid, so the question
-    "is anyone working this?" is answered exactly by asking whether that pid is alive. The previous
-    age heuristic — requeue once the job outlives a worker's hard ceiling — had to wait longer than
-    any possible worker, which after the deadline became one number meant 62 minutes of a consult
-    sitting dead before anything noticed. A job with no recorded pid predates this and still falls
-    back to the age rule.
-
-    Recovery prefers RETRIEVE over re-sending. The waiter dying does not stop ChatGPT: the
-    conversation is usually still generating, so re-sending would open a second conversation, redo
-    the round and bill the quota twice. Only a job that never got far enough to have a conversation
-    is genuinely re-sent."""
-    age_cutoff = time.time() - (spool.STUCK_AFTER_S + 120)
-    n = 0
-    try:
-        names = sorted(os.listdir(spool._p("processing")))
-    except OSError:
-        return 0
-    for name in names:
-        if not name.endswith(".json"):
-            continue
-        src = spool._p("processing", name)
-        rid = name[:-5]
-        st = spool.read_status(rid) or {}
-        pid = st.get("worker_pid")
-        if pid is not None:
-            if spool._pid_alive(pid):
-                continue                      # genuinely being worked
-        elif os.path.getmtime(src) > age_cutoff:
-            continue                          # pre-pid job, not yet provably unowned
-        job = spool._read_json(src) or {}
-        conv = st.get("conversation") or job.get("conversation")
-        try:
-            if conv and conv != "auto":
-                # Its ChatGPT conversation outlived the waiter — attach and read, do not re-ask.
-                job = {"rid": rid, "kind": "retrieve", "conversation": conv,
-                       "out": job.get("out") or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt"),
-                       "poll": job.get("poll", spool.POLL_S), "timeout": job.get("timeout", spool.STUCK_AFTER_S)}
-                os.remove(src)
-                spool.enqueue_job(job)
-                spool.write_status(rid, "queued",
-                                   msg=f"worker died; re-attaching to {conv} to read its answer")
-            else:
-                # No conversation recorded → the send MAY already have reached ChatGPT before the
-                # worker died (an orphan can be post-click). Re-sending would duplicate a possible
-                # send — the same at-most-once violation the store forbids. NEVER auto-resend; mark
-                # it for human reconciliation. This also closes the rollback path the diff-review
-                # flagged S0: a store round imported as possibly_accepted leaves a legacy processing
-                # record, and a later CGC_STORE_BACKEND=0 rollback must not turn it back into an
-                # automatic send.
-                spool.finish_job(
-                    rid, state="blocker", exit=3,
-                    out=job.get("out") or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt"),
-                    msg="worker died before a conversation was recorded — the send may have happened; "
-                        "NOT auto-resent (at-most-once). Retrieve by conversation or reconcile by hand.")
-        except (OSError, ValueError):
-            continue
-        n += 1
-    if n:
-        sys.stderr.write(f"CGC_DAEMON recovered {n} orphaned job(s)\n")
-    return n
-
 
 def run_loop(poll: float, concurrency: int, once: bool) -> int:
     spool.ensure_dirs()
@@ -641,74 +431,33 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
         f"CGC_DAEMON up (pid {os.getpid()}) — spool {spool.SPOOL_DIR}, concurrency {concurrency}, "
         f"poll {poll}s. This is the user-owned egress gate; the agent only reads/writes local files.\n")
     children = {}  # rid -> Popen
-    next_orphan_scan = 0.0
-    _store_mode = cgc_backend.store_enabled()
     daemon_instance_id = store_mod.new_daemon_instance_id()
-    if _store_mode:
-        # Recovery: a round left `sending` when the daemon died is uncertain, not resendable.
-        with store_mod.Store() as _s:
-            moved = _s.promote_sending_to_uncertain()
-        sys.stderr.write(f"CGC_DAEMON store backend (instance {daemon_instance_id[:8]}); "
-                         f"{len(moved)} interrupted send(s) marked possibly_accepted.\n")
+    # Recovery: a round left `sending` when the daemon died is uncertain, not resendable.
+    with store_mod.Store() as _s:
+        moved = _s.promote_sending_to_uncertain()
+    sys.stderr.write(f"CGC_DAEMON store (instance {daemon_instance_id[:8]}); "
+                     f"{len(moved)} interrupted send(s) marked possibly_accepted.\n")
+    next_maintenance = 0.0
+    last_repair = 0.0
     try:
         while _running:
             spool.heartbeat_write(os.getpid())
-            # Rescan periodically, not only at startup. A job becomes requeue-eligible only once it
-            # is older than a worker's hard ceiling, so a daemon that restarts EARLY in a job's life
-            # scans while that job is still ineligible and then never looks again — the consult sits
-            # in processing/ forever. (Observed: daemon restarted 415s into a job whose window opens
-            # at 1620s.) This also covers a worker that died without writing a terminal status while
-            # the daemon itself stayed up.
-            # Legacy file-spool maintenance — ONLY in spool mode. In store mode both are wrong:
-            # _recover_orphans rewrites the rollback spool (it can flip an old processing job back to
-            # `pending` "re-sending", priming a future CGC_STORE_BACKEND=0 rollback to duplicate an
-            # uncertain send), and _sweep_tabs decides liveness from file-spool PIDs alone — it knows
-            # nothing about store rounds, so it can close the tab of an active store send/wait. Store
-            # mode has its own recovery (startup promote_sending_to_uncertain + _dispatch_store
-            # reattach) and no tab sweep yet, which is safer than a sweep that guesses ownership.
-            if not _store_mode and time.time() >= next_orphan_scan:
-                _recover_orphans()
-                if websocket is not None:
-                    _sweep_tabs()
-                next_orphan_scan = time.time() + 60
             # reap
             for rid in list(children):
                 if children[rid].poll() is not None:
                     del children[rid]
-            # dispatch
-            if _store_mode:
-                _dispatch_store(children, concurrency, daemon_instance_id)
-                if once and not children:
-                    with store_mod.Store() as _s:
-                        if not _s.recover()["dispatchable"]:
-                            break
-                time.sleep(poll)
-                continue
-            for pf in spool.list_pending():
-                if len(children) >= concurrency:
-                    break
-                # Admission is serialised against browser restart: claim, spawn and publish the
-                # worker pid atomically, so a worker is never invisible to a neighbour scan while it
-                # is being admitted.
-                with spool.lifecycle_lock() as lk:
-                    if not lk.acquired:
-                        # A browser restart holds the lock. Admitting now would hand a worker a tab
-                        # the in-progress restart destroys — the reported "my consult was killed"
-                        # bug. Admit nothing this cycle; pending jobs stay pending and retry next
-                        # loop, once the restart releases the lock (fail closed, never unserialised).
+            # Idle maintenance — only with NO live children (both actions are browser-global):
+            # sweep unowned tabs, and break the requeue loop of a browser that cannot open tabs.
+            if not children and time.time() >= next_maintenance:
+                if websocket is not None:
+                    _sweep_tabs()
+                last_repair = _maybe_repair_browser(children, last_repair)
+                next_maintenance = time.time() + 60
+            _dispatch_store(children, concurrency, daemon_instance_id)
+            if once and not children:
+                with store_mod.Store() as _s:
+                    if not _s.recover()["dispatchable"]:
                         break
-                    claimed = spool.claim(pf)
-                    if not claimed:
-                        continue  # another worker took it
-                    rid = os.path.basename(claimed)[:-5]
-                    p = subprocess.Popen([sys.executable, os.path.abspath(__file__),
-                                          "--worker", claimed], env=dict(os.environ))
-                    children[rid] = p
-                    spool.write_status(rid, "processing", worker_pid=p.pid)
-                sys.stderr.write(f"CGC_DAEMON dispatched {rid} pid={p.pid} "
-                                 f"({len(children)}/{concurrency} busy)\n")
-            if once and not children and not spool.list_pending():
-                break
             time.sleep(poll)
         # drain: let in-flight workers finish (they hold real consults), bounded.
         if children:
@@ -733,7 +482,6 @@ def main() -> int:
     p.add_argument("--poll", type=float, default=2.0)
     p.add_argument("--concurrency", type=int, default=3)
     p.add_argument("--once", action="store_true")
-    p.add_argument("--worker", help="internal: process one claimed job file then exit")
     p.add_argument("--worker-store", help="internal: process one claimed store round then exit")
     p.add_argument("--worker-store-resume", help="internal: reattach one accepted/waiting round then exit")
     a = p.parse_args()
@@ -741,8 +489,6 @@ def main() -> int:
         return run_worker_store_resume(a.worker_store_resume)
     if a.worker_store:
         return run_worker_store(a.worker_store)
-    if a.worker:
-        return run_worker(a.worker)
     return run_loop(a.poll, max(1, a.concurrency), a.once)
 
 

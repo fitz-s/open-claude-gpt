@@ -1,9 +1,11 @@
-# Tests for the local spool + validating egress gate (cgc_spool.py).
+# Tests for the validating egress gate + store-backed CLI (cgc_spool.py).
 #
 # cgc_spool.SPOOL_DIR is computed at import time from CGC_SPOOL_DIR (or CGC_STATE_DIR/spool), so
 # every test sets env BEFORE importing and loads a FRESH copy of the module (mirrors
 # tests/test_config.py / tests/test_state.py's importlib.util spec-loading pattern). Network is
-# never touched: cgc_spool._repo_is_public (which shells `gh`) is monkeypatched to a stub.
+# never touched: cgc_spool._repo_is_public (which shells `gh`) is monkeypatched to a stub. The
+# round lifecycle itself lives in the SQLite store (test_store / test_store_backend); here the CLI
+# is exercised end-to-end against a per-test store DB (pinned by conftest)._
 import argparse
 import importlib.util
 import json
@@ -36,75 +38,6 @@ def spool(tmp_path, monkeypatch):
 
 def _rid(suffix="000001"):
     return f"REQ-20260707-120000-{suffix}"
-
-
-# ---- enqueue_job / list_pending / claim -------------------------------------
-
-def test_enqueue_job_writes_pending_file(spool):
-    rid = _rid()
-    path = spool.enqueue_job({"rid": rid, "kind": "submit"})
-    assert path == spool.pending_path(rid)
-    assert os.path.exists(path)
-    with open(path, encoding="utf-8") as f:
-        job = json.load(f)
-    assert job["rid"] == rid
-    assert job["kind"] == "submit"
-
-
-def test_enqueue_job_bad_rid_raises_value_error(spool):
-    with pytest.raises(ValueError):
-        spool.enqueue_job({"rid": "not-a-valid-rid"})
-
-
-def test_list_pending_finds_enqueued_job(spool):
-    rid = _rid()
-    spool.enqueue_job({"rid": rid})
-    assert spool.list_pending() == [spool.pending_path(rid)]
-
-
-def test_claim_moves_pending_job_to_processing(spool):
-    rid = _rid()
-    pending = spool.enqueue_job({"rid": rid})
-    result = spool.claim(pending)
-    assert result == spool.processing_path(rid)
-    assert os.path.exists(spool.processing_path(rid))
-    assert not os.path.exists(pending)
-
-
-def test_second_claim_of_same_pending_file_returns_none(spool):
-    rid = _rid()
-    pending = spool.enqueue_job({"rid": rid})
-    first = spool.claim(pending)
-    assert first is not None
-    second = spool.claim(pending)
-    assert second is None
-
-
-# ---- write_status / read_status / finish_job --------------------------------
-
-def test_write_status_then_read_status_roundtrip(spool):
-    rid = _rid()
-    spool.write_status(rid, "queued", out="/tmp/answer.txt")
-    st = spool.read_status(rid)
-    assert st["rid"] == rid
-    assert st["state"] == "queued"
-    assert st["out"] == "/tmp/answer.txt"
-
-
-def test_finish_job_moves_processing_to_done_and_sets_terminal_status(spool):
-    rid = _rid()
-    pending = spool.enqueue_job({"rid": rid})
-    spool.claim(pending)
-    assert os.path.exists(spool.processing_path(rid))
-
-    spool.finish_job(rid, state="done", exit=0, out="/tmp/answer.txt", conversation="conv1")
-
-    assert not os.path.exists(spool.processing_path(rid))
-    assert os.path.exists(spool.done_path(rid))
-    st = spool.read_status(rid)
-    assert st["state"] == "done"
-    assert st["exit"] == 0
-    assert st["conversation"] == "conv1"
 
 
 # ---- heartbeat / daemon_alive ------------------------------------------------
@@ -173,7 +106,16 @@ def test_validate_prompt_gist_link_allowed_when_env_set(spool, monkeypatch):
     assert ok is True
 
 
-# ---- cmd_enqueue (CLI) --------------------------------------------------------
+# ---- cmd_enqueue / cmd_await (CLI over the store) ----------------------------
+#
+# cmd_enqueue creates a store round; cmd_await polls it. Both import cgc_backend lazily, which
+# imports cgc_store; the conftest fixtures pin CGC_STORE_DB into this test's tmp dir.
+
+def _store(spool):
+    sys.path.insert(0, SCRIPTS)
+    import cgc_store
+    return cgc_store
+
 
 def _enqueue_args(rid, prompt_file, **overrides):
     defaults = dict(
@@ -182,6 +124,7 @@ def _enqueue_args(rid, prompt_file, **overrides):
         kind="submit",
         project_url="https://chatgpt.com/",
         conversation="auto",
+        parent=None,
         model="Pro",
         out=None,
         poll=20,
@@ -195,73 +138,97 @@ def test_cmd_enqueue_secret_in_prompt_exits_2_and_does_not_queue(spool, tmp_path
     rid = _rid()
     prompt_file = tmp_path / "prompt.txt"
     prompt_file.write_text("here is my key AKIAABCDEFGHIJKLMNOP for github.com/acme/widgets")
-    args = _enqueue_args(rid, str(prompt_file))
-    code = spool.cmd_enqueue(args)
+    code = spool.cmd_enqueue(_enqueue_args(rid, str(prompt_file)))
     assert code == 2
-    assert not os.path.exists(spool.pending_path(rid))
+    sm = _store(spool)
+    with sm.Store() as s:
+        assert s.get_round(rid) is None, "a locally-refused prompt must never reach the store"
 
 
 def test_cmd_enqueue_public_link_exits_0_and_queues(spool, tmp_path):
     rid = _rid()
     prompt_file = tmp_path / "prompt.txt"
     prompt_file.write_text("please review https://github.com/acme/widgets")
-    args = _enqueue_args(rid, str(prompt_file))
-    code = spool.cmd_enqueue(args)
+    code = spool.cmd_enqueue(_enqueue_args(rid, str(prompt_file)))
     assert code == 0
-    assert os.path.exists(spool.pending_path(rid))
-    st = spool.read_status(rid)
-    assert st["state"] == "queued"
+    sm = _store(spool)
+    with sm.Store() as s:
+        r = s.get_round(rid)
+    assert r is not None and r["state"] == "queued"
+    assert r["rendered_prompt"] == "please review https://github.com/acme/widgets"
 
 
-# ---- cmd_await (CLI state machine) -------------------------------------------
+def test_cmd_enqueue_same_rid_twice_refuses(spool, tmp_path, capsys):
+    rid = _rid("dd0001")
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("please review https://github.com/acme/widgets")
+    assert spool.cmd_enqueue(_enqueue_args(rid, str(prompt_file))) == 0
+    assert spool.cmd_enqueue(_enqueue_args(rid, str(prompt_file))) == 2
+    assert "already_enqueued" in capsys.readouterr().err
+
+
+# ---- cmd_await (CLI over the store) ------------------------------------------
 
 def _await_args(rid, out, timeout=1, poll=0.05):
     return argparse.Namespace(rid=rid, out=out, poll=poll, timeout=timeout)
 
 
-def test_cmd_await_done_state_exits_0(spool, tmp_path, monkeypatch):
+def _terminal_round(spool, rid, state, **fields):
+    sm = _store(spool)
+    with sm.Store() as s:
+        s.create_round(rid, "submit", prompt="p https://github.com/acme/widgets")
+        s.set_state(rid, sm.READY)
+        if state == sm.READY:
+            return
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="t")
+        if state == sm.BLOCKED:
+            s.set_state(rid, sm.BLOCKED, expect=sm.SENDING, **fields)
+            return
+        s.mark_accepted(aid, "conv-t")
+        s.mark_waiting(rid)
+        if state in (sm.COMPLETED_VERIFIED, sm.COMPLETED_UNVERIFIED):
+            s.finish(rid, state, **fields)
+        elif state == sm.FAILED:
+            s.set_state(rid, sm.FAILED, **fields)
+
+
+def test_cmd_await_verified_answer_exits_0_and_materializes(spool, tmp_path, monkeypatch):
     monkeypatch.setattr(spool, "daemon_alive", lambda: True)
     rid = _rid()
     out = tmp_path / "answer.txt"
-    out.write_text("the answer")
-    spool.write_status(rid, "done", exit=0, out=str(out))
+    _terminal_round(spool, rid, _store(spool).COMPLETED_VERIFIED, result_text="the answer")
     code = spool.cmd_await(_await_args(rid, str(out)))
     assert code == 0
+    assert out.read_text() == "the answer", "the store's result must be materialized to --out"
 
 
-def test_cmd_await_blocker_state_exits_3(spool, tmp_path, monkeypatch):
+def test_cmd_await_blocked_exits_3(spool, tmp_path, monkeypatch):
     monkeypatch.setattr(spool, "daemon_alive", lambda: True)
     rid = _rid()
-    out = tmp_path / "answer.txt"
-    spool.write_status(rid, "blocker", exit=3, out=str(out))
-    code = spool.cmd_await(_await_args(rid, str(out)))
-    assert code == 3
+    _terminal_round(spool, rid, _store(spool).BLOCKED, error_code="login_needed")
+    assert spool.cmd_await(_await_args(rid, str(tmp_path / "a.txt"))) == 3
 
 
-def test_cmd_await_no_answer_and_error_both_exit_1(spool, tmp_path, monkeypatch):
-    """One outcome, not two. "the daemon finished and produced nothing" and "the daemon errored"
-    differ in cause but not in what the caller does next — read the log — so they are one code."""
+def test_cmd_await_failed_exits_1(spool, tmp_path, monkeypatch):
     monkeypatch.setattr(spool, "daemon_alive", lambda: True)
-    for state in ("no_answer", "error"):
-        rid = _rid()
-        out = tmp_path / f"{state}.txt"
-        spool.write_status(rid, state, out=str(out))
-        assert spool.cmd_await(_await_args(rid, str(out))) == 1, state
+    rid = _rid()
+    _terminal_round(spool, rid, _store(spool).FAILED, error_code="wait failed")
+    assert spool.cmd_await(_await_args(rid, str(tmp_path / "a.txt"))) == 1
 
 
 def test_await_keeps_waiting_while_a_live_daemon_works_the_job(spool, tmp_path, monkeypatch):
     """The normal path for a GPT-5.6 Pro consult: still reasoning. Waiting longer is the waiter's
-    job, so it must NOT return — this used to exit 5, turning every healthy round into something
-    the caller had to notice and manually retry."""
+    job, so it must NOT return early — that would turn every healthy round into something the
+    caller had to notice and manually retry."""
     monkeypatch.setattr(spool, "daemon_alive", lambda: True)
     rid = _rid()
-    out = tmp_path / "answer.txt"
-    spool.write_status(rid, "processing", out=str(out))
+    sm = _store(spool)
+    with sm.Store() as s:
+        s.create_round(rid, "submit", prompt="p")   # queued, being worked
+    import cgc_backend
     slept = []
-    monkeypatch.setattr(spool.time, "sleep", lambda n: slept.append(n))
-    # A deadline far out: it must still be looping (not returning) after many polls.
-    a = _await_args(rid, str(out), timeout=0.5, poll=0.01)
-    spool.cmd_await(a)
+    monkeypatch.setattr(cgc_backend.time, "sleep", lambda n: slept.append(n))
+    spool.cmd_await(_await_args(rid, str(tmp_path / "a.txt"), timeout=0.5, poll=0.01))
     assert len(slept) > 1, "the waiter must keep polling a healthy in-flight consult"
 
 
@@ -270,10 +237,10 @@ def test_await_declares_stuck_not_slow_when_the_deadline_passes(spool, tmp_path,
     so the message must send the caller to the log instead of inviting another wait."""
     monkeypatch.setattr(spool, "daemon_alive", lambda: True)
     rid = _rid()
-    out = tmp_path / "answer.txt"
-    spool.write_status(rid, "processing", out=str(out))
-    code = spool.cmd_await(_await_args(rid, str(out), timeout=0.05, poll=0.01))
-    assert code == 1
+    sm = _store(spool)
+    with sm.Store() as s:
+        s.create_round(rid, "submit", prompt="p")
+    assert spool.cmd_await(_await_args(rid, str(tmp_path / "a.txt"), timeout=0.05, poll=0.01)) == 1
 
 
 
@@ -382,23 +349,14 @@ def test_repo_is_public_404_is_terminal_not_retried(spool, monkeypatch):
 
 # ---- await: a daemon that dies mid-consult must terminate the wait -----------
 
-def test_await_gives_up_when_daemon_dies_mid_processing(spool, tmp_path, monkeypatch):
-    """The liveness guard used to switch OFF once the job reached `processing`. A daemon that died
-    after pickup therefore left every later await burning its full window and returning 5 = 'still
-    running, re-run me' — an unbounded loop over a job nobody was working."""
-    rid = _rid("aa0001")
-    spool.write_status(rid, "processing", out=str(tmp_path / "a.txt"))
-    monkeypatch.setattr(spool, "daemon_alive", lambda: False)
-    monkeypatch.setattr(spool, "DAEMON_GRACE_S", 0)
-    code = spool.cmd_await(_await_args(rid, str(tmp_path / "a.txt"), timeout=3))
-    assert code == 1
-
-
 def test_await_reports_a_dead_daemon_as_broken_not_as_still_running(spool, tmp_path, monkeypatch):
-    """A daemon that died mid-consult is the one case where "still running" would be a lie: nothing
-    is working the job, so waiting can never end. That must surface as broken."""
+    """A dead daemon is the one case where "still running" would be a lie: nothing is working the
+    round, so waiting can never end. That must surface as broken-with-next-step promptly — not as
+    the full STUCK window of silent polling."""
     rid = _rid("aa0002")
-    spool.write_status(rid, "processing", out=str(tmp_path / "b.txt"))
+    sm = _store(spool)
+    with sm.Store() as s:
+        s.create_round(rid, "submit", prompt="p")   # queued, nobody working it
     monkeypatch.setattr(spool, "daemon_alive", lambda: False)
     monkeypatch.setattr(spool, "DAEMON_GRACE_S", 0)
     assert spool.cmd_await(_await_args(rid, str(tmp_path / "b.txt"), timeout=3)) == 1
@@ -465,51 +423,7 @@ def test_allowlist_never_exempts_secrets(spool, monkeypatch):
     assert ok is False and "AWS access key id" in why
 
 
-# ---- one id, one worker ------------------------------------------------------
-#
-# Re-enqueuing a rid that was already being worked put two workers on one id. They share a status
-# file, an answer path and a job log, so they overwrite each other and the log reads as a single
-# incoherent stream — observed live: a superseded worker wrote `error` while the current one was
-# still happily generating, and the job looked dead when it was fine.
-
-def _enq_args(spool, rid, prompt_file):
-    return argparse.Namespace(rid=rid, prompt_file=str(prompt_file), kind="submit",
-                              project_url="https://chatgpt.com/", conversation="auto",
-                              model="Pro", out=None, poll=20, timeout=spool.STUCK_AFTER_S)
-
-
-def test_enqueue_refuses_a_rid_that_already_has_a_live_worker(spool, tmp_path, capsys):
-    rid = _rid("bb0001")
-    pf = tmp_path / "p.md"
-    pf.write_text("review https://github.com/acme/widgets", encoding="utf-8")
-    spool.write_status(rid, "processing", worker_pid=os.getpid())   # this process is alive
-    assert spool.cmd_enqueue(_enq_args(spool, rid, pf)) == 2
-    assert "already_running" in capsys.readouterr().err
-
-
-def test_enqueue_allows_a_rid_whose_worker_is_gone(spool, tmp_path):
-    """A dead worker is exactly the recovery case; it must not be mistaken for a live one."""
-    rid = _rid("bb0002")
-    pf = tmp_path / "p.md"
-    pf.write_text("review https://github.com/acme/widgets", encoding="utf-8")
-    spool.write_status(rid, "processing", worker_pid=2 ** 22)
-    assert spool.cmd_enqueue(_enq_args(spool, rid, pf)) == 0
-
-
-def test_a_superseded_worker_cannot_record_the_jobs_outcome(spool, tmp_path):
-    """The live failure: a worker whose tab was pulled away by a browser restart reported its own
-    error as the job's result while the current worker was still generating."""
-    rid = _rid("bb0003")
-    spool.write_status(rid, "processing", worker_pid=os.getpid())   # current owner = this process
-    # a DIFFERENT, superseded worker tries to terminalise it
-    import unittest.mock as _m
-    with _m.patch.object(spool.os, "getpid", return_value=999999):
-        spool.finish_job(rid, state="error", exit=2, msg="my tab died")
-    assert spool.read_status(rid)["state"] == "processing", "stale worker must not win"
-
-
-def test_the_current_owner_can_still_finish_normally(spool, tmp_path):
-    rid = _rid("bb0004")
-    spool.write_status(rid, "processing", worker_pid=os.getpid())
-    spool.finish_job(rid, state="done", exit=0, msg="answer retrieved")
-    assert spool.read_status(rid)["state"] == "done"
+# One id, one worker: in the store this is structural, not fenced by pids — a duplicate rid is a
+# primary-key refusal at enqueue (test_cmd_enqueue_same_rid_twice_refuses above), atomic claim_ready
+# gives a round to exactly one worker (test_daemon), and terminal states are immutable so a
+# superseded worker cannot overwrite an outcome (test_store).
