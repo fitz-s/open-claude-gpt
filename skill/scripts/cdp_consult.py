@@ -1144,7 +1144,11 @@ def _await_contract(c, rid):
     return "selector_drift", adapter, detail
 
 
-_JS_RID_IN_MAIN = """(function(r){var m=document.querySelector('main')||document.body;
+# No <main>, no proof. A body-wide fallback would fire in exactly the situation this exists for —
+# the adapters are blind because ChatGPT's DOM moved, and the same move could drop this element —
+# silently restoring the whole-body scan that matches our rid in the sidebar of tabs that never held
+# it. An unreadable page is an unproven one.
+_JS_RID_IN_MAIN = """(function(r){var m=document.querySelector('main');
   return !!m && (m.innerText||'').indexOf(r)>=0;})(%s)"""
 
 
@@ -2107,7 +2111,9 @@ def _is_canonical(conversation) -> bool:
     """cgc_spool's canonical-id law, borrowed. Lazy import keeps cdp_consult standalone-runnable;
     unavailable means we cannot vouch for the shape, so it does not pass."""
     try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        _here = os.path.dirname(os.path.abspath(__file__))
+        if _here not in sys.path:
+            sys.path.insert(0, _here)
         import cgc_spool as _spool
         return _spool.is_canonical_conversation(conversation)
     except Exception:

@@ -351,10 +351,16 @@ def _evidence() -> tuple:
         with store_mod.Store() as s:
             convs, hold = set(), []
             for rid in s.recover()["uncertain"]:
+                # ONE rule: evidence expires. An addressed tab costs one tab per round rather than
+                # the whole sweep, but `possibly_accepted` has no automatic exit, so pinning it
+                # forever leaks the same browser one round at a time — the aggregate is the outage
+                # the bound exists to prevent, just on a slower clock.
+                if _age_s(s.get_round(rid)) >= _EVIDENCE_HOLD_S:
+                    continue
                 conv = s.conversation_of(rid)
                 if conv:
                     convs.add(conv)
-                elif _age_s(s.get_round(rid)) < _EVIDENCE_HOLD_S:
+                else:
                     hold.append(rid)
             return convs, hold
     except Exception as e:
@@ -412,7 +418,17 @@ def _sweep_tabs(protect_convs=(), hold=()) -> int:
         pages = [t for t in info if t.get("type") == "page"]
         if len(pages) <= 1:
             return 0
-        doomed = [t for t in pages[1:] if _tab_conversation(t.get("url")) not in protect_convs]
+        # A tab whose URL cannot be read (mid-navigation, a target reporting about:blank) is
+        # UNIDENTIFIABLE, not unowned — sweeping it while any conversation is protected would
+        # destroy the very evidence the protection exists to keep. Every other decision here fails
+        # closed; so does this one. With nothing to protect, an unreadable tab is just litter.
+        def _protected(t):
+            url = t.get("url")
+            if not url:
+                return bool(protect_convs)
+            return _tab_conversation(url) in protect_convs
+
+        doomed = [t for t in pages[1:] if not _protected(t)]
         if not doomed:
             return 0
         ver = json.load(urllib.request.urlopen(f"{base}/json/version", timeout=5))
