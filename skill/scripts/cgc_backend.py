@@ -652,14 +652,22 @@ def _await_round(a) -> int:
             # mistaken for this round's answer).
             with store_mod.Store() as _s:
                 conv = _s.conversation_of(a.rid)
+            # With no conversation recorded there is still one thing to try before a human reads the
+            # screen: the rid is inside the prompt that was sent, so an open tab carrying it IS this
+            # round's thread. That search is read-only and cannot duplicate anything.
+            cdp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cdp_consult.py")
             retrieve = (f"python3 {_spool.__file__} enqueue --rid <new-rid> --kind retrieve "
-                       f"--conversation {conv} --parent {a.rid}") if conv else None
+                        f"--conversation {conv} --parent {a.rid}") if conv else (
+                        f"python3 {cdp} find-conversation --rid {a.rid}")
             sys.stderr.write(
                 f"CGC_UNCERTAIN {a.rid}: the send may have reached ChatGPT but was not confirmed "
                 f"({r['error_code'] or 'unknown'}). NOT auto-resent to avoid a duplicate consult — "
-                + (f"retrieve it:\n  {retrieve}\n" if retrieve else
-                   "check the ChatGPT window before re-sending (no conversation was recorded to "
-                   "retrieve from).\n"))
+                + (f"retrieve it:\n  {retrieve}\n" if conv else
+                   "no conversation was captured, so first ASK THE BROWSER which thread holds this "
+                   f"rid (read-only, sends nothing):\n  {retrieve}\n"
+                   "If it names a conversation, retrieve from it (enqueue --kind retrieve "
+                   f"--conversation <id> --parent {a.rid}); if it finds none, a human must look at "
+                   "the ChatGPT window before any re-send.\n"))
             _emit(a.rid, state, retryable=False, parent_rid=parent,
                   human_action="check the ChatGPT window; retrieve by conversation before re-sending",
                   next_command=retrieve, error=r["error_code"])
@@ -803,12 +811,12 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                                           f"{_EXIT_NOT_SENT_PRECLICK}): {(sub.get('stderr') or '').strip()[:300]}")
         return store_mod.FAILED
 
-    if conv:
+    if conv and sub.get("code") == 0:
         store.mark_accepted(attempt, conv)
         store.mark_waiting(rid)
         return _wait_phase(store, rid, conv, spec, run_cdp)
 
-    # No conversation → the click did not confirm. Distinguish PROVEN-not-sent from uncertain.
+    # The click did not confirm. Distinguish PROVEN-not-sent from uncertain.
     if any(m.lower() in stderr for m in _NOT_SENT_BLOCK):
         store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
                         error_code=_first_marker(stderr, _NOT_SENT_BLOCK))
@@ -818,7 +826,20 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         store.set_state(rid, store_mod.QUEUED, expect=store_mod.SENDING,
                         error_code=_first_marker(stderr, _NOT_SENT_RETRY))
         return store_mod.QUEUED
-    store.mark_possibly_accepted(attempt, f"submit gave no conversation (exit {sub.get('code')})")
+    # UNCERTAIN. A conversation reported by a FAILING submit is an address, not a confirmation (the
+    # driver reports one whenever the post-click tab sits in a thread, including a reused tab it was
+    # already in), so the state stays possibly_accepted — but recording it is what makes this round
+    # retrievable read-only (recover()'s `retrievable` bucket, verified by its own END_RESPONSE
+    # sentinel) instead of the dead end that forced a human to copy the answer out of the window by
+    # hand. Linked ONLY here: on the proven-not-sent branches above the round is re-queued, and a
+    # thread pinned from a send that never happened would follow it into its next attempt.
+    if conv:
+        store.link_conversation(rid, conv)
+    store.mark_possibly_accepted(
+        attempt,
+        f"submit did not confirm the send (exit {sub.get('code')})"
+        + (f"; conversation {conv} recorded for read-only retrieval" if conv else
+           "; no conversation captured"))
     return store_mod.POSSIBLY_ACCEPTED
 
 
@@ -887,6 +908,15 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
         unverified = os.path.exists(answer_path + ".raw")
         store.finish(rid, store_mod.COMPLETED_UNVERIFIED if unverified else store_mod.COMPLETED_VERIFIED,
                      result_text=answer)
+        if is_retrieve and wait_rid and wait_rid != rid and not unverified:
+            # The waiter matched END_RESPONSE:<wait_rid> on the thread — proof that the SOURCE
+            # round's send landed and that this is its answer. Close the source with it; leaving it
+            # uncertain with its answer already in hand is a lie the next reader has to re-litigate
+            # (and, since uncertainty holds the tab sweep, one that keeps costing). Only a verified
+            # sentinel may do this: an unwrapped salvage cannot prove which turn it came from.
+            if store.adopt_retrieved_answer(wait_rid, answer):
+                sys.stderr.write(f"CGC_RECONCILED {wait_rid}: resolved from retrieve {rid} "
+                                 "(sentinel-verified on the thread).\n")
         return store_mod.COMPLETED_UNVERIFIED if unverified else store_mod.COMPLETED_VERIFIED
     if code == 3:
         store.set_state(rid, store_mod.BLOCKED, error_code=(res.get("stderr") or "blocker")[:200])

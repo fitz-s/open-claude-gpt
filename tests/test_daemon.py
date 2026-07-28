@@ -623,3 +623,30 @@ def test_flock_fails_closed_when_fcntl_is_unavailable(daemon, monkeypatch):
         daemon.spool.acquire_browser_lease(shared=True)
     with pytest.raises(RuntimeError, match="fcntl"):
         daemon.spool.acquire_daemon_singleton(timeout=0)
+
+
+def test_tab_sweep_holds_while_a_round_is_uncertain(daemon, monkeypatch):
+    """The evidence contradiction: `unknown_send` leaves its tab open ON PURPOSE — it is the only
+    record of whether the prompt went — and the sweep, whose lease only proves 'no live worker',
+    used to close it a minute later. A round with no worker is not an unowned tab."""
+    import io
+    monkeypatch.setattr(
+        daemon.urllib.request, "urlopen",
+        lambda *a, **k: io.BytesIO(json.dumps(
+            [{"type": "page", "id": "A"}, {"type": "page", "id": "B"}]).encode()))
+    # two tabs: without the guard this sweep closes one
+    assert daemon._sweep_tabs(["REQ-20260707-120000-00u001"]) == 0
+
+
+def test_uncertain_rids_fails_closed_when_the_store_cannot_be_read(daemon, monkeypatch):
+    """Unable to read the store is unable to prove a tab is not evidence."""
+    class Boom:
+        def __enter__(self): raise RuntimeError("db gone")
+        def __exit__(self, *a): return False
+    monkeypatch.setattr(daemon.store_mod, "Store", lambda *a, **k: Boom())
+    assert daemon._uncertain_rids(), "must report SOMETHING uncertain, so the sweep holds"
+
+
+def test_maintenance_sweep_is_passed_the_uncertain_rounds(daemon):
+    import inspect
+    assert "_sweep_tabs(_uncertain_rids())" in inspect.getsource(daemon.run_loop)

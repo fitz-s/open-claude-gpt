@@ -737,6 +737,37 @@ class Store:
         self.set_state(rid, state, result_text=result_text, error_code=error_code,
                        completion_confidence=confidence)
 
+    def adopt_retrieved_answer(self, rid: str, result_text: str) -> bool:
+        """Close an uncertain round with the answer a VERIFIED retrieve just proved is its own.
+
+        The retrieve waiter matched END_RESPONSE:<rid> on the thread, which settles both open
+        questions at once: the send DID land, and this text is what it produced. Without carrying
+        that proof back, a round stays uncertain forever with its answer already in hand — and an
+        uncertain round is not free, it holds the tab sweep and keeps offering itself as unfinished
+        business to every human who reads `status`. Returns False if the round is already terminal
+        (someone resolved it first); a still-`sending` round is NOT adopted — its own live attempt
+        owns the row.
+
+        Only ever called with a sentinel-VERIFIED answer: an unwrapped salvage cannot prove which
+        turn it came from, so it must not close a round that no worker confirmed."""
+        with self._tx():
+            row = self.db.execute("SELECT state FROM rounds WHERE rid=?", (rid,)).fetchone()
+            if row is None or row["state"] in TERMINAL or row["state"] == SENDING:
+                return False
+            if row["state"] != WAITING:
+                # Every non-terminal, non-sending state (ready/accepted/possibly_accepted) has a
+                # legal edge to WAITING — take it rather than inventing a shortcut edge into a
+                # terminal, so the transition table stays the one description of the lifecycle.
+                if WAITING not in _LEGAL.get(row["state"], set()):
+                    return False
+                self._apply_round_fields(rid, state=WAITING)
+                self._event("state", rid=rid,
+                            detail=f"{row['state']} -> {WAITING} (retrieve proved the send landed)")
+            self._apply_round_fields(rid, state=COMPLETED_VERIFIED, result_text=result_text,
+                                     completion_confidence="verified")
+            self._event("state", rid=rid, detail=f"-> {COMPLETED_VERIFIED} (adopted from retrieve)")
+        return True
+
     def gate_reject(self, rid: str, reason: str) -> None:
         self.set_state(rid, GATE_REJECTED, error_code=reason)
 
@@ -773,6 +804,31 @@ class Store:
                 if s == POSSIBLY_ACCEPTED and self.conversation_of(rid) and not self.was_auto_retrieved(rid):
                     out["retrievable"].append(rid)
         return out
+
+    def link_conversation(self, rid: str, conversation_id: str) -> None:
+        """Record WHERE a round lives without claiming anything about whether its send landed.
+
+        `mark_accepted` couples those two facts, but an uncertain send needs them apart: the click is
+        unconfirmed while the conversation is known, and it is precisely that pairing which makes the
+        round retrievable (read-only, verified by its own END_RESPONSE sentinel) instead of a dead end
+        a human has to resolve by hand. State is untouched, so this can never launder an unconfirmed
+        send into a confirmed one."""
+        now = _now()
+        with self._tx():
+            r = self.db.execute("SELECT state,thread_id FROM rounds WHERE rid=?", (rid,)).fetchone()
+            if r is None:
+                raise IllegalTransition(f"{rid}: no such round")
+            if r["state"] in TERMINAL:
+                raise IllegalTransition(f"{rid}: {r['state']!r} is terminal — no further writes")
+            tid = r["thread_id"] or conversation_id
+            self.db.execute(
+                "INSERT OR IGNORE INTO threads(thread_id,conversation_id,created_at,updated_at) "
+                "VALUES(?,?,?,?)", (tid, conversation_id, now, now))
+            self.db.execute("UPDATE threads SET conversation_id=?,updated_at=? WHERE thread_id=?",
+                            (conversation_id, now, tid))
+            if not r["thread_id"]:
+                self.db.execute("UPDATE rounds SET thread_id=? WHERE rid=?", (tid, rid))
+            self._event("conversation_linked", rid=rid, detail=conversation_id)
 
     def conversation_of(self, rid: str) -> str | None:
         """The ChatGPT conversation id addressable for this round via its thread, or None."""

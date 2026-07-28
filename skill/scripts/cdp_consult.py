@@ -1144,6 +1144,27 @@ def _await_contract(c, rid):
     return "selector_drift", adapter, detail
 
 
+def _send_proven_by_url(before_conv, after_conv) -> bool:
+    """Did the URL alone prove this click sent something?
+
+    ChatGPT mints a conversation when a message is SENT and at no other time, so a tab that held no
+    thread before the click and holds one after it has sent. Anything else proves nothing: a reused
+    tab was already in its thread (sending does not change the id), and a before->different-after
+    jump is navigation, not our send."""
+    return bool(after_conv) and not before_conv
+
+
+def _poll_conversation(c, seconds=20.0):
+    """The attached tab's /c/<id>, waiting out the post-send URL transition (it lands a beat after
+    the message). '' if the tab never entered a conversation."""
+    end = time.time() + seconds
+    while True:
+        conv = c.conversation_id()
+        if conv or time.time() >= end:
+            return conv
+        time.sleep(0.5)
+
+
 def _write_private(path, text):
     """Write an answer/salvage file readable only by this user.
 
@@ -1426,6 +1447,13 @@ def cmd_submit(a) -> int:
                              "the same --request-key.\n")
             return EXIT_NOT_SENT_PRECLICK
         time.sleep(0.3)
+        # Pre-click thread identity. A fresh tab sits on /project with no /c/<id>; a reused tab may
+        # already be inside one. ChatGPT mints a conversation when a message is SENT and at no other
+        # time, so ""->/c/<id> across the click is send evidence that lives in the URL rather than in
+        # the DOM — the one witness that survives when the turn schema moves and the rid echo becomes
+        # unreadable. Captured here because after the click it is no longer distinguishable from a
+        # thread the tab was already in.
+        before_conv = c.conversation_id()
         # Submit. Prefer the send button; fall back to Enter. (POST-click from here: a failure past
         # this point is uncertain, never provably-not-sent.)
         clicked = c.eval(
@@ -1440,24 +1468,47 @@ def cmd_submit(a) -> int:
         # count to have grown past before_user_count there. A fresh tab always starts at 0,
         # so ">0" and "> before_user_count" are equivalent and new-tab behavior is unchanged.
         verdict, adapter, contract = _await_contract(c, a.rid)
+        # Post-click, the conversation id is the round's ADDRESS: every recovery path (retrieve,
+        # auto-retrieve, followup) is addressed by conversation, so a round that may have sent but
+        # carries no conversation is unrecoverable by construction — that is exactly how a live,
+        # still-generating answer once became a manual copy-paste. So resolve it on EVERY post-click
+        # outcome, not just the clean one, and report it in every envelope below.
+        conv = _poll_conversation(c)
+        if verdict == "unknown_send" and _send_proven_by_url(before_conv, conv):
+            # The rid echo is unreadable, but the tab moved from "no thread" into one. Only a sent
+            # message does that, so the send DID land; the reader, not the send, is what failed.
+            # Downgrading this to `unknown_send` would strand a confirmed consult as uncertain —
+            # and the waiter re-verifies END_RESPONSE:<rid> anyway, so nothing here is taken on
+            # trust that the answer itself won't have to prove.
+            sys.stderr.write(
+                f"CGC_WARN rid_echo_unreadable: no turn schema showed BEGIN_RESPONSE:{a.rid}, but "
+                f"the tab entered conversation {conv} across the click (it had none before), which "
+                "only a sent message does. Treating the send as landed; the waiter still verifies "
+                f"END_RESPONSE:{a.rid}. The turn adapters need updating.\n")
+            verdict, adapter = "ok", adapter or "url_transition"
         if verdict == "unknown_send":
             # Deliberately NOT close_tab(): this outcome exists because a human has to look
             # at this window to see whether the prompt actually went. Closing it destroys
             # the only evidence. It is the one failure allowed to leave a tab behind.
             c.close()
             print(json.dumps({"ok": False, "submitted": None, "rid": a.rid,
-                              "reason": "unknown_send", "contract": contract}))
+                              "reason": "unknown_send", "contract": contract,
+                              "conversation_id": conv}))
             sys.stderr.write(
                 "CGC_ERROR unknown_send: clicked send, but no known turn schema shows a user turn "
                 f"carrying BEGIN_RESPONSE:{a.rid} within {_RID_LANDED_S}s. This does NOT prove the "
                 "prompt was not sent, so it will NOT be resent automatically — a duplicate would "
                 "cost another full round. A human should look at the ChatGPT window.\n"
-                f"observed: {json.dumps(contract)}\n")
+                + (f"The tab is in conversation {conv} (it was already there before the click, so "
+                   "this is an address, not proof) — retrieve from it before considering a resend.\n"
+                   if conv else "")
+                + f"observed: {json.dumps(contract)}\n")
             return 3
         if verdict == "selector_drift":
             c.close_tab()   # the send is confirmed and the conversation persists server-side
             print(json.dumps({"ok": False, "submitted": True, "rid": a.rid,
-                              "reason": "selector_drift", "adapter": adapter, "contract": contract}))
+                              "reason": "selector_drift", "adapter": adapter, "contract": contract,
+                              "conversation_id": conv}))
             sys.stderr.write(
                 f"CGC_ERROR selector_drift: the prompt WAS sent (its rid is in a {adapter} user "
                 f"turn), but no assistant turn or generating indicator is recognizable within "
@@ -1466,19 +1517,11 @@ def cmd_submit(a) -> int:
                 f"observed: {json.dumps(contract)}\n")
             return 1
         n, ok = 1, True
-        # The URL transitions /project -> /c/<id> a beat after the message sends; poll for it.
-        # SUBMIT-RACE: a submit that reports ok=true with no captured conversation id is worse
-        # than a clean failure — a later `wait`/`followup --conversation auto` would resolve to
-        # whatever OTHER tab/thread is active and silently answer the wrong request. So poll a
-        # little longer here (up to ~25s total) and, if still no conv id, fail closed: do NOT
-        # write active-thread state (that would point `auto` at a request with no known tab) and
-        # do NOT return success.
-        conv = ""
-        for _ in range(40):
-            conv = c.conversation_id()
-            if conv:
-                break
-            time.sleep(0.5)
+        # SUBMIT-RACE: a submit that reports ok=true with no captured conversation id is worse than a
+        # clean failure — a later `wait`/`followup --conversation auto` would resolve to whatever
+        # OTHER tab/thread is active and silently answer the wrong request. So if the URL never
+        # transitioned, fail closed: do NOT write active-thread state (that would point `auto` at a
+        # request with no known tab) and do NOT return success.
         if not ok:
             print(json.dumps({"ok": False, "userMsgs": n, "model": model_now,
                               "modelConfirmed": model_confirmed, "conversation_id": conv}))
@@ -2036,6 +2079,70 @@ def cmd_wait(a) -> int:
         c.close()
 
 
+def cmd_find_conversation(a) -> int:
+    """Read-only: which open ChatGPT tab is carrying this rid?
+
+    The recovery for an uncertain send is addressed BY CONVERSATION, so a round whose submit never
+    captured one has nothing to retrieve from even while its answer is generating in a visible tab.
+    This is the search that closes that gap: the rid is inside the prompt we sent, so a tab whose
+    text carries it IS this round's thread. Scans only — it never sends, clicks, or navigates, so it
+    cannot duplicate a consult.
+
+    Best-effort by construction: ChatGPT virtualizes long threads, so a rid scrolled far out of the
+    DOM can be missed. A miss is reported as a miss, never as 'the consult was not sent'."""
+    base = f"http://127.0.0.1:{a.port}"
+    try:
+        info = json.load(urllib.request.urlopen(f"{base}/json", timeout=5))
+    except Exception as e:
+        sys.stderr.write(f"CGC_ERROR browser_unreachable: no debug Chrome on port {a.port} "
+                         f"({type(e).__name__}) — nothing to search.\n")
+        return 1
+    convs, seen = [], set()
+    for t in info:
+        if t.get("type") != "page":
+            continue
+        u = urllib.parse.urlparse(t.get("url") or "")
+        h = (u.hostname or "").lower()
+        if not (h == "chatgpt.com" or h.endswith(".chatgpt.com")):
+            continue
+        m = re.search(r"(?:^|/)c/([0-9a-f-]+)(?:/|$)", u.path)
+        if m and m.group(1) not in seen:
+            seen.add(m.group(1))
+            convs.append(m.group(1))
+    hits = []
+    for conv in convs:
+        try:
+            c = CDP(a.port, match=conv)
+        except SystemExit:
+            continue
+        try:
+            found = c.eval("(function(){var r=%s;return (document.title||'').indexOf(r)>=0 || "
+                           "(document.body?document.body.innerText:'').indexOf(r)>=0;})()"
+                           % json.dumps(a.rid))
+            if found:
+                hits.append(conv)
+        except Exception:
+            pass
+        finally:
+            c.close()
+    print(json.dumps({"rid": a.rid, "scanned": convs, "conversations": hits}))
+    if not hits:
+        sys.stderr.write(
+            f"CGC_ERROR rid_not_on_any_open_tab: scanned {len(convs)} ChatGPT conversation tab(s); "
+            f"none shows {a.rid}. This does NOT prove the prompt was never sent (a closed tab, or a "
+            "virtualized thread that scrolled the turn out of the DOM, looks identical) — open "
+            "ChatGPT's history and look before re-sending.\n")
+        return 1
+    if len(hits) > 1:
+        sys.stderr.write(f"CGC_ERROR ambiguous_rid: {a.rid} appears in {len(hits)} conversations "
+                         f"({', '.join(hits)}) — a human must pick.\n")
+        return 1
+    sys.stderr.write(f"CGC_FOUND {a.rid} is in conversation {hits[0]}. Retrieve it read-only:\n"
+                     f"  python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cgc_spool.py')}"
+                     f" enqueue --rid <new-rid> --kind retrieve --conversation {hits[0]} --parent {a.rid}\n")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="cdp_consult.py")
     p.add_argument("--port", type=int, default=CGC_PORT)
@@ -2048,6 +2155,12 @@ def main() -> int:
                                  "holds a non-empty answer, status reports done/retrieved instead of "
                                  "erroring conversation_not_found")
     s.set_defaults(fn=cmd_status)
+
+    fc = sub.add_parser("find-conversation",
+                        help="read-only: find which open ChatGPT tab carries this rid (recovery for "
+                             "an uncertain send whose conversation id was never captured)")
+    fc.add_argument("--rid", required=True)
+    fc.set_defaults(fn=cmd_find_conversation)
 
     su = sub.add_parser("submit")
     su.add_argument("--rid", required=True)
