@@ -888,6 +888,19 @@ def _read_answer(path) -> str:
         return ""
 
 
+def _no_live_worker(rid: str) -> bool:
+    """Is nobody else working this round? The retrieve holds only its OWN rid lease, so the round it
+    is about to resolve is unfenced: the daemon's one-shot auto-retrieve can be mid-wait on the very
+    round a human-enqueued retrieve just recovered. Terminalising it under that worker turns its own
+    `finish` into an IllegalTransition traceback — the data stays right, the log looks like
+    corruption. Probing the lease is what makes the two paths mutually exclusive."""
+    try:
+        import cgc_spool as _spool
+        return _spool.rid_lease_free(rid)
+    except Exception:
+        return False   # cannot prove it is free → do not touch it
+
+
 def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=False) -> str:
     out_tmp = os.path.join(store_mod.CGC_STATE_DIR, f"_wait_{rid}.txt")
     # Clear any stale answer + .raw sidecar from a PRIOR wait on this rid (e.g. a timed-out first
@@ -908,7 +921,8 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
         unverified = os.path.exists(answer_path + ".raw")
         store.finish(rid, store_mod.COMPLETED_UNVERIFIED if unverified else store_mod.COMPLETED_VERIFIED,
                      result_text=answer)
-        if is_retrieve and wait_rid and wait_rid != rid and not unverified:
+        if (is_retrieve and wait_rid and wait_rid != rid and not unverified
+                and _no_live_worker(wait_rid)):
             # The waiter matched END_RESPONSE:<wait_rid> on the thread — proof that the SOURCE
             # round's send landed and that this is its answer. Close the source with it; leaving it
             # uncertain with its answer already in hand is a lie the next reader has to re-litigate

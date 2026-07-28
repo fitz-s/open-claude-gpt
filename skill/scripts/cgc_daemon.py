@@ -36,13 +36,16 @@ Flags:
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 # All urllib targets here are the loopback CDP endpoint (127.0.0.1:CGC_PORT). Loopback must never
@@ -89,7 +92,12 @@ def _make_run_cdp():
         if kind == "submit":
             cmd = [sys.executable, _CDP, "submit", "--rid", kw["rid"], "--prompt-file", "-",
                    "--project-url", kw["project_url"], "--model", kw["model"]]
-            code, so, se = _run(cmd, 240, kw["rid"], stdin_text=kw["prompt"], pass_fds=fds)
+            # 300s, not 240: a submit's worst case is composer wait (60) + model select + paste +
+            # the two contract windows (10+45) + the conversation-id poll (20), and that poll now
+            # runs on the FAILURE paths too — where the id it captures is the only thing that makes
+            # the round recoverable. A kill here loses stdout, which is exactly how the round this
+            # budget protects became unrecoverable in the first place.
+            code, so, se = _run(cmd, 300, kw["rid"], stdin_text=kw["prompt"], pass_fds=fds)
             conv = ""
             try:
                 conv = (json.loads(so.strip().splitlines()[-1]) if so.strip() else {}).get(
@@ -322,27 +330,68 @@ def _sweep_ownerless_sending(children: dict, reason: str) -> list:
     return promoted
 
 
-def _uncertain_rids() -> list:
-    """Rounds whose send may have reached ChatGPT and is not confirmed. Their tabs are evidence."""
+# How long a round that is uncertain AND has no conversation may stop the sweep. It is the window in
+# which a human can still look at the window and say what happened; past it, a tab nobody has claimed
+# is worth less than a browser that can still open one. Bounded on purpose: an unreconciled round is
+# a permanent state (possibly_accepted's only exits are human/recovery-driven), so an unbounded hold
+# would let one stranded round silently disable every future consult — the exact failure the sweep
+# exists to prevent.
+_EVIDENCE_HOLD_S = 6 * 3600
+
+
+def _evidence() -> tuple:
+    """(conversations to protect, rids holding the sweep).
+
+    Two different kinds of evidence. A tab whose conversation belongs to an uncertain round is
+    protected INDIVIDUALLY and forever — it is precisely addressable, so keeping it costs one tab and
+    blocks nothing. A recent uncertain round with NO conversation is the hard case (the incident):
+    nothing identifies its tab, so the only way to keep it is to keep them all — that one holds the
+    whole sweep, and only for _EVIDENCE_HOLD_S."""
     try:
         with store_mod.Store() as s:
-            return s.recover()["uncertain"]
+            convs, hold = set(), []
+            for rid in s.recover()["uncertain"]:
+                conv = s.conversation_of(rid)
+                if conv:
+                    convs.add(conv)
+                elif _age_s(s.get_round(rid)) < _EVIDENCE_HOLD_S:
+                    hold.append(rid)
+            return convs, hold
     except Exception as e:
         # Fail CLOSED: unable to read the store means unable to prove a tab is not evidence.
         sys.stderr.write(f"CGC_DAEMON uncertain-round check failed ({type(e).__name__}); "
                          "treating tabs as evidence\n")
-        return ["<store-unreadable>"]
+        return set(), ["<store-unreadable>"]
 
 
-def _sweep_tabs(uncertain=()) -> int:
+def _age_s(round_row) -> float:
+    """Seconds since the round last moved. Unparseable timestamps read as fresh — the safe direction
+    is to keep evidence, not to sweep it."""
+    try:
+        ts = datetime.datetime.fromisoformat(round_row["updated_at"])
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+        return (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds()
+    except Exception:
+        return 0.0
+
+
+def _tab_conversation(url) -> str:
+    """The /c/<id> a tab is showing, read from its PATH only (never the query/hash)."""
+    m = re.search(r"(?:^|/)c/([0-9a-f-]+)(?:/|$)", urllib.parse.urlparse(url or "").path)
+    return m.group(1) if m else ""
+
+
+def _sweep_tabs(protect_convs=(), hold=()) -> int:
     """Close leftover ChatGPT tabs. CALLER-GUARDED: call only under the EXCLUSIVE browser lease —
     unobtainable while any worker of any daemon generation is alive.
 
     "No live worker" is NOT the same as "unowned", and the gap is exactly one state: a round left
     UNCERTAIN has no worker and still owns its tab. `unknown_send` deliberately leaves that tab open
     because it is the only evidence of whether the prompt went — and this sweep used to close it a
-    minute later, turning a still-generating answer into an unrecoverable one. So the sweep holds
-    while any round is uncertain; those tabs are not litter, they are the recovery.
+    minute later, turning a still-generating answer into an unrecoverable one. So an uncertain
+    round's tab is spared: by conversation where one is known, and otherwise by holding the whole
+    sweep for a bounded window.
 
     Tabs accumulate. Fixing the leaks in submit's failure paths removes the known source, but not
     the one no code path can cover: a worker killed mid-send — by a daemon restart, say — never runs
@@ -350,9 +399,12 @@ def _sweep_tabs(uncertain=()) -> int:
     of them stops being able to start new ones, which is the failure that ends every consult (a
     freshly created tab that never answers Runtime.enable). One tab is kept, because the profile
     with zero windows is a worse state to leave the browser in than one with a spare."""
-    if uncertain:
-        sys.stderr.write(f"CGC_DAEMON tab sweep held: {len(uncertain)} uncertain round(s) "
-                         f"({', '.join(list(uncertain)[:3])}) — their tabs are the only send evidence\n")
+    if hold:
+        sys.stderr.write(
+            f"CGC_DAEMON tab sweep HELD: {len(hold)} uncertain round(s) with no conversation "
+            f"({', '.join(list(hold)[:3])}) — their tabs are the only send evidence. Tabs accumulate "
+            f"until they are reconciled or {_EVIDENCE_HOLD_S // 3600}h passes; reconcile them "
+            "(cdp_consult.py find-conversation --rid <rid>).\n")
         return 0
     try:
         base = f"http://127.0.0.1:{os.environ.get('CGC_PORT', '9333')}"
@@ -360,14 +412,20 @@ def _sweep_tabs(uncertain=()) -> int:
         pages = [t for t in info if t.get("type") == "page"]
         if len(pages) <= 1:
             return 0
+        doomed = [t for t in pages[1:] if _tab_conversation(t.get("url")) not in protect_convs]
+        if not doomed:
+            return 0
         ver = json.load(urllib.request.urlopen(f"{base}/json/version", timeout=5))
         bw = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=5)
-        for i, t in enumerate(pages[1:], start=1):
+        for i, t in enumerate(doomed, start=1):
             bw.send(json.dumps({"id": 900 + i, "method": "Target.closeTarget",
                                 "params": {"targetId": t["id"]}}))
         bw.close()
-        sys.stderr.write(f"CGC_DAEMON swept {len(pages) - 1} unowned browser tab(s)\n")
-        return len(pages) - 1
+        kept = len(pages) - 1 - len(doomed)
+        sys.stderr.write(f"CGC_DAEMON swept {len(doomed)} unowned browser tab(s)"
+                         + (f"; kept {kept} holding an uncertain round's conversation" if kept else "")
+                         + "\n")
+        return len(doomed)
     except Exception as e:
         sys.stderr.write(f"CGC_DAEMON tab sweep skipped: {type(e).__name__}\n")
         return 0
@@ -628,7 +686,7 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
                 if blease is not None:
                     try:
                         if websocket is not None:
-                            _sweep_tabs(_uncertain_rids())
+                            _sweep_tabs(*_evidence())
                         last_repair = _maybe_repair_browser(children, last_repair)
                     finally:
                         if hasattr(blease, "close"):

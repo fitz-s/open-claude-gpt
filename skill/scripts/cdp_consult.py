@@ -1144,14 +1144,34 @@ def _await_contract(c, rid):
     return "selector_drift", adapter, detail
 
 
-def _send_proven_by_url(before_conv, after_conv) -> bool:
-    """Did the URL alone prove this click sent something?
+_JS_RID_IN_MAIN = """(function(r){var m=document.querySelector('main')||document.body;
+  return !!m && (m.innerText||'').indexOf(r)>=0;})(%s)"""
 
-    ChatGPT mints a conversation when a message is SENT and at no other time, so a tab that held no
-    thread before the click and holds one after it has sent. Anything else proves nothing: a reused
-    tab was already in its thread (sending does not change the id), and a before->different-after
-    jump is navigation, not our send."""
-    return bool(after_conv) and not before_conv
+
+def _rid_in_main(c, rid) -> bool:
+    """Is this round's rid in the CONVERSATION region of the page?
+
+    Schema-independent on purpose: it is used exactly when the turn adapters failed, so it must not
+    depend on them. Scoped to <main> because ChatGPT renders the thread LIST in every tab's nav, and
+    a title derived from our own first message would otherwise match in tabs that never held it."""
+    try:
+        return bool(c.eval(_JS_RID_IN_MAIN % json.dumps(rid)))
+    except Exception:
+        return False
+
+
+def _send_proven_by_landing(before_conv, after_conv, rid_in_page) -> bool:
+    """Did this click provably send OUR prompt, without the turn adapters?
+
+    Two independent facts, both required. The tab entered a thread it did not hold before — ChatGPT
+    mints a conversation on send — AND our rid is rendered in that thread. The URL alone is not
+    enough and naming it proof was wrong: `location.pathname` moves on plain NAVIGATION into an
+    existing thread just as readily as on minting, so a no-op click plus any unrelated navigation
+    inside the poll window would have been read as a successful send, silencing the one failure that
+    is supposed to summon a human and pinning the global active-thread to a foreign conversation.
+    The rid is what makes the landing OURS. A reused tab (before_conv set) proves nothing either way
+    — sending does not change the id — so it stays uncertain."""
+    return bool(after_conv) and not before_conv and bool(rid_in_page)
 
 
 def _poll_conversation(c, seconds=20.0):
@@ -1453,7 +1473,14 @@ def cmd_submit(a) -> int:
         # the DOM — the one witness that survives when the turn schema moves and the rid echo becomes
         # unreadable. Captured here because after the click it is no longer distinguishable from a
         # thread the tab was already in.
-        before_conv = c.conversation_id()
+        # Caught, not raised: this read sits in the pre-click window, where an escaping CDP timeout
+        # would exit without the not_sent_preclick marker and turn a provably re-queueable round into
+        # an uncertain one. An unknown before-state costs only the URL upgrade below (which requires
+        # it to be empty), so failing it closed to "unknown" is strictly the safe direction.
+        try:
+            before_conv = c.conversation_id()
+        except Exception:
+            before_conv = "?unknown"
         # Submit. Prefer the send button; fall back to Enter. (POST-click from here: a failure past
         # this point is uncertain, never provably-not-sent.)
         clicked = c.eval(
@@ -1474,16 +1501,17 @@ def cmd_submit(a) -> int:
         # still-generating answer once became a manual copy-paste. So resolve it on EVERY post-click
         # outcome, not just the clean one, and report it in every envelope below.
         conv = _poll_conversation(c)
-        if verdict == "unknown_send" and _send_proven_by_url(before_conv, conv):
-            # The rid echo is unreadable, but the tab moved from "no thread" into one. Only a sent
-            # message does that, so the send DID land; the reader, not the send, is what failed.
-            # Downgrading this to `unknown_send` would strand a confirmed consult as uncertain —
-            # and the waiter re-verifies END_RESPONSE:<rid> anyway, so nothing here is taken on
-            # trust that the answer itself won't have to prove.
+        if verdict == "unknown_send" and _send_proven_by_landing(
+                before_conv, conv, _rid_in_main(c, a.rid)):
+            # The turn adapters are blind, but the thread is new AND our rid is rendered in it. That
+            # is the send, read without them; the reader, not the send, is what failed. Downgrading
+            # it to `unknown_send` would strand a confirmed consult as uncertain — and the waiter
+            # re-verifies END_RESPONSE:<rid> anyway, so nothing here is taken on trust that the
+            # answer itself won't have to prove.
             sys.stderr.write(
                 f"CGC_WARN rid_echo_unreadable: no turn schema showed BEGIN_RESPONSE:{a.rid}, but "
-                f"the tab entered conversation {conv} across the click (it had none before), which "
-                "only a sent message does. Treating the send as landed; the waiter still verifies "
+                f"the tab entered conversation {conv} across the click (it held none before) and "
+                f"{a.rid} is rendered in it. Treating the send as landed; the waiter still verifies "
                 f"END_RESPONSE:{a.rid}. The turn adapters need updating.\n")
             verdict, adapter = "ok", adapter or "url_transition"
         if verdict == "unknown_send":
@@ -1516,16 +1544,12 @@ def cmd_submit(a) -> int:
                 "replies — a tool defect, not a missing answer. Do not resend; fix the adapter.\n"
                 f"observed: {json.dumps(contract)}\n")
             return 1
-        n, ok = 1, True
         # SUBMIT-RACE: a submit that reports ok=true with no captured conversation id is worse than a
         # clean failure — a later `wait`/`followup --conversation auto` would resolve to whatever
         # OTHER tab/thread is active and silently answer the wrong request. So if the URL never
         # transitioned, fail closed: do NOT write active-thread state (that would point `auto` at a
         # request with no known tab) and do NOT return success.
-        if not ok:
-            print(json.dumps({"ok": False, "userMsgs": n, "model": model_now,
-                              "modelConfirmed": model_confirmed, "conversation_id": conv}))
-            return 2
+        n = 1
         if not conv:
             print(json.dumps({"ok": False, "userMsgs": n, "model": model_now,
                               "modelConfirmed": model_confirmed, "conversation_id": ""}))
@@ -2079,6 +2103,17 @@ def cmd_wait(a) -> int:
         c.close()
 
 
+def _is_canonical(conversation) -> bool:
+    """cgc_spool's canonical-id law, borrowed. Lazy import keeps cdp_consult standalone-runnable;
+    unavailable means we cannot vouch for the shape, so it does not pass."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import cgc_spool as _spool
+        return _spool.is_canonical_conversation(conversation)
+    except Exception:
+        return False
+
+
 def cmd_find_conversation(a) -> int:
     """Read-only: which open ChatGPT tab is carrying this rid?
 
@@ -2106,7 +2141,10 @@ def cmd_find_conversation(a) -> int:
         if not (h == "chatgpt.com" or h.endswith(".chatgpt.com")):
             continue
         m = re.search(r"(?:^|/)c/([0-9a-f-]+)(?:/|$)", u.path)
-        if m and m.group(1) not in seen:
+        # Canonical ids only — this command's whole output is an id the retrieve path will consume,
+        # and every lease/followup gate is a strict fullmatch. Printing a shape they refuse would
+        # hand the caller a command that dies terminally instead of an answer.
+        if m and m.group(1) not in seen and _is_canonical(m.group(1)):
             seen.add(m.group(1))
             convs.append(m.group(1))
     hits = []
@@ -2116,10 +2154,11 @@ def cmd_find_conversation(a) -> int:
         except SystemExit:
             continue
         try:
-            found = c.eval("(function(){var r=%s;return (document.title||'').indexOf(r)>=0 || "
-                           "(document.body?document.body.innerText:'').indexOf(r)>=0;})()"
-                           % json.dumps(a.rid))
-            if found:
+            # <main> only. The thread LIST lives in every tab's nav and its titles are derived from
+            # the first message, so a whole-body (or title) scan matches our rid in tabs that never
+            # held it — which turns every multi-tab search into `ambiguous_rid`, defeating the one
+            # case this exists for.
+            if _rid_in_main(c, a.rid):
                 hits.append(conv)
         except Exception:
             pass

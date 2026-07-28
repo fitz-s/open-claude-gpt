@@ -752,7 +752,9 @@ class Store:
         turn it came from, so it must not close a round that no worker confirmed."""
         with self._tx():
             row = self.db.execute("SELECT state FROM rounds WHERE rid=?", (rid,)).fetchone()
-            if row is None or row["state"] in TERMINAL or row["state"] == SENDING:
+            # SENDING and WAITING are the states a live worker drives; terminals are immutable.
+            # Callers additionally probe the rid lease — this is the last fence, not the only one.
+            if row is None or row["state"] in TERMINAL or row["state"] in (SENDING, WAITING):
                 return False
             if row["state"] != WAITING:
                 # Every non-terminal, non-sending state (ready/accepted/possibly_accepted) has a
