@@ -322,10 +322,27 @@ def _sweep_ownerless_sending(children: dict, reason: str) -> list:
     return promoted
 
 
-def _sweep_tabs() -> int:
+def _uncertain_rids() -> list:
+    """Rounds whose send may have reached ChatGPT and is not confirmed. Their tabs are evidence."""
+    try:
+        with store_mod.Store() as s:
+            return s.recover()["uncertain"]
+    except Exception as e:
+        # Fail CLOSED: unable to read the store means unable to prove a tab is not evidence.
+        sys.stderr.write(f"CGC_DAEMON uncertain-round check failed ({type(e).__name__}); "
+                         "treating tabs as evidence\n")
+        return ["<store-unreadable>"]
+
+
+def _sweep_tabs(uncertain=()) -> int:
     """Close leftover ChatGPT tabs. CALLER-GUARDED: call only under the EXCLUSIVE browser lease —
-    unobtainable while any worker of any daemon generation is alive, so a tab this sweep sees is
-    provably unowned.
+    unobtainable while any worker of any daemon generation is alive.
+
+    "No live worker" is NOT the same as "unowned", and the gap is exactly one state: a round left
+    UNCERTAIN has no worker and still owns its tab. `unknown_send` deliberately leaves that tab open
+    because it is the only evidence of whether the prompt went — and this sweep used to close it a
+    minute later, turning a still-generating answer into an unrecoverable one. So the sweep holds
+    while any round is uncertain; those tabs are not litter, they are the recovery.
 
     Tabs accumulate. Fixing the leaks in submit's failure paths removes the known source, but not
     the one no code path can cover: a worker killed mid-send — by a daemon restart, say — never runs
@@ -333,6 +350,10 @@ def _sweep_tabs() -> int:
     of them stops being able to start new ones, which is the failure that ends every consult (a
     freshly created tab that never answers Runtime.enable). One tab is kept, because the profile
     with zero windows is a worse state to leave the browser in than one with a spare."""
+    if uncertain:
+        sys.stderr.write(f"CGC_DAEMON tab sweep held: {len(uncertain)} uncertain round(s) "
+                         f"({', '.join(list(uncertain)[:3])}) — their tabs are the only send evidence\n")
+        return 0
     try:
         base = f"http://127.0.0.1:{os.environ.get('CGC_PORT', '9333')}"
         info = json.load(urllib.request.urlopen(f"{base}/json", timeout=5))
@@ -607,7 +628,7 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
                 if blease is not None:
                     try:
                         if websocket is not None:
-                            _sweep_tabs()
+                            _sweep_tabs(_uncertain_rids())
                         last_repair = _maybe_repair_browser(children, last_repair)
                     finally:
                         if hasattr(blease, "close"):

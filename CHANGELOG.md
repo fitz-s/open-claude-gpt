@@ -4,6 +4,41 @@ All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); this project uses date-based
 releases until it stabilizes.
 
+## [Unreleased]
+
+Field incident: a submit clicked, the DOM rid echo was unreadable, and the round went
+`possibly_accepted` with **no conversation recorded**. Recovery is addressed *by conversation*, so
+there was nothing to retrieve from — while the answer was generating in a tab the daemon was about
+to sweep. A human had to copy 32KB out of the browser by hand. The send fence was never in
+question; what failed is everything downstream of it.
+
+### Fixed
+- **An unconfirmed send keeps its address.** `submit` now resolves the tab's `/c/<id>` on *every*
+  post-click outcome (`unknown_send`, `selector_drift`, ok) and reports it in the envelope; the
+  worker records it via the new `Store.link_conversation` — state untouched, so an unconfirmed send
+  is never laundered into a confirmed one — which puts the round in `recover()`'s `retrievable`
+  bucket and lets the existing read-only auto-retrieve resolve it. Linked only on the uncertain
+  branch: a re-queued proven-not-sent round must not inherit a thread.
+- **The URL is send evidence the DOM cannot veto.** ChatGPT mints a conversation on send and on
+  nothing else, so a tab that held no thread before the click and holds one after it *has* sent
+  (`_send_proven_by_url`). `unknown_send` on that evidence is upgraded to a landed send instead of
+  being stranded as uncertain — the waiter still verifies `END_RESPONSE:<rid>`, so nothing is taken
+  on trust that the answer will not have to prove.
+- **The tab sweep no longer destroys the evidence it was told to preserve.** `unknown_send` leaves
+  its tab open on purpose; the sweeper's lease proves only "no live worker", which is not the same
+  as "unowned" — an uncertain round has no worker and still owns its tab. The sweep now holds while
+  any round is uncertain, and fails closed if the store cannot be read.
+- **The recovery loop terminates.** A retrieve that matched `END_RESPONSE:<source>` proved both that
+  the source's send landed and what it answered, so it now closes the source round
+  (`Store.adopt_retrieved_answer`). Sentinel-verified answers only — an unwrapped salvage cannot
+  prove which turn produced it.
+
+### Added
+- `cdp_consult.py find-conversation --rid <rid>` — read-only search of open ChatGPT tabs for the rid
+  that is inside the prompt we sent. It is the last automated step before a human reads the screen,
+  and `await`'s uncertain-round message now names it. Best-effort by construction (a virtualized
+  thread can scroll the turn out of the DOM); a miss is reported as a miss, never as "not sent".
+
 ## [0.2.1] — 2026-07-24
 
 Driven by a first-principles maturity audit (a 25-min GPT-5.6 Pro deep review of a48e3d1 collided

@@ -316,3 +316,41 @@ def test_a_proxy_free_opener_actually_drops_proxy_handling(monkeypatch):
     ours = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     assert not [h for h in ours.handlers if type(h).__name__ == "ProxyHandler"], (
         "the proxy-free opener must carry no proxy handling at all")
+
+
+# ---- an uncertain send must not lose its address --------------------------------------------
+
+def test_url_transition_proves_a_send_only_from_no_thread_into_one():
+    """The one witness that survives when the DOM turn schema moves. A thread is minted BY a send,
+    so ""->/c/<id> is proof; a reused tab already in its thread proves nothing (sending does not
+    change the id), and a jump between two threads is navigation, not our click."""
+    assert _CDP._send_proven_by_url("", "conv-new") is True
+    assert _CDP._send_proven_by_url("", "") is False
+    assert _CDP._send_proven_by_url("conv-old", "conv-old") is False
+    assert _CDP._send_proven_by_url("conv-old", "conv-new") is False
+
+
+def test_poll_conversation_waits_out_the_post_send_url_transition(monkeypatch):
+    """The URL lands a beat after the message; reading it once returns '' and loses the address."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+
+    class C:
+        def __init__(self): self.n = 0
+        def conversation_id(self):
+            self.n += 1
+            return "conv-9" if self.n >= 3 else ""
+
+    assert _CDP._poll_conversation(C(), seconds=5) == "conv-9"
+
+
+def test_every_post_click_submit_envelope_carries_the_conversation():
+    """Recovery is addressed BY conversation. An unconfirmed send that reports none is unrecoverable
+    by construction — the field failure where a still-generating answer became a manual paste."""
+    import inspect
+    src = inspect.getsource(_CDP.cmd_submit)
+    head, _, tail = src.partition('"reason": "unknown_send"')
+    assert tail, "the unknown_send envelope must still exist"
+    assert '"conversation_id": conv' in tail.split("return 3")[0], \
+        "unknown_send must report where the tab is"
+    drift = src.partition('"reason": "selector_drift"')[2].split("return 1")[0]
+    assert '"conversation_id": conv' in drift, "selector_drift must report its conversation too"

@@ -1511,3 +1511,119 @@ def test_worker_fails_presend_on_noncanonical_conversation_without_locking_or_se
     # no lease was taken for the alias: acquire_conversation_lease is the only opener of that file and
     # it returned before reaching it, so the lock file was never even created.
     assert not os.path.exists(cgc_spool._conversation_lease_path(rid_shape)), "no lock file was created"
+
+
+# ---- an uncertain send must stay ADDRESSABLE ---------------------------------------------------
+# The field failure this closes: submit clicked, the rid echo was unreadable, and the round went
+# possibly_accepted with NO conversation. Recovery is addressed BY conversation, so there was
+# nothing to retrieve from — while the answer was generating in a tab a minute from being swept.
+# The human had to copy 30KB out of the browser by hand.
+
+def test_unconfirmed_send_with_a_conversation_is_retrievable_not_a_dead_end(env):
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+
+    def cdp(kind, **kw):
+        # unknown_send on a REUSED tab: the driver reports where the tab is, which is an address,
+        # not a confirmation.
+        return {"code": 3, "conversation": "conv-live",
+                "stderr": "CGC_ERROR unknown_send: rid never echoed"}
+
+    final = backend.process_round(s, r, cdp, daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.POSSIBLY_ACCEPTED, "an unconfirmed send is never laundered into accepted"
+    rec = s.recover()
+    assert r["rid"] in rec["uncertain"], "still uncertain — the send is not proven"
+    assert r["rid"] not in rec["dispatchable"], "and never re-sendable"
+    assert s.conversation_of(r["rid"]) == "conv-live"
+    assert r["rid"] in rec["retrievable"], "the recorded address is what makes recovery automatic"
+
+
+def test_unconfirmed_send_without_a_conversation_is_still_not_retrievable(env):
+    """No address recorded → no auto-retrieve to attempt. It must fall to a human, not to a resend."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    final = backend.process_round(
+        s, r, lambda *a, **k: {"code": 3, "conversation": "", "stderr": "unknown_send"},
+        daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.POSSIBLY_ACCEPTED
+    rec = s.recover()
+    assert r["rid"] in rec["uncertain"] and r["rid"] not in rec["retrievable"]
+    assert r["rid"] not in rec["dispatchable"]
+
+
+def test_proven_not_sent_retry_does_not_inherit_a_thread(env):
+    """A re-queued round must carry no thread: a conversation pinned from a send that never happened
+    would follow it into its next attempt and mis-address the answer."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    final = backend.process_round(
+        s, r, lambda *a, **k: {"code": 3, "conversation": "conv-stale",
+                               "stderr": "CGC_ERROR model_not_selectable: wanted 'Pro'"},
+        daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.QUEUED
+    assert s.conversation_of(r["rid"]) is None
+
+
+def test_link_conversation_never_moves_state_and_refuses_terminal(env):
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    rid = r["rid"]
+    s.link_conversation(rid, "conv-x")
+    assert s.get_round(rid)["state"] == store_mod.READY, "an address is not a state change"
+    assert s.conversation_of(rid) == "conv-x"
+    aid = s.begin_send(rid, r["rendered_prompt"] or "p", store_mod.sha256("p"),
+                       daemon_instance_id="d1")
+    s.mark_send_not_sent(aid, "proven pre-click")          # -> FAILED (terminal)
+    with pytest.raises(store_mod.IllegalTransition):
+        s.link_conversation(rid, "conv-y")
+
+
+def test_a_verified_retrieve_closes_the_round_it_recovered(env):
+    """The recovery loop must terminate. A retrieve that matched END_RESPONSE:<source> proved both
+    that the source's send landed and what it answered — so the source stops being uncertain."""
+    store_mod, backend, s, tmp = env
+    src = _ready_round(store_mod, s)
+    aid = s.begin_send(src["rid"], "p", store_mod.sha256("p"), daemon_instance_id="d1")
+    s.mark_possibly_accepted(aid, "unknown send")
+
+    s.create_round("REQ-20260721-000000-00re01", "retrieve", out_path=str(tmp / "r.txt"),
+                   spec_json=json.dumps({"conversation": "conv-live", "parent_rid": src["rid"]}))
+    s.set_state("REQ-20260721-000000-00re01", store_mod.READY)
+
+    def cdp(kind, **kw):
+        assert kind == "wait", "a retrieve NEVER sends"
+        assert kw["rid"] == src["rid"], "it must verify the SOURCE round's sentinel"
+        with open(kw["out"], "w") as f:
+            f.write("the recovered answer")
+        return {"code": 0, "out": kw["out"], "stderr": ""}
+
+    final = backend.process_round(s, s.get_round("REQ-20260721-000000-00re01"), cdp,
+                                  daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.COMPLETED_VERIFIED
+    rr = s.get_round(src["rid"])
+    assert rr["state"] == store_mod.COMPLETED_VERIFIED
+    assert rr["result_text"] == "the recovered answer"
+    assert src["rid"] not in s.recover()["uncertain"], "no longer unfinished business"
+
+
+def test_an_unverified_salvage_does_not_close_the_round_it_recovered(env):
+    """An unwrapped answer cannot prove which turn produced it, so it may not settle an uncertain
+    send — that is the one judgement a human still owns."""
+    store_mod, backend, s, tmp = env
+    src = _ready_round(store_mod, s)
+    aid = s.begin_send(src["rid"], "p", store_mod.sha256("p"), daemon_instance_id="d1")
+    s.mark_possibly_accepted(aid, "unknown send")
+    s.create_round("REQ-20260721-000000-00re02", "retrieve", out_path=str(tmp / "r2.txt"),
+                   spec_json=json.dumps({"conversation": "conv-live", "parent_rid": src["rid"]}))
+    s.set_state("REQ-20260721-000000-00re02", store_mod.READY)
+
+    def cdp(kind, **kw):
+        with open(kw["out"], "w") as f:
+            f.write("salvaged text")
+        with open(kw["out"] + ".raw", "w") as f:   # the sidecar marks it unverified
+            f.write("x")
+        return {"code": 0, "out": kw["out"], "stderr": ""}
+
+    backend.process_round(s, s.get_round("REQ-20260721-000000-00re02"), cdp,
+                          daemon_instance_id="d1", validate=_OK_GATE)
+    assert s.get_round(src["rid"])["state"] == store_mod.POSSIBLY_ACCEPTED
