@@ -21,3 +21,4 @@ Thumbs.db
 
 # install backups
 *.bak
+.claude/worktrees/
