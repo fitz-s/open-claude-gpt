@@ -8,6 +8,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "skill", "scripts")
 
@@ -270,3 +272,22 @@ if __name__ == "__main__":
                 print(f"FAIL {name}: {e}")
     print(f"\n{'PASS' if not fails else 'FAIL'} — {fails} failure(s)")
     sys.exit(1 if fails else 0)
+
+
+def test_no_undefined_names_anywhere_in_the_scripts():
+    """The regression that shipped past 399 green tests: removing a dead branch also removed the
+    binding a live line still used, so EVERY submit died with NameError at its final print — after
+    the send had landed, which is the one place a crash costs a whole consult. No test executes
+    cmd_submit end-to-end (it drives a browser), and none ever will cheaply; a static undefined-name
+    check is what actually covers that surface. Skipped if ruff is unavailable — the CI value is in
+    running it where it exists, not in a hard dependency."""
+    import shutil
+    import subprocess
+
+    ruff = shutil.which("ruff")
+    if ruff is None:
+        pytest.skip("ruff not installed")
+    scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skill", "scripts")
+    r = subprocess.run([ruff, "check", "--select", "F821", "--output-format", "concise", scripts],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, f"undefined names in the scripts:\n{r.stdout}{r.stderr}"

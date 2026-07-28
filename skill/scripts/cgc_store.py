@@ -465,9 +465,14 @@ class Store:
         psha = sha256(prompt) if prompt is not None else None
         with self._tx():
             if thread_id is not None:
+                # thread_id IS the conversation id at every call site (enqueue passes the
+                # resolved `conv`). Leaving the column NULL made the row a thread nobody could
+                # address: conversation_of() returned None, so a completed round could not be
+                # continued with --parent and vanished from `latest_conversation` — a follow-up
+                # then silently degraded into a fresh consult that threw the thread's context away.
                 self.db.execute(
-                    "INSERT OR IGNORE INTO threads(thread_id,created_at,updated_at) VALUES(?,?,?)",
-                    (thread_id, now, now))
+                    "INSERT OR IGNORE INTO threads(thread_id,conversation_id,created_at,updated_at) "
+                    "VALUES(?,?,?,?)", (thread_id, thread_id, now, now))
             self.db.execute(
                 "INSERT INTO rounds(rid,thread_id,kind,source_mode,spec_json,rendered_prompt,"
                 "prompt_sha256,out_path,request_key,parent_rid,state,created_at,updated_at,"
@@ -539,9 +544,14 @@ class Store:
             self._event("key_released", rid=old_rid,
                         detail=f"request-key transferred to {rid}: prior proven not sent")
             if thread_id is not None:
+                # thread_id IS the conversation id at every call site (enqueue passes the
+                # resolved `conv`). Leaving the column NULL made the row a thread nobody could
+                # address: conversation_of() returned None, so a completed round could not be
+                # continued with --parent and vanished from `latest_conversation` — a follow-up
+                # then silently degraded into a fresh consult that threw the thread's context away.
                 self.db.execute(
-                    "INSERT OR IGNORE INTO threads(thread_id,created_at,updated_at) VALUES(?,?,?)",
-                    (thread_id, now, now))
+                    "INSERT OR IGNORE INTO threads(thread_id,conversation_id,created_at,updated_at) "
+                    "VALUES(?,?,?,?)", (thread_id, thread_id, now, now))
             self.db.execute(
                 "INSERT INTO rounds(rid,thread_id,kind,source_mode,spec_json,rendered_prompt,"
                 "prompt_sha256,out_path,request_key,parent_rid,state,created_at,updated_at,"
@@ -737,7 +747,8 @@ class Store:
         self.set_state(rid, state, result_text=result_text, error_code=error_code,
                        completion_confidence=confidence)
 
-    def adopt_retrieved_answer(self, rid: str, result_text: str) -> bool:
+    def adopt_retrieved_answer(self, rid: str, result_text: str,
+                               conversation_id: str | None = None) -> bool:
         """Close an uncertain round with the answer a VERIFIED retrieve just proved is its own.
 
         The retrieve waiter matched END_RESPONSE:<rid> on the thread, which settles both open
@@ -750,21 +761,33 @@ class Store:
 
         Only ever called with a sentinel-VERIFIED answer: an unwrapped salvage cannot prove which
         turn it came from, so it must not close a round that no worker confirmed."""
+        now = _now()
         with self._tx():
-            row = self.db.execute("SELECT state FROM rounds WHERE rid=?", (rid,)).fetchone()
+            row = self.db.execute("SELECT state,thread_id FROM rounds WHERE rid=?", (rid,)).fetchone()
             # SENDING and WAITING are the states a live worker drives; terminals are immutable.
             # Callers additionally probe the rid lease — this is the last fence, not the only one.
             if row is None or row["state"] in TERMINAL or row["state"] in (SENDING, WAITING):
                 return False
-            if row["state"] != WAITING:
-                # Every non-terminal, non-sending state (ready/accepted/possibly_accepted) has a
-                # legal edge to WAITING — take it rather than inventing a shortcut edge into a
-                # terminal, so the transition table stays the one description of the lifecycle.
-                if WAITING not in _LEGAL.get(row["state"], set()):
-                    return False
-                self._apply_round_fields(rid, state=WAITING)
-                self._event("state", rid=rid,
-                            detail=f"{row['state']} -> {WAITING} (retrieve proved the send landed)")
+            # Every state that reaches here (ready/accepted/possibly_accepted) has a legal edge to
+            # WAITING — take it rather than inventing a shortcut edge into a terminal, so the
+            # transition table stays the one description of the lifecycle.
+            if WAITING not in _LEGAL.get(row["state"], set()):
+                return False
+            self._apply_round_fields(rid, state=WAITING)
+            self._event("state", rid=rid,
+                        detail=f"{row['state']} -> {WAITING} (retrieve proved the send landed)")
+            if conversation_id:
+                # The retrieve proved WHERE this round lives, and a completed round without that
+                # address is not continuable: `--parent <rid>` refuses, `latest_conversation` skips
+                # it, and the follow-up silently degrades into a fresh consult that throws the
+                # thread's context away. Recovering the answer but not the thread is half a recovery.
+                tid = row["thread_id"] or conversation_id
+                self.db.execute(
+                    "INSERT OR IGNORE INTO threads(thread_id,conversation_id,created_at,updated_at) "
+                    "VALUES(?,?,?,?)", (tid, conversation_id, now, now))
+                self.db.execute("UPDATE threads SET conversation_id=?,updated_at=? WHERE thread_id=?",
+                                (conversation_id, now, tid))
+                self.db.execute("UPDATE rounds SET thread_id=? WHERE rid=?", (tid, rid))
             self._apply_round_fields(rid, state=COMPLETED_VERIFIED, result_text=result_text,
                                      completion_confidence="verified")
             self._event("state", rid=rid, detail=f"-> {COMPLETED_VERIFIED} (adopted from retrieve)")
