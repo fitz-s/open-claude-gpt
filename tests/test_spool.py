@@ -159,11 +159,29 @@ def test_cmd_enqueue_public_link_exits_0_and_queues(spool, tmp_path):
     assert r["rendered_prompt"] == "please review https://github.com/acme/widgets"
 
 
-def test_cmd_enqueue_same_rid_twice_refuses(spool, tmp_path, capsys):
+def test_cmd_enqueue_same_rid_same_bytes_is_idempotent(spool, tmp_path, capsys):
+    """The canonical invocation is `enqueue && await`, so refusing an exact repeat short-circuited
+    the chain that actually delivers the answer — the retry failed identically every time while the
+    round sat COMPLETED in the store (observed in the field). Same rid + same bytes is the same
+    request: nothing new is queued, and the caller proceeds to await."""
     rid = _rid("dd0001")
     prompt_file = tmp_path / "prompt.txt"
     prompt_file.write_text("please review https://github.com/acme/widgets")
     assert spool.cmd_enqueue(_enqueue_args(rid, str(prompt_file))) == 0
+    assert spool.cmd_enqueue(_enqueue_args(rid, str(prompt_file))) == 0
+    err = capsys.readouterr()
+    assert "CGC_IDEMPOTENT" in err.err
+    assert '"queued": false' in err.out, "a receipt claiming it queued something would be a lie"
+
+
+def test_cmd_enqueue_same_rid_different_bytes_refuses(spool, tmp_path, capsys):
+    """A different prompt under the same rid is a DIFFERENT request — answering it from the first
+    round's thread would return an answer to a question nobody asked."""
+    rid = _rid("dd0002")
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("please review https://github.com/acme/widgets")
+    assert spool.cmd_enqueue(_enqueue_args(rid, str(prompt_file))) == 0
+    prompt_file.write_text("please review https://github.com/acme/widgets — and also this")
     assert spool.cmd_enqueue(_enqueue_args(rid, str(prompt_file))) == 2
     assert "already_enqueued" in capsys.readouterr().err
 

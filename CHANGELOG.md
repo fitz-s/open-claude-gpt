@@ -46,6 +46,15 @@ question; what failed is everything downstream of it.
   paths, where the id it captures is the only thing that makes the round recoverable; a kill there
   loses stdout, which is how the round this budget protects became unrecoverable in the first place.
 
+- **`enqueue` is idempotent on an exact repeat.** The canonical invocation is `enqueue && await`, so
+  refusing a same-rid/same-bytes repeat short-circuited the chain that actually delivers the answer:
+  the command failed identically on every retry while the round sat COMPLETED in the store, its
+  22KB answer never materialized. Same rid + same bytes is the same request — nothing new is queued,
+  the receipt says `queued: false`, and the caller proceeds to await. A DIFFERENT prompt under the
+  same rid still refuses, and that refusal now names the round's state and the one command that
+  follows from it (read/await the answer, continue with `--followup --parent`, render a fresh rid,
+  or retrieve an uncertain send) instead of a bare "already exists in the store".
+
 ### Added
 - `cdp_consult.py find-conversation --rid <rid>` — read-only search of open ChatGPT tabs for the rid
   that is inside the prompt we sent. It is the last automated step before a human reads the screen,
