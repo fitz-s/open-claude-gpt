@@ -1627,3 +1627,37 @@ def test_an_unverified_salvage_does_not_close_the_round_it_recovered(env):
     backend.process_round(s, s.get_round("REQ-20260721-000000-00re02"), cdp,
                           daemon_instance_id="d1", validate=_OK_GATE)
     assert s.get_round(src["rid"])["state"] == store_mod.POSSIBLY_ACCEPTED
+
+
+def test_a_retrieve_does_not_terminalise_a_round_a_live_worker_owns(env, monkeypatch):
+    """The retrieve holds only its OWN rid lease, so the round it recovers is unfenced: the daemon's
+    one-shot auto-retrieve can be mid-wait on it. Closing it underneath that worker turns the
+    worker's own finish into an IllegalTransition traceback."""
+    store_mod, backend, s, tmp = env
+    src = _ready_round(store_mod, s)
+    aid = s.begin_send(src["rid"], "p", store_mod.sha256("p"), daemon_instance_id="d1")
+    s.mark_possibly_accepted(aid, "unknown send")
+    monkeypatch.setattr(backend, "_no_live_worker", lambda rid: False)   # someone owns it
+
+    s.create_round("REQ-20260721-000000-00re03", "retrieve", out_path=str(tmp / "r3.txt"),
+                   spec_json=json.dumps({"conversation": "conv-live", "parent_rid": src["rid"]}))
+    s.set_state("REQ-20260721-000000-00re03", store_mod.READY)
+
+    def cdp(kind, **kw):
+        with open(kw["out"], "w") as f:
+            f.write("the recovered answer")
+        return {"code": 0, "out": kw["out"], "stderr": ""}
+
+    assert backend.process_round(s, s.get_round("REQ-20260721-000000-00re03"), cdp,
+                                 daemon_instance_id="d1",
+                                 validate=_OK_GATE) == store_mod.COMPLETED_VERIFIED
+    assert s.get_round(src["rid"])["state"] == store_mod.POSSIBLY_ACCEPTED, "left to its owner"
+
+
+def test_adopt_refuses_a_round_that_is_being_waited_on(env):
+    """WAITING is a live worker's state — the store's own last fence behind the lease probe."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    s.set_state(r["rid"], store_mod.WAITING)
+    assert s.adopt_retrieved_answer(r["rid"], "text") is False
+    assert s.get_round(r["rid"])["state"] == store_mod.WAITING

@@ -625,28 +625,68 @@ def test_flock_fails_closed_when_fcntl_is_unavailable(daemon, monkeypatch):
         daemon.spool.acquire_daemon_singleton(timeout=0)
 
 
-def test_tab_sweep_holds_while_a_round_is_uncertain(daemon, monkeypatch):
+def _pages(*urls):
+    import io, json as _j
+    return lambda *a, **k: io.BytesIO(_j.dumps(
+        [{"type": "page", "id": f"T{i}", "url": u} for i, u in enumerate(urls)]).encode())
+
+
+def test_tab_sweep_holds_for_an_uncertain_round_with_no_conversation(daemon, monkeypatch):
     """The evidence contradiction: `unknown_send` leaves its tab open ON PURPOSE — it is the only
     record of whether the prompt went — and the sweep, whose lease only proves 'no live worker',
-    used to close it a minute later. A round with no worker is not an unowned tab."""
-    import io
-    monkeypatch.setattr(
-        daemon.urllib.request, "urlopen",
-        lambda *a, **k: io.BytesIO(json.dumps(
-            [{"type": "page", "id": "A"}, {"type": "page", "id": "B"}]).encode()))
-    # two tabs: without the guard this sweep closes one
-    assert daemon._sweep_tabs(["REQ-20260707-120000-00u001"]) == 0
+    used to close it a minute later. With no conversation, nothing identifies that tab, so the only
+    way to keep it is to keep them all."""
+    monkeypatch.setattr(daemon.urllib.request, "urlopen",
+                        _pages("https://chatgpt.com/", "https://chatgpt.com/c/aaa"))
+    assert daemon._sweep_tabs(set(), ["REQ-20260707-120000-00u001"]) == 0
 
 
-def test_uncertain_rids_fails_closed_when_the_store_cannot_be_read(daemon, monkeypatch):
+def test_the_hold_is_bounded_so_one_stranded_round_cannot_disable_all_consults(daemon):
+    """possibly_accepted has no automatic exit, so an unbounded hold would let a single unreconciled
+    round stop every future sweep — and a browser with enough tabs cannot open new ones, which is the
+    failure that ends every consult. The hold expires; per-conversation protection does not."""
+    import io, json as _j
+    assert daemon._EVIDENCE_HOLD_S <= 24 * 3600
+    old = {"updated_at": "2020-01-01T00:00:00+00:00"}
+    assert daemon._age_s(old) > daemon._EVIDENCE_HOLD_S
+    assert daemon._age_s({"updated_at": "not a timestamp"}) == 0.0, "unparseable reads as fresh"
+
+
+def test_sweep_spares_only_the_tab_of_an_uncertain_rounds_conversation(daemon, monkeypatch):
+    """A known conversation is precisely addressable, so keeping it costs ONE tab and blocks nothing.
+    Everything else is litter and still goes."""
+    closed = []
+
+    class FakeWS:
+        def send(self, m): closed.append(__import__("json").loads(m)["params"]["targetId"])
+        def close(self): pass
+
+    import io, json as _j
+
+    def urlopen(url, *a, **k):
+        if url.endswith("/json/version"):
+            return io.BytesIO(_j.dumps({"webSocketDebuggerUrl": "ws://x"}).encode())
+        return _pages("https://chatgpt.com/",
+                      "https://chatgpt.com/c/6a684b38-bef4-83ea-83d4-134bf9610e05",
+                      "https://chatgpt.com/c/6a630a18-cbcc-83ea-a985-2fcd42a0a173",
+                      "about:blank")(url)
+
+    monkeypatch.setattr(daemon.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(daemon.websocket, "create_connection", lambda *a, **k: FakeWS())
+    assert daemon._sweep_tabs({"6a684b38-bef4-83ea-83d4-134bf9610e05"}, []) == 2
+    assert closed == ["T2", "T3"], "the protected conversation's tab survives"
+
+
+def test_evidence_fails_closed_when_the_store_cannot_be_read(daemon, monkeypatch):
     """Unable to read the store is unable to prove a tab is not evidence."""
     class Boom:
         def __enter__(self): raise RuntimeError("db gone")
         def __exit__(self, *a): return False
     monkeypatch.setattr(daemon.store_mod, "Store", lambda *a, **k: Boom())
-    assert daemon._uncertain_rids(), "must report SOMETHING uncertain, so the sweep holds"
+    convs, hold = daemon._evidence()
+    assert hold, "must hold the sweep"
 
 
-def test_maintenance_sweep_is_passed_the_uncertain_rounds(daemon):
+def test_maintenance_sweep_is_passed_the_evidence(daemon):
     import inspect
-    assert "_sweep_tabs(_uncertain_rids())" in inspect.getsource(daemon.run_loop)
+    assert "_sweep_tabs(*_evidence())" in inspect.getsource(daemon.run_loop)

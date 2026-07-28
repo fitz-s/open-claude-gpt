@@ -320,14 +320,30 @@ def test_a_proxy_free_opener_actually_drops_proxy_handling(monkeypatch):
 
 # ---- an uncertain send must not lose its address --------------------------------------------
 
-def test_url_transition_proves_a_send_only_from_no_thread_into_one():
-    """The one witness that survives when the DOM turn schema moves. A thread is minted BY a send,
-    so ""->/c/<id> is proof; a reused tab already in its thread proves nothing (sending does not
-    change the id), and a jump between two threads is navigation, not our click."""
-    assert _CDP._send_proven_by_url("", "conv-new") is True
-    assert _CDP._send_proven_by_url("", "") is False
-    assert _CDP._send_proven_by_url("conv-old", "conv-old") is False
-    assert _CDP._send_proven_by_url("conv-old", "conv-new") is False
+def test_a_landing_is_proven_only_by_a_NEW_thread_carrying_OUR_rid():
+    """The one witness left when the DOM turn schema moves. Both facts are required: the URL alone
+    moves on plain navigation into an existing thread, so a no-op click plus any unrelated navigation
+    inside the poll window would otherwise read as a successful send — silencing the failure that is
+    supposed to summon a human, and pinning the global active-thread to a foreign conversation."""
+    assert _CDP._send_proven_by_landing("", "conv-new", True) is True
+    assert _CDP._send_proven_by_landing("", "conv-new", False) is False, "a thread that is not ours"
+    assert _CDP._send_proven_by_landing("", "", True) is False
+    assert _CDP._send_proven_by_landing("conv-old", "conv-old", True) is False, "a reused tab proves nothing"
+    assert _CDP._send_proven_by_landing("conv-old", "conv-new", True) is False, "that is navigation"
+    assert _CDP._send_proven_by_landing("?unknown", "conv-new", True) is False, "unknown before-state"
+
+
+def test_rid_scan_is_scoped_to_the_conversation_not_the_sidebar():
+    """ChatGPT renders the thread LIST in every tab, and titles derive from the first message — so a
+    whole-body scan matches our rid in tabs that never held it."""
+    assert "querySelector('main')" in _CDP._JS_RID_IN_MAIN
+    assert "document.body.innerText" not in _CDP._JS_RID_IN_MAIN
+
+
+def test_rid_in_main_fails_closed_when_the_page_cannot_be_read():
+    class Dead:
+        def eval(self, _js): raise RuntimeError("detached")
+    assert _CDP._rid_in_main(Dead(), "REQ-1") is False
 
 
 def test_poll_conversation_waits_out_the_post_send_url_transition(monkeypatch):
