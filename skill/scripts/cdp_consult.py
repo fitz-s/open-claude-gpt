@@ -904,7 +904,7 @@ def cmd_status(a) -> int:
             out_chars = 0
     try:
         c = CDP(a.port, match=_resolve_conv(a.conversation))
-    except SystemExit as e:
+    except SystemExit:
         if out_chars > 0:
             print(json.dumps({"done": True, "retrieved": True, "out": a.out,
                               "len": out_chars, "note": "tab closed; answer already retrieved"}))
@@ -1419,16 +1419,11 @@ def cmd_submit(a) -> int:
     else:
         c = CDP(a.port, create_url=a.project_url)
     try:
-        # REUSE-TAB false-positive guard: a reused tab may already hold OLD user messages
-        # from a prior conversation, so "at least one user message after send" can be
-        # satisfied by stale history even when THIS submit's composer insert/click failed.
-        # Capture the count before insertion so the post-send check can require a NEW
-        # message (after > before) on the reuse-tab path. A fresh tab always starts at 0,
-        # so this is a no-op there — new-tab behavior is unchanged.
-        before_user_count = 0
-        if a.reuse_tab:
-            before_user_count = c.eval(
-                "document.querySelectorAll(" + _JS_U + ").length") or 0
+        # (The old reuse-tab user-message COUNT guard lived here. It became dead when the post-send
+        # check moved to _await_contract, which matches THIS request's rid inside a user turn — an
+        # identity check that stale history cannot satisfy, so counting is no longer load-bearing.
+        # It was left computing a value nobody read, next to a comment describing a guard that no
+        # longer existed.)
         ready, _cstate = _await_composer(c)
         if not ready:
             _code, _msg = _composer_failure(_cstate)
@@ -1565,7 +1560,7 @@ def cmd_submit(a) -> int:
                 "the tab's URL shows a /c/<id>.\n")
             return 2
         _write_state(conversation=conv, rid=a.rid)  # so `followup`/`wait` can auto-resolve
-        print(json.dumps({"ok": ok, "userMsgs": n, "model": model_now, "adapter": adapter,
+        print(json.dumps({"ok": True, "userMsgs": n, "model": model_now, "adapter": adapter,
                           "modelConfirmed": model_confirmed, "conversation_id": conv}))
         out = os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
         # Hand the agent the exact waiter to run (run_in_background:true). It holds the whole

@@ -928,7 +928,7 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
             # uncertain with its answer already in hand is a lie the next reader has to re-litigate
             # (and, since uncertainty holds the tab sweep, one that keeps costing). Only a verified
             # sentinel may do this: an unwrapped salvage cannot prove which turn it came from.
-            if store.adopt_retrieved_answer(wait_rid, answer):
+            if store.adopt_retrieved_answer(wait_rid, answer, conversation_id=conv):
                 sys.stderr.write(f"CGC_RECONCILED {wait_rid}: resolved from retrieve {rid} "
                                  "(sentinel-verified on the thread).\n")
         return store_mod.COMPLETED_UNVERIFIED if unverified else store_mod.COMPLETED_VERIFIED

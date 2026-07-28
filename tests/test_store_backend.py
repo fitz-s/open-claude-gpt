@@ -1661,3 +1661,36 @@ def test_adopt_refuses_a_round_that_is_being_waited_on(env):
     s.set_state(r["rid"], store_mod.WAITING)
     assert s.adopt_retrieved_answer(r["rid"], "text") is False
     assert s.get_round(r["rid"])["state"] == store_mod.WAITING
+
+
+def test_a_recovered_round_stays_continuable(env):
+    """Recovering the answer but not the thread is half a recovery: without its conversation the
+    round refuses `--parent <rid>` and drops out of `latest_conversation`, so the follow-up silently
+    degrades into a fresh consult that throws the thread's context away. (Observed in the field: a
+    re-review follow-up was refused `followup_parent_unresolved` and re-fired as a new submit.)"""
+    store_mod, backend, s, tmp = env
+    src = _ready_round(store_mod, s)
+    aid = s.begin_send(src["rid"], "p", store_mod.sha256("p"), daemon_instance_id="d1")
+    s.mark_possibly_accepted(aid, "unknown send")
+    s.create_round("REQ-20260721-000000-00re04", "retrieve", out_path=str(tmp / "r4.txt"),
+                   spec_json=json.dumps({"conversation": "conv-live", "parent_rid": src["rid"]}))
+    s.set_state("REQ-20260721-000000-00re04", store_mod.READY)
+
+    def cdp(kind, **kw):
+        with open(kw["out"], "w") as f:
+            f.write("recovered")
+        return {"code": 0, "out": kw["out"], "stderr": ""}
+
+    backend.process_round(s, s.get_round("REQ-20260721-000000-00re04"), cdp,
+                          daemon_instance_id="d1", validate=_OK_GATE)
+    assert s.conversation_of(src["rid"]) == "conv-live", "the thread the retrieve proved it lives in"
+    assert s.latest_conversation() == "conv-live"
+
+
+def test_a_round_created_on_a_known_thread_is_addressable(env):
+    """`thread_id` IS the conversation id at every call site. Storing it without the conversation
+    made a thread nobody could address — the round completed and was still not continuable."""
+    store_mod, backend, s, tmp = env
+    s.create_round("REQ-20260721-000000-00th01", "followup", out_path=str(tmp / "t.txt"),
+                   prompt="continuing this consult", thread_id="conv-abc")
+    assert s.conversation_of("REQ-20260721-000000-00th01") == "conv-abc"
