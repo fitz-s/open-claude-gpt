@@ -21,8 +21,9 @@ question; what failed is everything downstream of it.
   branch: a re-queued proven-not-sent round must not inherit a thread.
 - **A landing can be read without the turn adapters.** `_send_proven_by_landing` upgrades
   `unknown_send` to a landed send when the tab entered a thread it did not hold *and* our rid is
-  rendered in that thread (`_rid_in_main`, scoped to `<main>` so the sidebar's derived titles cannot
-  match). Both facts are required: `location.pathname` moves on plain navigation into an existing
+  rendered in that thread (`_rid_in_main`, scoped to `<main>` with no body fallback — it runs
+  precisely when ChatGPT's DOM has moved — so the sidebar's derived titles cannot match).
+  Both facts are required: `location.pathname` moves on plain navigation into an existing
   thread, so the URL alone would let a no-op click plus any unrelated navigation read as a
   successful send — silencing the one failure that is meant to summon a human, and pinning the
   global active-thread to a conversation that is not ours. The waiter still verifies
@@ -31,9 +32,10 @@ question; what failed is everything downstream of it.
   permanent outage.** `unknown_send` leaves its tab open on purpose; the sweeper's lease proves only
   "no live worker", which is not the same as "unowned" — an uncertain round has no worker and still
   owns its tab. An uncertain round's tab is now spared *by conversation* where one is known (precise,
-  costs one tab, blocks nothing); only the case with no conversation holds the whole sweep, and that
-  hold expires after 6h. `possibly_accepted` has no automatic exit, so an unbounded hold would let a
-  single unreconciled round stop every future sweep — and a browser carrying enough tabs cannot open
+  costs one tab, blocks nothing); only the case with no conversation holds the whole sweep. Either
+  way the claim expires after 6h — pinning an addressed tab forever leaks the same browser one round
+  at a time. `possibly_accepted` has no automatic exit, so an unbounded hold would let a single
+  unreconciled round stop every future sweep — and a browser carrying enough tabs cannot open
   new ones, which is the failure that ends every consult. Fails closed if the store is unreadable.
 - **The recovery loop terminates.** A retrieve that matched `END_RESPONSE:<source>` proved both that
   the source's send landed and what it answered, so it now closes the source round

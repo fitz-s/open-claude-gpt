@@ -677,6 +677,22 @@ def test_sweep_spares_only_the_tab_of_an_uncertain_rounds_conversation(daemon, m
     assert closed == ["T2", "T3"], "the protected conversation's tab survives"
 
 
+def test_a_tab_whose_url_cannot_be_read_is_protected_not_swept(daemon, monkeypatch):
+    """Unidentifiable is not unowned: a protected tab caught mid-navigation reports no URL, and
+    sweeping it destroys the evidence the protection exists to keep."""
+    import io, json as _j
+
+    def urlopen(url, *a, **k):
+        if url.endswith("/json/version"):
+            return io.BytesIO(_j.dumps({"webSocketDebuggerUrl": "ws://x"}).encode())
+        return _pages("https://chatgpt.com/", "")(url)
+
+    monkeypatch.setattr(daemon.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(daemon.websocket, "create_connection",
+                        lambda *a, **k: pytest.fail("nothing may be closed"))
+    assert daemon._sweep_tabs({"6a684b38-bef4-83ea-83d4-134bf9610e05"}, []) == 0
+
+
 def test_evidence_fails_closed_when_the_store_cannot_be_read(daemon, monkeypatch):
     """Unable to read the store is unable to prove a tab is not evidence."""
     class Boom:

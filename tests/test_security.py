@@ -337,7 +337,11 @@ def test_rid_scan_is_scoped_to_the_conversation_not_the_sidebar():
     """ChatGPT renders the thread LIST in every tab, and titles derive from the first message — so a
     whole-body scan matches our rid in tabs that never held it."""
     assert "querySelector('main')" in _CDP._JS_RID_IN_MAIN
-    assert "document.body.innerText" not in _CDP._JS_RID_IN_MAIN
+    # No fallback: this runs precisely when ChatGPT's DOM has moved, so a body-wide fallback would
+    # fire in the one situation the scoping exists for. (The earlier form of this assertion checked
+    # for the literal "document.body.innerText" and passed while a `||document.body` fallback was
+    # present — a test that named a guarantee it did not establish.)
+    assert "document.body" not in _CDP._JS_RID_IN_MAIN
 
 
 def test_rid_in_main_fails_closed_when_the_page_cannot_be_read():
