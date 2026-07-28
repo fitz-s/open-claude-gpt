@@ -365,8 +365,31 @@ def enqueue_round(a, prompt: str, out: str) -> int:
                     return res
                 # res is the prior rid → move its released key onto this retry, atomically.
                 return _enqueue_transfer(s, a, prompt, out, prior, fingerprint, rkey)
-        if s.get_round(a.rid) is not None:
-            sys.stderr.write(f"CGC_ERROR already_enqueued: {a.rid} already exists in the store.\n")
+        existing = s.get_round(a.rid)
+        if existing is not None:
+            # A rid is minted per render, so re-enqueuing one is always a repeat of a request the
+            # store already owns — and the caller's next move depends entirely on WHICH state it is
+            # in. Saying only "already exists" left a retry loop with nothing to act on: the same
+            # command failed the same way every time, and the round it was colliding with had
+            # already answered. Name the state and the one command that follows from it.
+            import cgc_spool as _spool
+            st = existing["state"]
+            if st in (store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED):
+                nxt = (f"read its answer: {existing['out_path']}  (or re-materialize it: python3 "
+                       f"{_spool.__file__} await --rid {a.rid} --out {existing['out_path']})\n"
+                       "  To ask something NEW on that thread, render a fresh round and continue it:\n"
+                       f"  consult.py fire --followup --parent {a.rid} --task \"<...>\"")
+            elif st in (store_mod.FAILED, store_mod.GATE_REJECTED, store_mod.BLOCKED):
+                nxt = (f"it ended '{st}' ({existing['error_code'] or 'no detail'}) — render a FRESH "
+                       "round (new rid) rather than re-enqueuing this one")
+            elif st in store_mod.UNCERTAIN:
+                nxt = ("its send may already have reached ChatGPT — retrieve it, never re-send: "
+                       f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cdp_consult.py')}"
+                       f" find-conversation --rid {a.rid}")
+            else:
+                nxt = (f"it is '{st}' and the daemon is working it: python3 {_spool.__file__} "
+                       f"await --rid {a.rid} --out {existing['out_path']}")
+            sys.stderr.write(f"CGC_ERROR already_enqueued: {a.rid} is already in the store — {nxt}\n")
             return 2
         # Resolve the follow-up's thread NOW, while the agent's intent is fresh (pinning at enqueue,
         # not at process time, keeps a concurrent consult from stealing the selection). Prefer CAUSAL
