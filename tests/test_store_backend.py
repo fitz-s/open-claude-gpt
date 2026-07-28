@@ -1718,3 +1718,46 @@ def test_re_enqueuing_an_existing_rid_says_what_to_do_about_it(env, capsys):
     assert "already_enqueued" in err
     assert "read its answer" in err and "--followup --parent" in err, \
         "a completed collision must point at the answer and at how to continue the thread"
+
+
+def test_a_followup_that_provably_did_not_send_is_requeued_not_uncertain(env):
+    """The two branches must read the same evidence the same way. `model_not_selectable` and the
+    rest of _NOT_SENT_RETRY are emitted FAIL-CLOSED before the click, so the follow-up provably did
+    not send. Filing that as UNCERTAIN is the costliest misfiling there is: it blocks the free
+    automatic retry, burns a full auto-retrieve and then a manual one hunting an answer nobody
+    asked for, and leaves a human with only a resend left to try — under exactly the uncertainty
+    the invariant exists to prevent. (Observed: a Pro-tier drop cost an hour this way.)"""
+    store_mod, backend, s, tmp = env
+    s.create_round("REQ-20260721-000000-00fu01", "followup", out_path=str(tmp / "f.txt"),
+                   prompt="continuing this consult",
+                   spec_json=json.dumps({"conversation": "6a684b38-bef4-83ea-83d4-134bf9610e05"}))
+    s.set_state("REQ-20260721-000000-00fu01", store_mod.READY)
+
+    def cdp(kind, **kw):
+        return {"code": 2, "stderr": "CGC_ERROR model_not_selectable: thread offers 'None', not 'Pro'"}
+
+    final = backend.process_round(s, s.get_round("REQ-20260721-000000-00fu01"), cdp,
+                                  daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.QUEUED, "proven not-sent → retryable, never uncertain"
+    rec = s.recover()
+    assert "REQ-20260721-000000-00fu01" in rec["dispatchable"]
+    assert "REQ-20260721-000000-00fu01" not in rec["uncertain"]
+
+
+def test_a_failed_wait_does_not_overwrite_why_the_round_became_uncertain(env):
+    """This fallback is also where the one-shot auto-retrieve of an ALREADY-uncertain round lands.
+    Stamping 'accepted but wait produced no answer' there asserted a confirmation that never
+    happened and erased the real disposition a human needs to judge a resend."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    rid = r["rid"]
+    aid = s.begin_send(rid, "p", store_mod.sha256("p"), daemon_instance_id="d1")
+    s.mark_possibly_accepted(aid, "model_not_selectable — provably not sent")
+    s.link_conversation(rid, "conv-live")
+    assert s.claim_auto_retrieve(rid)          # possibly_accepted -> waiting, as the daemon does
+
+    backend._wait_phase(s, rid, "conv-live", {}, lambda *a, **k: {"code": 4, "out": str(tmp / "x"),
+                                                                  "stderr": "nothing"})
+    err = s.get_round(rid)["error_code"]
+    assert "accepted" not in err, "it was never accepted — the message must not claim it was"
+    assert "model_not_selectable" in err, "the original disposition must survive"

@@ -828,6 +828,17 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
                             error_code=_first_marker(stderr, _NOT_SENT_BLOCK))
             return store_mod.BLOCKED
+        if any(m.lower() in stderr for m in _NOT_SENT_RETRY):
+            # Same evidence, same verdict as a submit's. These markers are emitted FAIL-CLOSED
+            # before the click, so the follow-up provably did not send and re-queuing duplicates
+            # nothing. Omitting this check here (the submit branch always had it) filed a proven
+            # not-sent as UNCERTAIN, which is the costliest possible misfiling: it blocks the free
+            # automatic retry, burns a full auto-retrieve and then a manual one hunting an answer
+            # that was never asked for, and leaves a human staring at "may have sent" with only a
+            # resend left to try — under exactly the uncertainty the invariant exists to prevent.
+            store.set_state(rid, store_mod.QUEUED, expect=store_mod.SENDING,
+                            error_code=_first_marker(stderr, _NOT_SENT_RETRY))
+            return store_mod.QUEUED
         store.mark_possibly_accepted(attempt, f"followup send failed (exit {send.get('code')}) — retrieve, don't resend")
         return store_mod.POSSIBLY_ACCEPTED
 
@@ -984,10 +995,18 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
                     error_code=detail or f"retrieve could not confirm source_rid={wait_rid or rid} "
                                          f"(exit {code})")
         return store_mod.FAILED
-    # a wait that returns nothing usable, while the send WAS accepted, is not a clean failure: the
-    # answer may still exist in the conversation. Leave it uncertain so it is retrieved, not resent.
+    # A wait that returns nothing usable is not a clean failure: the answer may still exist in the
+    # conversation. Leave it uncertain so it is retrieved, not resent — but do NOT overwrite WHY the
+    # round became uncertain in the first place. This fallback is also where the one-shot
+    # auto-retrieve of an already-uncertain round lands, and stamping "accepted but wait produced no
+    # answer" there asserted a confirmation that never happened, erasing the real disposition (a
+    # proven-not-sent `model_not_selectable`, in the observed case) that a human needs to judge
+    # whether a resend would duplicate anything.
+    prior_row = store.get_round(rid)
+    prior = prior_row["error_code"] if prior_row else None
     store.set_state(rid, store_mod.POSSIBLY_ACCEPTED,
-                    error_code=f"accepted but wait produced no answer (exit {code}) — retrieve, don't resend")
+                    error_code=(f"wait produced no answer (exit {code}) — retrieve, don't resend"
+                                + (f"; original disposition: {prior}" if prior else "")))
     return store_mod.POSSIBLY_ACCEPTED
 
 
