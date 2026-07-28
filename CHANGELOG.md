@@ -55,6 +55,19 @@ question; what failed is everything downstream of it.
   follows from it (read/await the answer, continue with `--followup --parent`, render a fresh rid,
   or retrieve an uncertain send) instead of a bare "already exists in the store".
 
+- **A follow-up that provably did not send is re-queued, not left uncertain.** The follow-up branch
+  never checked `_NOT_SENT_RETRY` (the submit branch always did), so a fail-closed pre-click refusal
+  — `model_not_selectable` when the thread's tier had dropped off Pro — was filed as UNCERTAIN. That
+  is the costliest possible misfiling: it blocks the free automatic retry, burns a full auto-retrieve
+  and then a manual retrieve hunting an answer that was never asked for, and leaves a human with only
+  a resend left to try, under exactly the uncertainty the invariant exists to prevent. Observed in
+  the field; it cost an hour and ended in a resend.
+- **A failed wait no longer overwrites WHY a round became uncertain.** The uncertain fallback is also
+  where the one-shot auto-retrieve of an already-uncertain round lands, and it stamped "accepted but
+  wait produced no answer" — asserting a confirmation that never happened and erasing the real
+  disposition (a proven-not-sent `model_not_selectable`) that a human needs to judge whether a resend
+  would duplicate anything. The original disposition is now carried forward.
+
 ### Added
 - `cdp_consult.py find-conversation --rid <rid>` — read-only search of open ChatGPT tabs for the rid
   that is inside the prompt we sent. It is the last automated step before a human reads the screen,
