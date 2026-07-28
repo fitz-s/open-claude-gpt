@@ -1694,3 +1694,27 @@ def test_a_round_created_on_a_known_thread_is_addressable(env):
     s.create_round("REQ-20260721-000000-00th01", "followup", out_path=str(tmp / "t.txt"),
                    prompt="continuing this consult", thread_id="conv-abc")
     assert s.conversation_of("REQ-20260721-000000-00th01") == "conv-abc"
+
+
+def test_re_enqueuing_an_existing_rid_says_what_to_do_about_it(env, capsys):
+    """A rid is minted per render, so re-enqueuing one is always a repeat of a request the store
+    already owns — and a bare 'already exists' leaves a retry loop with nothing to act on (observed:
+    the same command failed identically every time while the round it collided with had already
+    answered). The refusal must name the state and the one command that follows from it."""
+    import argparse
+    import cgc_spool
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    s.set_state(r["rid"], store_mod.WAITING)
+    s.finish(r["rid"], store_mod.COMPLETED_VERIFIED, result_text="done")
+
+    pf = tmp / "p.md"
+    pf.write_text("continuing this consult\nhttps://github.com/o/r/pull/1\n")
+    a = argparse.Namespace(rid=r["rid"], prompt_file=str(pf), kind="submit", out=str(tmp / "o.txt"),
+                           conversation="auto", parent=None, model="Pro", request_key=None,
+                           logical_sha=None, project_url=None, poll=20, timeout=60, quiet=True)
+    assert cgc_spool.cmd_enqueue(a) == 2
+    err = capsys.readouterr().err
+    assert "already_enqueued" in err
+    assert "read its answer" in err and "--followup --parent" in err, \
+        "a completed collision must point at the answer and at how to continue the thread"
