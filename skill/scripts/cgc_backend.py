@@ -254,22 +254,25 @@ def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str):
     return 0
 
 
-def _post_create_receipt(a, out: str) -> int:
-    """The shared tail after a round is created (fresh insert OR key transfer): warn if no daemon
-    will send it, then print the one queued receipt unless composed into `fire` (quiet)."""
+def _post_create_receipt(a, out: str, queued: bool = True) -> int:
+    """The shared tail after a round is created (fresh insert OR key transfer) — and after an
+    idempotent repeat, where `queued=False`: the round was already there, so claiming it was queued
+    would be a receipt that lies. Warns if no daemon will send it, then prints the one receipt
+    unless composed into `fire` (quiet). Either way the caller's next step is the same `await`."""
     import cgc_spool as _spool
-    if not _spool.daemon_alive():
+    if queued and not _spool.daemon_alive():
         sys.stderr.write("CGC_WARN daemon_down: queued, but nothing will send it until the daemon "
                          "runs. Relay ONE line to the user: cgc install-daemon\n")
     if getattr(a, "quiet", False):
         # Composed into `fire`, which prints the one receipt that matters. Two receipts for one
         # action is pure noise.
         return 0
-    print(json.dumps({"queued": True, "rid": a.rid, "out": out, "backend": "store"}))
+    print(json.dumps({"queued": queued, "rid": a.rid, "out": out, "backend": "store"}))
     argv = ["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgc_spool.py"),
             "await", "--rid", a.rid, "--out", out]
     import shlex
-    sys.stderr.write(f"CGC_QUEUED {a.rid} (store). Await it:\n  {' '.join(shlex.quote(x) for x in argv)}\n")
+    sys.stderr.write(f"{'CGC_QUEUED' if queued else 'CGC_ALREADY'} {a.rid} (store). Await it:\n"
+                     f"  {' '.join(shlex.quote(x) for x in argv)}\n")
     return 0
 
 
@@ -374,6 +377,17 @@ def enqueue_round(a, prompt: str, out: str) -> int:
             # already answered. Name the state and the one command that follows from it.
             import cgc_spool as _spool
             st = existing["state"]
+            # SAME rid + SAME bytes is the same request, so say so and SUCCEED. The caller's next
+            # step (`await`) is what actually delivers the answer, and the canonical invocation
+            # chains the two with `&&` — refusing here short-circuited that chain and left an
+            # answer sitting completed in the store while the command failed identically on every
+            # retry. Nothing is enqueued either way; this only decides whether the chain proceeds.
+            # A DIFFERENT prompt under the same rid is a different request and still refuses.
+            if existing["prompt_sha256"] == (store_mod.sha256(prompt) if prompt else None):
+                sys.stderr.write(
+                    f"CGC_IDEMPOTENT {a.rid} is already in the store ('{st}') with these exact "
+                    "bytes — nothing new queued; await it for the answer.\n")
+                return _post_create_receipt(a, out, queued=False)
             if st in (store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED):
                 nxt = (f"read its answer: {existing['out_path']}  (or re-materialize it: python3 "
                        f"{_spool.__file__} await --rid {a.rid} --out {existing['out_path']})\n"
