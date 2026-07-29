@@ -58,6 +58,28 @@ class ConversationLeaseRefused(Exception):
         self.conversation = conversation
 
 
+# A pre-click failure is called transient because a retry MAY fix it — not because it will. Three
+# begun sends that all died before the click is no longer evidence of a blip; it is a standing
+# condition (the observed one: the thread's model tier had dropped off Pro, which no retry can
+# restore). Unbounded, that retry is a hot loop against the daemon poll, and each turn of it opens
+# a browser tab — exhausting the one resource whose exhaustion ends every consult. So it is bounded,
+# and the round then BLOCKS: terminal, never resent, addressed to the human who can actually fix it.
+_MAX_NOT_SENT_RETRIES = 3
+
+
+def _requeue_or_block(store, rid: str, marker: str) -> str:
+    """Route a PROVEN not-sent round: retry while the evidence still reads transient, then block."""
+    if store.attempt_count(rid) >= _MAX_NOT_SENT_RETRIES:
+        store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
+                        error_code=(f"{marker} — still failing after {_MAX_NOT_SENT_RETRIES} "
+                                    "automatic retries; nothing was ever sent, but this needs a "
+                                    "human (check the ChatGPT window: model tier, login, the tab)"))
+        return store_mod.BLOCKED
+    store.set_state(rid, store_mod.QUEUED, expect=store_mod.SENDING, error_code=marker)
+    return store_mod.QUEUED
+
+
+
 def _gate(store, rid: str, prompt: str, validate) -> str | None:
     """Run the egress gate on a `ready` round. Two failure kinds, two outcomes:
       - `refused:`     — an AUTHORITATIVE denial (secret detected / no public link / repo confirmed
@@ -708,7 +730,12 @@ def _await_round(a) -> int:
             _emit(a.rid, state, retryable=False, parent_rid=parent,
                   human_action="check the ChatGPT window; retrieve by conversation before re-sending",
                   next_command=retrieve, error=r["error_code"])
-            return 1
+            # 3, not 1. The documented contract is 0 answer / 3 a human must act / 1 BROKEN, and an
+            # uncertain send is the definition of "a human must act" — nothing is broken, the send
+            # may well have landed. Reporting it as broken is what made every one of these read as a
+            # tool failure in the caller's log ("failed with exit code 1") instead of as the one
+            # action item it is, which is how an hour went into hunting a crash that never happened.
+            return 3
         if state in (store_mod.FAILED, store_mod.GATE_REJECTED):
             err = r["error_code"] or "the daemon could not deliver an answer"
             sys.stderr.write(f"CGC_BROKEN {a.rid}: {err}\n")
@@ -836,9 +863,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             # automatic retry, burns a full auto-retrieve and then a manual one hunting an answer
             # that was never asked for, and leaves a human staring at "may have sent" with only a
             # resend left to try — under exactly the uncertainty the invariant exists to prevent.
-            store.set_state(rid, store_mod.QUEUED, expect=store_mod.SENDING,
-                            error_code=_first_marker(stderr, _NOT_SENT_RETRY))
-            return store_mod.QUEUED
+            return _requeue_or_block(store, rid, _first_marker(stderr, _NOT_SENT_RETRY))
         store.mark_possibly_accepted(attempt, f"followup send failed (exit {send.get('code')}) — retrieve, don't resend")
         return store_mod.POSSIBLY_ACCEPTED
 
@@ -870,10 +895,8 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                         error_code=_first_marker(stderr, _NOT_SENT_BLOCK))
         return store_mod.BLOCKED
     if any(m.lower() in stderr for m in _NOT_SENT_RETRY):
-        # provably not sent → safe to re-queue (this is NOT resending a possible send)
-        store.set_state(rid, store_mod.QUEUED, expect=store_mod.SENDING,
-                        error_code=_first_marker(stderr, _NOT_SENT_RETRY))
-        return store_mod.QUEUED
+        # provably not sent → safe to re-queue (this is NOT resending a possible send), bounded
+        return _requeue_or_block(store, rid, _first_marker(stderr, _NOT_SENT_RETRY))
     # UNCERTAIN. A conversation reported by a FAILING submit is an address, not a confirmation (the
     # driver reports one whenever the post-click tab sits in a thread, including a reused tab it was
     # already in), so the state stays possibly_accepted — but recording it is what makes this round

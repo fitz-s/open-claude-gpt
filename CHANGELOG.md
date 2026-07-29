@@ -68,6 +68,21 @@ question; what failed is everything downstream of it.
   disposition (a proven-not-sent `model_not_selectable`) that a human needs to judge whether a resend
   would duplicate anything. The original disposition is now carried forward.
 
+- **The proven-not-sent retry is bounded.** "Transient" means a retry MAY fix it, not that it will.
+  Three begun sends that all died before the click is a standing condition — the observed one was a
+  thread whose model tier had dropped off Pro, which no retry restores — and each turn of an
+  unbounded retry opens a browser tab, exhausting the one resource whose exhaustion ends every
+  consult. After three the round BLOCKS: terminal, never sent, addressed to the human who can fix it.
+- **`await` reports an uncertain round as 3 (a human must act), not 1 (broken).** That is the
+  documented contract, and nothing about an uncertain send is broken — it may well have landed.
+  Reporting it as broken made every one of these read as a tool failure in the caller's log
+  ("failed with exit code 1") instead of as the one action item it is.
+- **`enqueue` reads the rid from the prompt.** The rid is a property of the RENDERED PROMPT — prep
+  writes `BEGIN_RESPONSE:<rid>` into the text and the waiter accepts an answer only if that exact
+  sentinel returns — so `--rid` is now optional, and one that DISAGREES with the prompt is refused
+  rather than silently producing a round that could never be confirmed. Hand-typing the format was a
+  step that only ever produced `bad_rid`.
+
 ### Added
 - `cdp_consult.py find-conversation --rid <rid>` — read-only search of open ChatGPT tabs for the rid
   that is inside the prompt we sent. It is the last automated step before a human reads the screen,

@@ -1761,3 +1761,33 @@ def test_a_failed_wait_does_not_overwrite_why_the_round_became_uncertain(env):
     err = s.get_round(rid)["error_code"]
     assert "accepted" not in err, "it was never accepted — the message must not claim it was"
     assert "model_not_selectable" in err, "the original disposition must survive"
+
+
+def test_a_standing_not_sent_failure_blocks_instead_of_retrying_forever(env):
+    """'Transient' means a retry MAY fix it, not that it will. Three begun sends that all died before
+    the click is a standing condition (the observed one: the thread's tier had dropped off Pro, which
+    no retry restores) — and each turn of an unbounded retry opens a browser tab, exhausting the one
+    resource whose exhaustion ends every consult."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    rid = r["rid"]
+
+    def cdp(kind, **kw):
+        return {"code": 3, "conversation": "",
+                "stderr": "CGC_ERROR model_not_selectable: wanted 'Pro'"}
+
+    seen = []
+    for _ in range(4):
+        rr = s.get_round(rid)
+        if rr["state"] == store_mod.QUEUED:
+            s.set_state(rid, store_mod.READY)
+            rr = s.get_round(rid)
+        if rr["state"] != store_mod.READY:
+            break
+        seen.append(backend.process_round(s, rr, cdp, daemon_instance_id="d1", validate=_OK_GATE))
+
+    assert seen[:2] == [store_mod.QUEUED, store_mod.QUEUED], "the first retries are legitimate"
+    assert seen[-1] == store_mod.BLOCKED, "a standing failure must reach a human, not spin"
+    err = s.get_round(rid)["error_code"]
+    assert "model_not_selectable" in err and "automatic retries" in err
+    assert rid not in s.recover()["uncertain"], "nothing was ever sent — never uncertain"
