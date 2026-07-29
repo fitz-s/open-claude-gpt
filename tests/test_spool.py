@@ -532,3 +532,36 @@ def test_enqueue_refuses_a_rid_that_disagrees_with_the_prompt(spool, tmp_path, c
     pf.write_text(f"review https://github.com/acme/widgets\n\nBEGIN_RESPONSE:{_rid('bb0002')}\n")
     assert spool.cmd_enqueue(_enqueue_args(_rid("bb0003"), str(pf))) == 2
     assert "rid_prompt_mismatch" in capsys.readouterr().err
+
+
+# ---- a retrieve mints its own rid --------------------------------------------
+
+def test_retrieve_without_rid_mints_one_and_returns_it(spool, capsys):
+    """A retrieve has no prompt to read a rid back from — and no caller-meaningful rid at all: what
+    identifies the recovery is --parent, the round being recovered. So enqueue mints it and the
+    receipt RETURNS it. Hand-writing the format was the last path to `bad_rid`, and it burned a
+    live recovery in the field."""
+    parent = _rid("00pa01")
+    a = _enqueue_args(None, None, kind="retrieve", conversation="8f2a1c00-0000-4000-8000-000000000001",
+                      parent=parent)
+    assert spool.cmd_enqueue(a) == 0
+    minted = json.loads(capsys.readouterr().out.strip().splitlines()[-1])["rid"]
+    assert spool._RID_RE.match(minted), f"minted rid must be canonical, got {minted!r}"
+    sm = _store(spool)
+    with sm.Store() as s:
+        r = s.get_round(minted)
+    assert r is not None and r["kind"] == "retrieve" and r["parent_rid"] == parent
+
+
+def test_retrieve_still_refuses_a_malformed_hand_written_rid(spool):
+    """Minting is a default, not a laundering step: a rid that IS passed still has to be canonical,
+    because everything downstream (leases, the sentinel, the store key) fullmatches the shape."""
+    a = _enqueue_args("not-a-rid", None, kind="retrieve",
+                      conversation="8f2a1c00-0000-4000-8000-000000000002", parent=_rid("00pa02"))
+    assert spool.cmd_enqueue(a) == 2
+
+
+def test_new_rid_is_accepted_by_the_validator_that_guards_every_round(spool):
+    """One definition of the rid shape: the minter and the regex live together, so they cannot
+    drift into a format that mints rounds the store refuses."""
+    assert spool._RID_RE.match(spool.new_rid())

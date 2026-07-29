@@ -42,6 +42,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -96,6 +97,18 @@ POLL_S = 20
 
 # rid shape must match cdp_consult.py exactly.
 _RID_RE = re.compile(r"^REQ-\d{8}-\d{6}-[0-9a-f]{6}$")
+
+
+def new_rid() -> str:
+    """Mint a rid. Lives next to the regex that validates it so the shape has exactly one
+    definition — it used to be written here and spelled out again in consult.cmd_prep, two
+    copies of a format whose mismatch is unobservable until a round refuses to enqueue."""
+    return "REQ-" + time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(3)
+
+
+def default_out(rid: str) -> str:
+    """Where a round's answer file goes when nobody chose one."""
+    return os.path.join(CGC_STATE_DIR, f"answer_{rid}.txt")
 
 # The SAME public-code-URL rule cdp_consult.cmd_submit uses (github / gist / raw), so the gate
 # and the submit backstop agree on what counts as a real, public code link.
@@ -682,12 +695,18 @@ def cmd_enqueue(a) -> int:
                     "this round could never be confirmed. Drop --rid (it is read from the prompt) "
                     "or pass the prompt this rid belongs to.\n")
                 return 2
+    # A retrieve has no prompt, so there is no sentinel to read a rid back from — but its own rid is
+    # pure bookkeeping (what identifies the recovery is --parent, the round being recovered), so
+    # there is nothing for a caller to know and nothing to hand-write. Mint it. Hand-writing was the
+    # only remaining path to `bad_rid`, and it burned a live recovery in the field.
+    if a.kind == "retrieve" and not a.rid:
+        a.rid = new_rid()
     if not _RID_RE.match(a.rid or ""):
         sys.stderr.write(f"CGC_ERROR bad_rid: {a.rid!r} (want REQ-YYYYMMDD-HHMMSS-hhhhhh). Do not "
                          "hand-write one: `consult.py prep` mints it and puts it in the prompt, and "
                          "enqueue reads it back from there — omit --rid entirely.\n")
         return 2
-    out = a.out or os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
+    out = a.out or default_out(a.rid)
     if a.kind == "retrieve" and (not a.conversation or a.conversation == "auto"):
         sys.stderr.write("CGC_ERROR need_conversation: --kind retrieve requires an explicit "
                          "--conversation <id>.\n")
@@ -725,6 +744,13 @@ def cmd_await(a) -> int:
         3  a human must act in the ChatGPT window (login / captcha / rate limit / safeguard refusal)
         1  broken                   -> the job log path is printed; go look
 
+    The exit code is a routing bit; the RETURN is an address. Every outcome names the artifact it
+    produced — `answer_path` on 0, `next_command` + `human_action` on 3, `log_path` on 1 — because
+    a caller told only "0" still has to find the answer, and the round already knows where it is.
+    That is also why --out is an override and not an argument: the address is chosen once, when the
+    round is created, and recorded on the round. Requiring the caller to carry it back in was the
+    last surviving instance of the copy-a-path-between-JSON-blobs step `fire` exists to delete.
+
     "Still running" is NOT among them. A consult routinely outlasts any particular observation, and
     making that an exit code turned every healthy 25-minute round into a failure the caller had to
     notice and manually retry. Waiting longer is the waiter's job, so the waiter just keeps waiting.
@@ -757,11 +783,12 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     e = sub.add_parser("enqueue", help="create a queued consult round in the store (LOCAL write only)")
-    e.add_argument("--rid", help="omit it for submit/followup: prep mints the rid INTO the prompt "
-                                 "(BEGIN_RESPONSE:<rid>) and enqueue reads it back from there. One "
-                                 "that disagrees with the prompt is refused — the waiter verifies "
-                                 "the prompt's own sentinel, so such a round could never confirm. "
-                                 "Required for --kind retrieve, which has no prompt.")
+    e.add_argument("--rid", help="never needed — omit it. For submit/followup prep mints the rid "
+                                 "INTO the prompt (BEGIN_RESPONSE:<rid>) and enqueue reads it back "
+                                 "from there; one that disagrees with the prompt is refused, since "
+                                 "the waiter verifies the prompt's own sentinel and such a round "
+                                 "could never confirm. For --kind retrieve (no prompt) enqueue mints "
+                                 "one and prints it — a retrieve is identified by --parent.")
     e.add_argument("--prompt-file", help="rendered prompt (required except for --kind retrieve)")
     e.add_argument("--kind", choices=("submit", "followup", "retrieve"), default="submit",
                    help="submit=new consult, followup=continue a thread, retrieve=read an existing "
@@ -790,7 +817,10 @@ def main() -> int:
 
     w = sub.add_parser("await", help="poll the local answer/status for a queued job (LOCAL read only)")
     w.add_argument("--rid", required=True)
-    w.add_argument("--out", required=True)
+    w.add_argument("--out", help="OPTIONAL override. The answer's address was chosen when the round "
+                                 "was created and is recorded on the round, so await reads it back "
+                                 "and prints it — pass this only to materialize the answer somewhere "
+                                 "else as well.")
     w.add_argument("--poll", type=int, default=POLL_S)
     w.add_argument("--timeout", type=int, default=STUCK_AFTER_S,
                    help=f"seconds before declaring the job STUCK (default {STUCK_AFTER_S} = "
