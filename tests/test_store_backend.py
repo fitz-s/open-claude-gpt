@@ -1791,3 +1791,102 @@ def test_a_standing_not_sent_failure_blocks_instead_of_retrying_forever(env):
     err = s.get_round(rid)["error_code"]
     assert "model_not_selectable" in err and "automatic retries" in err
     assert rid not in s.recover()["uncertain"], "nothing was ever sent — never uncertain"
+
+
+# ---- the return is an address, not a bit -------------------------------------
+# The answer's path is chosen ONCE, when the round is created, and recorded on the round. await
+# reads it back and returns it; it does not ask the caller to carry it in. These pin that.
+
+def test_await_without_out_uses_the_address_recorded_on_the_round(env, capsys):
+    """`await --rid R` with no --out writes exactly where the receipt promised, and the envelope
+    returns that path. Requiring --out made the caller re-supply an address the round already
+    knew — and let it supply a DIFFERENT one, putting the answer where no reader looks."""
+    store_mod, backend, s, tmp = env
+    rid, recorded = "REQ-20260729-000000-00adr1", str(tmp / "recorded.txt")
+    s.create_round(rid, "submit", out_path=recorded)
+    s.set_state(rid, store_mod.READY)
+    aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid, "conv-adr1"); s.mark_waiting(rid)
+    s.finish(rid, store_mod.COMPLETED_VERIFIED, result_text="the answer")
+
+    assert backend.await_round(types.SimpleNamespace(rid=rid, timeout=2, poll=1)) == 0
+    assert open(recorded).read() == "the answer"
+    env_line = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert env_line["answer_path"] == recorded, "the envelope must RETURN the address, not just 0"
+
+
+def test_await_out_is_an_override_that_does_not_rewrite_the_round(env):
+    """An explicit --out is a second copy for a human, not a relocation: the round keeps naming the
+    address every other reader (status, the raw-salvage lookup) already trusts."""
+    store_mod, backend, s, tmp = env
+    rid, recorded = "REQ-20260729-000000-00adr2", str(tmp / "recorded2.txt")
+    s.create_round(rid, "submit", out_path=recorded)
+    s.set_state(rid, store_mod.READY)
+    aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid, "conv-adr2"); s.mark_waiting(rid)
+    s.finish(rid, store_mod.COMPLETED_VERIFIED, result_text="the answer")
+
+    elsewhere = str(tmp / "elsewhere.txt")
+    assert backend.await_round(types.SimpleNamespace(rid=rid, out=elsewhere, timeout=2, poll=1)) == 0
+    assert open(elsewhere).read() == "the answer"
+    assert s.get_round(rid)["out_path"] == recorded
+
+
+def test_await_falls_back_to_the_default_address_for_a_round_without_one(env):
+    """Legacy rows (and any round created without --out) have no recorded path — derive the same
+    default enqueue would have, never crash on the missing column."""
+    store_mod, backend, s, tmp = env
+    import cgc_spool as spool
+    rid = "REQ-20260729-000000-00adr3"
+    s.create_round(rid, "submit")
+    s.set_state(rid, store_mod.READY)
+    aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid, "conv-adr3"); s.mark_waiting(rid)
+    s.finish(rid, store_mod.COMPLETED_VERIFIED, result_text="the answer")
+
+    assert backend.await_round(types.SimpleNamespace(rid=rid, timeout=2, poll=1)) == 0
+    assert open(spool.default_out(rid)).read() == "the answer"
+
+
+def test_printed_await_command_carries_no_path(env, capsys):
+    """The receipt's next command is `await --rid R`. A printed --out is a path the caller must
+    copy between JSON blobs — the exact step `fire` exists to delete — and a stale one silently
+    materializes the answer where nobody is looking."""
+    store_mod, backend, s, tmp = env
+    a = types.SimpleNamespace(rid="REQ-20260729-000000-00adr4", kind="submit",
+                              project_url="https://chatgpt.com/", model="Pro", conversation=None,
+                              poll=1, timeout=1)
+    assert backend.enqueue_round(a, "references no code; a maths question", str(tmp / "x.txt")) == 0
+    cap = capsys.readouterr()
+    assert "await --rid REQ-20260729-000000-00adr4" in cap.err
+    assert "--out" not in cap.err
+
+
+def test_status_names_the_answer_path_and_the_thread(env, capsys):
+    """`status --rid` reported a state word and an attempt id — the reader then had to derive both
+    addresses by hand. The conversation especially: it is what a stranded round's recovery is
+    addressed BY, so a status that omits it withholds the one field recovery needs."""
+    store_mod, backend, s, tmp = env
+    rid, recorded = "REQ-20260729-000000-00sta1", str(tmp / "st.txt")
+    s.create_round(rid, "submit", out_path=recorded)
+    s.set_state(rid, store_mod.READY)
+    aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid, "conv-sta1"); s.mark_waiting(rid)
+
+    assert backend.store_status(True, rid) == 0
+    line = [ln for ln in capsys.readouterr().out.splitlines() if f"round[{rid}]" in ln][0]
+    fields = json.loads(line.split(": ", 1)[1])
+    assert fields["out_path"] == recorded
+    assert fields["conversation"] == "conv-sta1"
+
+
+def test_status_for_a_round_with_no_thread_reports_no_conversation(env, capsys):
+    """A round that never sent has no thread — report that as null, never crash the status a human
+    runs precisely because something went wrong."""
+    store_mod, backend, s, tmp = env
+    rid = "REQ-20260729-000000-00sta2"
+    s.create_round(rid, "submit")
+    assert backend.store_status(False, rid) == 0
+    line = [ln for ln in capsys.readouterr().out.splitlines() if f"round[{rid}]" in ln][0]
+    fields = json.loads(line.split(": ", 1)[1])
+    assert fields["conversation"] is None and fields["out_path"] is None

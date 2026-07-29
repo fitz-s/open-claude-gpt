@@ -123,7 +123,13 @@ def store_status(up: bool, rid: str | None = None) -> int:
         if rid:
             rr = s.get_round(rid)
             if rr:
+                # The addresses, not just the verdict: where the answer is (or will be) and which
+                # ChatGPT thread holds it. A status that reports only a state word makes the reader
+                # go derive both by hand — and the conversation is exactly what a stranded round's
+                # recovery is addressed by.
                 fields = {k: rr[k] for k in ("state", "kind", "error_code", "current_attempt_id")}
+                fields["out_path"] = rr.get("out_path")
+                fields["conversation"] = s.conversation_of(rid)
                 print(f"  round[{rid}]: {json.dumps(fields)}")
             else:
                 print(f"  round[{rid}]: (not in store)")
@@ -291,7 +297,7 @@ def _post_create_receipt(a, out: str, queued: bool = True) -> int:
         return 0
     print(json.dumps({"queued": queued, "rid": a.rid, "out": out, "backend": "store"}))
     argv = ["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgc_spool.py"),
-            "await", "--rid", a.rid, "--out", out]
+            "await", "--rid", a.rid]
     import shlex
     sys.stderr.write(f"{'CGC_QUEUED' if queued else 'CGC_ALREADY'} {a.rid} (store). Await it:\n"
                      f"  {' '.join(shlex.quote(x) for x in argv)}\n")
@@ -412,7 +418,7 @@ def enqueue_round(a, prompt: str, out: str) -> int:
                 return _post_create_receipt(a, out, queued=False)
             if st in (store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED):
                 nxt = (f"read its answer: {existing['out_path']}  (or re-materialize it: python3 "
-                       f"{_spool.__file__} await --rid {a.rid} --out {existing['out_path']})\n"
+                       f"{_spool.__file__} await --rid {a.rid})\n"
                        "  To ask something NEW on that thread, render a fresh round and continue it:\n"
                        f"  consult.py fire --followup --parent {a.rid} --task \"<...>\"")
             elif st in (store_mod.FAILED, store_mod.GATE_REJECTED, store_mod.BLOCKED):
@@ -424,7 +430,7 @@ def enqueue_round(a, prompt: str, out: str) -> int:
                        f" find-conversation --rid {a.rid}")
             else:
                 nxt = (f"it is '{st}' and the daemon is working it: python3 {_spool.__file__} "
-                       f"await --rid {a.rid} --out {existing['out_path']}")
+                       f"await --rid {a.rid}")
             sys.stderr.write(f"CGC_ERROR already_enqueued: {a.rid} is already in the store — {nxt}\n")
             return 2
         # Resolve the follow-up's thread NOW, while the agent's intent is fresh (pinning at enqueue,
@@ -602,7 +608,7 @@ def _await_round(a) -> int:
     alive to advance it, so a dead daemon must surface as broken-with-next-step promptly — not as
     90 silent minutes of polling a row nobody is working."""
     import cgc_spool as _spool
-    out = os.path.abspath(a.out)
+    out = None
     deadline = time.time() + a.timeout
     down_since = None
     while time.time() < deadline:
@@ -612,6 +618,14 @@ def _await_round(a) -> int:
             sys.stderr.write(f"CGC_BROKEN {a.rid}: no such round in the store.\n")
             _emit(a.rid, "missing", retryable=False, error="no such round in the store")
             return 1
+        # The answer's address belongs to the ROUND, not to this invocation: it was chosen at
+        # creation (--out, or the default) and recorded. Resolve it from there so `await --rid R`
+        # writes exactly where the receipt promised. An explicit --out still overrides, for a human
+        # who wants a second copy elsewhere; it is deliberately not written back, so the round keeps
+        # naming the address every other reader (status, raw-salvage lookup) already trusts.
+        if out is None:
+            out = os.path.abspath(getattr(a, "out", None) or r.get("out_path")
+                                  or _spool.default_out(a.rid))
         state = r["state"]
         parent = r.get("parent_rid")
         # A retrieve round stores the rid it is RECOVERING in the same parent_rid column (its own
@@ -635,7 +649,7 @@ def _await_round(a) -> int:
                         "as the daemon is up.\n")
                     _emit(a.rid, state, retryable=True, parent_rid=parent,
                           human_action="run `cgc install-daemon` (the daemon is not running)",
-                          next_command=f"python3 {_spool.__file__} await --rid {a.rid} --out {out}",
+                          next_command=f"python3 {_spool.__file__} await --rid {a.rid}",
                           error="daemon down")
                     return 1
         if state == store_mod.COMPLETED_VERIFIED:
@@ -685,7 +699,7 @@ def _await_round(a) -> int:
                 # --parent pins the SOURCE rid the retrieve must verify on the page — never let it
                 # auto-adopt whatever the conversation's latest turn happens to be by the time a
                 # human clears the blocker and runs this.
-                retrieve = (f"python3 {_spool.__file__} enqueue --rid <new-rid> --kind retrieve "
+                retrieve = (f"python3 {_spool.__file__} enqueue --kind retrieve "
                             f"--conversation {conv} --parent {a.rid}")
                 sys.stderr.write(
                     f"CGC_BLOCKER {a.rid} (post-send): {r['error_code'] or 'login/captcha/rate-limit'}\n"
@@ -715,7 +729,7 @@ def _await_round(a) -> int:
             # screen: the rid is inside the prompt that was sent, so an open tab carrying it IS this
             # round's thread. That search is read-only and cannot duplicate anything.
             cdp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cdp_consult.py")
-            retrieve = (f"python3 {_spool.__file__} enqueue --rid <new-rid> --kind retrieve "
+            retrieve = (f"python3 {_spool.__file__} enqueue --kind retrieve "
                         f"--conversation {conv} --parent {a.rid}") if conv else (
                         f"python3 {cdp} find-conversation --rid {a.rid}")
             sys.stderr.write(

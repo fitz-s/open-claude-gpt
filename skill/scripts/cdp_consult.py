@@ -2189,7 +2189,7 @@ def cmd_find_conversation(a) -> int:
         return 1
     sys.stderr.write(f"CGC_FOUND {a.rid} is in conversation {hits[0]}. Retrieve it read-only:\n"
                      f"  python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cgc_spool.py')}"
-                     f" enqueue --rid <new-rid> --kind retrieve --conversation {hits[0]} --parent {a.rid}\n")
+                     f" enqueue --kind retrieve --conversation {hits[0]} --parent {a.rid}\n")
     return 0
 
 

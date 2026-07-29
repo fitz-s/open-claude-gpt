@@ -518,7 +518,8 @@ def cmd_prep(a: argparse.Namespace) -> int:
         raise SystemExit("CGC_ERROR bad_chunk_sizes: need target-chars>=2000 and hard-chars>=target-chars")
     if a.expect_minutes < 1 or a.expect_minutes > 60:
         raise SystemExit("CGC_ERROR bad_expect_minutes: need 1<=expect-minutes<=60")
-    rid = "REQ-" + time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(3)
+    import cgc_spool as spool
+    rid = spool.new_rid()
 
     # Wake plan. Each wake = one full main-context reload (ScheduleWakeup sleep
     # >5 min always misses the prompt cache), so token cost ~= wake_count *
@@ -806,7 +807,7 @@ def cmd_fire(a: argparse.Namespace) -> int:
         return 2
     out = os.path.abspath(a.out or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt"))
     spool_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgc_spool.py")
-    await_argv = ["python3", spool_py, "await", "--rid", rid, "--out", out]
+    await_argv = ["python3", spool_py, "await", "--rid", rid]
     # argv is the canonical receipt; the string is only a copyable display (shell-quoted so a path
     # with a space or a shell metacharacter can't break or change the parsed command).
     return {"rid": rid, "out": out, "await_argv": await_argv,

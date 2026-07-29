@@ -6,6 +6,36 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Changed — the return of a command is an address, not a status bit
+
+An exit code routes the caller; it does not tell them where anything is. Applied across the
+caller-facing surface: wherever the system already knew an identifier or a path, it now mints and
+returns it instead of demanding the caller invent one and hand it back.
+
+- **`await --out` is an override, not an argument.** The answer's address is chosen ONCE, when the
+  round is created (`--out`, or the default), and recorded on the round; `await --rid <rid>` reads
+  it back, materializes there, and returns it as `answer_path`. It was `required=True`, so the
+  caller had to carry a path from `fire`'s JSON receipt into a second command — the exact
+  copy-a-path-between-blobs step `fire` exists to delete, and the last one standing. It was also a
+  live hazard: a divergent `--out` wrote the answer to an address nobody recorded, leaving the
+  store naming one location and the disk holding another. An explicit `--out` still writes a
+  second copy for a human and deliberately does *not* rewrite the round, so `status`, the
+  raw-salvage lookup, and every other reader keep trusting one address. Legacy rows with no
+  recorded path fall back to the same default `enqueue` would have chosen. Every printed `await`
+  command (fire's receipt, `_post_create_receipt`, the daemon-down `next_command`) drops `--out`.
+- **A `retrieve` mints its own rid.** `enqueue --kind retrieve` has no prompt to read a
+  `BEGIN_RESPONSE:` sentinel from, so `--rid` was required and hand-written — the last remaining
+  path to `bad_rid`, and it burned a live recovery in the field. A retrieve's own rid is pure
+  bookkeeping (what identifies the recovery is `--parent`, the round being recovered), so there was
+  never anything for a caller to know. It is minted and returned in the receipt; a rid that *is*
+  passed still has to be canonical. Every printed retrieve command drops `--rid <new-rid>`.
+- **One definition of the rid shape.** `cgc_spool.new_rid()` lives next to the `_RID_RE` that
+  validates it; `consult.cmd_prep` no longer spells the format out a second time, where a drift
+  would have been unobservable until rounds started refusing to enqueue.
+- **`status --rid` names the artifacts.** It reported a state word and an attempt id; it now also
+  reports `out_path` and `conversation` — where the answer is, and which thread holds it, the
+  latter being exactly what a stranded round's recovery is addressed by.
+
 Field incident: a submit clicked, the DOM rid echo was unreadable, and the round went
 `possibly_accepted` with **no conversation recorded**. Recovery is addressed *by conversation*, so
 there was nothing to retrieve from — while the answer was generating in a tab the daemon was about

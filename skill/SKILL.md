@@ -33,7 +33,9 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py fire --repo owner/re
 
 # 2. Await DETACHED (run_in_background:true) — copy the exact line fire prints. It waits as long
 #    as the consult takes and wakes you with the answer path. NEVER `nohup … &` instead.
-python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid> --out <out>
+#    The rid is the whole handle: the answer's path was chosen when the round was created and is
+#    recorded on it, so await reads it back and PRINTS it. You never pass or track a path.
+python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid>
 ```
 
 - Reviewing `main`/a branch → `--ref <sha>` (commit-pinned; a branch can move mid-consult).
@@ -48,9 +50,10 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid> 
 
 ## Outcomes — read the envelope, not the prose
 
-`await` exits 0 (answer ready) / 3 (a human must act) / 1 (broken), and its LAST stdout line is a
-JSON envelope: `{schema:1, rid, parent_rid, state, retryable, human_action, next_command,
-answer_path, log_path, confidence, error}`. Act on the fields:
+The exit code only routes you (0 answer ready / 3 a human must act / 1 broken); the RETURN is an
+address. `await`'s LAST stdout line is a JSON envelope — `{schema:1, rid, parent_rid, state,
+retryable, human_action, next_command, answer_path, log_path, confidence, error}` — and every
+outcome names the artifact it produced. Act on the fields, never on the code alone:
 
 - `answer_path` set → Read it. `confidence:"unverified"` → a human verifies the answer is complete
   and belongs to this round before you act on it; never auto-chain a follow-up on it.
