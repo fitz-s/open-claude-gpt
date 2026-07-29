@@ -625,10 +625,26 @@ class Store:
     def claim_ready(self, daemon_instance_id: str) -> dict | None:
         """Atomically pick ONE queued round and move it to `ready`, returning it — the store-native
         replacement for the pending→processing rename. IMMEDIATE transaction + single-writer means
-        two daemons cannot both claim the same round (and phase 5 enforces one daemon anyway)."""
+        two daemons cannot both claim the same round (and phase 5 enforces one daemon anyway).
+
+        ONE IN-FLIGHT SEND PER CONVERSATION. A follow-up whose thread already has a live round is
+        not claimed at all — a thread is a single shared composer and a single ordered transcript,
+        so two overlapping sends into it are two writers on one mutable resource. The per-conversation
+        mutator lease alone does not cover this: it is released once the send LANDS, leaving the whole
+        answer wait unguarded, and a second follow-up sent then interleaves its turn into a thread the
+        first round is still being answered from. Enforced here rather than by holding that lease
+        longer, because refusing at claim time spawns no worker and therefore cannot spin: the round
+        stays QUEUED and is picked up the moment the thread frees. Scoped to follow-ups — a `retrieve`
+        is read-only and IS the recovery path, so it must never be fenced out of a busy thread — and
+        to genuinely live states, since an unreconciled `possibly_accepted` would otherwise block its
+        thread forever."""
         with self._tx():
             row = self.db.execute(
-                "SELECT rid FROM rounds WHERE state=? ORDER BY created_at LIMIT 1", (QUEUED,)
+                "SELECT rid FROM rounds r WHERE r.state=? AND ("
+                "  r.kind!='followup' OR r.thread_id IS NULL OR NOT EXISTS ("
+                "    SELECT 1 FROM rounds o WHERE o.thread_id=r.thread_id AND o.rid!=r.rid"
+                f"     AND o.state IN (?,?,?)))"
+                " ORDER BY r.created_at LIMIT 1", (QUEUED, SENDING, ACCEPTED, WAITING)
             ).fetchone()
             if row is None:
                 return None

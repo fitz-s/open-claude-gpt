@@ -1763,17 +1763,24 @@ def cmd_followup(a) -> int:
         # fast path; the authoritative signal is the LAST rendered user turn echoing OUR rid.
         n = u_before
         echoed = ""
+        grew = False
         _sdl = time.time() + 30
         while time.time() < _sdl:
             time.sleep(0.5)
             n = c.eval("document.querySelectorAll(" + _JS_U + ").length") or 0
-            if n > u_before:
-                break
-            if rid:
-                echoed = _turn_canonical_rid(c.eval(_last_user_text_js()) or "") or ""
-                if echoed == rid:
+            grew = grew or n > u_before
+            if not rid:
+                if grew:        # nothing to verify against; the count is all the evidence there is
                     break
-        ok = bool(n > u_before) or bool(rid and echoed == rid)
+                continue
+            echoed = _turn_canonical_rid(c.eval(_last_user_text_js()) or "") or ""
+            if echoed == rid:
+                break
+        # Count growth is a HINT, not an exit: the node can appear a beat before its text hydrates,
+        # and breaking on it left the authoritative rid read below as a single shot against an empty
+        # turn — a landed follow-up reported as rid_echo_mismatch, i.e. a false uncertain on a send
+        # that did happen. Keep polling for the canonical echo and let the deadline end the loop.
+        ok = grew or bool(rid and echoed == rid)
         # CONVERSATION-INTEGRITY GUARD (after send): require the EXACT same conversation still
         # holds — do NOT silently adopt whatever conv the page now reports (that would let a
         # mid-send navigation/redirect to a DIFFERENT thread pass unnoticed, with the follow-up
@@ -1808,8 +1815,11 @@ def cmd_followup(a) -> int:
         # rendering yields one, and the explicit --prompt-file path without --rid now parses it
         # from the prompt file itself (_extract_rid_from_prompt_file, which fails closed before
         # send if the file has zero or multiple distinct rids) — so this check always runs.
-        if rid:
+        if rid and echoed != rid:
+            # Only re-read when the loop never saw our echo — a match it already polled is the same
+            # fact, and re-reading it can only lose to a turn that arrived in between.
             echoed = _turn_canonical_rid(c.eval(_last_user_text_js()) or "") or ""
+        if rid:
             if echoed != rid:
                 print(json.dumps({"ok": False, "userMsgs": n, "conversation_id": conv,
                                   "rid": rid, "followup": True, "echoedRid": echoed}))

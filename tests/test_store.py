@@ -535,3 +535,69 @@ class TestSchemaMigrations:
         m = _load(tmp_path / "unused.db")
         with pytest.raises(m.SchemaTooNew):
             m.Store(p)
+
+
+# ---- one in-flight send per conversation --------------------------------------
+
+def _thread_round(s, sm, rid, kind, conv, state):
+    s.create_round(rid, kind, thread_id=conv, prompt="continuing this consult")
+    if state != sm.QUEUED:
+        s.set_state(rid, sm.READY)
+    if state not in (sm.QUEUED, sm.READY):
+        aid = s.begin_send(rid, "p", sm.sha256("p"), daemon_instance_id="t")
+        if state == sm.WAITING:
+            s.mark_accepted(aid, conv)
+            s.mark_waiting(rid)
+        elif state == sm.ACCEPTED:
+            s.mark_accepted(aid, conv)
+        elif state == sm.POSSIBLY_ACCEPTED:
+            s.mark_possibly_accepted(aid, "unknown send")
+
+
+def test_a_followup_is_not_claimed_while_its_thread_has_a_live_round(store):
+    """A thread is one shared composer and one ordered transcript, so two overlapping sends into it
+    are two writers on one mutable resource. The per-conversation mutator lease is released once the
+    send LANDS, leaving the whole answer wait unguarded — this is what covers that window."""
+    sm, s = store
+    conv = "6a684b38-bef4-83ea-83d4-134bf9610e05"
+    _thread_round(s, sm, "REQ-20260721-000000-00cc01", "followup", conv, sm.WAITING)
+    _thread_round(s, sm, "REQ-20260721-000000-00cc02", "followup", conv, sm.QUEUED)
+    assert s.claim_ready("d1") is None, "the thread is busy — nothing to claim"
+
+    # the live round finishes → the queued follow-up becomes claimable, no worker ever spun
+    s.finish("REQ-20260721-000000-00cc01", sm.COMPLETED_VERIFIED, result_text="a")
+    got = s.claim_ready("d1")
+    assert got is not None and got["rid"] == "REQ-20260721-000000-00cc02"
+
+
+def test_a_retrieve_is_never_fenced_out_of_a_busy_thread(store):
+    """A retrieve is read-only and IS the recovery path: fencing it behind the round it exists to
+    recover would deadlock the one operation that can resolve a stuck thread."""
+    sm, s = store
+    conv = "6a684b38-bef4-83ea-83d4-134bf9610e05"
+    _thread_round(s, sm, "REQ-20260721-000000-00cc03", "followup", conv, sm.WAITING)
+    s.create_round("REQ-20260721-000000-00cc04", "retrieve", thread_id=conv,
+                   parent_rid="REQ-20260721-000000-00cc03")
+    got = s.claim_ready("d1")
+    assert got is not None and got["rid"] == "REQ-20260721-000000-00cc04"
+
+
+def test_an_unreconciled_uncertain_round_does_not_block_its_thread_forever(store):
+    """possibly_accepted has no automatic exit, so counting it as 'live' would make one unreconciled
+    round a permanent embargo on its whole thread."""
+    sm, s = store
+    conv = "6a684b38-bef4-83ea-83d4-134bf9610e05"
+    _thread_round(s, sm, "REQ-20260721-000000-00cc05", "followup", conv, sm.POSSIBLY_ACCEPTED)
+    _thread_round(s, sm, "REQ-20260721-000000-00cc06", "followup", conv, sm.QUEUED)
+    got = s.claim_ready("d1")
+    assert got is not None and got["rid"] == "REQ-20260721-000000-00cc06"
+
+
+def test_a_submit_is_never_fenced_by_another_thread(store):
+    """Submits open their own conversation; they have no thread to contend for."""
+    sm, s = store
+    conv = "6a684b38-bef4-83ea-83d4-134bf9610e05"
+    _thread_round(s, sm, "REQ-20260721-000000-00cc07", "followup", conv, sm.WAITING)
+    s.create_round("REQ-20260721-000000-00cc08", "submit", prompt="fresh consult")
+    got = s.claim_ready("d1")
+    assert got is not None and got["rid"] == "REQ-20260721-000000-00cc08"
