@@ -663,8 +663,29 @@ def cmd_enqueue(a) -> int:
     link presence, no network) gives the agent instant feedback on what the daemon's authoritative
     gate would reject anyway; the real gate runs in the daemon worker before anything is sent."""
     import cgc_backend
+    # The rid is a property of the RENDERED PROMPT, not a caller input: prep writes
+    # BEGIN_RESPONSE:<rid> into the text, and the waiter accepts an answer only if that exact
+    # sentinel comes back. So read it from the prompt when it wasn't passed, and REFUSE a passed rid
+    # that disagrees with the text — a mismatch guarantees an answer that can never verify, and
+    # hand-typing the format is a step that only ever produces `bad_rid` (observed: an agent burned
+    # a round on it, then reached for `date` to synthesise one).
+    if a.kind != "retrieve" and a.prompt_file and os.path.exists(a.prompt_file):
+        m = re.search(r"^BEGIN_RESPONSE:(REQ-\d{8}-\d{6}-[0-9a-f]{6})\s*$",
+                      open(a.prompt_file, encoding="utf-8").read(), re.M)
+        if m:
+            if not a.rid:
+                a.rid = m.group(1)
+            elif a.rid != m.group(1):
+                sys.stderr.write(
+                    f"CGC_ERROR rid_prompt_mismatch: --rid {a.rid!r} is not the rid the prompt "
+                    f"carries ({m.group(1)!r}). The waiter verifies the prompt's OWN sentinel, so "
+                    "this round could never be confirmed. Drop --rid (it is read from the prompt) "
+                    "or pass the prompt this rid belongs to.\n")
+                return 2
     if not _RID_RE.match(a.rid or ""):
-        sys.stderr.write(f"CGC_ERROR bad_rid: {a.rid!r} (want REQ-YYYYMMDD-HHMMSS-hhhhhh)\n")
+        sys.stderr.write(f"CGC_ERROR bad_rid: {a.rid!r} (want REQ-YYYYMMDD-HHMMSS-hhhhhh). Do not "
+                         "hand-write one: `consult.py prep` mints it and puts it in the prompt, and "
+                         "enqueue reads it back from there — omit --rid entirely.\n")
         return 2
     out = a.out or os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
     if a.kind == "retrieve" and (not a.conversation or a.conversation == "auto"):
@@ -736,7 +757,11 @@ def main() -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     e = sub.add_parser("enqueue", help="create a queued consult round in the store (LOCAL write only)")
-    e.add_argument("--rid", required=True)
+    e.add_argument("--rid", help="omit it for submit/followup: prep mints the rid INTO the prompt "
+                                 "(BEGIN_RESPONSE:<rid>) and enqueue reads it back from there. One "
+                                 "that disagrees with the prompt is refused — the waiter verifies "
+                                 "the prompt's own sentinel, so such a round could never confirm. "
+                                 "Required for --kind retrieve, which has no prompt.")
     e.add_argument("--prompt-file", help="rendered prompt (required except for --kind retrieve)")
     e.add_argument("--kind", choices=("submit", "followup", "retrieve"), default="submit",
                    help="submit=new consult, followup=continue a thread, retrieve=read an existing "

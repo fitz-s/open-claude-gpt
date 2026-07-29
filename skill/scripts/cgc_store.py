@@ -855,6 +855,12 @@ class Store:
                 self.db.execute("UPDATE rounds SET thread_id=? WHERE rid=?", (tid, rid))
             self._event("conversation_linked", rid=rid, detail=conversation_id)
 
+    def attempt_count(self, rid: str) -> int:
+        """How many times a send has been BEGUN for this round. begin_send writes exactly one row per
+        attempt, so this is the honest retry counter — the thing that tells a caller whether a
+        'transient' failure is actually transient."""
+        return self.db.execute("SELECT count(*) c FROM attempts WHERE rid=?", (rid,)).fetchone()["c"]
+
     def conversation_of(self, rid: str) -> str | None:
         """The ChatGPT conversation id addressable for this round via its thread, or None."""
         row = self.db.execute(

@@ -490,3 +490,45 @@ def test_gate_existence_only_checks_admitted_repos(spool, monkeypatch):
     monkeypatch.setattr(spool, "_gh_exists", lambda path: probed.append(path) or (True, "exists"))
     spool.validate_prompt("review https://github.com/acme/widgets/pull/12")
     assert all("acme/widgets" in p for p in probed)
+
+
+def test_cmd_await_uncertain_exits_3_a_human_must_act_not_1_broken(spool, tmp_path, monkeypatch):
+    """The documented contract is 0 answer / 3 a human must act / 1 BROKEN. An uncertain send is the
+    definition of "a human must act" — nothing is broken, the send may well have landed. Reporting
+    it as broken made every one of these read as a tool failure in the caller's log ("failed with
+    exit code 1") instead of as the one action item it is."""
+    monkeypatch.setattr(spool, "daemon_alive", lambda: True)
+    rid = _rid("uu0001")
+    sm = _store(spool)
+    with sm.Store() as s:
+        s.create_round(rid, "submit", prompt="p https://github.com/acme/widgets")
+        s.set_state(rid, sm.READY)
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="t")
+        s.mark_possibly_accepted(aid, "unknown send")
+    assert spool.cmd_await(_await_args(rid, str(tmp_path / "u.txt"))) == 3
+
+
+def test_enqueue_reads_the_rid_from_the_prompt_when_none_is_passed(spool, tmp_path):
+    """The rid is a property of the RENDERED PROMPT — prep writes BEGIN_RESPONSE:<rid> into the text
+    and the waiter accepts an answer only if that exact sentinel comes back. Hand-typing the format
+    is a step that only ever produces bad_rid (observed: an agent burned a round on it, then reached
+    for `date` to synthesise one)."""
+    import argparse
+    rid = _rid("bb0001")
+    pf = tmp_path / "p.md"
+    pf.write_text(f"review https://github.com/acme/widgets\n\nBEGIN_RESPONSE:{rid}\n...\nEND_RESPONSE:{rid}\n")
+    a = _enqueue_args(rid, str(pf))
+    a.rid = None
+    assert spool.cmd_enqueue(a) == 0
+    sm = _store(spool)
+    with sm.Store() as s:
+        assert s.get_round(rid) is not None
+
+
+def test_enqueue_refuses_a_rid_that_disagrees_with_the_prompt(spool, tmp_path, capsys):
+    """A mismatch guarantees an answer that can never verify: the waiter checks the PROMPT's own
+    sentinel, not the rid the caller happened to type."""
+    pf = tmp_path / "p.md"
+    pf.write_text(f"review https://github.com/acme/widgets\n\nBEGIN_RESPONSE:{_rid('bb0002')}\n")
+    assert spool.cmd_enqueue(_enqueue_args(_rid("bb0003"), str(pf))) == 2
+    assert "rid_prompt_mismatch" in capsys.readouterr().err
