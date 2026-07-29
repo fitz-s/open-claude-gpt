@@ -34,7 +34,10 @@ def env(tmp_path):
 
 
 def _ready_round(store_mod, s, prompt="review https://github.com/acme/x/tree/deadbeef please"):
-    s.create_round("REQ-20260721-000000-00000a", "submit", out_path="/tmp/a.txt", prompt=prompt,
+    # No out_path: the worker now materializes the answer on completion, so a hardcoded /tmp target
+    # here would have every worker test write outside its tmp dir. Unset falls back to
+    # default_out(rid) under CGC_STATE_DIR, which the fixture pins into tmp_path.
+    s.create_round("REQ-20260721-000000-00000a", "submit", prompt=prompt,
                    spec_json=json.dumps({"project_url": "https://chatgpt.com/", "model": "Pro"}))
     s.set_state("REQ-20260721-000000-00000a", store_mod.READY)
     return s.get_round("REQ-20260721-000000-00000a")
@@ -1890,3 +1893,105 @@ def test_status_for_a_round_with_no_thread_reports_no_conversation(env, capsys):
     line = [ln for ln in capsys.readouterr().out.splitlines() if f"round[{rid}]" in ln][0]
     fields = json.loads(line.split(": ", 1)[1])
     assert fields["conversation"] is None and fields["out_path"] is None
+
+
+# ---- the producer materializes ----------------------------------------------
+# The answer file used to be written ONLY by `await`. A detached waiter that got stopped therefore
+# left a completed_verified round with NOTHING at the address every receipt had printed — observed
+# in the field, where a caller then polled that path forever. The worker writes it on completion.
+
+def test_worker_writes_the_answer_to_the_rounds_address_with_no_waiter(env):
+    """No await runs in this test at all. The file must still be there when process_round returns."""
+    store_mod, backend, s, tmp = env
+    import cgc_spool as spool
+    recorded = str(tmp / "worker_wrote_this.txt")
+    rid = "REQ-20260729-000000-00pub1"
+    s.create_round(rid, "submit", out_path=recorded,
+                   prompt="review https://github.com/acme/x/tree/deadbeef",
+                   spec_json=json.dumps({"project_url": "https://chatgpt.com/", "model": "Pro"}))
+    s.set_state(rid, store_mod.READY)
+
+    def cdp(kind, **kw):
+        if kind == "submit":
+            return {"code": 0, "conversation": "conv-pub1", "stderr": ""}
+        with open(kw["out"], "w") as f:
+            f.write(f"BEGIN_RESPONSE:{rid}\nthe answer\nEND_RESPONSE:{rid}")
+        return {"code": 0, "out": kw["out"], "stderr": ""}
+
+    assert backend.process_round(s, s.get_round(rid), cdp, daemon_instance_id="d1",
+                                 validate=_OK_GATE) == store_mod.COMPLETED_VERIFIED
+    assert os.path.exists(recorded), "a completed round must not leave its promised address empty"
+    assert "the answer" in open(recorded).read()
+    assert spool  # the fallback path exists; this round pinned its own
+
+
+def test_worker_materializes_an_unverified_salvage_too(env):
+    """The verdict lives in the store and the envelope (await still returns 3); the FILE is just the
+    artifact, and a human cannot review what was never written."""
+    store_mod, backend, s, tmp = env
+    recorded = str(tmp / "salvage.txt")
+    rid = "REQ-20260729-000000-00pub2"
+    s.create_round(rid, "submit", out_path=recorded,
+                   prompt="review https://github.com/acme/x/tree/deadbeef",
+                   spec_json=json.dumps({"project_url": "https://chatgpt.com/", "model": "Pro"}))
+    s.set_state(rid, store_mod.READY)
+
+    def cdp(kind, **kw):
+        if kind == "submit":
+            return {"code": 0, "conversation": "conv-pub2", "stderr": ""}
+        with open(kw["out"], "w") as f:
+            f.write("an unwrapped salvage")
+        open(kw["out"] + ".raw", "w").write("raw")  # the .raw sidecar marks it unverified
+        return {"code": 0, "out": kw["out"], "stderr": ""}
+
+    assert backend.process_round(s, s.get_round(rid), cdp, daemon_instance_id="d1",
+                                 validate=_OK_GATE) == store_mod.COMPLETED_UNVERIFIED
+    assert open(recorded).read() == "an unwrapped salvage"
+
+
+def test_a_failed_materialize_never_fails_a_committed_round(env, monkeypatch):
+    """The file is a derived view; the store is the authority. A disk error must leave the round
+    completed (await repairs the file later), never turn a delivered answer into a failure."""
+    store_mod, backend, s, tmp = env
+    rid = "REQ-20260729-000000-00pub3"
+    s.create_round(rid, "submit", out_path=str(tmp / "nope.txt"),
+                   prompt="review https://github.com/acme/x/tree/deadbeef",
+                   spec_json=json.dumps({"project_url": "https://chatgpt.com/", "model": "Pro"}))
+    s.set_state(rid, store_mod.READY)
+
+    def boom(out, text):
+        raise OSError("No space left on device")
+    monkeypatch.setattr(backend, "_materialize", boom)
+
+    def cdp(kind, **kw):
+        if kind == "submit":
+            return {"code": 0, "conversation": "conv-pub3", "stderr": ""}
+        with open(kw["out"], "w") as f:
+            f.write(f"BEGIN_RESPONSE:{rid}\nthe answer\nEND_RESPONSE:{rid}")
+        return {"code": 0, "out": kw["out"], "stderr": ""}
+
+    assert backend.process_round(s, s.get_round(rid), cdp, daemon_instance_id="d1",
+                                 validate=_OK_GATE) == store_mod.COMPLETED_VERIFIED
+    assert "the answer" in s.get_round(rid)["result_text"]
+
+
+def test_status_reports_whether_the_answer_is_actually_on_disk(env, capsys):
+    """An address can lie — /tmp is evicted, and a round can complete with no waiter alive. Printing
+    the path without saying whether anything is AT it is what let a caller watch a promised file
+    that no writer was keeping."""
+    store_mod, backend, s, tmp = env
+    rid, recorded = "REQ-20260729-000000-00pub4", str(tmp / "gone.txt")
+    s.create_round(rid, "submit", out_path=recorded)
+    s.set_state(rid, store_mod.READY)
+    aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d1")
+    s.mark_accepted(aid, "conv-pub4"); s.mark_waiting(rid)
+    s.finish(rid, store_mod.COMPLETED_VERIFIED, result_text="committed, but no file")
+
+    backend.store_status(True, rid)
+    line = [ln for ln in capsys.readouterr().out.splitlines() if f"round[{rid}]" in ln][0]
+    assert json.loads(line.split(": ", 1)[1])["answer_on_disk"] is False
+
+    backend.await_round(types.SimpleNamespace(rid=rid, timeout=2, poll=1)); capsys.readouterr()
+    backend.store_status(True, rid)
+    line = [ln for ln in capsys.readouterr().out.splitlines() if f"round[{rid}]" in ln][0]
+    assert json.loads(line.split(": ", 1)[1])["answer_on_disk"] is True

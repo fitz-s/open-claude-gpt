@@ -128,7 +128,13 @@ def store_status(up: bool, rid: str | None = None) -> int:
                 # go derive both by hand — and the conversation is exactly what a stranded round's
                 # recovery is addressed by.
                 fields = {k: rr[k] for k in ("state", "kind", "error_code", "current_attempt_id")}
-                fields["out_path"] = rr.get("out_path")
+                out = rr.get("out_path")
+                fields["out_path"] = out
+                # An address can lie: /tmp is evicted, and a round can complete while no waiter is
+                # alive to write the file. Report whether the artifact is actually THERE, so nobody
+                # ever again watches a promised path that no writer is keeping. `await --rid`
+                # rewrites it from the store on demand.
+                fields["answer_on_disk"] = bool(out and os.path.exists(out))
                 fields["conversation"] = s.conversation_of(rid)
                 print(f"  round[{rid}]: {json.dumps(fields)}")
             else:
@@ -780,6 +786,29 @@ def _materialize(out: str, text: str) -> None:
     os.replace(tmp, out)
 
 
+def _publish_answer(store, rid: str, text: str) -> None:
+    """Write a just-completed answer to the address the round has been promising since it was created.
+
+    THE PRODUCER MATERIALIZES. The answer file used to be written only by `await`, which made the
+    artifact's existence depend on a notifier being alive at the instant the daemon committed the
+    round — and it is not: a detached waiter was stopped, the daemon finished the round seconds
+    later, and the answer existed only inside SQLite while the caller polled the promised path
+    forever. Nothing was lost (the store is the authority) but nothing arrived either, and the path
+    every receipt had printed was a promise no writer was keeping.
+
+    The file stays a derived view, so a failed write must never fail a round whose answer is already
+    durably committed: log it and leave it for `await`/`status`, which still repair on demand."""
+    import cgc_spool as _spool
+    try:
+        r = store.get_round(rid)
+        out = (r or {}).get("out_path") or _spool.default_out(rid)
+        _materialize(out, text)
+        sys.stderr.write(f"CGC_ANSWER {rid} ({len(text.encode('utf-8'))} bytes) -> {out}\n")
+    except Exception as e:
+        sys.stderr.write(f"CGC_WARN materialize_failed {rid}: {type(e).__name__}: {e} — the answer "
+                         "IS committed in the store; `await --rid` writes it on demand.\n")
+
+
 # ---- the worker --------------------------------------------------------------
 def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate) -> str:
     """Drive one claimed (`ready`) round to a terminal or uncertain state. `run_cdp` is injected (the
@@ -1006,6 +1035,9 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
         unverified = os.path.exists(answer_path + ".raw")
         store.finish(rid, store_mod.COMPLETED_UNVERIFIED if unverified else store_mod.COMPLETED_VERIFIED,
                      result_text=answer)
+        # After the commit, never before: a file that appears ahead of the round's terminal state
+        # would let a watcher read an answer for a round that then fails to commit.
+        _publish_answer(store, rid, answer)
         if (is_retrieve and wait_rid and wait_rid != rid and not unverified
                 and _no_live_worker(wait_rid)):
             # The waiter matched END_RESPONSE:<wait_rid> on the thread — proof that the SOURCE
@@ -1016,6 +1048,9 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
             if store.adopt_retrieved_answer(wait_rid, answer, conversation_id=conv):
                 sys.stderr.write(f"CGC_RECONCILED {wait_rid}: resolved from retrieve {rid} "
                                  "(sentinel-verified on the thread).\n")
+                # The SOURCE round completes here too, and its own waiter is long gone by
+                # construction — this is the recovery path. It needs its answer on disk most of all.
+                _publish_answer(store, wait_rid, answer)
         return store_mod.COMPLETED_UNVERIFIED if unverified else store_mod.COMPLETED_VERIFIED
     if code == 3:
         store.set_state(rid, store_mod.BLOCKED, error_code=(res.get("stderr") or "blocker")[:200])
