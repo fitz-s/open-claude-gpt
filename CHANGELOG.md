@@ -6,6 +6,33 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — a completed round's answer reaches its address without a waiter
+
+Field incident: a detached `await` was stopped by the caller's harness (twice). The round finished
+normally — `completed_verified`, 23KB of answer durably committed — but **nothing was ever written
+to the path every receipt had printed**, because the answer file was materialized ONLY inside
+`await`. A promise no writer was keeping: the caller fell back to `until [ -s <path> ]; do sleep 20;
+done` and would have polled forever. A store scan found 33 of 39 completed rounds with nothing at
+their recorded address.
+
+- **The producer materializes.** `_wait_phase` now writes the answer to the round's recorded
+  `out_path` immediately after `store.finish` commits it (`_publish_answer`) — so the artifact's
+  existence no longer depends on a notifier being alive at the instant of completion. Written
+  strictly AFTER the commit: a file that appeared first would let a watcher read an answer for a
+  round that then failed to commit. Unverified salvages are materialized too — the verdict lives in
+  the store and the envelope (`await` still returns 3), while the file is just the artifact, and a
+  human cannot review what was never written. The recovery path's reconciled SOURCE round gets its
+  answer written as well; its own waiter is gone by construction, which is the whole reason that
+  path exists. The file remains a derived view: a failed write is logged and left for `await` to
+  repair, never allowed to fail a round whose answer is already durably committed.
+- **`status --rid` reports `answer_on_disk`.** An address can lie — `/tmp` is evicted, and until
+  this release a round could complete with no writer. Printing the path without saying whether
+  anything is AT it is what let a caller watch a file nobody was writing.
+- **`SKILL.md`: a stopped `await` is a non-event, and a shell wait loop is not a substitute.** The
+  round lives in the store and the daemon finishes it regardless; re-arm `await --rid <rid>`. An
+  `until [ -s … ]` loop cannot terminate on `blocked`/`failed`/`possibly_accepted` — precisely the
+  states that need a human — and reads an unverified salvage as success.
+
 ### Changed — the return of a command is an address, not a status bit
 
 An exit code routes the caller; it does not tell them where anything is. Applied across the

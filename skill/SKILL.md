@@ -66,6 +66,15 @@ outcome names the artifact it produced. Act on the fields, never on the code alo
 - "Still running" is not an outcome — a round takes ~25 min and await just keeps waiting. It gives
   up only after 60+ min, which means broken, not slow.
 
+**A stopped/killed `await` is a NON-EVENT.** The round lives in the store and the daemon finishes
+it regardless; the waiter is only the notifier. Re-arm the same one-liner (`await --rid <rid>`,
+detached) — it is pure polling, safe to repeat, and returns the answer's address whether the answer
+landed a second ago or an hour ago. **Never substitute a shell wait loop** (`until [ -s <file> ];
+do sleep …`): it cannot terminate on `blocked` / `failed` / `possibly_accepted` — exactly the
+states that need a human, so it spins forever on them — and it reads an unverified salvage as
+success. If you want to know where things stand right now, `cgc_spool.py status --rid <rid>` gives
+you `state`, `out_path`, `answer_on_disk`, and `conversation` in one read.
+
 ## Repeat-safety (idempotency)
 
 | Action | Safe to repeat? |
