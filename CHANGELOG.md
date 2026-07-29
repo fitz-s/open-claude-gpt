@@ -83,6 +83,25 @@ question; what failed is everything downstream of it.
   rather than silently producing a round that could never be confirmed. Hand-typing the format was a
   step that only ever produced `bad_rid`.
 
+### Fixed — the three deferred round-5 residuals (#1, #2, #3)
+- **#2 The follow-up landing window keeps polling for the rid echo.** Count growth broke the loop
+  immediately, leaving the authoritative rid read as a single shot against a turn whose text had not
+  hydrated — a landed follow-up reported as `rid_echo_mismatch`, i.e. a false uncertain on a send
+  that did happen. Count growth is now a hint; the canonical echo (or the deadline) ends the loop.
+- **#3 One in-flight send per conversation.** A thread is one shared composer and one ordered
+  transcript, so two overlapping sends into it are two writers on one mutable resource. The
+  per-conversation mutator lease is released once the send LANDS, leaving the whole answer wait
+  unguarded. A follow-up whose thread has a live round (`sending`/`accepted`/`waiting`) is now not
+  CLAIMED at all — refusing at claim time spawns no worker and so cannot spin; the round stays
+  queued until the thread frees. Scoped to follow-ups (a `retrieve` is read-only and IS the recovery
+  path) and to genuinely live states (an unreconciled `possibly_accepted` would embargo its thread
+  forever).
+- **#1 The inherited-lease handoff is proven against the kernel, not asserted.** The prior tests
+  covered the fd registry and the subprocess kwargs — the intent. The guarantee is an OFD property,
+  so the new tests run the real schedule: a child inherits the rid/browser/conversation descriptors,
+  the backend closes its own handles, contenders are verified BLOCKED, and ownership ends only when
+  the child exits. Confirmed discriminating — the same flow without `pass_fds` leaves the lease free.
+
 ### Added
 - `cdp_consult.py find-conversation --rid <rid>` — read-only search of open ChatGPT tabs for the rid
   that is inside the prompt we sent. It is the last automated step before a human reads the screen,

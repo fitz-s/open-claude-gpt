@@ -706,3 +706,82 @@ def test_evidence_fails_closed_when_the_store_cannot_be_read(daemon, monkeypatch
 def test_maintenance_sweep_is_passed_the_evidence(daemon):
     import inspect
     assert "_sweep_tabs(*_evidence())" in inspect.getsource(daemon.run_loop)
+
+
+# ---- #1: the OFD handoff, proven against the kernel ---------------------------
+#
+# The existing pass_fds tests verify the registry and the subprocess kwargs — the INTENT. The
+# guarantee itself is a kernel property: flock binds to the open file DESCRIPTION, so a lease
+# survives the backend's death for exactly as long as the inherited descriptor stays open in the
+# child. Nothing short of a real parent-death/child-alive schedule tests that, and it is the fence
+# the whole cross-generation ownership story rests on.
+
+def _hold_fds_script(paths):
+    """A child that inherits the lease fds, reports ready, and holds them until told to exit."""
+    return (
+        "import os,sys\n"
+        f"paths={paths!r}\n"
+        "sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+        "sys.stdin.readline()\n"          # hold the inherited descriptors open until released
+    )
+
+
+def test_an_inherited_lease_outlives_the_backend_and_blocks_contenders(daemon, tmp_path):
+    import subprocess
+
+    spool = daemon.spool
+    rid = _rid("00fd01")
+    rid_lease = spool.acquire_rid_lease(rid)
+    browser_lease = spool.acquire_browser_lease(shared=True)
+    assert rid_lease is not None and browser_lease is not None
+    fds = spool.live_lease_fds()
+    assert fds, "the registry must expose the descriptors the child is meant to inherit"
+
+    child = subprocess.Popen([sys.executable, "-c", _hold_fds_script(list(fds))],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                             pass_fds=fds)
+    assert child.stdout.readline().strip() == "ready"
+
+    # The backend releases ITS handles — the worker process is, as far as this daemon is concerned,
+    # gone. The lock must NOT be released: the child still holds the same open file description.
+    rid_lease.close()
+    browser_lease.close()
+
+    assert spool.acquire_rid_lease(rid) is None, "a dead backend must not release its child's lease"
+    assert spool.acquire_browser_lease(shared=False) is None, "browser maintenance must stay fenced"
+
+    child.stdin.write("go\n")
+    child.stdin.close()
+    child.wait(timeout=10)
+
+    # Only now, with the last descriptor closed, does ownership actually end.
+    regained = spool.acquire_rid_lease(rid)
+    assert regained is not None, "the lease must be free once the child is gone"
+    regained.close()
+    b = spool.acquire_browser_lease(shared=False)
+    assert b is not None
+    b.close()
+
+
+def test_an_inherited_conversation_lease_blocks_a_same_thread_sender(daemon, tmp_path):
+    """The follow-up mutating region: while a CDP child holds the conversation lease, a second
+    same-thread follow-up must refuse rather than race onto the one shared composer."""
+    import subprocess
+
+    spool = daemon.spool
+    conv = "6a684b38-bef4-83ea-83d4-134bf9610e05"
+    lease = spool.acquire_conversation_lease(conv)
+    assert lease is not None
+    fds = spool.live_lease_fds()
+    child = subprocess.Popen([sys.executable, "-c", _hold_fds_script(list(fds))],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                             pass_fds=fds)
+    assert child.stdout.readline().strip() == "ready"
+    lease.close()
+    assert spool.acquire_conversation_lease(conv) is None, "the child still owns the composer"
+    child.stdin.write("go\n")
+    child.stdin.close()
+    child.wait(timeout=10)
+    again = spool.acquire_conversation_lease(conv)
+    assert again is not None
+    again.close()
