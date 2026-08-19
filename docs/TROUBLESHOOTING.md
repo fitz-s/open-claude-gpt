@@ -93,7 +93,11 @@ of sync with the spool gate; the two now share one predicate.)
 
 ## `CGC_ERROR model_not_selectable`
 The target model tier (`CGC_MODEL`) isn't offered in the composer for this
-account/thread. Options, in order of preference:
+account/thread. The picker is driven by whatever the live UI exposes — the
+current build's power slider (`Instant / Medium / High / Extra High / Pro`), its
+`Effort` submenu, or an older build's flat menu — so this error means none of
+those carried the target, not that one particular widget was missing. Options,
+in order of preference:
 
 - **Set a tier your account actually has:** `export CGC_MODEL="High"` (or
   whichever tier your plan offers).

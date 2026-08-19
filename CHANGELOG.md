@@ -6,6 +6,39 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — the tier picker follows ChatGPT's new power slider
+
+ChatGPT replaced the composer's tier menu with a **power slider**, and the old picker could no
+longer reach Pro. Probed live: the composer keeps one switcher button whose label is the current
+tier, but its menu now holds `[role=menuitem][aria-label="Power"]` wrapping a `[role=slider]`
+(`aria-valuenow` 0–4, ArrowLeft/ArrowRight, saturating at both ends) that maps onto
+`Instant / Medium / High / Extra High / Pro`. There is **no `Pro` menuitem in that menu at all**, so
+the click-the-item path could only ever "succeed" on a tab already sitting on Pro — every other tab
+failed closed and refused to send.
+
+- **Slider is the primary path.** `_slider_set` saturates left to a known position, then steps right
+  one tier at a time, re-reading `(label, valuenow)` after every press and stopping the instant the
+  target matches. Labels are read from the live DOM (`"Pro, 5 of 5."` → `Pro`), never hardcoded, so
+  a tier rename does not need a code change. Verified live: Instant→Pro 6.6s, Medium→Pro 5.8s,
+  Pro→High 5.2s, already-on-target 0.0s (the verdict short-circuits without touching the UI).
+- **Fail-closed is side-effect-free again.** A target this account does not have used to leave the
+  slider wherever the rightward search gave up — the composer silently ended up on the HIGHEST tier
+  it passed through while the error still claimed the tier "could not be changed", and
+  `--allow-model-mismatch` would then have sent on the most expensive tier the user never chose.
+  Every failure return now walks back to the entry position (bounded, best-effort, never looping on
+  a restore press that does not land). Verified live: High + unreachable target → refused, left on
+  High.
+- **The refusal names the tier, not the mode toggle.** `_model_verdict`'s no-match fallback reports
+  `labels[0]`, which on a project page is the Chat/Agent toggle — the error told users the switcher
+  showed `Chat` when the question was about a reasoning tier. The slider-observed label now wins
+  that fallback.
+- **Two fallbacks kept, deliberately.** The flat-menu click (older builds) and a submenu sweep (this
+  build duplicates the tiers under `Advanced → Effort`) still run when the slider path does not
+  land. ChatGPT ships this UI in stages; a single-mechanism picker is what just broke.
+- **Keys-not-landing no longer false-bails.** A press is confirmed by a short bounded poll (≤3 reads
+  at ~0.2s) instead of one flat 0.3s sleep — live settle time is 0.35–0.45s, so the old read
+  mistook a merely-slow frame for a dead control.
+
 ### Fixed — a completed round's answer reaches its address without a waiter
 
 Field incident: a detached `await` was stopped by the caller's harness (twice). The round finished
