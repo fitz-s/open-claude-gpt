@@ -919,11 +919,15 @@ def cmd_status(a) -> int:
 
 
 # ---- model selection (two-menu aware: model menu vs reasoning-effort menu) ----
-# The composer has more than one switcher button. The reasoning-effort menu
-# (Instant/Medium/High/Extra High) does NOT contain 'Pro' — 'Pro' lives in the model
-# menu. So we must try EACH candidate switcher, open its menu, and pick the one whose
-# menu actually contains the target. Detection is by short button label, not a fixed
-# whitelist, so it survives ChatGPT renaming the tiers.
+# The composer has more than one switcher button. Which one carries the target tier is
+# NOT fixed — a build seen 2026-08-18 puts Instant/Medium/High/Extra High/Pro entirely
+# inside the reasoning-effort/power control (see _slider_set below); an older build
+# still served a flat 'Pro' menuitem directly. (An earlier version of this comment
+# claimed the effort menu never contains 'Pro' — that was true of the flat-menu build
+# only and is now the stale case, not the current one.) So we must try EACH candidate
+# switcher, open its menu, and pick the one whose menu actually contains the target.
+# Detection is by short button label, not a fixed whitelist, so it survives ChatGPT
+# renaming the tiers.
 # Candidate = a COMPOSER model/effort switcher only. Scoped tightly so a stray
 # 'Pro'-reading button elsewhere (e.g. 'Upgrade to Pro', a plan badge, account chrome)
 # can NEVER false-confirm the model. A real switcher: short label, opens a menu
@@ -956,6 +960,13 @@ def _open_cand_js(i):
 
 
 def _click_item_js(target):
+    # Fallback #2 (after the slider, below): the flat-menu layout, where a tier sits directly
+    # as a [role=menuitem] in the open menu. Superseded as the PRIMARY path by _slider_set on
+    # the build probed 2026-08-18 (the top-level menu there holds no item at all — the tiers
+    # live on a slider), but kept because ChatGPT is mid-rollout and older accounts still serve
+    # this flat form; also still needed for the reasoning-effort SUBMENU (see _submenu_try),
+    # which reintroduces a flat item list one level down.
+    #
     # Match the menuitem's FIRST LINE, Pro-family aware — MUST mirror _matches():
     # a 'Pro' target is satisfied by any Pro tier the menu offers (ChatGPT's effort menu
     # labels the top tier 'Pro Extended', there is no bare 'Pro' item), so an exact-only
@@ -970,6 +981,168 @@ def _click_item_js(target):
             "var EL=ms.find(function(x){var f=(x.innerText||'').trim().toLowerCase().split('\\n')[0];"
             "return f===T||(T.indexOf('pro')===0&&f.indexOf('pro')===0);});"
             "if(EL){%s return true;}return false;})()" % (t, _GESTURE))
+
+
+# ---- slider path (primary on the build probed 2026-08-18) ----
+# That build's tier control is a Radix slider, not a menuitem list: opening a switcher's menu
+# shows a group (data-testid="composer-intelligence-picker-content") whose first line is e.g.
+# "Pro, 5 of 5." followed by a span[role="slider"][aria-valuemin=0][aria-valuemax=4] that
+# saturates at both ends (no wraparound). valuenow 0..4 maps onto Instant/Medium/High/Extra
+# High/Pro in that order — verified live by walking it with ArrowLeft/ArrowRight via CDP
+# Input.dispatchKeyEvent after focusing the slider's [role=menuitem] ancestor (the slider
+# itself is not focusable; .focus() on a bare <span role=slider> does nothing in this build).
+def _slider_label(first_line):
+    """Pure parse of the group's first line ('Pro, 5 of 5.' -> 'Pro'). No comma means the text
+    is not this group's format at all (composer's plain label, a stale read, ...), so there is
+    no tier to report — return '' rather than guess at a value that was never delimited."""
+    s = (first_line or "").strip()
+    if "," not in s:
+        return ""
+    return s.split(",", 1)[0].strip()
+
+
+_SLIDER_STATE_JS = (
+    "(function(){var s=document.querySelector('[role=\"menu\"] [role=\"slider\"]');"
+    "if(!s)return null;var mi=s.closest('[role=\"menuitem\"]');"
+    "var grp=document.querySelector('[data-testid=\"composer-intelligence-picker-content\"]');"
+    "var src=grp||mi;var first=((src&&src.innerText)||'').trim().split('\\n')[0];"
+    "return {first:first,now:parseInt(s.getAttribute('aria-valuenow'),10),"
+    "min:parseInt(s.getAttribute('aria-valuemin'),10),max:parseInt(s.getAttribute('aria-valuemax'),10)};"
+    "})()")
+
+_SLIDER_FOCUS_JS = (
+    "(function(){var s=document.querySelector('[role=\"menu\"] [role=\"slider\"]');"
+    "if(!s)return false;var mi=s.closest('[role=\"menuitem\"]');"
+    "if(!mi)return false;mi.focus();return true;})()")
+
+
+def _slider_set(c, target):
+    """Primary path: walk the power/effort slider to `target` inside the currently-open menu.
+    Deterministic by construction — always saturate LEFT first (valuemax-valuemin presses; a
+    press at the floor is a verified no-op, not a wrap) so the walk starts from a known state
+    regardless of where the tier began, then step RIGHT one position at a time, re-reading
+    (label, valuenow) after every press and stopping the instant _matches() is satisfied.
+
+    Bails the moment a press that SHOULD have moved valuenow (i.e. we were not already sitting
+    on the boundary it presses toward) does not move it, per a short bounded poll rather than a
+    single fixed sleep — a live probe found single presses settle in 0.35-0.45s, and one flat
+    0.3s sleep read that as "stuck" on a merely-slow frame. See _press below.
+
+    FAIL-CLOSED MUST BE SIDE-EFFECT-FREE. Live-verified: a target this account does not have
+    (walk saturates left, then right to the ceiling, never matches) used to leave the slider
+    wherever the walk gave up — the composer silently ended up retargeted to the HIGHEST tier
+    it happened to pass through, even though the caller's own message says "could not be
+    changed". So every failure return that happens after at least one press actually landed
+    now walks back toward the ENTRY valuenow (bounded, same landing check as the forward walk —
+    a restore press that does not land stops the restore instead of looping) and reports
+    whatever label is genuinely showing at wherever that walk ends up, not the transient label
+    from mid-walk. The success path never restores — there is nothing to undo.
+    """
+    st = c.eval(_SLIDER_STATE_JS)
+    if not st or st.get("now") is None:
+        return False, None
+    lo, hi, now = st["min"], st["max"], st["now"]
+    entry_now = now
+    label = _slider_label(st.get("first") or "")
+    entry_label = label
+    if _matches(label, target):
+        return True, label
+    if not c.eval(_SLIDER_FOCUS_JS):
+        return False, None  # nothing pressed yet — nothing to restore
+
+    def _press(key_name, code, keycode, prev_now):
+        c.key(key_name, code, keycode)
+        # Bounded settle poll: re-read up to 3 times at ~0.2s and take the first read that
+        # actually differs from prev_now. Only 3 unchanged reads in a row counts as no-move —
+        # a single stale read (the value hasn't landed yet) is not mistaken for stuck keys.
+        st2 = None
+        for _ in range(3):
+            time.sleep(0.2)
+            st2 = c.eval(_SLIDER_STATE_JS)
+            if st2 and st2.get("now") is not None and st2["now"] != prev_now:
+                break
+        if not st2 or st2.get("now") is None:
+            return None, None
+        return st2["now"], _slider_label(st2.get("first") or "")
+
+    def _restore(pos):
+        """Best-effort walk back to entry_now. Same bail discipline as the forward walk: a
+        restore press that does not land stops the restore rather than looping — a partial
+        restore is still strictly better than none, and a stuck restore must not hang. Returns
+        the label actually observed after the attempt, which is the ground truth for what the
+        composer is left on (whether or not the restore fully succeeded)."""
+        while pos != entry_now:
+            key_name, code, keycode = (
+                ("ArrowLeft", "ArrowLeft", 37) if pos > entry_now else ("ArrowRight", "ArrowRight", 39))
+            new_pos, _ = _press(key_name, code, keycode, pos)
+            if new_pos is None or new_pos == pos:
+                break  # stuck — leave it where it is rather than hang
+            pos = new_pos
+        st_final = c.eval(_SLIDER_STATE_JS)
+        if st_final and st_final.get("now") is not None:
+            return _slider_label(st_final.get("first") or "")
+        return entry_label
+
+    span = hi - lo
+    for _ in range(span):
+        expect_move = now > lo
+        new_now, new_label = _press("ArrowLeft", "ArrowLeft", 37, now)
+        if new_now is None or (expect_move and new_now == now):
+            return False, _restore(now if new_now is None else new_now)
+        now, label = new_now, new_label
+    if _matches(label, target):
+        return True, label
+
+    for _ in range(span):
+        expect_move = now < hi
+        new_now, new_label = _press("ArrowRight", "ArrowRight", 39, now)
+        if new_now is None or (expect_move and new_now == now):
+            return False, _restore(now if new_now is None else new_now)
+        now, label = new_now, new_label
+        if _matches(label, target):
+            return True, label
+    return False, _restore(now)
+
+
+# ---- submenu path (fallback #3) ----
+# The Effort/Model rows inside the open menu are themselves [role=menuitem][aria-haspopup=menu]
+# triggers that open a SECOND [role=menu]; on the probed build the Effort submenu duplicates the
+# slider's tiers as flat, checkable items (Instant/Medium/High/Extra High/Pro), reachable by
+# _click_item_js once open. Never hardcode which trigger by name ('Effort') — a future build
+# could relocate it, and Model must never be touched (it picks the model family, not the tier) —
+# so every haspopup trigger is tried and left to the item-match to decide. Verified live: hover
+# events alone (pointerover/pointerenter/mouseover/mousemove) did NOT open the submenu; only
+# following them with the same pointer-down/up gesture used to open the top-level menu (_GESTURE)
+# did.
+def _submenu_count_js():
+    return ("(function(){return [].slice.call(document.querySelectorAll("
+            "'[role=\"menu\"] [role=\"menuitem\"][aria-haspopup=\"menu\"]')).length;})()")
+
+
+def _open_submenu_js(i):
+    return ("(function(){var els=[].slice.call(document.querySelectorAll("
+            "'[role=\"menu\"] [role=\"menuitem\"][aria-haspopup=\"menu\"]'));"
+            "var EL=els[%d];if(!EL)return false;"
+            "['pointerover','pointerenter','mouseover','mousemove'].forEach(function(t){"
+            "EL.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));});"
+            "%s return true;})()" % (i, _GESTURE))
+
+
+def _submenu_try(c, target):
+    """Open each haspopup trigger in the currently-open menu, in DOM order, and retry
+    _click_item_js inside it. Escapes out of a submenu that did not contain the target before
+    trying the next, so a Model submenu opened first never blocks reaching Effort second."""
+    n = c.eval(_submenu_count_js()) or 0
+    for i in range(min(int(n), 6)):
+        if not c.eval(_open_submenu_js(i)):
+            continue
+        time.sleep(0.6)  # second Radix menu also renders async
+        if c.eval(_click_item_js(target)):
+            time.sleep(0.5)
+            return True
+        c.key("Escape", "Escape", 27)
+        time.sleep(0.25)
+    return False
 
 
 def _cand_labels_js():
@@ -1010,11 +1183,21 @@ def _model_verdict(labels, target):
 
 
 def _select_model(c, target):
-    """Switch the composer to `target` by trying each switcher menu. Returns (confirmed, shown).
-    Fully automated — no human step."""
+    """Switch the composer to `target` by trying each switcher menu; within each open menu, try
+    the slider, then the flat item, then each submenu trigger, in that order — the three forms
+    ChatGPT is known to serve for the same setting depending on rollout stage. Returns
+    (confirmed, shown). Fully automated — no human step.
+
+    On a final failure, `shown` prefers the last real tier label the slider path observed over
+    _model_verdict's labels[0] fallback: labels[0] is the composer's MODE toggle (Chat/Agent),
+    not a tier (see _model_verdict), so on an unreachable target the caller's own error message
+    ("switcher shows '{model_now}'") would otherwise report the mode toggle — useless for
+    diagnosing a tier problem, and live-verified to happen. With the slider's own fail-closed
+    restore (see _slider_set) that label is also the tier the composer is actually left on."""
     ok, shown = _model_verdict(c.eval(_cand_labels_js()), target)
     if ok:
         return True, shown
+    last_slider_label = None
     for _ in range(2):
         n = c.eval(_cand_count_js()) or 0
         for i in range(min(int(n), 8)):
@@ -1022,16 +1205,31 @@ def _select_model(c, target):
             if opened is None:
                 continue
             time.sleep(1.0)  # Radix menu renders async after the gesture
-            if c.eval(_click_item_js(target)):
-                time.sleep(0.7)
+            slid_ok, slid_label = _slider_set(c, target)
+            if slid_label:
+                last_slider_label = slid_label
+            hit = slid_ok or c.eval(_click_item_js(target)) or _submenu_try(c, target)
+            if hit:
+                time.sleep(0.5)
                 ok, shown = _model_verdict(c.eval(_cand_labels_js()), target)
+                # Leave the composer clean before the paste that follows, success or not. Two
+                # Escapes cover the submenu path's second [role=menu] level; an Escape when
+                # nothing is open is a verified no-op, so this never harms the flat/slider cases.
+                c.key("Escape", "Escape", 27)
+                time.sleep(0.15)
+                c.key("Escape", "Escape", 27)
+                time.sleep(0.15)
                 if ok:
                     return True, shown
+                continue
             # wrong menu (target not in it) → close and try the next switcher
             c.key("Escape", "Escape", 27)
             time.sleep(0.25)
         time.sleep(0.4)
-    return _model_verdict(c.eval(_cand_labels_js()), target)
+    ok, shown = _model_verdict(c.eval(_cand_labels_js()), target)
+    if not ok and last_slider_label:
+        shown = last_slider_label
+    return ok, shown
 
 
 # A real code-source URL: https:// on github.com / gist.github.com / raw.githubusercontent.com,

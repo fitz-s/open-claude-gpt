@@ -36,7 +36,7 @@ Any of these can be set in the environment (they win over the config file), in a
 | `CGC_PROJECT_URL` | `https://chatgpt.com/` (new chat) | URL a fresh consult opens. Set to **your** ChatGPT project (`…/g/g-p-<id>-<slug>/project`) to keep every consult grouped in one project. Easiest: `cgc set-project <url>` (above). |
 | `CGC_CONFIG` | `~/.config/cgc/config` | Path to the persistent config file that `cgc set-project` writes and every script reads. |
 | `CGC_AUTO_MODEL` | `1` | Auto model-selection toggle (see below). `1`/`true`/`on` = pick `CGC_MODEL` and fail closed if unavailable; `0`/`false`/`off` = don't touch the picker. |
-| `CGC_MODEL` | `Pro` | Which tier auto-select targets (only used when `CGC_AUTO_MODEL` is on). A `Pro*` target is satisfied by any Pro tier ChatGPT offers (Pro / Pro Extended) but never by Instant/Medium/High. Per-consult override: `--model "High"` / `--model skip`. |
+| `CGC_MODEL` | `Pro` | Which tier auto-select targets (only used when `CGC_AUTO_MODEL` is on). ChatGPT's current composer offers `Instant / Medium / High / Extra High / Pro` on a power slider; a `Pro*` target is satisfied by any Pro tier the build offers (`Pro`, or `Pro Extended` on older builds) but never by a weaker tier. Per-consult override: `--model "High"` / `--model skip`. |
 | `CGC_PORT` | `9333` | Remote-debugging port of the dedicated Chrome. Must be free. |
 | `CGC_PROFILE` | `~/.cgc-chrome` | Dedicated Chrome profile dir. Kept separate from your normal Chrome (CDP is disallowed on the default profile since Chrome 136). |
 | `CGC_CHROME` | auto-detect | Explicit browser binary. Auto-detected across Chrome/Chromium/Edge on macOS + Linux; set only if detection fails. |
