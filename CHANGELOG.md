@@ -6,6 +6,42 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — a proven-unsent round no longer eats its request-key forever
+
+Found by dogfooding the picker breakage above. `model_not_selectable` is a **pre-click** failure —
+the driver refuses to submit and the state machine already treats that marker as proof nothing was
+sent — but when the retry budget ran out, the round went terminal as `blocked` with
+`send_disposition` left NULL. `_release_eligible` only ever considered `GATE_REJECTED`/`FAILED`, and
+`_idempotent_receipt` did not treat `blocked` as terminal at all, so it fell through to the
+live/completed branch. Re-firing the same consult with the same `--request-key` therefore returned
+an **idempotent receipt pointing at a dead round** — no error, no retry, no way forward short of
+inventing a new key. Two real consults sat in that trap; one for nine days.
+
+- **The proof is stamped where it is proven.** Every send-phase fail-closed marker now writes
+  `send_disposition=not_sent_proven` in the same transaction as the block — retry exhaustion
+  (`_requeue_or_block`) and the immediate login/captcha/rate-limit class alike. Both are pre-click by
+  construction: the login and captcha exits come from the composer probe that runs before anything is
+  typed, and the only `rate_limit` detector outside it lives in the wait loop, whose
+  `waiting -> blocked` path is a different, post-send transition that is deliberately left unstamped.
+- **A stamped `blocked` round releases its key; an unstamped one still cannot.** The stamp, never the
+  state name, is what proves no-send — so the post-send blocker keeps the key owned exactly as before.
+  `_idempotent_receipt` now handles `blocked` in the terminal branch and refuses with a message naming
+  the prior round and its state, instead of handing back a receipt for something dead.
+- **`reconcile` is a command now.** `record_not_sent_proof` was documented as *the* operator act and
+  had no CLI — reconciling a stuck round meant hand-writing Python against the live store, which is
+  what this release's own recovery required. `cgc_spool.py reconcile --rid <rid> --not-sent
+  --evidence "<what you checked>"` performs it; evidence is required and non-empty, `--not-sent` must
+  be explicit, and a bad rid or an in-flight round exits with `CGC_ERROR`, not a traceback. It also
+  stamps an already-`blocked` round in place, without a state change — otherwise the command could not
+  repair the rounds this very bug created. `BLOCKED` remains structurally unreachable in `_LEGAL`.
+- **`docs/TROUBLESHOOTING.md`** documents the whole recovery: `find-conversation` finds nothing → look
+  in ChatGPT's own history → stamp it. With the honest caveat the tool already makes: a closed tab or
+  a virtualized thread looks identical to a prompt that never landed, so look before stamping.
+- **`CDP.call` honours a timeout longer than its socket's.** The deadline was enforced in a Python
+  loop around `ws.recv()` while the socket kept its 10s connect-time timeout, so any longer call died
+  with `WebSocketTimeoutException` well before its own deadline (hit live driving a 40s evaluation).
+  The socket timeout is now stretched for the call and restored in `finally`.
+
 ### Fixed — the tier picker follows ChatGPT's new power slider
 
 ChatGPT replaced the composer's tier menu with a **power slider**, and the old picker could no

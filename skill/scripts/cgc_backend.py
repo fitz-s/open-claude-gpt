@@ -68,9 +68,22 @@ _MAX_NOT_SENT_RETRIES = 3
 
 
 def _requeue_or_block(store, rid: str, marker: str) -> str:
-    """Route a PROVEN not-sent round: retry while the evidence still reads transient, then block."""
+    """Route a PROVEN not-sent round: retry while the evidence still reads transient, then block.
+
+    The incident this fixed: a UI change (ChatGPT's composer) made `model_not_selectable` fire on
+    every attempt, so two real rounds ran out their 3 retries and landed BLOCKED with
+    send_disposition left NULL — the terminal round's error text asserted "nothing was ever sent"
+    but the durable proof was never written down. `_release_eligible` only ever looked at
+    GATE_REJECTED/FAILED, so a proven-not-sent BLOCKED round could never release its request-key,
+    and `_idempotent_receipt` fell through to treating it as a live/completed prior and handed back
+    an idempotent receipt pointing at a dead round — no error, no retry, no path forward short of a
+    brand-new key. Stamped here, in the SAME transaction as the state change (exactly like
+    mark_send_not_sent does for exit 6), because the marker that got us here is one of _NOT_SENT_RETRY
+    — a fail-closed pre-click stderr marker the code already treats as proof this attempt did not
+    send (see the module docstring and the _LEGAL comment on SENDING)."""
     if store.attempt_count(rid) >= _MAX_NOT_SENT_RETRIES:
         store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
+                        send_disposition=store_mod.NOT_SENT_PROVEN,
                         error_code=(f"{marker} — still failing after {_MAX_NOT_SENT_RETRIES} "
                                     "automatic retries; nothing was ever sent, but this needs a "
                                     "human (check the ChatGPT window: model tier, login, the tab)"))
@@ -225,18 +238,29 @@ def _request_fingerprint(a, prompt: str) -> str:
 
 def _release_eligible(s, prior: dict) -> bool:
     """Does the store DURABLY prove the prior round's send never reached ChatGPT, so its request-key
-    may move to a retry? Three sufficient proofs, and nothing else:
+    may move to a retry? Four sufficient proofs, and nothing else:
       - GATE_REJECTED — pre-send by construction (the gate runs while `ready`, before begin_send).
       - FAILED with no send attempt EVER — has_send_attempt is False, i.e. the round never entered
         `sending`, so nothing could have been sent (cancel-while-queued, no-thread, gate paths).
       - FAILED carrying a not-sent proof (send_disposition) — an operator's explicit reconcile, OR the
         CDP driver's own pre-click exit (mark_send_not_sent, exit 6: a paste/verify failure proven to
         precede the send click) recorded automatically, no operator step needed.
-    A FAILED round that DID cross the send fence (an attempt exists) with no such proof is
+      - BLOCKED carrying a not-sent proof (send_disposition) — stamped automatically at both
+        _NOT_SENT_BLOCK sites (login_needed/captcha/rate_limit/usage — blocked immediately, no
+        retry) and by the retry-exhaustion path (_requeue_or_block, for _NOT_SENT_RETRY) — every one
+        of them is a fail-closed pre-click stderr marker in the send-phase classifier, so exhausting
+        the retry budget or blocking immediately is not new uncertainty, just how long a
+        proven-not-sent condition gets retried (if at all) before a human is asked to look. A BLOCKED
+        round WITHOUT the stamp — the one case left: a blocker hit post-send, while already `waiting`
+        on an answer (_wait_phase's `code == 3` branch, a separate invocation from a confirmed send)
+        — is NOT release-eligible: the stamp, not the state name, is what proves no-send.
+    A FAILED or BLOCKED round that DID cross the send fence (an attempt exists) with no such proof is
     post-send-uncertain — possibly_accepted->failed / waiting->failed are legal reconciles that do
-    NOT prove no-send — so its key stays owned. FAILED alone is never sufficient."""
+    NOT prove no-send — so its key stays owned. The state alone is never sufficient."""
     if prior["state"] == store_mod.GATE_REJECTED:
         return True
+    if prior["state"] == store_mod.BLOCKED:
+        return prior.get("send_disposition") == store_mod.NOT_SENT_PROVEN
     if prior["state"] != store_mod.FAILED:
         return False
     if prior.get("send_disposition") == store_mod.NOT_SENT_PROVEN:
@@ -253,9 +277,13 @@ def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str):
 
     With a MATCHING fingerprint:
       - a live/completed prior returns its ORIGINAL receipt (idempotent repeat);
-      - a terminally-failed prior releases its key to the retry ONLY when the store durably proves
-        no send ever happened (_release_eligible); otherwise the key stays owned and the retry is
-        refused as possibly-already-sent.
+      - a terminal prior (FAILED, GATE_REJECTED, or BLOCKED — all three are terminal, see
+        cgc_store._LEGAL) releases its key to the retry ONLY when the store durably proves no send
+        ever happened (_release_eligible); otherwise the key stays owned and the retry is refused as
+        possibly-already-sent. BLOCKED is handled HERE, not as a live round: a BLOCKED prior is over,
+        the human it is addressed to has not necessarily acted yet, and a caller re-firing the same
+        key must get either the release or an explicit refusal — never a receipt pointing at a round
+        that will never move again.
 
     Returns 0 (idempotent receipt printed), 2 (conflict), or prior['rid'] (str) — the row to
     transfer the key FROM into a fresh successor."""
@@ -266,17 +294,18 @@ def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str):
                          "kind, parent, conversation, project, or model differ). One key names "
                          "one logical request — use a new key.\n")
         return 2
-    if prior["state"] in (store_mod.FAILED, store_mod.GATE_REJECTED):
+    if prior["state"] in (store_mod.FAILED, store_mod.GATE_REJECTED, store_mod.BLOCKED):
         if _release_eligible(s, prior):
             sys.stderr.write(f"CGC_KEY_RELEASED request-key {rkey!r}: prior {prior['rid']} "
                              f"({prior['state']}) is durably proven not-sent — moving the key to a "
                              "fresh round.\n")
             return prior["rid"]  # caller performs the atomic transfer
         sys.stderr.write(
-            f"CGC_ERROR request_key_locked: request-key {rkey!r} names {prior['rid']}, which "
-            "FAILED after its send may have reached ChatGPT (a durable send attempt exists and no "
-            "operator not-sent proof was recorded). Re-using the key could send a duplicate consult. "
-            "Retrieve/reconcile that round — record a not-sent proof if you have verified it never "
+            f"CGC_ERROR request_key_locked: request-key {rkey!r} names {prior['rid']}, which is "
+            f"terminal ({prior['state']}) but its send was never proven not to have reached ChatGPT "
+            "(no not-sent proof recorded). Re-using the key could send a duplicate consult. "
+            "Retrieve/reconcile that round — record a not-sent proof via `cgc_spool.py reconcile "
+            f"--rid {prior['rid']} --not-sent --evidence \"...\"` if you have verified it never "
             "sent — or use a new key.\n")
         return 2
     sys.stderr.write(f"CGC_IDEMPOTENT request-key {rkey!r} already enqueued as "
@@ -519,6 +548,34 @@ def cancel_round(rid: str) -> int:
                              "it is being dispatched. Await it instead.\n")
             return 2
     sys.stderr.write(f"CGC_CANCELLED {rid}: cancelled before send.\n")
+    return 0
+
+
+# ---- operator reconcile -------------------------------------------------------
+def reconcile_not_sent(rid: str, evidence: str) -> int:
+    """The operator act `Store.record_not_sent_proof` documents but nothing invoked: a human looked at
+    ChatGPT (its history, an open tab `find-conversation` came up empty on) and confirmed a round's
+    send never happened, and needs to record that proof durably so the round's request-key can
+    release. Without this, `find-conversation`'s own miss path told the operator to "look before
+    re-sending" and then left them nowhere to record what they saw — the round stayed
+    possibly_accepted forever, re-triggering the daemon's HELD-tabs warning on every poll.
+    Never raises: an unknown rid or an illegal-from-here round prints a CGC_ERROR line and returns
+    non-zero, the same contract as cancel_round above."""
+    with store_mod.Store() as s:
+        row = s.get_round(rid)
+        if row is None:
+            sys.stderr.write(f"CGC_ERROR no_such_round: {rid}\n")
+            return 2
+        old_state = row["state"]
+        try:
+            s.record_not_sent_proof(rid, evidence)
+        except store_mod.IllegalTransition as e:
+            sys.stderr.write(f"CGC_ERROR not_sent_reconcile_refused: {e}\n")
+            return 2
+        new_row = s.get_round(rid)
+    sys.stderr.write(
+        f"CGC_RECONCILED {rid}: {old_state} -> {new_row['state']} "
+        f"(send_disposition={new_row['send_disposition']}).\n")
     return 0
 
 
@@ -895,7 +952,16 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             store.mark_waiting(rid)
             return _wait_phase(store, rid, conv, spec, run_cdp)
         if any(m.lower() in stderr for m in _NOT_SENT_BLOCK):
+            # Same proof shape as _NOT_SENT_RETRY below (module docstring, _NOT_SENT_BLOCK comment
+            # above): login_needed/captcha/rate_limit fire from the preflight probe or
+            # _composer_failure, both strictly before the click, in this send-phase classifier only
+            # (the wait-phase blocker at _wait_phase's `code == 3` branch is a DIFFERENT invocation
+            # and is deliberately never stamped — that one follows a confirmed send). Stamped so an
+            # expired-login BLOCKED round — the most common real case of this class — can release its
+            # request-key once the human logs back in, instead of the model_not_selectable trap this
+            # round fixed for _NOT_SENT_RETRY recurring here.
             store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
+                            send_disposition=store_mod.NOT_SENT_PROVEN,
                             error_code=_first_marker(stderr, _NOT_SENT_BLOCK))
             return store_mod.BLOCKED
         if any(m.lower() in stderr for m in _NOT_SENT_RETRY):
@@ -934,7 +1000,14 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
 
     # The click did not confirm. Distinguish PROVEN-not-sent from uncertain.
     if any(m.lower() in stderr for m in _NOT_SENT_BLOCK):
+        # Both call sites of this branch run in the send-phase classifier (expect=SENDING, against
+        # stderr _run scopes to this one invocation) — login_needed/captcha are raised before the
+        # composer is even populated, so this is pre-click proof exactly like _NOT_SENT_RETRY below,
+        # and gets the same stamp. (`"usage"` also matches argparse's own `usage:` banner on a CLI
+        # misuse of cdp_consult.py — still a pre-click condition, so the stamp is correct there too;
+        # noted here so it doesn't read as an accidental substring match.)
         store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
+                        send_disposition=store_mod.NOT_SENT_PROVEN,
                         error_code=_first_marker(stderr, _NOT_SENT_BLOCK))
         return store_mod.BLOCKED
     if any(m.lower() in stderr for m in _NOT_SENT_RETRY):

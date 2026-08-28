@@ -496,17 +496,23 @@ class Store:
 
     def record_not_sent_proof(self, rid: str, evidence: str) -> None:
         """Operator reconcile: durably record that a round's send was PROVEN never to have reached
-        ChatGPT (e.g. browser inspection found no such message). This explicit act — and ONLY this —
-        qualifies a post-send-uncertain FAILED round to later release its request-key; a generic
-        FAILED never does, because possibly_accepted->failed and waiting->failed are legal reconciles
-        that do not themselves prove no-send. Drives a still-reconcilable round to FAILED as part of
-        the act; on an already-FAILED round it just stamps the durable proof."""
+        ChatGPT (e.g. browser inspection found no such message, or ChatGPT's own history confirmed
+        it). This explicit act — and ONLY this — qualifies a post-send-uncertain FAILED round, or an
+        as-yet-unstamped BLOCKED round, to later release its request-key; a generic FAILED/BLOCKED
+        never does, because possibly_accepted->failed, waiting->failed, and a blocker hit post-send
+        while `waiting` are all legal reconciles that do not themselves prove no-send. Drives a
+        still-reconcilable round (POSSIBLY_ACCEPTED/WAITING/READY) to FAILED as part of the act; on
+        an already-FAILED or already-BLOCKED round it just stamps the durable proof IN PLACE — BOTH
+        are already terminal, so this is a stamp, not a state transition, and BLOCKED must stay
+        unreachable as a _LEGAL target from here (it never becomes one). This is also how a round
+        BLOCKED before this operator command existed — carrying no stamp because the automatic
+        stamping at its blocking site did not exist yet — gets reconciled after the fact."""
         with self._tx():
             row = self.db.execute("SELECT state FROM rounds WHERE rid=?", (rid,)).fetchone()
             if row is None:
                 raise KeyError(rid)
             cur = row["state"]
-            if cur == FAILED:
+            if cur in (FAILED, BLOCKED):
                 self.db.execute("UPDATE rounds SET send_disposition=?,updated_at=? WHERE rid=?",
                                 (NOT_SENT_PROVEN, _now(), rid))
             elif FAILED in _LEGAL.get(cur, set()):
@@ -517,7 +523,7 @@ class Store:
             else:
                 raise IllegalTransition(
                     f"{rid}: cannot record not-sent proof from {cur!r} — the reconcile applies to an "
-                    "uncertain or already-failed round, not one still in flight")
+                    "uncertain or already-terminal (failed/blocked) round, not one still in flight")
             self._event("not_sent_proof", rid=rid, detail=evidence)
 
     def transfer_request_key(self, old_rid: str, *, rid: str, kind: str,

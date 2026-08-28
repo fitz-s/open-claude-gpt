@@ -778,6 +778,30 @@ def cmd_status(a) -> int:
     return cgc_backend.store_status(daemon_alive(), a.rid)
 
 
+# ---- CLI: reconcile (operator-driven durable reconcile of a stuck round) ----
+
+def cmd_reconcile(a) -> int:
+    """The operator step `find-conversation`'s own miss message points at and TROUBLESHOOTING.md's
+    uncertain-round recovery flow ends with: you looked in the ChatGPT window (or its history) and
+    confirmed a round's send never happened, so record that proof durably. `--not-sent` is required
+    explicitly rather than defaulted — a bare `reconcile --rid X` does nothing, so a future reconcile
+    action can be added without changing what today's invocation means."""
+    if not a.not_sent:
+        sys.stderr.write("CGC_ERROR no_reconcile_action: pass --not-sent to record a not-sent proof "
+                         "(the only reconcile action this command supports today) — a bare "
+                         "`reconcile --rid` does nothing on purpose.\n")
+        return 2
+    evidence = (a.evidence or "").strip()
+    if not evidence:
+        sys.stderr.write("CGC_ERROR evidence_required: --evidence must be a non-empty description of "
+                         "what you verified and how (e.g. 'checked ChatGPT history for 2026-08-18, "
+                         "no matching prompt/thread exists') — the proof is the point of this "
+                         "command.\n")
+        return 2
+    import cgc_backend
+    return cgc_backend.reconcile_not_sent(a.rid, evidence)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="cgc_spool.py")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -839,6 +863,18 @@ def main() -> int:
     st = sub.add_parser("stats", help="reliability metrics: outcome rates + completion latency "
                                       "percentiles + sentinel-drift alarm")
     st.set_defaults(fn=lambda a: __import__("cgc_backend").stats_report())
+
+    rc = sub.add_parser("reconcile", help="operator-driven durable reconcile of a stuck round "
+                                          "(today: recording a verified not-sent proof)")
+    rc.add_argument("--rid", required=True)
+    rc.add_argument("--not-sent", action="store_true", dest="not_sent",
+                    help="record that this round's send was PROVEN to have never reached ChatGPT — "
+                         "must be passed explicitly, there is no default reconcile action")
+    rc.add_argument("--evidence",
+                    help="REQUIRED, non-empty: what you verified and how (e.g. checked ChatGPT's "
+                         "own history, no matching thread exists). A closed tab or a virtualized "
+                         "thread looks identical to a never-sent prompt — look before stamping this.")
+    rc.set_defaults(fn=cmd_reconcile)
 
     a = p.parse_args()
     return a.fn(a)

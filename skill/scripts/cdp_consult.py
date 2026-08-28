@@ -439,14 +439,29 @@ class CDP:
         self._id += 1
         mid = self._id
         self.ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
-        deadline = time.time() + (timeout or 30)
-        while time.time() < deadline:
-            msg = json.loads(self.ws.recv())
-            if msg.get("id") == mid:
-                if "error" in msg:
-                    raise RuntimeError(f"CDP {method} error: {msg['error']}")
-                return msg.get("result", {})
-        raise RuntimeError(f"CDP {method} timeout")
+        deadline_s = timeout or 30
+        deadline = time.time() + deadline_s
+        # The socket's own recv() timeout was fixed at connect time (__init__'s `timeout`, default
+        # 10s) and does not track THIS call's requested deadline — the field incident: a 45s
+        # composer eval (_clear_composer_js/_paste_chunk_js/_composer_text_js) died with a raw
+        # WebSocketTimeoutException around the 10s mark, long before the Python-level loop below
+        # would have given up. Make the requested timeout authoritative by stretching the socket
+        # timeout to cover it, and restore the prior value in `finally` so an exception here can
+        # never leave a later call running on a silently widened socket.
+        prev_timeout = self.ws.gettimeout()
+        if prev_timeout is not None and prev_timeout < deadline_s:
+            self.ws.settimeout(deadline_s)
+        try:
+            while time.time() < deadline:
+                msg = json.loads(self.ws.recv())
+                if msg.get("id") == mid:
+                    if "error" in msg:
+                        raise RuntimeError(f"CDP {method} error: {msg['error']}")
+                    return msg.get("result", {})
+            raise RuntimeError(f"CDP {method} timeout")
+        finally:
+            if prev_timeout is not None and prev_timeout < deadline_s:
+                self.ws.settimeout(prev_timeout)
 
     def eval(self, expr, timeout=None):
         r = self.call("Runtime.evaluate",
