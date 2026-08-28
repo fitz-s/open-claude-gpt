@@ -12,7 +12,9 @@ parser, and _select_model driven against a small fake-CDP state machine (no brow
 network). Run: python3 -m pytest tests/test_model_picker.py -q
 """
 import importlib.util as _ilu
+import json as _json
 import os as _os
+import re as _re
 
 _REPO = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 _CDP_PATH = _os.path.join(_REPO, "skill", "scripts", "cdp_consult.py")
@@ -20,8 +22,28 @@ _spec = _ilu.spec_from_file_location("cdp_consult", _CDP_PATH)
 _CDP = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_CDP)
 
+_WANT_RE = _re.compile(r'var want=(".*?");')
+
+
+def _wanted_label(expr):
+    """Pull the label _open_cand_by_label_js asked to open out of its generated JS text — the
+    fakes below dispatch on substrings of the generated JS rather than running a JS engine (see
+    the module docstring), so this is how they see WHICH candidate a Runtime.evaluate call was
+    actually addressing, now that addressing is by label instead of by a positional index."""
+    m = _WANT_RE.search(expr)
+    return _json.loads(m.group(1)) if m else None
+
 
 # ---- _slider_label: pure parse of the slider group's first line -----------------------------
+#
+# Superseded 2026-08-28: a live fresh-tab probe showed the group's first line is sometimes the
+# BARE tier word ('Pro'), not just the ', N of M.' announced form ('Pro, 5 of 5.') — the suffix
+# is an accessibility announcement present only once the control has been driven by keyboard
+# (data-keyboard-interaction-active). The old contract ("no comma -> not this format -> return
+# '' ") could not tell a bare label apart from genuinely unrelated text and silently discarded
+# BOTH, which is why a walk that landed exactly on Pro still reported (False, ''). The new
+# contract: strip the announcement suffix when present, else trust the (short, single-line)
+# text as-is.
 
 def test_slider_label_pro():
     assert _CDP._slider_label("Pro, 5 of 5.") == "Pro"
@@ -31,10 +53,22 @@ def test_slider_label_extra_high():
     assert _CDP._slider_label("Extra High, 4 of 5.") == "Extra High"
 
 
-def test_slider_label_no_comma_is_not_this_format():
-    """A line with no comma is not the slider group's shape at all — there is nothing to
-    parse a tier out of, so this must not guess."""
-    assert _CDP._slider_label("Advanced") == ""
+def test_slider_label_bare_pro():
+    """Live-verified 2026-08-28: a fresh tab's picker group renders the bare word with no
+    ', N of M.' suffix at all until the control has been driven by keyboard. Must parse through,
+    not be discarded for lacking a comma."""
+    assert _CDP._slider_label("Pro") == "Pro"
+
+
+def test_slider_label_bare_extra_high():
+    assert _CDP._slider_label("Extra High") == "Extra High"
+
+
+def test_slider_label_long_prose_is_not_a_label():
+    """The sanity bound: a control's instructional prose must not be mistaken for a tier label,
+    even though _matches() could never have turned it into a false MATCH on its own — this just
+    keeps such text out of the reported 'shown' value on failure."""
+    assert _CDP._slider_label("Use Left and Right arrow keys to adjust power.") == ""
 
 
 def test_slider_label_empty_string():
@@ -79,7 +113,10 @@ class _FakeSliderClient:
             return 0
         if "menuitemradio" in expr:                        # _click_item_js — no flat item here
             return False
-        if "var EL=c[" in expr:                             # _open_cand_js
+        if "var EL=c[" in expr:                             # _open_cand_by_label_js
+            want = _wanted_label(expr)
+            if want != self._label():
+                return None
             self.menu_open = True
             return self._label()
         if ".map(function(b){" in expr:                     # _cand_labels_js
@@ -147,9 +184,12 @@ class _FakeFlatMenuClient:
                 self.selected = True
                 return True
             return False
-        if "var EL=c[" in expr:                               # _open_cand_js
+        if "var EL=c[" in expr:                               # _open_cand_by_label_js
+            cur = "Pro" if self.selected else "Medium"
+            if _wanted_label(expr) != cur:
+                return None
             self.opened = True
-            return "Medium"
+            return cur
         if ".map(function(b){" in expr:                       # _cand_labels_js
             return ["Pro"] if self.selected else ["Medium"]
         return 1                                                # _cand_count_js
@@ -202,12 +242,13 @@ class _FakeUnreachableTargetClient:
             return 0
         if "menuitemradio" in expr:                            # _click_item_js
             return False                                        # no flat 'Ultra' item anywhere
-        if "var EL=c[" in expr:                                 # _open_cand_js(i)
-            import re
-            m = re.search(r"var EL=c\[(\d+)\]", expr)
-            i = int(m.group(1)) if m else 0
-            self.opened_i = i
-            return ["Chat", self._label()][i] if i < 2 else None
+        if "var EL=c[" in expr:                                 # _open_cand_by_label_js
+            cands = ["Chat", self._label()]
+            want = _wanted_label(expr)
+            if want not in cands:
+                return None
+            self.opened_i = cands.index(want)
+            return want
         if ".map(function(b){" in expr:                         # _cand_labels_js
             return ["Chat", self._label()]
         return 2                                                  # _cand_count_js: 2 switchers
@@ -285,7 +326,9 @@ class _FakeLaggingSliderClient:
             return 0
         if "menuitemradio" in expr:
             return False
-        if "var EL=c[" in expr:
+        if "var EL=c[" in expr:                                  # _open_cand_by_label_js
+            if _wanted_label(expr) != self._label(self.now):
+                return None
             self.menu_open = True
             return self._label(self.now)
         if ".map(function(b){" in expr:
@@ -313,9 +356,275 @@ def test_settle_poll_tolerates_a_lagging_read_without_bailing(monkeypatch):
     assert ok is True and shown == "Pro", "a one-tick-late read must not be mistaken for stuck keys"
 
 
+# ---- addressing fix: identity, not index --------------------------------------------------
+#
+# Commit 601771d's _select_model was verified live only against an ALREADY-OPEN, settled tab.
+# The daemon's real path opens a FRESH tab, where the candidate NodeList is rebuilt on every
+# Runtime.evaluate and its size FLAPS as the composer re-renders — live-verified 2026-08-28: one
+# read saw ['Chat', 'Extra High'], the next (two seconds later) saw only ['Extra High']. The old
+# _open_cand_js(i) read labels in one round-trip and opened candidate[i] in a SECOND, separate
+# round-trip against a freshly re-queried list — so index i could name a different button than
+# the one whose label was read. In the repro this opened the Chat/Agent MODE TOGGLE (whose menu
+# has no slider and no tier items) instead of the tier switcher, and the consult refused to send
+# with the tier button sitting right there. The tests below pin the fix: candidates are found
+# and opened by their OWN label inside a single evaluation (_open_cand_by_label_js), so an
+# addressing miss can only ever return None or a mismatched label — never a wrong-but-real
+# element acted on as if it were the one asked for.
+
+def test_composer_scoped_switcher_tried_before_document_wide_scan():
+    """_FORM_CAND_JS (the composer's own <form>-scoped switcher — the tier control on the build
+    probed 2026-08-28, and what the live repro proved actually works) must be concatenated
+    AHEAD of what the wide, document-wide _CAND_JS scan adds, so _select_model tries it first."""
+    all_js = _CDP._ALL_CAND_JS
+    form_marker = "composer-plus-btn"  # unique to _FORM_CAND_JS
+    wide_marker = "new chat"           # unique to _CAND_JS's deny-list regex
+    assert form_marker in all_js and wide_marker in all_js
+    assert all_js.index(form_marker) < all_js.index(wide_marker), (
+        "form-scoped candidates must be concatenated first, ahead of the wide scan's additions")
+
+
+class _FakeAlwaysMismatchedOpenClient:
+    """Every open-by-label call resolves to a label OTHER than the one requested — as if the
+    composer re-rendered between the labels read and the open landing, or the click simply
+    missed. A slider genuinely exists and would satisfy the target if searched — proving
+    _select_model never acts on a mismatched open is exactly proving it never gets searched."""
+
+    def __init__(self):
+        self.slider_reads = 0
+
+    def eval(self, expr):
+        if "aria-valuenow" in expr:
+            self.slider_reads += 1
+            return {"first": "Pro, 5 of 5.", "now": 4, "min": 0, "max": 4}
+        if ".focus();return true" in expr:
+            return True
+        if "pointerover" in expr:
+            return False
+        if 'aria-haspopup="menu"' in expr:
+            return 0
+        if "menuitemradio" in expr:
+            return False
+        if "var EL=c[" in expr:                # _open_cand_by_label_js — always the wrong label
+            return "Something Else"
+        if ".map(function(b){" in expr:
+            return ["Extra High"]
+        return 1
+
+    def key(self, key_name, code, keycode):
+        pass
+
+
+def test_mismatched_open_is_never_acted_on(monkeypatch):
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeAlwaysMismatchedOpenClient()
+    ok, shown = _CDP._select_model(client, "Pro")
+    assert ok is False
+    assert client.slider_reads == 0, "an open that didn't land on the requested label must never be searched"
+
+
+class _FakeFlappingCandidatesClient:
+    """Reproduces the live repro verbatim: the candidate NodeList is rebuilt fresh on EVERY
+    evaluation and its size FLAPS between reads — odd opens see ['Chat', '<tier>'] (mode toggle
+    plus tier switcher both rendered), even opens see only ['<tier>'] (mode toggle transiently
+    unrendered). Confirmed (2026-08-28) to FAIL against the pre-fix index-addressed
+    _open_cand_js: with 'candidates' always reported as 2 (a moment-ago, now-stale count),
+    index 0 keeps landing on whichever read is the 2-item shape — the Chat/Agent MODE TOGGLE,
+    not the tier switcher — so the walk that would reach Pro never starts, on either retry pass.
+    The fix (_open_cand_by_label_js) finds the tier switcher by ITS OWN LABEL inside a single
+    evaluation, so it is found wherever it actually sits in THAT snapshot, never mistaken for
+    the mode toggle."""
+
+    LABELS = ["Instant", "Medium", "High", "Extra High", "Pro"]
+
+    def __init__(self):
+        self.now = 3  # Extra High
+        self.open_calls = 0
+        self.menu_open = False
+        self.opened_chat = False
+
+    def _tier_label(self):
+        return self.LABELS[self.now]
+
+    def eval(self, expr):
+        if "aria-valuenow" in expr:                          # _SLIDER_STATE_JS
+            if not self.menu_open or self.opened_chat:
+                return None
+            return {"first": "%s, %d of 5." % (self._tier_label(), self.now + 1),
+                    "now": self.now, "min": 0, "max": 4}
+        if ".focus();return true" in expr:                    # _SLIDER_FOCUS_JS
+            return self.menu_open and not self.opened_chat
+        if "pointerover" in expr:                              # _open_submenu_js
+            return False
+        if 'aria-haspopup="menu"' in expr:                     # _submenu_count_js
+            return 0
+        if "menuitemradio" in expr:                            # _click_item_js
+            return False
+        if ".length;})()" in expr:                             # _cand_count_js (old code only) —
+            return 2                                            # a stale "2 a moment ago" read
+        if "var EL=c[" in expr:                                # _open_cand_js(i) / by-label open
+            self.open_calls += 1
+            state_a = (self.open_calls % 2 == 1)                # flaps every open call
+            cands = ["Chat", self._tier_label()] if state_a else [self._tier_label()]
+            want = _wanted_label(expr)
+            if want is not None:                                # new: identity search
+                if want not in cands:
+                    return None
+                got = want
+            else:                                               # old: positional index
+                m = _re.search(r"var EL=c\[(\d+)\]", expr)
+                i = int(m.group(1)) if m else 0
+                if i >= len(cands):
+                    return None
+                got = cands[i]
+            self.opened_chat = (got == "Chat")
+            self.menu_open = True
+            return got
+        if ".map(function(b){" in expr:                         # _cand_labels_js
+            return [self._tier_label()]
+        return 1
+
+    def key(self, key_name, code, keycode):
+        if key_name == "Escape":
+            self.menu_open = False
+            self.opened_chat = False
+            return
+        if not self.menu_open or self.opened_chat:
+            return
+        if key_name == "ArrowLeft":
+            self.now = max(0, self.now - 1)
+        elif key_name == "ArrowRight":
+            self.now = min(4, self.now + 1)
+
+
+def test_flapping_candidate_list_still_reaches_pro(monkeypatch):
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeFlappingCandidatesClient()
+    ok, shown = _CDP._select_model(client, "Pro")
+    assert ok is True and shown == "Pro"
+
+
+# ---- the bare-label form (no keyboard-interaction announcement) --------------------------
+#
+# Live-verified 2026-08-28 on a FRESH tab at the project URL: _slider_set walked the slider
+# correctly, landing exactly on Pro (see the ArrowLeft/ArrowRight trace in the fix commit), and
+# still reported (False, '') — because the group's first line was the bare word 'Pro', not
+# 'Pro, 5 of 5.', and the pre-fix _slider_label discarded any line without a comma.
+
+class _FakeBareLabelSliderClient:
+    """Same shape as _FakeSliderClient, except the picker group's first line is the BARE tier
+    word with no ', N of M.' accessibility suffix at all — the live fresh-tab shape."""
+
+    LABELS = ["Instant", "Medium", "High", "Extra High", "Pro"]
+
+    def __init__(self, start=2):
+        self.now = start
+        self.menu_open = False
+
+    def _label(self):
+        return self.LABELS[self.now]
+
+    def eval(self, expr):
+        if "aria-valuenow" in expr:                        # _SLIDER_STATE_JS
+            if not self.menu_open:
+                return None
+            return {"first": self._label(), "now": self.now, "min": 0, "max": 4}
+        if ".focus();return true" in expr:
+            return self.menu_open
+        if "pointerover" in expr:
+            return False
+        if 'aria-haspopup="menu"' in expr:
+            return 0
+        if "menuitemradio" in expr:
+            return False
+        if "var EL=c[" in expr:                             # _open_cand_by_label_js
+            if _wanted_label(expr) != self._label():
+                return None
+            self.menu_open = True
+            return self._label()
+        if ".map(function(b){" in expr:                     # _cand_labels_js
+            return [self._label()]
+        return 1
+
+    def key(self, key_name, code, keycode):
+        if key_name == "Escape":
+            self.menu_open = False
+            return
+        if key_name == "ArrowLeft":
+            self.now = max(0, self.now - 1)
+        elif key_name == "ArrowRight":
+            self.now = min(4, self.now + 1)
+
+
+def test_bare_label_form_still_reaches_pro(monkeypatch):
+    """Confirmed (2026-08-28) to FAIL against the pre-fix _slider_label, which returned '' for
+    any line without a comma: label stayed '' through the whole walk, _matches() never fired
+    even after landing exactly on Pro, and _select_model reported failure with the tier button
+    already showing the right value."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeBareLabelSliderClient(start=2)  # High
+    ok, shown = _CDP._select_model(client, "Pro")
+    assert ok is True and shown == "Pro"
+
+
+class _FakeGroupMissingButtonLabelClient:
+    """The picker group's own text is unusable (empty first line — group absent, or some third
+    shape) but the composer switcher BUTTON's own label is present and tracks the slider
+    position live. Proves the state read's fallback source (btnLabel, see _slider_state_label)
+    lets the walk proceed even when the group text gives nothing to parse."""
+
+    LABELS = ["Instant", "Medium", "High", "Extra High", "Pro"]
+
+    def __init__(self, start=2):
+        self.now = start
+        self.menu_open = False
+
+    def _label(self):
+        return self.LABELS[self.now]
+
+    def eval(self, expr):
+        if "aria-valuenow" in expr:                        # _SLIDER_STATE_JS
+            if not self.menu_open:
+                return None
+            return {"first": "", "btnLabel": self._label(), "now": self.now, "min": 0, "max": 4}
+        if ".focus();return true" in expr:
+            return self.menu_open
+        if "pointerover" in expr:
+            return False
+        if 'aria-haspopup="menu"' in expr:
+            return 0
+        if "menuitemradio" in expr:
+            return False
+        if "var EL=c[" in expr:                             # _open_cand_by_label_js
+            if _wanted_label(expr) != self._label():
+                return None
+            self.menu_open = True
+            return self._label()
+        if ".map(function(b){" in expr:                     # _cand_labels_js
+            return [self._label()]
+        return 1
+
+    def key(self, key_name, code, keycode):
+        if key_name == "Escape":
+            self.menu_open = False
+            return
+        if key_name == "ArrowLeft":
+            self.now = max(0, self.now - 1)
+        elif key_name == "ArrowRight":
+            self.now = min(4, self.now + 1)
+
+
+def test_group_text_missing_falls_back_to_button_label(monkeypatch):
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeGroupMissingButtonLabelClient(start=2)  # High
+    ok, shown = _CDP._select_model(client, "Pro")
+    assert ok is True and shown == "Pro"
+
+
 if __name__ == "__main__":
     test_slider_label_pro()
     test_slider_label_extra_high()
-    test_slider_label_no_comma_is_not_this_format()
+    test_slider_label_bare_pro()
+    test_slider_label_bare_extra_high()
+    test_slider_label_long_prose_is_not_a_label()
     test_slider_label_empty_string()
     print("OK")

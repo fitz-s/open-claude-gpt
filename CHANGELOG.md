@@ -6,6 +6,33 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — the picker actually works on the tab the daemon opens
+
+The slider fix above was verified by attaching to an already-open, settled tab. The daemon opens a
+FRESH tab per consult, and there it failed every time — a real consult burned its three retries and
+blocked with `model_not_selectable` while the tier button sat right there. Two independent bugs, both
+invisible to the test suite because both fixtures encoded the same wrong assumptions the code did.
+
+- **Candidates were addressed by index into a live NodeList.** `_CAND_JS` is re-evaluated inside every
+  call, so reading labels and then opening `c[i]` are two round-trips with a React re-render in
+  between. Live: labels read `['Extra High']`, then opening index 0 opened the Chat/Agent MODE TOGGLE
+  — whose menu has no slider and no tier items — and since the count read back as 1, the tier switcher
+  was never tried at all. Hence the honest-but-useless `switcher shows 'Chat'`. Candidates are now
+  addressed by identity: one evaluation finds the button by label AND clicks it, returning the label
+  it actually opened, and an open that does not match what was asked for is discarded rather than
+  acted on. The composer-scoped switcher (`form button[aria-haspopup=menu]`, minus the plus button) is
+  tried before the document-wide scan, which stays as the fallback for other builds.
+- **The label parser rejected the real DOM.** `_slider_label` returned `""` for any line without a
+  comma, but the picker group renders `"Pro, 5 of 5."` only once keyboard interaction is active — a
+  fresh tab shows the bare word `"Pro"`. So the walk drove the slider correctly to the target and then
+  compared every reading against `""`: never a match, run to the ceiling, report failure. Traced live,
+  one press at a time: `now` went 4→3→2→1→0→…→4 with `first` tracking each tier, and `_slider_set`
+  still returned `(False, '')`. Both forms now parse, and the state read carries a second source — the
+  composer button's own label, the same text the verdict already trusts — so the walk is never blind.
+
+Verified on a fresh daemon-style tab: `High → Pro` confirmed in 8.6s, where the same path failed
+outright before.
+
 ### Fixed — a proven-unsent round no longer eats its request-key forever
 
 Found by dogfooding the picker breakage above. `model_not_selectable` is a **pre-click** failure —
