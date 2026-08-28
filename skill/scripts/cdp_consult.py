@@ -956,9 +956,29 @@ _CAND_JS = ("[].slice.call(document.querySelectorAll('button')).filter(function(
             "var labelish=/^(Instant|Medium|High|Extra High|Pro|Auto|Thinking|GPT|ChatGPT|o[0-9]|[0-9]\\.[0-9])/.test(t);"
             "return menuish||labelish;})")
 
+# The composer's OWN switcher, scoped to its <form>: on the build live-repro'd 2026-08-28 this
+# is exactly the tier control (a button[aria-haspopup=menu] under the form, never the '+'
+# attach button) and it is what actually works — the wide, document-wide _CAND_JS scan above
+# can (and on this build did) resolve its first entry to the Chat/Agent MODE TOGGLE instead of
+# the tier switcher. Tried FIRST for that reason; _CAND_JS remains as the fallback for a build
+# whose switcher sits outside the form (do not delete it). aria-haspopup is read via
+# getAttribute rather than a CSS attribute selector purely so this stays a plain equality check
+# alongside _CAND_JS's own such check above.
+_FORM_CAND_JS = (
+    "[].slice.call((document.querySelector('form')||document.documentElement)"
+    ".querySelectorAll('button')).filter(function(b){"
+    "return b.getAttribute('aria-haspopup')==='menu'&&b.id!=='composer-plus-btn';})"
+)
 
-def _cand_count_js():
-    return "(function(){return %s.length;})()" % _CAND_JS
+# Every candidate this run considers, form-scoped ones FIRST (see _FORM_CAND_JS) followed by
+# whatever the wide scan adds that isn't already in that list. A single expression so
+# _cand_labels_js / _open_cand_by_label_js each get one internally consistent DOM snapshot per
+# Runtime.evaluate call — never a snapshot stitched together from two separate round-trips.
+_ALL_CAND_JS = (
+    "(function(){var f=%s;var w=%s;"
+    "return f.concat(w.filter(function(b){return f.indexOf(b)<0;}));})()"
+    % (_FORM_CAND_JS, _CAND_JS)
+)
 
 
 # ChatGPT's model pill is a Radix popover: it opens ONLY on a real pointer-event
@@ -969,9 +989,34 @@ _GESTURE = ("['pointerdown','mousedown','pointerup','mouseup','click'].forEach(f
             "EL.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));});")
 
 
-def _open_cand_js(i):
-    return ("(function(){var c=%s;var EL=c[%d];if(!EL)return null;%s"
-            "return (EL.innerText||'').trim().split('\\n')[0];})()" % (_CAND_JS, i, _GESTURE))
+def _open_cand_by_label_js(label):
+    """Atomically FIND the candidate whose first-line label is exactly `label` and dispatch the
+    open gesture to it — all inside ONE Runtime.evaluate call. Returns the label it actually
+    opened (None if `label` is not present in THIS snapshot).
+
+    This replaces addressing-by-index. The previous version (`_open_cand_js(i)`) read every
+    candidate's label in one round-trip, then in a SECOND, separate round-trip re-ran the
+    candidate query and opened whatever sat at position `i` — but that query rebuilds a live
+    NodeList, and between the two round-trips React can re-render the composer and change which
+    button occupies position `i`, or how many candidates exist at all. Live-verified 2026-08-28
+    on a FRESH tab at the project URL: the candidate set itself flapped between one and two
+    entries across reads two seconds apart. One run's index-1 open resolved to nothing (that
+    read only had one candidate); the next opened index 0, which resolved to the composer's
+    Chat/Agent MODE TOGGLE, not the tier switcher — its menu has no slider and no tier items, so
+    the walk below never even started, and the consult refused to send with the tier button
+    sitting right there the whole time. Searching for `label` INSIDE the same evaluation that
+    also builds the candidate list and dispatches the gesture means there is only ever one live
+    snapshot in play; nothing about the addressing can survive — or be invalidated by — a round
+    trip, so it can never land on a button other than the one actually named `label` right now."""
+    t = json.dumps(label)
+    return (
+        "(function(){var c=%s;var want=%s;var idx=-1;"
+        "for(var k=0;k<c.length;k++){"
+        "if(((c[k].innerText||'').trim().split('\\n')[0])===want){idx=k;break;}}"
+        "var EL=c[idx];if(!EL)return null;%s"
+        "return (EL.innerText||'').trim().split('\\n')[0];})()"
+        % (_ALL_CAND_JS, t, _GESTURE)
+    )
 
 
 def _click_item_js(target):
@@ -1006,14 +1051,48 @@ def _click_item_js(target):
 # High/Pro in that order — verified live by walking it with ArrowLeft/ArrowRight via CDP
 # Input.dispatchKeyEvent after focusing the slider's [role=menuitem] ancestor (the slider
 # itself is not focusable; .focus() on a bare <span role=slider> does nothing in this build).
+_SLIDER_ANNOUNCE_RE = re.compile(r",\s*\d+\s+of\s+\d+\.?\s*$", re.IGNORECASE)
+
+
 def _slider_label(first_line):
-    """Pure parse of the group's first line ('Pro, 5 of 5.' -> 'Pro'). No comma means the text
-    is not this group's format at all (composer's plain label, a stale read, ...), so there is
-    no tier to report — return '' rather than guess at a value that was never delimited."""
+    """Parse the group's first line into a tier label. Two shapes are both real, live-verified
+    2026-08-28: a control that has been driven by keyboard announces 'Pro, 5 of 5.' (an
+    accessibility 'N of M' suffix — the Power menuitem carries data-keyboard-interaction-active,
+    which stays false, and the suffix absent, until the control has actually been driven by
+    keyboard); a fresh tab whose menu was only just opened renders the bare word 'Pro' with no
+    suffix at all. Strip the suffix when present; otherwise trust the line as-is.
+
+    (The previous version returned '' whenever there was no comma, on the theory that a line
+    with no 'N of M' delimiter was not this group's format at all. That was the live bug: it
+    silently discarded the bare form too, so _matches() compared every read against '' and a
+    walk that landed exactly on Pro still reported failure. The theory does not survive contact
+    with the real DOM — a fresh tab serves the bare form as its FIRST and only shape until
+    keyboard interaction flips the flag.)
+
+    A short, single-line sanity bound still guards the result: _matches() demands an exact
+    label match (or the Pro-family prefix) anyway, so a long non-label line (e.g. 'Use Left and
+    Right arrow keys to adjust power.') could never have produced a false MATCH — but an
+    unbounded return would still let such prose leak into the reported 'shown' value on
+    failure, which is worth keeping out."""
     s = (first_line or "").strip()
-    if "," not in s:
+    if not s:
         return ""
-    return s.split(",", 1)[0].strip()
+    s = _SLIDER_ANNOUNCE_RE.sub("", s).strip()
+    if not s or len(s) > 24 or "\n" in s:
+        return ""
+    return s
+
+
+def _slider_state_label(st):
+    """The slider group's own first line, falling back to the composer switcher BUTTON's own
+    label — the same text _model_verdict already trusts as ground truth — when the group text
+    yields nothing usable. Needed on top of _slider_label's now-permissive parse (above) because
+    the group can also be genuinely ABSENT or shaped a third way entirely; the button's label is
+    an independent second source for the same fact, not just another suffix to strip."""
+    lab = _slider_label(st.get("first") or "")
+    if lab:
+        return lab
+    return _slider_label(st.get("btnLabel") or "")
 
 
 _SLIDER_STATE_JS = (
@@ -1021,7 +1100,9 @@ _SLIDER_STATE_JS = (
     "if(!s)return null;var mi=s.closest('[role=\"menuitem\"]');"
     "var grp=document.querySelector('[data-testid=\"composer-intelligence-picker-content\"]');"
     "var src=grp||mi;var first=((src&&src.innerText)||'').trim().split('\\n')[0];"
-    "return {first:first,now:parseInt(s.getAttribute('aria-valuenow'),10),"
+    "var trig=(document.querySelector('form')||document).querySelector('button[aria-expanded=\"true\"]');"
+    "var btnLabel=((trig&&trig.innerText)||'').trim().split('\\n')[0];"
+    "return {first:first,btnLabel:btnLabel,now:parseInt(s.getAttribute('aria-valuenow'),10),"
     "min:parseInt(s.getAttribute('aria-valuemin'),10),max:parseInt(s.getAttribute('aria-valuemax'),10)};"
     "})()")
 
@@ -1058,7 +1139,7 @@ def _slider_set(c, target):
         return False, None
     lo, hi, now = st["min"], st["max"], st["now"]
     entry_now = now
-    label = _slider_label(st.get("first") or "")
+    label = _slider_state_label(st)
     entry_label = label
     if _matches(label, target):
         return True, label
@@ -1078,7 +1159,7 @@ def _slider_set(c, target):
                 break
         if not st2 or st2.get("now") is None:
             return None, None
-        return st2["now"], _slider_label(st2.get("first") or "")
+        return st2["now"], _slider_state_label(st2)
 
     def _restore(pos):
         """Best-effort walk back to entry_now. Same bail discipline as the forward walk: a
@@ -1095,7 +1176,7 @@ def _slider_set(c, target):
             pos = new_pos
         st_final = c.eval(_SLIDER_STATE_JS)
         if st_final and st_final.get("now") is not None:
-            return _slider_label(st_final.get("first") or "")
+            return _slider_state_label(st_final)
         return entry_label
 
     span = hi - lo
@@ -1161,10 +1242,12 @@ def _submenu_try(c, target):
 
 
 def _cand_labels_js():
-    """Every switcher-ish button's first-line label, in DOM order. c[0] is the composer's own
-    model pill; later entries are the other switchers (ChatGPT splits model and reasoning effort)."""
+    """Every switcher-ish button's first-line label, in DOM order — composer/form-scoped
+    candidates FIRST (see _FORM_CAND_JS), then whatever the wide, document-wide scan adds.
+    c[0] is therefore the composer's own switcher when the build serves one there; later
+    entries are other switchers (ChatGPT splits model and reasoning effort) or modes."""
     return ("(function(){return %s.map(function(b){"
-            "return (b.innerText||'').trim().split('\\n')[0];});})()" % _CAND_JS)
+            "return (b.innerText||'').trim().split('\\n')[0];});})()" % _ALL_CAND_JS)
 
 
 def _matches(label, target):
@@ -1203,6 +1286,19 @@ def _select_model(c, target):
     ChatGPT is known to serve for the same setting depending on rollout stage. Returns
     (confirmed, shown). Fully automated — no human step.
 
+    Candidates are read as LABELS, not positions, and each is opened by identity in a single
+    evaluation (see _open_cand_by_label_js) — never by an index into a NodeList read in an
+    earlier round-trip. If a candidate's open does not land on the label it was asked for, that
+    open is discarded and nothing inside whatever it actually opened is acted on: an addressing
+    miss (the composer re-rendered between the labels read and this open) is not evidence about
+    the menu's contents, so it must not be treated as one.
+
+    `exhausted` remembers a label whose menu WAS opened as asked and searched (slider, flat
+    item, submenus) without finding target, and skips it on the next pass — the composer
+    genuinely does re-render, so a bounded retry is kept, but a candidate already proven wrong
+    must not be what the whole retry budget gets spent re-opening. A label that merely failed to
+    OPEN (addressing miss, not content miss) is never added, so it stays eligible next pass.
+
     On a final failure, `shown` prefers the last real tier label the slider path observed over
     _model_verdict's labels[0] fallback: labels[0] is the composer's MODE toggle (Chat/Agent),
     not a tier (see _model_verdict), so on an unreachable target the caller's own error message
@@ -1213,12 +1309,15 @@ def _select_model(c, target):
     if ok:
         return True, shown
     last_slider_label = None
+    exhausted = set()
     for _ in range(2):
-        n = c.eval(_cand_count_js()) or 0
-        for i in range(min(int(n), 8)):
-            opened = c.eval(_open_cand_js(i))
-            if opened is None:
+        labels = [x for x in (c.eval(_cand_labels_js()) or []) if x]
+        for lab in labels:
+            if lab in exhausted:
                 continue
+            opened = c.eval(_open_cand_by_label_js(lab))
+            if opened != lab:
+                continue  # addressing miss — nothing opened is trustworthy, try the next label
             time.sleep(1.0)  # Radix menu renders async after the gesture
             slid_ok, slid_label = _slider_set(c, target)
             if slid_label:
@@ -1237,7 +1336,9 @@ def _select_model(c, target):
                 if ok:
                     return True, shown
                 continue
-            # wrong menu (target not in it) → close and try the next switcher
+            # this WAS the candidate asked for, and it genuinely does not carry target — budget
+            # must not be spent reopening it.
+            exhausted.add(lab)
             c.key("Escape", "Escape", 27)
             time.sleep(0.25)
         time.sleep(0.4)
