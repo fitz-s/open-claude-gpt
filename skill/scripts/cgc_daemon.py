@@ -388,6 +388,19 @@ def _tab_conversation(url) -> str:
     return m.group(1) if m else ""
 
 
+def _browser_reachable() -> bool:
+    """Cheap yes/no: can the daemon even ask Chrome for its tab list? Split out from `_sweep_tabs`
+    (which keeps its own defensive except — it still has real sweeping work to do when reachable) so
+    the maintenance loop can decide whether to back off BEFORE running anything browser-global, and
+    can tell 'nothing to sweep' apart from 'could not even ask'."""
+    try:
+        base = f"http://127.0.0.1:{os.environ.get('CGC_PORT', '9333')}"
+        json.load(urllib.request.urlopen(f"{base}/json", timeout=5))
+        return True
+    except Exception:
+        return False
+
+
 def _sweep_tabs(protect_convs=(), hold=()) -> int:
     """Close leftover ChatGPT tabs. CALLER-GUARDED: call only under the EXCLUSIVE browser lease —
     unobtainable while any worker of any daemon generation is alive.
@@ -560,6 +573,109 @@ def _maybe_repair_browser(children: dict, last_repair: float) -> float:
     return time.time()
 
 
+class _DedupStderr:
+    """Collapse a run of IDENTICAL consecutive stderr lines into one, with a repeat count folded into
+    the note printed once something actually changes. The fix for evidence like 6896 copies of one
+    'tab sweep skipped: URLError' line and 325 copies of one HELD line burying every other signal in
+    the log — a line that DIFFERS from the last one always prints immediately; only an exact repeat
+    is deferred. Scoped to the daemon's own loop (installed only around run_loop, restored after):
+    a worker subprocess's stderr is a separate process and untouched by this."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._last = None
+        self._repeats = 0
+
+    def write(self, text) -> int:
+        if text and text == self._last:
+            self._repeats += 1
+            return len(text)
+        self._flush_repeat_note()
+        self._stream.write(text)
+        self._last = text
+        self._repeats = 0
+        return len(text)
+
+    def _flush_repeat_note(self) -> None:
+        if self._repeats:
+            self._stream.write(f"  ... (repeated {self._repeats}x)\n")
+            self._repeats = 0
+
+    def flush(self) -> None:
+        self._flush_repeat_note()
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+# The idle-maintenance cadence, and the cap its backoff grows toward once the browser stops
+# answering — a few minutes is plenty; nothing here is time-critical the way a send is.
+_MAINT_INTERVAL_S = 60.0
+_MAINT_BACKOFF_CAP_S = 600.0
+
+
+def _maintenance_pass(children: dict, *, next_maintenance: float, maint_backoff_s: float,
+                      browser_was_down: bool, dispatched_since_sweep: bool,
+                      last_repair: float) -> tuple:
+    """One maintenance decision, CALLER-GUARDED exactly like _sweep_tabs/_maybe_repair_browser: call
+    only when `not children` and `time.time() >= next_maintenance` (run_loop's own gate — a live
+    worker's shared browser lease makes this unobtainable anyway, but the check avoids even trying).
+
+    Two evidence-driven policies, layered:
+      - SKIP when nothing dispatched since the last pass. No tab could exist to sweep and no queued
+        round could carry a fresh tab-family error to repair, so there is nothing a probe could find
+        — 6896 identical 'tab sweep skipped: URLError' lines were almost all from one ~5-day idle
+        stretch with zero dispatches, probed anyway on an unconditional 60s cadence.
+      - BACK OFF the probe cadence itself when the browser answers 'unreachable', capped, and resume
+        the normal cadence immediately once it answers again — so a daemon that IS busy while Chrome
+        is down does not hammer it every 60s either.
+    Pulled out of run_loop's while-body (rather than left inline) so these transitions are directly
+    testable — the same shape _maybe_repair_browser/_sweep_ownerless_sending already use.
+
+    Returns (next_maintenance, maint_backoff_s, browser_was_down, dispatched_since_sweep,
+    last_repair), each updated."""
+    if not dispatched_since_sweep:
+        return (time.time() + _MAINT_INTERVAL_S, maint_backoff_s, browser_was_down,
+                dispatched_since_sweep, last_repair)
+    blease = spool.acquire_browser_lease(shared=False)
+    if blease is None:
+        # A prior-generation worker (not in `children`) still holds the shared lease. Reschedule;
+        # dispatched_since_sweep stays True so the next pass tries again rather than being skipped.
+        return (time.time() + maint_backoff_s, maint_backoff_s, browser_was_down,
+                dispatched_since_sweep, last_repair)
+    try:
+        reachable = websocket is None or _browser_reachable()
+        if reachable:
+            if browser_was_down:
+                sys.stderr.write(
+                    "CGC_DAEMON browser reachable again — resuming normal maintenance cadence\n")
+            browser_was_down = False
+            maint_backoff_s = _MAINT_INTERVAL_S
+            if websocket is not None:
+                _sweep_tabs(*_evidence())
+            # Only a probe that actually REACHED the browser accounts for whatever was dispatched —
+            # an unreachable probe (below) could not have swept anything, so the activity stays
+            # outstanding and the next pass (at the backed-off interval) must try again.
+            dispatched_since_sweep = False
+        else:
+            maint_backoff_s = min(maint_backoff_s * 2, _MAINT_BACKOFF_CAP_S)
+            if not browser_was_down:
+                sys.stderr.write(
+                    "CGC_DAEMON browser unreachable — backing off maintenance probes (next retry in "
+                    f"{maint_backoff_s:.0f}s, capped at {_MAINT_BACKOFF_CAP_S:.0f}s)\n")
+            browser_was_down = True
+        # Repair is independent of the sweep's own reachability check: a browser unreachable via the
+        # plain /json list is exactly the condition _restart_chrome exists to fix, so this must run
+        # on BOTH branches, not just the happy one.
+        last_repair = _maybe_repair_browser(children, last_repair)
+    finally:
+        if hasattr(blease, "close"):
+            blease.close()
+    return (time.time() + maint_backoff_s, maint_backoff_s, browser_was_down,
+            dispatched_since_sweep, last_repair)
+
+
 _running = True
 
 
@@ -665,71 +781,84 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
         return 0
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    spool.heartbeat_write(os.getpid())
-    sys.stderr.write(
-        f"CGC_DAEMON up (pid {os.getpid()}) — store {store_mod.db_path()}, concurrency {concurrency}, "
-        f"poll {poll}s. This is the user-owned egress gate; the agent only reads/writes local files.\n")
-    children = {}  # rid -> Popen
-    daemon_instance_id = store_mod.new_daemon_instance_id()
-    # Recovery: a round left `sending` with NO live owner is uncertain, not resendable. "No live
-    # owner" is proven per-rid by the cross-generation lease, held THROUGH the promotion — the same
-    # fence the per-poll sweep uses, so a `sending` row a surviving prior-generation worker still
-    # owns is never mutated.
-    moved = _sweep_ownerless_sending(
-        children, reason="daemon startup: sending round found ownerless — uncertain, not resent")
-    with store_mod.Store() as _s:
-        identity = {"protocol": 1, "schema_version": store_mod.SCHEMA_VERSION,
-                    "db_path": os.path.abspath(store_mod.db_path()),
-                    "store_uuid": _s.store_uuid(), "daemon_instance_id": daemon_instance_id}
-    sys.stderr.write(f"CGC_DAEMON store (instance {daemon_instance_id[:8]}); "
-                     f"{len(moved)} interrupted send(s) marked possibly_accepted.\n")
-    next_maintenance = 0.0
-    last_repair = 0.0
+    # Every daemon message from here on goes through the dedup wrapper — restored in the finally
+    # below. Scoped to run_loop only: a worker subprocess (--worker-store, --worker-store-resume)
+    # never reaches this function, so its stderr is untouched.
+    real_stderr = sys.stderr
+    sys.stderr = _DedupStderr(real_stderr)
     try:
-        while _running:
-            spool.heartbeat_write(os.getpid(), identity)
-            _reap_children(children)
-            # A `sending` round whose owner died WITHOUT this daemon ever spawning it (a prior
-            # generation's worker that outlived our startup) is invisible to _reap_children. Sweep
-            # for it every poll — same per-rid lease fence, so a live owner is never disturbed.
-            _sweep_ownerless_sending(
-                children, reason="periodic sweep: sending round found ownerless — uncertain, not resent")
-            # Idle maintenance — both actions are browser-global, so they run only under the
-            # EXCLUSIVE browser lease: unobtainable while any worker (THIS generation's children
-            # or a surviving prior generation's) holds its shared lease.
-            if not children and time.time() >= next_maintenance:
-                blease = spool.acquire_browser_lease(shared=False)
-                if blease is not None:
-                    try:
-                        if websocket is not None:
-                            _sweep_tabs(*_evidence())
-                        last_repair = _maybe_repair_browser(children, last_repair)
-                    finally:
-                        if hasattr(blease, "close"):
-                            blease.close()
-                next_maintenance = time.time() + 60
-            _dispatch_store(children, concurrency, daemon_instance_id)
-            if once and not children:
-                with store_mod.Store() as _s:
-                    if not _s.recover()["dispatchable"]:
-                        break
-            time.sleep(poll)
-        # drain: let in-flight workers finish (they hold real consults), bounded.
-        if children:
-            sys.stderr.write(f"CGC_DAEMON draining {len(children)} in-flight consult(s)…\n")
-            for p in children.values():
-                try:
-                    p.wait(timeout=30)
-                except Exception:
-                    pass
-    finally:
+        spool.heartbeat_write(os.getpid())
+        sys.stderr.write(
+            f"CGC_DAEMON up (pid {os.getpid()}) — store {store_mod.db_path()}, concurrency {concurrency}, "
+            f"poll {poll}s. This is the user-owned egress gate; the agent only reads/writes local files.\n")
+        children = {}  # rid -> Popen
+        daemon_instance_id = store_mod.new_daemon_instance_id()
+        # Recovery: a round left `sending` with NO live owner is uncertain, not resendable. "No live
+        # owner" is proven per-rid by the cross-generation lease, held THROUGH the promotion — the
+        # same fence the per-poll sweep uses, so a `sending` row a surviving prior-generation worker
+        # still owns is never mutated.
+        moved = _sweep_ownerless_sending(
+            children, reason="daemon startup: sending round found ownerless — uncertain, not resent")
+        with store_mod.Store() as _s:
+            identity = {"protocol": 1, "schema_version": store_mod.SCHEMA_VERSION,
+                        "db_path": os.path.abspath(store_mod.db_path()),
+                        "store_uuid": _s.store_uuid(), "daemon_instance_id": daemon_instance_id}
+        sys.stderr.write(f"CGC_DAEMON store (instance {daemon_instance_id[:8]}); "
+                         f"{len(moved)} interrupted send(s) marked possibly_accepted.\n")
+        next_maintenance = 0.0
+        last_repair = 0.0
+        maint_backoff_s = _MAINT_INTERVAL_S
+        browser_was_down = False
+        # Has the daemon dispatched ANY worker since the last maintenance pass? If not, no tab could
+        # possibly exist to sweep and no queued round could carry a fresh tab-family error to repair
+        # — skip the browser-global pass entirely instead of probing a browser with nothing to do.
+        # Evidence: 6896 identical "tab sweep skipped: URLError" lines, almost all from one ~5-day
+        # idle stretch with zero dispatches, at an unconditional 60s cadence regardless of activity.
+        dispatched_since_sweep = False
         try:
-            if os.path.exists(spool.daemon_path()):
-                os.remove(spool.daemon_path())  # so `daemon_alive()` flips to false immediately
-        except OSError:
-            pass
-    sys.stderr.write("CGC_DAEMON stopped.\n")
-    return 0
+            while _running:
+                spool.heartbeat_write(os.getpid(), identity)
+                _reap_children(children)
+                # A `sending` round whose owner died WITHOUT this daemon ever spawning it (a prior
+                # generation's worker that outlived our startup) is invisible to _reap_children. Sweep
+                # for it every poll — same per-rid lease fence, so a live owner is never disturbed.
+                _sweep_ownerless_sending(
+                    children, reason="periodic sweep: sending round found ownerless — uncertain, not resent")
+                # Idle maintenance — both actions are browser-global, so they run only under the
+                # EXCLUSIVE browser lease: unobtainable while any worker (THIS generation's children
+                # or a surviving prior generation's) holds its shared lease.
+                if not children and time.time() >= next_maintenance:
+                    (next_maintenance, maint_backoff_s, browser_was_down, dispatched_since_sweep,
+                     last_repair) = _maintenance_pass(
+                        children, next_maintenance=next_maintenance, maint_backoff_s=maint_backoff_s,
+                        browser_was_down=browser_was_down,
+                        dispatched_since_sweep=dispatched_since_sweep, last_repair=last_repair)
+                _dispatch_store(children, concurrency, daemon_instance_id)
+                dispatched_since_sweep = dispatched_since_sweep or bool(children)
+                if once and not children:
+                    with store_mod.Store() as _s:
+                        if not _s.recover()["dispatchable"]:
+                            break
+                time.sleep(poll)
+            # drain: let in-flight workers finish (they hold real consults), bounded.
+            if children:
+                sys.stderr.write(f"CGC_DAEMON draining {len(children)} in-flight consult(s)…\n")
+                for p in children.values():
+                    try:
+                        p.wait(timeout=30)
+                    except Exception:
+                        pass
+        finally:
+            try:
+                if os.path.exists(spool.daemon_path()):
+                    os.remove(spool.daemon_path())  # so `daemon_alive()` flips to false immediately
+            except OSError:
+                pass
+        sys.stderr.write("CGC_DAEMON stopped.\n")
+        return 0
+    finally:
+        sys.stderr.flush()
+        sys.stderr = real_stderr
 
 
 def main() -> int:

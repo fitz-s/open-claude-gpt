@@ -6,6 +6,39 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Changed — work that makes no progress now costs nothing and says nothing
+
+A first-principles efficiency pass, driven by counting what the running system actually did rather
+than by guessing where time goes. Three of the four findings were pure waste hiding in plain sight in
+the daemon log and the event table.
+
+- **A requeued round no longer hot-spins the daemon.** `ready -> queued` was 93% of all state events
+  in the live store — 2461 of them from a single round, one every ~2.2s for 91 minutes, ending only
+  because a human cancelled it. `_gate` requeues a round when the egress gate fails *transiently*
+  (`gh` missing, timed out, API error) and its docstring claimed "the daemon poll paces the retry";
+  nothing paced it, because a requeued round was instantly re-claimable and each cycle shelled out to
+  `gh` again. Rounds now carry a `not_before` fence that `claim_ready` honours, with exponential
+  backoff (5s doubling to a 180s cap) and a bound: past five retries this is a standing `gh` problem,
+  not a blip, so the round blocks for a human — carrying the same `not_sent_proven` stamp the
+  send-phase precheck uses, since the gate runs strictly before `begin_send`. Schema 4.
+- **Idle maintenance stopped probing a browser that was not there.** `tab sweep skipped: URLError`
+  was the single most common line in the daemon log — **6896** of them, one per minute for about five
+  days, while Chrome simply was not running. Maintenance is now skipped entirely when nothing has been
+  dispatched that could leave a tab behind, the probe backs off when it fails (to a 600s cap) and
+  resumes its normal cadence the moment the browser answers, and only the *transitions* are logged.
+- **Consecutive identical log lines collapse.** The same `tab sweep HELD` line appeared 325 times for
+  one unreconciled round whose state never changed once. Repeats now print once and report
+  `(repeated N×)` when the line finally changes. A small wrapper around the daemon's own stderr —
+  worker output is untouched.
+- **Two operator steps that should not have existed.** `enqueue --kind retrieve --parent <rid>`
+  refused without an explicit `--conversation` even though the store already knows the parent's
+  conversation; it now resolves it (an explicit value still overrides, and a parent with no recorded
+  conversation still refuses, naming `find-conversation`). And re-firing a proven-unsent round meant
+  hand-writing Python against the live store to rewrite the prompt's rid sentinels and re-assemble the
+  spec — done twice by hand during this release. `cgc_spool.py refire --rid <rid>` does it, and
+  refuses anything not durably proven unsent by reusing `_release_eligible` rather than inventing a
+  second definition of "safe to send again".
+
 ### Fixed — the picker actually works on the tab the daemon opens
 
 The slider fix above was verified by attaching to an already-open, settled tab. The daemon opens a

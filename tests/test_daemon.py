@@ -704,8 +704,152 @@ def test_evidence_fails_closed_when_the_store_cannot_be_read(daemon, monkeypatch
 
 
 def test_maintenance_sweep_is_passed_the_evidence(daemon):
+    """The sweep call itself now lives in _maintenance_pass (extracted out of run_loop's while-body
+    so its state transitions are directly testable — see the tests below) — run_loop just calls it."""
     import inspect
-    assert "_sweep_tabs(*_evidence())" in inspect.getsource(daemon.run_loop)
+    assert "_maintenance_pass(" in inspect.getsource(daemon.run_loop)
+    assert "_sweep_tabs(*_evidence())" in inspect.getsource(daemon._maintenance_pass)
+
+
+# ---- item 2: idle maintenance must not probe a browser with nothing to do ----
+
+def test_browser_reachable_true_when_the_endpoint_responds(daemon, monkeypatch):
+    import io
+    monkeypatch.setattr(daemon.urllib.request, "urlopen",
+                        lambda *a, **k: io.BytesIO(json.dumps([]).encode()))
+    assert daemon._browser_reachable() is True
+
+
+def test_browser_reachable_false_when_the_endpoint_is_unreachable(daemon, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("connection refused")
+    monkeypatch.setattr(daemon.urllib.request, "urlopen", boom)
+    assert daemon._browser_reachable() is False
+
+
+def test_maintenance_pass_skips_the_probe_when_nothing_was_dispatched(daemon, monkeypatch):
+    """Evidence: 6896 identical 'tab sweep skipped: URLError' lines, almost all logged during a
+    ~5-day idle stretch with zero dispatches — probing a browser that has nothing to sweep or
+    repair is pure waste. dispatched_since_sweep=False must skip the probe (and the browser-lease
+    acquire) entirely, only rescheduling the next check."""
+    monkeypatch.setattr(daemon.spool, "acquire_browser_lease",
+                        lambda *a, **k: pytest.fail("must not even try to acquire the lease"))
+    before = daemon.time.time()
+    (next_maintenance, backoff, was_down, dispatched, last_repair) = daemon._maintenance_pass(
+        {}, next_maintenance=0.0, maint_backoff_s=daemon._MAINT_INTERVAL_S,
+        browser_was_down=False, dispatched_since_sweep=False, last_repair=0.0)
+    assert next_maintenance >= before + daemon._MAINT_INTERVAL_S
+    assert backoff == daemon._MAINT_INTERVAL_S, "the cadence must not change on a skip"
+    assert dispatched is False
+    assert last_repair == 0.0
+
+
+def test_maintenance_pass_probes_when_something_was_dispatched(daemon, monkeypatch):
+    """The counterpart: once ANYTHING has been dispatched since the last pass, the probe must run —
+    and a successful probe clears dispatched_since_sweep, since that activity has now been
+    accounted for."""
+    import io
+
+    class _Lease:
+        def close(self): pass
+
+    monkeypatch.setattr(daemon.spool, "acquire_browser_lease", lambda *a, **k: _Lease())
+    monkeypatch.setattr(daemon.urllib.request, "urlopen",
+                        lambda *a, **k: io.BytesIO(json.dumps([{"type": "page", "id": "A"}]).encode()))
+    (next_maintenance, backoff, was_down, dispatched, last_repair) = daemon._maintenance_pass(
+        {}, next_maintenance=0.0, maint_backoff_s=daemon._MAINT_INTERVAL_S,
+        browser_was_down=False, dispatched_since_sweep=True, last_repair=0.0)
+    assert dispatched is False, "the activity that triggered this pass has now been accounted for"
+    assert was_down is False
+    assert backoff == daemon._MAINT_INTERVAL_S
+
+
+def test_maintenance_pass_backs_off_on_failure_and_resumes_on_recovery(daemon, monkeypatch):
+    """The next probe should be further away each time (capped), and resume the normal cadence
+    immediately once the browser answers again — not stay backed off forever."""
+    class _Lease:
+        def close(self): pass
+
+    monkeypatch.setattr(daemon.spool, "acquire_browser_lease", lambda *a, **k: _Lease())
+
+    def unreachable(*a, **k):
+        raise OSError("connection refused")
+    monkeypatch.setattr(daemon.urllib.request, "urlopen", unreachable)
+
+    backoff = daemon._MAINT_INTERVAL_S
+    was_down = False
+    for _ in range(4):
+        (nm, new_backoff, was_down, dispatched, _lr) = daemon._maintenance_pass(
+            {}, next_maintenance=0.0, maint_backoff_s=backoff, browser_was_down=was_down,
+            dispatched_since_sweep=True, last_repair=0.0)
+        assert new_backoff > backoff, "each consecutive failure must push the interval further out"
+        assert was_down is True
+        assert dispatched is True, "an unreachable probe leaves the activity unaccounted for"
+        backoff = new_backoff
+    assert backoff <= daemon._MAINT_BACKOFF_CAP_S, "the backoff must be capped"
+    # capped: another failure must not grow it further
+    (_nm, capped_again, _wd, _d, _lr) = daemon._maintenance_pass(
+        {}, next_maintenance=0.0, maint_backoff_s=daemon._MAINT_BACKOFF_CAP_S,
+        browser_was_down=True, dispatched_since_sweep=True, last_repair=0.0)
+    assert capped_again == daemon._MAINT_BACKOFF_CAP_S
+
+    # now the browser answers again — cadence resets immediately, not gradually.
+    import io
+    monkeypatch.setattr(daemon.urllib.request, "urlopen",
+                        lambda *a, **k: io.BytesIO(json.dumps([{"type": "page", "id": "A"}]).encode()))
+    (_nm, recovered_backoff, was_down_now, _d, _lr) = daemon._maintenance_pass(
+        {}, next_maintenance=0.0, maint_backoff_s=backoff, browser_was_down=True,
+        dispatched_since_sweep=True, last_repair=0.0)
+    assert recovered_backoff == daemon._MAINT_INTERVAL_S
+    assert was_down_now is False
+
+
+# ---- item 3: identical daemon log lines collapse ------------------------------
+
+def test_dedup_stderr_collapses_identical_repeats_and_reports_the_count(daemon):
+    import io
+    real = io.StringIO()
+    w = daemon._DedupStderr(real)
+    w.write("CGC_DAEMON tab sweep skipped: URLError\n")
+    w.write("CGC_DAEMON tab sweep skipped: URLError\n")
+    w.write("CGC_DAEMON tab sweep skipped: URLError\n")
+    w.write("CGC_DAEMON something else entirely\n")
+    out = real.getvalue()
+    assert out.count("tab sweep skipped: URLError") == 1, "identical repeats must print only once"
+    assert "repeated 2" in out, "the two suppressed repeats must be reported"
+    assert "something else entirely" in out, "a line that differs must always print immediately"
+
+
+def test_dedup_stderr_a_changed_line_always_prints(daemon):
+    import io
+    real = io.StringIO()
+    w = daemon._DedupStderr(real)
+    w.write("line A\n")
+    w.write("line B\n")
+    w.write("line A\n")
+    out = real.getvalue()
+    assert out.count("line A") == 2, "non-consecutive repeats are each their own event"
+    assert "line B" in out
+
+
+def test_dedup_stderr_flushes_a_pending_repeat_note_on_flush(daemon):
+    """A run of repeats that is still open when the daemon stops (nothing new ever arrives to
+    trigger the note) must not be silently dropped — flush() must surface it."""
+    import io
+    real = io.StringIO()
+    w = daemon._DedupStderr(real)
+    w.write("CGC_DAEMON tab sweep HELD: 1 uncertain round(s)…\n")
+    w.write("CGC_DAEMON tab sweep HELD: 1 uncertain round(s)…\n")
+    assert "repeated" not in real.getvalue(), "not yet flushed — nothing new has arrived"
+    w.flush()
+    assert "repeated 1" in real.getvalue()
+
+
+def test_run_loop_installs_the_dedup_writer_around_its_own_stderr(daemon):
+    import inspect
+    src = inspect.getsource(daemon.run_loop)
+    assert "_DedupStderr(real_stderr)" in src
+    assert "sys.stderr = real_stderr" in src, "the real stderr must be restored, not left wrapped"
 
 
 # ---- #1: the OFD handoff, proven against the kernel ---------------------------

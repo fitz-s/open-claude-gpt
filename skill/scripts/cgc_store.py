@@ -233,7 +233,7 @@ def _relocate_legacy_db_locked(target: str, legacy: str, d: str) -> None:
         os.close(dfd)
     os.replace(legacy, legacy + ".migrated")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Ordered, transactional migrations: _MIGRATIONS[n] upgrades a version-(n-1) DB to version n.
 # A fresh DB is created at SCHEMA_VERSION directly by _DDL, so each migration must produce exactly
@@ -252,6 +252,17 @@ _MIGRATIONS = {
     # no-send (possibly_accepted->failed and waiting->failed are both legal reconciles).
     3: [
         "ALTER TABLE rounds ADD COLUMN send_disposition TEXT",
+    ],
+    # not_before / gate_retry_count: the backoff for a `ready` round requeued by a TRANSIENT egress-
+    # gate failure (cgc_backend._gate's `unverified:` branch — gh missing/timed out/API error, not a
+    # confirmed-private verdict). Before this, that requeue went straight back to `queued` with
+    # nothing stopping it from being claimed again on the very next poll — one round hit it 2461
+    # times in 91 minutes (~1 every 2.2s) before a human cancelled it. not_before is the "not
+    # claimable before this instant" fence claim_ready's WHERE clause now honours; gate_retry_count
+    # is how _gate tells a transient blip from a standing condition and bounds the retry.
+    4: [
+        "ALTER TABLE rounds ADD COLUMN not_before TEXT",
+        "ALTER TABLE rounds ADD COLUMN gate_retry_count INTEGER NOT NULL DEFAULT 0",
     ],
 }
 
@@ -643,14 +654,20 @@ class Store:
         stays QUEUED and is picked up the moment the thread frees. Scoped to follow-ups — a `retrieve`
         is read-only and IS the recovery path, so it must never be fenced out of a busy thread — and
         to genuinely live states, since an unreconciled `possibly_accepted` would otherwise block its
-        thread forever."""
+        thread forever.
+
+        `not_before`: a round requeued with a backoff (cgc_backend._gate_requeue_or_block) is not
+        eligible until that instant — this is the ONE place that fence has to be enforced, since it
+        is claiming, not requeuing, that makes a round hot-spinnable again."""
+        now = _now()
         with self._tx():
             row = self.db.execute(
-                "SELECT rid FROM rounds r WHERE r.state=? AND ("
+                "SELECT rid FROM rounds r WHERE r.state=? AND (r.not_before IS NULL OR r.not_before<=?) "
+                "AND ("
                 "  r.kind!='followup' OR r.thread_id IS NULL OR NOT EXISTS ("
                 "    SELECT 1 FROM rounds o WHERE o.thread_id=r.thread_id AND o.rid!=r.rid"
                 f"     AND o.state IN (?,?,?)))"
-                " ORDER BY r.created_at LIMIT 1", (QUEUED, SENDING, ACCEPTED, WAITING)
+                " ORDER BY r.created_at LIMIT 1", (QUEUED, now, SENDING, ACCEPTED, WAITING)
             ).fetchone()
             if row is None:
                 return None
@@ -1034,6 +1051,8 @@ CREATE TABLE IF NOT EXISTS rounds (
   request_key           TEXT,
   parent_rid            TEXT,
   send_disposition      TEXT,
+  not_before            TEXT,
+  gate_retry_count      INTEGER NOT NULL DEFAULT 0,
   created_at            TEXT NOT NULL,
   updated_at            TEXT NOT NULL,
   schema_version        INTEGER NOT NULL DEFAULT 1
