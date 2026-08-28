@@ -1290,6 +1290,45 @@ class TestKeyReleaseRequiresNoSendProof:
         assert out["rid"] == "REQ-20260707-120000-0g2002" and not out.get("idempotent_repeat")
         assert s.get_round(rid)["request_key"] is None
 
+    def test_record_not_sent_proof_stamps_an_already_blocked_round_in_place(self, env, capsys):
+        """round-5 gap: a round BLOCKED before the automatic stamping existed (or via a class that
+        stays deliberately unstamped, e.g. a post-send wait blocker) carries no send_disposition, and
+        the reconcile CLI must still be able to fix it — record_not_sent_proof on an already-BLOCKED
+        round stamps the proof WITHOUT moving it (BLOCKED stays BLOCKED; both are terminal already,
+        so this is a stamp, not a transition), and the key then releases exactly like a stamped
+        FAILED round does."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0g2101"
+        assert self._enq(backend, tmp_path, rid, "kg13") == 0
+        s.set_state(rid, store_mod.READY)
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d")
+        s.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
+                    error_code="login_needed (pretend this predates the automatic stamp)")
+        assert s.get_round(rid)["send_disposition"] is None
+        s.record_not_sent_proof(rid, "checked ChatGPT history: no such thread exists")
+        r = s.get_round(rid)
+        assert r["state"] == store_mod.BLOCKED, "stamping must not move an already-terminal round"
+        assert r["send_disposition"] == store_mod.NOT_SENT_PROVEN
+        capsys.readouterr()
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g2102", "kg13") == 0
+        out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert out["rid"] == "REQ-20260707-120000-0g2102" and not out.get("idempotent_repeat")
+        assert s.get_round(rid)["request_key"] is None
+
+    def test_record_not_sent_proof_still_refuses_an_in_flight_round(self, env):
+        """The guard that matters most stays closed: a round still in flight (here: `sending`, the
+        live attempt itself may reach ChatGPT at any moment) must keep raising IllegalTransition —
+        extending the stamp to already-BLOCKED rows must not loosen this."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0g2103"
+        assert self._enq(backend, tmp_path, rid, "kg14") == 0
+        s.set_state(rid, store_mod.READY)
+        s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d")
+        assert s.get_round(rid)["state"] == store_mod.SENDING
+        with pytest.raises(store_mod.IllegalTransition):
+            s.record_not_sent_proof(rid, "premature — nothing has proven anything yet")
+        assert s.get_round(rid)["send_disposition"] is None
+
     def test_preclick_exit_releases_the_key_without_operator_reconcile(self, env, capsys):
         """Driven end-to-end through process_round (not a manual record_not_sent_proof call, unlike
         the sibling test above): cdp_consult's EXIT_NOT_SENT_PRECLICK (6) is itself a durable
@@ -1429,6 +1468,136 @@ class TestKeyReleaseRequiresNoSendProof:
             "the retry inherited the prior's resolved thread, not the newer 'latest'"
         assert r2["thread_id"] == "conv-first"
         assert s.get_round("REQ-20260707-120000-0h0002")["request_key"] is None
+
+    # ---- BLOCKED: proven not-sent releases, unproven does not (round-5 fix) --
+    @staticmethod
+    def _drive_blocked_not_sent_proven(store_mod, backend, s, rid):
+        """queued -> ready -> sending -> queued (x2) -> ready -> sending -> blocked: three
+        model_not_selectable retries exhaust the budget, which stamps not_sent_proven automatically.
+        Driven end-to-end through process_round — the same entry point the worker uses — not by hand,
+        so this exercises the real retry-exhaustion path (_requeue_or_block)."""
+        def cdp(kind, **kw):
+            return {"code": 3, "conversation": "",
+                    "stderr": "CGC_ERROR model_not_selectable: wanted 'Pro'"}
+        for _ in range(4):
+            rr = s.get_round(rid)
+            if rr["state"] == store_mod.QUEUED:
+                s.set_state(rid, store_mod.READY)
+                rr = s.get_round(rid)
+            if rr["state"] != store_mod.READY:
+                break
+            backend.process_round(s, rr, cdp, daemon_instance_id="d1", validate=_OK_GATE)
+        assert s.get_round(rid)["state"] == store_mod.BLOCKED, "the loop must reach blocked"
+
+    def test_retry_exhaustion_stamps_not_sent_proven_on_the_blocked_round(self, env):
+        """The bug this fixes: two real consults hit model_not_selectable, ran out their 3 retries,
+        landed BLOCKED, and left send_disposition NULL — the error text said 'nothing was ever sent'
+        but the durable proof was never written, so the round's request-key could never release."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0g8001"
+        assert self._enq(backend, tmp_path, rid, "kg10") == 0
+        self._drive_blocked_not_sent_proven(store_mod, backend, s, rid)
+        r = s.get_round(rid)
+        assert r["state"] == store_mod.BLOCKED
+        assert r["send_disposition"] == store_mod.NOT_SENT_PROVEN
+
+    def test_blocked_not_sent_proven_releases_the_key(self, env, capsys):
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0g8001"
+        assert self._enq(backend, tmp_path, rid, "kg10") == 0
+        self._drive_blocked_not_sent_proven(store_mod, backend, s, rid)
+        capsys.readouterr()
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g8002", "kg10") == 0
+        out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert out["rid"] == "REQ-20260707-120000-0g8002" and not out.get("idempotent_repeat")
+        assert s.get_round(rid)["request_key"] is None
+        assert s.get_round("REQ-20260707-120000-0g8002")["request_key"] == "kg10"
+
+    def test_login_blocked_stamps_not_sent_proven_and_releases_the_key(self, env, capsys):
+        """The other half of the retry-exhaustion fix: _NOT_SENT_BLOCK (login_needed/captcha/
+        rate_limit/usage) fires in the same send-phase classifier as _NOT_SENT_RETRY, strictly
+        before the click — the most common real case is an expired login. It must stamp
+        not_sent_proven immediately (no retries to exhaust) and release its key exactly like the
+        retry-exhaustion path does, or the identical request-key trap survives for this class."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0g8301"
+        assert self._enq(backend, tmp_path, rid, "kg15") == 0
+        s.set_state(rid, store_mod.READY)
+
+        def cdp(kind, **kw):
+            return {"code": 3, "conversation": "", "stderr": "CGC_ERROR login_needed: log into ChatGPT"}
+
+        final = backend.process_round(s, s.get_round(rid), cdp, daemon_instance_id="d1",
+                                      validate=_OK_GATE)
+        assert final == store_mod.BLOCKED
+        r = s.get_round(rid)
+        assert r["state"] == store_mod.BLOCKED and r["send_disposition"] == store_mod.NOT_SENT_PROVEN
+        capsys.readouterr()
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g8302", "kg15") == 0
+        out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert out["rid"] == "REQ-20260707-120000-0g8302" and not out.get("idempotent_repeat")
+        assert s.get_round(rid)["request_key"] is None
+
+    def test_followup_login_blocked_stamps_not_sent_proven(self, env):
+        """The follow-up call site of _NOT_SENT_BLOCK (the sibling of the submit-path one above)
+        must stamp too — same evidence, same verdict, the module's own stated invariant."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0g8401"
+        s.create_round(rid, "followup", out_path=str(tmp_path / "f.txt"),
+                       prompt="continuing this consult",
+                       spec_json=json.dumps({"conversation": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"}))
+        s.set_state(rid, store_mod.READY)
+
+        def cdp(kind, **kw):
+            return {"code": 2, "stderr": "CGC_ERROR login_needed: log into ChatGPT"}
+
+        final = backend.process_round(s, s.get_round(rid), cdp, daemon_instance_id="d1",
+                                      validate=_OK_GATE)
+        assert final == store_mod.BLOCKED
+        r = s.get_round(rid)
+        assert r["state"] == store_mod.BLOCKED and r["send_disposition"] == store_mod.NOT_SENT_PROVEN
+
+    def test_blocked_without_stamp_refuses_the_rekey_and_names_the_prior(self, env, capsys):
+        """The one BLOCKED case that must stay unstamped: a blocker hit POST-send, while already
+        `waiting` on an answer (_wait_phase's own code==3 branch — a different invocation from the
+        send-phase classifier, following a CONFIRMED send). It must stay locked, exactly like a
+        generic FAILED with a live send attempt, and the refusal must name the prior rid rather than
+        silently handing back its (dead) receipt."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0g8101"
+        assert self._enq(backend, tmp_path, rid, "kg11") == 0
+        s.set_state(rid, store_mod.READY)
+        aid = s.begin_send(rid, "p", store_mod.sha256("p"), daemon_instance_id="d1")
+        s.mark_accepted(aid, "conv-g8101")
+        s.mark_waiting(rid)
+
+        final = backend._wait_phase(
+            s, rid, "conv-g8101", {},
+            lambda kind, **kw: {"code": 3, "stderr": "CGC_ERROR login_needed: log into ChatGPT"})
+        assert final == store_mod.BLOCKED
+        r = s.get_round(rid)
+        assert r["state"] == store_mod.BLOCKED and r["send_disposition"] is None
+        assert not backend._release_eligible(s, r), "a post-send blocker must never be release-eligible"
+        capsys.readouterr()
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g8102", "kg11") == 2
+        err = capsys.readouterr().err
+        assert "request_key_locked" in err
+        assert rid in err, "the refusal must name the prior round it refers to"
+        assert s.get_round(rid)["request_key"] == "kg11", "key retained — never proven unsent"
+        assert s.get_round("REQ-20260707-120000-0g8102") is None
+
+    def test_different_fingerprint_after_blocked_still_conflicts(self, env, capsys):
+        """Fingerprint is compared FIRST regardless of state, exactly as for FAILED: a DIFFERENT
+        logical request under the same key conflicts even though this prior is release-eligible."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0g8201"
+        assert self._enq(backend, tmp_path, rid, "kg12") == 0
+        self._drive_blocked_not_sent_proven(store_mod, backend, s, rid)
+        capsys.readouterr()
+        assert self._enq(backend, tmp_path, "REQ-20260707-120000-0g8202", "kg12",
+                         body="review https://github.com/acme/DIFFERENT") == 2
+        assert "request_key_conflict" in capsys.readouterr().err
+        assert s.get_round(rid)["request_key"] == "kg12", "not released — fingerprint checked first"
 
     # ---- S2: low-level --request-key demands --logical-sha -------------------
     def test_request_key_without_logical_sha_is_refused(self, env, capsys):
@@ -1794,6 +1963,28 @@ def test_a_standing_not_sent_failure_blocks_instead_of_retrying_forever(env):
     err = s.get_round(rid)["error_code"]
     assert "model_not_selectable" in err and "automatic retries" in err
     assert rid not in s.recover()["uncertain"], "nothing was ever sent — never uncertain"
+
+
+def test_post_send_wait_blocker_is_never_stamped_not_sent_proven(env):
+    """The invariant that keeps every stamp above safe: a blocker hit DURING the wait (login expired
+    mid-generation, a rate limit while polling) follows a CONFIRMED send — _wait_phase's own
+    code==3 branch is a wholly separate invocation from the send-phase classifier that stamps
+    _NOT_SENT_BLOCK/_NOT_SENT_RETRY, and must never be treated as pre-click proof."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    rid = r["rid"]
+    aid = s.begin_send(rid, "p", store_mod.sha256("p"), daemon_instance_id="d1")
+    s.mark_accepted(aid, "conv-psw")
+    s.mark_waiting(rid)
+
+    final = backend._wait_phase(
+        s, rid, "conv-psw", {},
+        lambda kind, **kw: {"code": 3, "stderr": "CGC_ERROR rate_limit: try again later"})
+    assert final == store_mod.BLOCKED
+    r = s.get_round(rid)
+    assert r["state"] == store_mod.BLOCKED
+    assert r["send_disposition"] is None, "a post-send blocker must carry no not-sent proof"
+    assert not backend._release_eligible(s, r), "and must therefore never be release-eligible"
 
 
 # ---- the return is an address, not a bit -------------------------------------

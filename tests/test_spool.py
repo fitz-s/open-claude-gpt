@@ -565,3 +565,85 @@ def test_new_rid_is_accepted_by_the_validator_that_guards_every_round(spool):
     """One definition of the rid shape: the minter and the regex live together, so they cannot
     drift into a format that mints rounds the store refuses."""
     assert spool._RID_RE.match(spool.new_rid())
+
+
+# ---- cmd_reconcile: the operator act Store.record_not_sent_proof had no CLI for -----------------
+
+def _reconcile_args(rid, **overrides):
+    defaults = dict(rid=rid, not_sent=False, evidence=None)
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def test_cmd_reconcile_not_sent_moves_uncertain_round_to_failed_proven(spool, capsys):
+    """The recorded incident: find-conversation came up empty, the operator looked in ChatGPT's own
+    history and confirmed the send never happened — reconcile is how that gets written down."""
+    rid = _rid("rc0001")
+    sm = _store(spool)
+    with sm.Store() as s:
+        s.create_round(rid, "submit", prompt="p https://github.com/acme/widgets")
+        s.set_state(rid, sm.READY)
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="t")
+        s.mark_possibly_accepted(aid, "unknown send — uncertain")
+    code = spool.cmd_reconcile(_reconcile_args(
+        rid, not_sent=True, evidence="checked ChatGPT history for 2026-08-28, no such thread exists"))
+    assert code == 0
+    with sm.Store() as s:
+        r = s.get_round(rid)
+    assert r["state"] == sm.FAILED and r["send_disposition"] == sm.NOT_SENT_PROVEN
+    assert "CGC_RECONCILED" in capsys.readouterr().err
+
+
+def test_cmd_reconcile_not_sent_stamps_an_already_blocked_round_in_place(spool, capsys):
+    """The rounds this bug actually left behind (round-5): stuck BLOCKED, no stamp, predating the
+    automatic stamping fix. The reconcile CLI must be able to fix those, not just uncertain rounds —
+    stamping in place, never moving BLOCKED anywhere else."""
+    rid = _rid("rc0004")
+    sm = _store(spool)
+    with sm.Store() as s:
+        s.create_round(rid, "submit", prompt="p https://github.com/acme/widgets")
+        s.set_state(rid, sm.READY)
+        s.begin_send(rid, "p", "h" * 64, daemon_instance_id="t")
+        s.set_state(rid, sm.BLOCKED, expect=sm.SENDING,
+                    error_code="model_not_selectable — predates the automatic stamp")
+    code = spool.cmd_reconcile(_reconcile_args(
+        rid, not_sent=True, evidence="checked ChatGPT history for 2026-08-28, no such thread exists"))
+    assert code == 0
+    with sm.Store() as s:
+        r = s.get_round(rid)
+    assert r["state"] == sm.BLOCKED, "stamping must not move an already-terminal round"
+    assert r["send_disposition"] == sm.NOT_SENT_PROVEN
+    assert "CGC_RECONCILED" in capsys.readouterr().err
+
+
+def test_cmd_reconcile_empty_evidence_is_refused(spool, capsys):
+    """The proof is the point: an empty or whitespace-only --evidence must not silently record
+    anything, and must not touch the round it was pointed at."""
+    rid = _rid("rc0002")
+    sm = _store(spool)
+    with sm.Store() as s:
+        s.create_round(rid, "submit", prompt="p https://github.com/acme/widgets")
+        s.set_state(rid, sm.READY)
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="t")
+        s.mark_possibly_accepted(aid, "unknown send — uncertain")
+    code = spool.cmd_reconcile(_reconcile_args(rid, not_sent=True, evidence="   "))
+    assert code == 2
+    assert "evidence_required" in capsys.readouterr().err
+    with sm.Store() as s:
+        r = s.get_round(rid)
+    assert r["state"] == sm.POSSIBLY_ACCEPTED, "a refused reconcile must not touch the round"
+
+
+def test_cmd_reconcile_without_not_sent_flag_does_nothing(spool, capsys):
+    """--not-sent is required explicitly (no default action), so a future reconcile action can be
+    added without changing what a bare `reconcile --rid` means today."""
+    code = spool.cmd_reconcile(_reconcile_args(_rid("rc0003"), evidence="checked, nothing there"))
+    assert code == 2
+    assert "no_reconcile_action" in capsys.readouterr().err
+
+
+def test_cmd_reconcile_unknown_rid_exits_nonzero_not_a_traceback(spool, capsys):
+    code = spool.cmd_reconcile(_reconcile_args(
+        _rid("rc9999"), not_sent=True, evidence="checked, nothing there"))
+    assert code == 2
+    assert "CGC_ERROR" in capsys.readouterr().err

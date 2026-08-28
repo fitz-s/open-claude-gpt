@@ -141,6 +141,34 @@ the *cause* survives in the log even though the agent-facing contract collapses 
 and `2` into `1`. Cause is worth keeping where it aids diagnosis, not where it forces
 the caller to branch on a difference it cannot act on.
 
+## A round is stuck uncertain (`possibly_accepted`) or `blocked` with no way forward
+A send whose outcome the driver could not confirm is left `possibly_accepted` on purpose — it is
+NEVER auto-resent, because a duplicate send is worse than a stuck round. Recovery is addressed by
+*conversation*, so first find which tab (if any) is carrying it:
+
+    python3 skill/scripts/cdp_consult.py find-conversation --rid <rid>
+
+- **Found in exactly one tab:** it prints the retrieve command to run — read-only, never resends.
+- **Found nowhere:** its own message is explicit that this is NOT proof the prompt was never sent —
+  a closed tab or a virtualized thread that scrolled the turn out of the DOM looks identical to a
+  round that never sent at all. **Look yourself**, in ChatGPT's own conversation history, before
+  concluding anything.
+- **You looked and it genuinely never sent:** record that proof durably, so the round terminates and
+  (if it holds a `--request-key`) that key releases to a fresh retry instead of staying locked to a
+  dead round forever:
+
+      python3 skill/scripts/cgc_spool.py reconcile --rid <rid> --not-sent --evidence "checked ChatGPT history for <date>, no matching prompt/thread exists"
+
+  `--evidence` is required and must be non-empty — the proof is the point. This is also the fix for
+  the daemon's `CGC_DAEMON tab sweep HELD` warning repeating every poll: that hold exists because an
+  uncertain round's tab is the only evidence of whether it sent, and it will not release the tab (or
+  stop warning) until the round is reconciled one way or the other.
+
+Retry-exhausted `model_not_selectable`/`composer_not_ready` rounds land `blocked` automatically with
+their not-sent proof already stamped (the driver's own fail-closed pre-click boundary IS the proof,
+same as exit 6 — no operator step needed there); `reconcile --not-sent` is for the case that proof
+was never automatic: a round left uncertain post-send that you had to go verify by hand.
+
 ## `sentinel_missing` / `CGC_UNWRAPPED` / `.raw`
 If the model never emits a clean `BEGIN_RESPONSE:<rid>` / `END_RESPONSE:<rid>`
 pair before the inner `--timeout` expires, the waiter does one last best-effort
