@@ -707,9 +707,14 @@ def cmd_enqueue(a) -> int:
                          "enqueue reads it back from there — omit --rid entirely.\n")
         return 2
     out = a.out or default_out(a.rid)
-    if a.kind == "retrieve" and (not a.conversation or a.conversation == "auto"):
+    if (a.kind == "retrieve" and (not a.conversation or a.conversation == "auto")
+            and not a.parent):
+        # Without --parent there is nothing to resolve the conversation FROM — with it,
+        # cgc_backend.enqueue_round resolves it from the parent round's own recorded thread (the
+        # store already knows it), so this only refuses the case neither can answer.
         sys.stderr.write("CGC_ERROR need_conversation: --kind retrieve requires an explicit "
-                         "--conversation <id>.\n")
+                         "--conversation <id>, or --parent <rid> to resolve it from the round "
+                         "being recovered.\n")
         return 2
     prompt = ""
     if a.kind != "retrieve":
@@ -802,6 +807,14 @@ def cmd_reconcile(a) -> int:
     return cgc_backend.reconcile_not_sent(a.rid, evidence)
 
 
+def cmd_refire(a) -> int:
+    """Re-fire a proven-not-sent round under a fresh rid, replaying its exact prompt and spec. See
+    cgc_backend.refire_round for the full contract (REFUSES unless the prior is durably proven
+    not-sent — never a round that may have sent)."""
+    import cgc_backend
+    return cgc_backend.refire_round(a.rid)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="cgc_spool.py")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -875,6 +888,12 @@ def main() -> int:
                          "own history, no matching thread exists). A closed tab or a virtualized "
                          "thread looks identical to a never-sent prompt — look before stamping this.")
     rc.set_defaults(fn=cmd_reconcile)
+
+    rf = sub.add_parser("refire", help="re-fire a proven-not-sent round under a fresh rid, replaying "
+                                       "its exact stored prompt and spec (refuses a round that may "
+                                       "have sent)")
+    rf.add_argument("--rid", required=True, help="the terminal, proven-not-sent round to replay")
+    rf.set_defaults(fn=cmd_refire)
 
     a = p.parse_args()
     return a.fn(a)

@@ -92,6 +92,49 @@ def test_transient_gate_failure_requeues_not_terminal(env):
     assert r["rid"] in s.recover()["dispatchable"], "requeued → safe to retry once gh recovers"
 
 
+def test_transient_gate_failure_backs_off_before_reclaim_and_blocks_after_the_bound(env):
+    """Live evidence: one followup round hit ready->queued 2461 times in 91 minutes (~1 every 2.2s)
+    because the gate's `unverified:` requeue carried no delay and was instantly re-claimable — the
+    daemon's own 2s poll became the retry pace a since-removed docstring falsely claimed was paced.
+    A requeued round must NOT be immediately re-claimable, the retry count must climb, and past the
+    bound it must go BLOCKED carrying the same not_sent_proven stamp the send-phase precheck's own
+    bound-then-block path (_requeue_or_block) carries — the gate runs on a `ready` round, strictly
+    before begin_send, so it is exactly as pre-send-proven."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    rid = r["rid"]
+    reason = "unverified: gh timed out after 8s"
+    gate = lambda p: (False, reason)
+    no_send = lambda *a, **k: (_ for _ in ()).throw(AssertionError("a gate failure must never send"))
+
+    rr = r
+    outcomes, retry_counts = [], []
+    for _ in range(backend._MAX_GATE_RETRIES + 1):
+        outcome = backend.process_round(s, rr, no_send, daemon_instance_id="d1", validate=gate)
+        outcomes.append(outcome)
+        if outcome == store_mod.BLOCKED:
+            break
+        row = s.get_round(rid)
+        assert row["not_before"] is not None, "a requeued round must carry a not-before fence"
+        assert s.claim_ready("d1") is None, "not immediately re-claimable — the whole bug"
+        retry_counts.append(row["gate_retry_count"])
+        # simulate the backoff having elapsed, then let claim_ready do the real transition
+        s.db.execute("UPDATE rounds SET not_before=NULL WHERE rid=?", (rid,))
+        rr = s.claim_ready("d1")
+        assert rr is not None
+
+    assert outcomes[:-1] == [store_mod.QUEUED] * (len(outcomes) - 1), "the early retries are legitimate"
+    assert outcomes[-1] == store_mod.BLOCKED, "a standing failure must reach a human, not spin forever"
+    assert retry_counts == list(range(1, backend._MAX_GATE_RETRIES + 1)), \
+        "the retry count must climb by exactly one each requeue"
+    final = s.get_round(rid)
+    assert final["send_disposition"] == store_mod.NOT_SENT_PROVEN, \
+        "pre-send by construction — must carry the same stamp the other pre-send blocks carry"
+    assert reason in final["error_code"] and "gate retries" in final["error_code"]
+    assert rid not in s.recover()["uncertain"], "nothing was ever sent — never uncertain"
+    assert backend._release_eligible(s, final), "a maxed-out gate failure must release its request-key"
+
+
 def test_auto_retrieve_recovers_possibly_accepted_with_conversation(env):
     """A possibly_accepted round with a known conversation is re-attached READ-ONLY exactly once: the
     waiter's rid-sentinel check means it completes only if THIS round's own answer is on the thread,
@@ -2186,3 +2229,149 @@ def test_status_reports_whether_the_answer_is_actually_on_disk(env, capsys):
     backend.store_status(True, rid)
     line = [ln for ln in capsys.readouterr().out.splitlines() if f"round[{rid}]" in ln][0]
     assert json.loads(line.split(": ", 1)[1])["answer_on_disk"] is True
+
+
+# ---- item 4a: retrieve --parent resolves the conversation from the parent ----
+
+class TestRetrieveResolvesFromParent:
+    def test_conversation_resolves_from_parent_when_not_given(self, env):
+        store_mod, backend, s, tmp_path = env
+        parent_rid = "REQ-20260707-120000-0par01"
+        s.create_round(parent_rid, "submit", thread_id="conv-par-real", prompt="p")
+
+        rc = backend.enqueue_round(
+            _enq_ns("REQ-20260707-120000-0ret01", None, kind="retrieve", conversation="auto",
+                   parent=parent_rid),
+            "", str(tmp_path / "a.txt"))
+        assert rc == 0
+        row = s.get_round("REQ-20260707-120000-0ret01")
+        assert s.conversation_of(row["rid"]) == "conv-par-real"
+        assert json.loads(row["spec_json"])["conversation"] == "conv-par-real"
+
+    def test_explicit_conversation_overrides_the_parents(self, env):
+        store_mod, backend, s, tmp_path = env
+        parent_rid = "REQ-20260707-120000-0par02"
+        s.create_round(parent_rid, "submit", thread_id="conv-par2-real", prompt="p")
+
+        override = "6a684b38-bef4-83ea-83d4-134bf9610e05"
+        rc = backend.enqueue_round(
+            _enq_ns("REQ-20260707-120000-0ret02", None, kind="retrieve",
+                   conversation=override, parent=parent_rid),
+            "", str(tmp_path / "a2.txt"))
+        assert rc == 0
+        spec = json.loads(s.get_round("REQ-20260707-120000-0ret02")["spec_json"])
+        assert spec["conversation"] == override, \
+            "an explicit --conversation must override the parent's, not be silently replaced"
+
+    def test_a_parent_with_no_recorded_conversation_still_refuses_naming_find_conversation(
+            self, env, capsys):
+        store_mod, backend, s, tmp_path = env
+        parent_rid = "REQ-20260707-120000-0par03"
+        s.create_round(parent_rid, "submit", prompt="p")  # no thread_id — no conversation ever recorded
+
+        rc = backend.enqueue_round(
+            _enq_ns("REQ-20260707-120000-0ret03", None, kind="retrieve", conversation="auto",
+                   parent=parent_rid),
+            "", str(tmp_path / "a3.txt"))
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "find-conversation" in err
+        assert f"--rid {parent_rid}" in err
+        assert s.get_round("REQ-20260707-120000-0ret03") is None, "nothing must be enqueued"
+
+    def test_no_conversation_and_no_parent_still_refuses_at_the_cli_gate(self, tmp_path, monkeypatch):
+        """cgc_spool.cmd_enqueue's own early check: with NEITHER --conversation nor --parent there is
+        nothing to resolve from either way, so it still refuses before ever reaching the store."""
+        import argparse
+        import importlib.util
+        import sys as _sys
+        monkeypatch.setenv("CGC_STATE_DIR", str(tmp_path))
+        monkeypatch.setenv("CGC_STORE_DB", str(tmp_path / "control.db"))
+        spec = importlib.util.spec_from_file_location(
+            "cgc_spool", os.path.join(SCRIPTS, "cgc_spool.py"))
+        spool = importlib.util.module_from_spec(spec)
+        _sys.modules["cgc_spool"] = spool
+        spec.loader.exec_module(spool)
+        a = argparse.Namespace(rid=None, prompt_file=None, kind="retrieve",
+                               project_url="https://chatgpt.com/", conversation="auto", parent=None,
+                               request_key=None, logical_sha=None, model="Pro",
+                               out=str(tmp_path / "o.txt"), poll=1, timeout=5)
+        assert spool.cmd_enqueue(a) == 2
+
+
+# ---- item 4b: refire a proven-not-sent round under a fresh rid ----------------
+
+class TestRefire:
+    def test_replays_a_proven_not_sent_round_under_a_fresh_rid(self, env, capsys):
+        store_mod, backend, s, tmp_path = env
+        old_rid = "REQ-20260707-120000-0ref01"
+        prompt = (f"review https://github.com/acme/x\nBEGIN_RESPONSE:{old_rid}\n"
+                 f"...\nEND_RESPONSE:{old_rid}\n")
+        s.create_round(old_rid, "submit", prompt=prompt,
+                       spec_json=json.dumps({"project_url": "https://chatgpt.com/proj",
+                                             "model": "Pro", "timeout": 999}))
+        s.set_state(old_rid, store_mod.READY)
+        aid = s.begin_send(old_rid, prompt, store_mod.sha256(prompt), daemon_instance_id="d1")
+        s.mark_send_not_sent(aid, "submit failed before the click (exit 6): boom")
+        assert s.get_round(old_rid)["state"] == store_mod.FAILED
+        assert s.get_round(old_rid)["send_disposition"] == store_mod.NOT_SENT_PROVEN
+
+        capsys.readouterr()
+        rc = backend.refire_round(old_rid)
+        assert rc == 0
+        out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        new_rid = out["rid"]
+        assert new_rid != old_rid
+        row = s.get_round(new_rid)
+        assert row is not None
+        assert new_rid in row["rendered_prompt"], "the fresh rid must be in the replayed prompt"
+        assert old_rid not in row["rendered_prompt"], "no trace of the old rid may remain"
+        spec = json.loads(row["spec_json"])
+        assert spec["project_url"] == "https://chatgpt.com/proj"
+        assert spec["model"] == "Pro"
+        assert spec["timeout"] == 999
+        # the prior round itself is untouched — refire never mutates what it replays
+        assert s.get_round(old_rid)["state"] == store_mod.FAILED
+
+    def test_refuses_a_round_that_is_not_release_eligible(self, env, capsys):
+        """A round that crossed the send fence with no not-sent proof MAY have sent — refiring it
+        could duplicate a live consult. Must refuse exactly like `_release_eligible` says, and must
+        not enqueue anything."""
+        store_mod, backend, s, tmp_path = env
+        rid = "REQ-20260707-120000-0ref02"
+        prompt = f"review https://github.com/acme/x\nBEGIN_RESPONSE:{rid}\n"
+        s.create_round(rid, "submit", prompt=prompt)
+        s.set_state(rid, store_mod.READY)
+        aid = s.begin_send(rid, prompt, store_mod.sha256(prompt), daemon_instance_id="d1")
+        s.mark_possibly_accepted(aid, "unknown send — uncertain")
+        s.set_state(rid, store_mod.FAILED, error_code="reconciled elsewhere, no proof recorded")
+        assert not backend._release_eligible(s, s.get_round(rid))
+
+        before = {r["rid"] for r in s.db.execute("SELECT rid FROM rounds")}
+        capsys.readouterr()
+        rc = backend.refire_round(rid)
+        assert rc == 2
+        assert "refire_refused" in capsys.readouterr().err
+        after = {r["rid"] for r in s.db.execute("SELECT rid FROM rounds")}
+        assert after == before, "nothing may be enqueued when refire refuses"
+
+    def test_refuses_a_retrieve_round_with_no_prompt_to_replay(self, env, capsys):
+        store_mod, backend, s, tmp_path = env
+        source_rid = "REQ-20260707-120000-0ref03src"
+        rid = "REQ-20260707-120000-0ref03"
+        s.create_round(rid, "retrieve", thread_id="conv-r3", parent_rid=source_rid,
+                       spec_json=json.dumps({"conversation": "conv-r3", "parent_rid": source_rid}))
+        s.set_state(rid, store_mod.FAILED, error_code="retrieve could not confirm the source turn")
+        assert backend._release_eligible(s, s.get_round(rid)), \
+            "a retrieve that never entered sending has no attempt — release-eligible by construction"
+
+        capsys.readouterr()
+        rc = backend.refire_round(rid)
+        assert rc == 2
+        assert "refire_no_prompt" in capsys.readouterr().err
+
+    def test_refuses_an_unknown_rid(self, env, capsys):
+        store_mod, backend, s, tmp_path = env
+        capsys.readouterr()
+        assert backend.refire_round("REQ-20260707-120000-0nope01") == 2
+        assert "no_such_round" in capsys.readouterr().err

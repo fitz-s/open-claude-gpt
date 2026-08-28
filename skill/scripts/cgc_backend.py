@@ -20,6 +20,7 @@ the anti-duplicate invariant holds on every path.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -93,22 +94,65 @@ def _requeue_or_block(store, rid: str, marker: str) -> str:
 
 
 
+# Backoff for the egress gate's TRANSIENT ('unverified:') failure — a `ready` round bounced back to
+# `queued` because gh could not CONFIRM a repo's visibility (missing/timed out/API error), not
+# because it confirmed anything private. Evidence this fixes: ONE followup round hit ready->queued
+# 2461 times in 91 minutes (~1 every 2.2s) — a requeue with no backoff is instantly re-claimable, so
+# the daemon's own 2s poll became the retry pace a since-removed docstring claimed was "paced",
+# until the caller cancelled it 91 minutes later. Exponential, capped — "a few minutes is plenty" —
+# and bounded: past _MAX_GATE_RETRIES this is not a blip, it is a standing gh problem (not installed,
+# not authenticated, network-partitioned), and a human needs to look rather than the daemon looping a
+# browser-tab's worth of gh calls forever.
+_MAX_GATE_RETRIES = 5
+_GATE_BACKOFF_BASE_S = 5.0
+_GATE_BACKOFF_CAP_S = 180.0
+
+
+def _gate_requeue_or_block(store, rid: str, reason: str, retry_count: int) -> str:
+    """Route a TRANSIENT gate failure: backoff-requeue while it still reads like a blip, then BLOCK.
+    Mirrors `_requeue_or_block`'s bound-then-block shape (same file, the send-phase precheck's
+    equivalent) rather than inventing a parallel one — and for the same reason that function stamps
+    NOT_SENT_PROVEN: the gate runs on a `ready` round, strictly BEFORE begin_send, so a gate failure
+    is exactly as pre-send-proven as a maxed-out send precheck. Without the stamp a maxed-out gate
+    failure would BLOCK holding its request-key forever, the same trap aa9ea36 closed for the send
+    side (see _release_eligible)."""
+    n = retry_count + 1  # this attempt
+    if n > _MAX_GATE_RETRIES:
+        store.set_state(rid, store_mod.BLOCKED, expect=store_mod.READY,
+                        send_disposition=store_mod.NOT_SENT_PROVEN,
+                        error_code=(f"{reason} — still unverified after {_MAX_GATE_RETRIES} "
+                                    "automatic gate retries; nothing was ever sent, but the egress "
+                                    "gate needs a human (is `gh` installed, authenticated, and "
+                                    "reachable?)"))
+        return store_mod.BLOCKED
+    delay_s = min(_GATE_BACKOFF_BASE_S * (2 ** (n - 1)), _GATE_BACKOFF_CAP_S)
+    not_before = (datetime.datetime.now(datetime.timezone.utc)
+                  + datetime.timedelta(seconds=delay_s)).isoformat()
+    store.set_state(rid, store_mod.QUEUED, expect=store_mod.READY, error_code=reason,
+                    not_before=not_before, gate_retry_count=n)
+    return store_mod.QUEUED
+
+
 def _gate(store, rid: str, prompt: str, validate) -> str | None:
     """Run the egress gate on a `ready` round. Two failure kinds, two outcomes:
       - `refused:`     — an AUTHORITATIVE denial (secret detected / no public link / repo confirmed
                          not public). Terminal GATE_REJECTED; the payload must never leave.
       - `unverified:`  — a TRANSIENT gate failure (gh not installed, gh timed out, gh API error). The
                          gate could not CONFIRM the repo is public, not that it is private. Requeue
-                         (the round is still `ready`, pre-send — nothing has left) so a temporary gh
-                         outage does not permanently strand a legitimate consult behind a terminal
-                         reject. The daemon poll paces the retry; gh's own timeout bounds a tight spin.
+                         (the round is still `ready`, pre-send — nothing has left) with a growing
+                         backoff (_gate_requeue_or_block) so a temporary gh outage does not
+                         permanently strand a legitimate consult behind a terminal reject, and does
+                         not hot-spin the daemon while it waits — the claim query itself now honours
+                         the backoff (cgc_store.claim_ready), so this is a real delay, not a poll-paced
+                         one nothing actually paced.
     Returns the resulting state if the gate did not pass, else None (passed — caller proceeds to send)."""
     ok, reason = validate(prompt)
     if ok:
         return None
     if reason.startswith("unverified:"):
-        store.set_state(rid, store_mod.QUEUED, expect=store_mod.READY, error_code=reason)
-        return store_mod.QUEUED
+        row = store.get_round(rid)
+        retry_count = (row or {}).get("gate_retry_count") or 0
+        return _gate_requeue_or_block(store, rid, reason, retry_count)
     store.gate_reject(rid, reason)
     return store_mod.GATE_REJECTED
 
@@ -490,12 +534,29 @@ def enqueue_round(a, prompt: str, out: str) -> int:
         # (via --parent) as the source to verify against on the page — never resolve "whatever the
         # conversation's latest turn is" (auto), which silently adopts a later same-thread send's
         # answer if one lands before/during recovery (the causal-substitution bug this fixes).
-        if a.kind == "retrieve" and not parent:
-            sys.stderr.write(
-                "CGC_ERROR retrieve_needs_source_rid: --kind retrieve requires --parent <rid> (the "
-                "rid of the uncertain round being recovered) — the recovery path must never "
-                "auto-adopt the conversation's latest turn.\n")
-            return 2
+        if a.kind == "retrieve":
+            if not parent:
+                sys.stderr.write(
+                    "CGC_ERROR retrieve_needs_source_rid: --kind retrieve requires --parent <rid> (the "
+                    "rid of the uncertain round being recovered) — the recovery path must never "
+                    "auto-adopt the conversation's latest turn.\n")
+                return 2
+            # The store already knows the parent round's conversation — requiring the caller to
+            # repeat it was a pure round-trip (the retrieve path exists precisely to recover a round,
+            # and the store has the answer). An explicit --conversation still OVERRIDES (the caller
+            # may know something the stored thread does not, e.g. it moved); resolve from the parent
+            # only when none was given. The one case that genuinely cannot be resolved this way — the
+            # parent has no recorded conversation — still refuses, naming the one command that can
+            # actually find it.
+            if conv in (None, "auto"):
+                conv = s.conversation_of(parent)
+                if not conv:
+                    sys.stderr.write(
+                        f"CGC_ERROR retrieve_parent_unresolved: --parent {parent} has no recorded "
+                        "conversation to retrieve from. Find it first: python3 "
+                        f"{os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cdp_consult.py')}"
+                        f" find-conversation --rid {parent}\n")
+                    return 2
         spec = {"project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
                 "conversation": conv, "parent_rid": parent, "poll": getattr(a, "poll", None),
                 "timeout": getattr(a, "timeout", None), "request_fingerprint": fingerprint}
@@ -577,6 +638,66 @@ def reconcile_not_sent(rid: str, evidence: str) -> int:
         f"CGC_RECONCILED {rid}: {old_state} -> {new_row['state']} "
         f"(send_disposition={new_row['send_disposition']}).\n")
     return 0
+
+
+# ---- operator refire -----------------------------------------------------------
+def refire_round(old_rid: str) -> int:
+    """Re-fire a proven-not-sent round under a fresh rid, replaying its exact stored prompt and spec.
+
+    The operator cost this replaces: read `rendered_prompt` out of the DB, hand-substitute the old
+    rid for a fresh one everywhere it appears (the prompt carries BEGIN_RESPONSE:<rid>/
+    END_RESPONSE:<rid>), write a temp file, and re-enqueue with the original spec's project URL,
+    model, and timeout copied by hand — done twice by hand against the live store in one session.
+
+    REFUSES unless `_release_eligible` durably proves the prior never sent — the exact bar
+    `_idempotent_receipt` already applies to a request-key retry, reused rather than reinvented: a
+    round that MAY have sent must never be refired, which is the invariant the whole store is built
+    around. The rewritten prompt is verified to carry the NEW rid and NONE of the old one before
+    enqueueing — a rewrite that failed silently would enqueue a round whose sentinel never matches
+    its own rid, an unconfirmable send by construction."""
+    import cgc_spool as _spool
+    with store_mod.Store() as s:
+        prior = s.get_round(old_rid)
+        if prior is None:
+            sys.stderr.write(f"CGC_ERROR no_such_round: {old_rid}\n")
+            return 2
+        if not _release_eligible(s, prior):
+            sys.stderr.write(
+                f"CGC_ERROR refire_refused: {old_rid} ({prior['state']}) is not durably proven "
+                "not-sent — refiring it could duplicate a consult that may have already reached "
+                "ChatGPT. If you have independently verified it never sent, reconcile it first "
+                f"(`cgc_spool.py reconcile --rid {old_rid} --not-sent --evidence \"...\"`), then "
+                "refire again.\n")
+            return 2
+        old_prompt = prior.get("rendered_prompt") or ""
+        if not old_prompt:
+            sys.stderr.write(f"CGC_ERROR refire_no_prompt: {old_rid} has no stored prompt to replay "
+                             "(a retrieve round sends nothing — there is nothing to refire).\n")
+            return 2
+        pspec = json.loads(prior["spec_json"]) if prior.get("spec_json") else {}
+
+    new_rid = _spool.new_rid()
+    new_prompt = old_prompt.replace(old_rid, new_rid)
+    if new_rid not in new_prompt or old_rid in new_prompt:
+        sys.stderr.write(
+            f"CGC_ERROR refire_rewrite_failed: substituting {old_rid} -> {new_rid} in the stored "
+            "prompt did not produce a clean rewrite (the new rid is missing, or the old one is "
+            "still present) — refusing to enqueue a round whose sentinel would not match its own "
+            "rid.\n")
+        return 2
+
+    import types
+    a = types.SimpleNamespace(
+        rid=new_rid, kind=prior["kind"],
+        project_url=pspec.get("project_url"), model=pspec.get("model", "Pro"),
+        conversation=pspec.get("conversation"),
+        parent=pspec.get("parent_rid") or prior.get("parent_rid"),
+        poll=pspec.get("poll"), timeout=pspec.get("timeout"),
+        request_key=None, logical_sha=None, out=None, quiet=False)
+    out = os.path.abspath(_spool.default_out(new_rid))
+    sys.stderr.write(f"CGC_REFIRE {old_rid} -> {new_rid}: replaying its stored prompt as a fresh "
+                     f"{prior['kind']} round.\n")
+    return enqueue_round(a, new_prompt, out)
 
 
 # ---- the outcome envelope ----------------------------------------------------
