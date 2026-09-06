@@ -51,7 +51,7 @@ Ship a **public GitHub PR/tree link**; get a grounded, file-cited review — cor
 - **`prep`** — renders the prompt from a template, wrapping the answer in `BEGIN_RESPONSE:<rid>` / `END_RESPONSE:<rid>` **sentinels** so completion is unambiguous.
 - **`submit` / `followup` / `wait` / `status`** — the CDP control plane: open a chat, (optionally) select the model tier, type + send, and poll to completion in a **detached process** that holds zero agent context.
 
-Every wait is bounded so nothing can hang. A GPT-5.6 Pro consult reasons for ~25 min, which is the timeout everywhere — see [Timeouts](docs/CONFIGURATION.md#timeouts). A **dedicated Chrome profile** is used because CDP is disallowed on Chrome's default profile (anti-cookie-theft, Chrome 136+) and is launched **loopback-bound** — you log into ChatGPT there once; your normal Chrome is untouched.
+Every wait is bounded so nothing can hang. A GPT-6 Astra Pro consult reasons for ~25 min, which is the timeout everywhere — see [Timeouts](docs/CONFIGURATION.md#timeouts). A **dedicated Chrome profile** is used because CDP is disallowed on Chrome's default profile (anti-cookie-theft, Chrome 136+) and is launched **loopback-bound** — you log into ChatGPT there once; your normal Chrome is untouched.
 
 ## Requirements
 
@@ -139,15 +139,16 @@ Copyable `--output-file` / `--output-replace` contracts live in [examples/_specs
 
 ## Auto model-selection (toggleable)
 
-When ChatGPT silently auto-downgrades a chat to a lighter model, a consult gets a weaker answer for free. So the tool **picks your Pro tier before every send and fails closed if it can't** — you always get the model you meant to use.
+When ChatGPT silently auto-downgrades a chat to a lighter model, a consult gets a weaker answer for free. So the tool **pins both the model and its reasoning tier before every send and fails closed if it can't** — you always get the model you meant to use. Two dimensions, because since GPT-6 (2026-09-03) the composer picks the model and the tier in the same menu, and `Pro` on `GPT-5.5` would otherwise pass a tier-only check.
 
 ```bash
-CGC_AUTO_MODEL=1        # ON (default): select CGC_MODEL, fail closed if unavailable
-CGC_MODEL="Pro"         # which tier to target (set the strongest your plan has)
+CGC_AUTO_MODEL=1        # ON (default): select CGC_MODEL + CGC_MODEL_FAMILY, fail closed if unavailable
+CGC_MODEL="Pro"         # which reasoning tier to target (set the strongest your plan has)
+CGC_MODEL_FAMILY="Latest"   # which model to pin; "skip" to leave the model alone
 CGC_AUTO_MODEL=0        # OFF: don't touch the picker, send on whatever is shown
 ```
 
-Per-consult override: `--model "High"` or `--model skip`.
+Per-consult override: `--model "High"` / `--model skip`, `--model-family "GPT-5.6 Sol"` / `--model-family skip`. An older build with no model radios ignores the family setting instead of refusing.
 
 ## Configuration
 
@@ -163,8 +164,9 @@ It persists in the tool's own config (`~/.config/cgc/config`); a `CGC_PROJECT_UR
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CGC_PROJECT_URL` | new chat | ChatGPT URL a fresh consult opens — set to *your* project to group consults |
-| `CGC_AUTO_MODEL` | `1` | auto-pick the model tier before sending (fail closed) — on/off |
-| `CGC_MODEL` | `Pro` | which tier auto-select targets |
+| `CGC_AUTO_MODEL` | `1` | auto-pick the model and its tier before sending (fail closed) — on/off |
+| `CGC_MODEL` | `Pro` | which reasoning tier auto-select targets |
+| `CGC_MODEL_FAMILY` | `Latest` | which model to pin (GPT-6 picker); `skip` to leave the model alone |
 | `CGC_PORT` | `9333` | remote-debugging port for the dedicated Chrome |
 | `CGC_PROFILE` | `~/.cgc-chrome` | dedicated Chrome profile dir |
 | `CGC_CHROME` | auto-detect | explicit browser binary |

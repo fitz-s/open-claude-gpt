@@ -68,6 +68,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import collections
 import contextlib
 import json
 import os
@@ -102,6 +103,8 @@ except ImportError:
 #   CGC_STATE_DIR    scratch dir for state + answer files           (default /tmp/cgc)
 #   CGC_AUTO_MODEL   auto-pick the model tier before sending? 1/0    (default 1 = on)
 #   CGC_MODEL        which tier to pick when auto-model is on        (default "Pro")
+#   CGC_MODEL_FAMILY which MODEL to pin in the same picker menu      (default "Latest")
+#                    — new on the GPT-6 composer (2026-09-03); "skip" disables the check
 #   CGC_PROJECT_URL  ChatGPT URL a fresh consult opens; set this to YOUR project
 #                    (…/g/g-p-<id>-<slug>/project) to keep consults in one project,
 #                    or leave default to open a plain new chat.     (default new chat)
@@ -123,6 +126,10 @@ CGC_STATE_DIR = os.environ.get("CGC_STATE_DIR", "/tmp/cgc")
 # the same effect as `--model skip`, exposed as a global switch.
 CGC_AUTO_MODEL = os.environ.get("CGC_AUTO_MODEL", "1").strip().lower() not in ("0", "false", "no", "off", "")
 CGC_MODEL = os.environ.get("CGC_MODEL", "Pro") if CGC_AUTO_MODEL else "skip"
+# The MODEL, as distinct from the tier — a second dimension the composer only started exposing
+# with GPT-6 (2026-09-03). Same toggle, same "skip" escape hatch as CGC_MODEL: auto-model OFF
+# means the picker is not touched at all, so neither dimension is enforced.
+CGC_MODEL_FAMILY = os.environ.get("CGC_MODEL_FAMILY", "Latest") if CGC_AUTO_MODEL else "skip"
 CGC_PROJECT_URL = os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/")
 
 # ---- per-rid job registry (makes follow-up zero-bookkeeping) ----------------
@@ -143,7 +150,7 @@ STATE_PATH = os.path.join(CGC_STATE_DIR, "active.json")
 
 STATE_LOCK_PATH = STATE_PATH + ".lock"
 
-# How long a consult takes: a GPT-5.6 Pro round reasons ~25 min typically, but a deep one (esp. a
+# How long a consult takes: a GPT-6 Astra Pro round reasons ~25 min typically, but a deep one (esp. a
 # follow-up that re-reasons from scratch) was observed at ~62 min. Same number as
 # cgc_spool.STUCK_AFTER_S — keep them in sync. This is NOT a budget for the consult and must never
 # kill a healthy one for thinking; it is the point past which waiting is no longer explained by the
@@ -933,7 +940,43 @@ def cmd_status(a) -> int:
     return 0
 
 
-# ---- model selection (two-menu aware: model menu vs reasoning-effort menu) ----
+# ---- model selection: TWO dimensions now, both pinned, both fail-closed ------
+# THE LAW CHANGED ON 2026-09-03. This block used to say "Model must never be touched (it picks
+# the model family, not the tier)". That was correct only while the composer offered no way to
+# pick the model at all — the single selectable thing was the reasoning tier, so touching
+# anything model-shaped could only be a mistake. OpenAI shipped GPT-6 ("GPT-6 Astra") on
+# 2026-09-03 and the picker now carries BOTH dimensions in ONE menu. Under the old law the
+# family would sit unguarded: "Pro tier on GPT-5.5" satisfies every tier check this file makes
+# while being a DIFFERENT MODEL than the receipt claims answered. A consult that silently runs
+# weaker than it says is precisely the failure this whole guard exists to prevent, so the family
+# is pinned too now — CGC_MODEL_FAMILY, default "Latest" — with the tier's own discipline: fail
+# closed, never send on an unconfirmed model.
+#
+# Live readings from a logged-in Pro tab, 2026-09-06 (verbatim, this is the build being fixed):
+#   _cand_labels_js()                                  -> ["6"]   (the switcher's label is now
+#                                                                  the MODEL BADGE, not a tier)
+#   that same button's innerText while its menu is OPEN -> "Thinking effort"
+#   [data-testid="composer-intelligence-picker-content"] innerText lines:
+#     0 "6"  1 "Pro"  2 "Pro, 5 of 5."  3 "Use Left and Right arrow keys to adjust power."
+#     4 "Latest" (menuitemradio, aria-checked=true)  5 "GPT-5.6 Sol"  6 "GPT-5.5"
+#   span[role=slider]: aria-valuemin=0 aria-valuemax=4 aria-valuenow=4, textContent "", NO
+#     aria-valuetext. Its [role=menuitem] ancestor is aria-label="Power" with EMPTY innerText
+#     AND textContent, carrying aria-describedby="_r_cn_ _r_co_" whose first id reads
+#     "Pro, 5 of 5." and whose second reads the arrow-keys instruction.
+#   _submenu_count_js()                                -> 0       (no haspopup trigger survives)
+#
+# WHY THE TIER IS NOW READ BY IDENTITY, NEVER BY LINE POSITION: the picker group's line 0 used
+# to BE the tier announcement ("Pro, 5 of 5.") and is now the model badge ("6"). Reading line 0
+# is exactly what broke every consult on this build — _slider_label("6") == "6",
+# _matches("6", "Pro") is false, so the walk matched at no slider position, the flat-click and
+# submenu fallbacks found nothing, and _select_model(c, "Pro") returned (False, '6') in 4.0s: a
+# total refusal to send, measured live. The tier is therefore read from the slider control's OWN
+# accessible description first, and only ever from text that is SHAPE-VALIDATED as the tier
+# announcement — see _slider_state_label's source chain.
+#
+# ORDER OF OPERATIONS: family FIRST, then tier. Changing the family re-renders the picker and can
+# reset the slider, so a tier chosen before a family change is not a tier that survives it.
+#
 # The composer has more than one switcher button. Which one carries the target tier is
 # NOT fixed — a build seen 2026-08-18 puts Instant/Medium/High/Extra High/Pro entirely
 # inside the reasoning-effort/power control (see _slider_set below); an older build
@@ -1052,6 +1095,12 @@ def _click_item_js(target):
 # Input.dispatchKeyEvent after focusing the slider's [role=menuitem] ancestor (the slider
 # itself is not focusable; .focus() on a bare <span role=slider> does nothing in this build).
 _SLIDER_ANNOUNCE_RE = re.compile(r",\s*\d+\s+of\s+\d+\.?\s*$", re.IGNORECASE)
+# The SAME announcement, anchored whole rather than as a trailing strip. This is the shape test
+# that lets the tier be found by identity instead of by line number: any line of the picker
+# group — or any element the slider points at with aria-describedby — that reads "<tier>, N of
+# M." IS the tier announcement, wherever it sits. An unanchored strip cannot say "this text is
+# not an announcement at all", which is what made "6" parse as a tier on the GPT-6 build.
+_TIER_ANNOUNCE_RE = re.compile(r"^(.+?),\s*\d+\s+of\s+\d+\.?$", re.IGNORECASE)
 
 
 def _slider_label(first_line):
@@ -1083,26 +1132,70 @@ def _slider_label(first_line):
     return s
 
 
+def _announced_tier(text):
+    """The tier out of a slider announcement — 'Pro, 5 of 5.' -> 'Pro' — or '' when `text` is not
+    that shape at all. Anchored on purpose (see _TIER_ANNOUNCE_RE): the two highest-priority
+    sources below trust this result BY SHAPE rather than by where it was found, so it must be
+    able to REJECT, not merely strip. The captured tier still goes through _slider_label's
+    single-line/24-char sanity bound — an announcement is not a licence to return prose."""
+    m = _TIER_ANNOUNCE_RE.match((text or "").strip())
+    return _slider_label(m.group(1)) if m else ""
+
+
 def _slider_state_label(st):
-    """The slider group's own first line, falling back to the composer switcher BUTTON's own
-    label — the same text _model_verdict already trusts as ground truth — when the group text
-    yields nothing usable. Needed on top of _slider_label's now-permissive parse (above) because
-    the group can also be genuinely ABSENT or shaped a third way entirely; the button's label is
-    an independent second source for the same fact, not just another suffix to strip."""
+    """The tier the slider is currently on, by IDENTITY. Ordered source chain — each source is
+    tried only because the one above it was unavailable on some real, live-observed build:
+
+      1. `descs` — the textContent of every id in the slider's [role=menuitem] ancestor's OWN
+         aria-describedby. This is the control describing itself, so it cannot be displaced by a
+         re-layout of the menu around it. On the GPT-6 build (live 2026-09-06) it is the only
+         place the tier is written down at all: that wrapper's innerText AND textContent are both
+         empty, and aria-describedby="_r_cn_ _r_co_" points at "Pro, 5 of 5.".
+      2. any `lines` entry of the picker group matching the same ", N of M." shape — the
+         pre-GPT-6 build, where line 0 was itself "Pro, 5 of 5.". Scanned rather than indexed
+         because on the GPT-6 build the same announcement moved to line 2.
+      3. the group's first line, permissively (see _slider_label) — the legacy BARE form: a fresh
+         pre-GPT-6 tab rendered "Pro" with no announcement suffix until the control had been
+         driven by keyboard.
+      4. `btnLabel`, the open switcher's own label — LAST RESORT ONLY. It used to be a trustworthy
+         independent read of the same fact; on the GPT-6 build that button reads "Thinking effort"
+         while its menu is open (live 2026-09-06), i.e. this source can now yield a string that is
+         not a tier at all. That is why it ranks below everything else and why sources 1-2 are
+         shape-validated instead of trusted for their position."""
+    for desc in st.get("descs") or []:
+        lab = _announced_tier(desc)
+        if lab:
+            return lab
+    for line in st.get("lines") or []:
+        lab = _announced_tier(line)
+        if lab:
+            return lab
     lab = _slider_label(st.get("first") or "")
     if lab:
         return lab
     return _slider_label(st.get("btnLabel") or "")
 
 
+# One snapshot, every source _slider_state_label might need — never a label stitched together
+# from two Runtime.evaluate round-trips, across which React can re-render the picker.
+#   descs     textContent of each aria-describedby target of the slider's [role=menuitem] wrapper
+#   lines     every non-empty line of the picker group (the announcement can sit at any of them)
+#   first     that group's first line — the legacy bare form, and on GPT-6 the model badge "6"
+#   btnLabel  the open switcher's label ("Thinking effort" while open, on GPT-6)
 _SLIDER_STATE_JS = (
     "(function(){var s=document.querySelector('[role=\"menu\"] [role=\"slider\"]');"
     "if(!s)return null;var mi=s.closest('[role=\"menuitem\"]');"
     "var grp=document.querySelector('[data-testid=\"composer-intelligence-picker-content\"]');"
-    "var src=grp||mi;var first=((src&&src.innerText)||'').trim().split('\\n')[0];"
+    "var src=grp||mi;"
+    "var lines=((src&&src.innerText)||'').split('\\n').map(function(x){return x.trim();})"
+    ".filter(function(x){return !!x;});"
+    "var descs=[];((mi&&mi.getAttribute('aria-describedby'))||'').split(/\\s+/)"
+    ".forEach(function(id){var e=id?document.getElementById(id):null;"
+    "if(e)descs.push((e.textContent||'').trim());});"
     "var trig=(document.querySelector('form')||document).querySelector('button[aria-expanded=\"true\"]');"
     "var btnLabel=((trig&&trig.innerText)||'').trim().split('\\n')[0];"
-    "return {first:first,btnLabel:btnLabel,now:parseInt(s.getAttribute('aria-valuenow'),10),"
+    "return {first:lines[0]||'',lines:lines,descs:descs,btnLabel:btnLabel,"
+    "now:parseInt(s.getAttribute('aria-valuenow'),10),"
     "min:parseInt(s.getAttribute('aria-valuemin'),10),max:parseInt(s.getAttribute('aria-valuemax'),10)};"
     "})()")
 
@@ -1205,8 +1298,12 @@ def _slider_set(c, target):
 # triggers that open a SECOND [role=menu]; on the probed build the Effort submenu duplicates the
 # slider's tiers as flat, checkable items (Instant/Medium/High/Extra High/Pro), reachable by
 # _click_item_js once open. Never hardcode which trigger by name ('Effort') — a future build
-# could relocate it, and Model must never be touched (it picks the model family, not the tier) —
-# so every haspopup trigger is tried and left to the item-match to decide. Verified live: hover
+# could relocate it — so every haspopup trigger is tried and left to the item-match to decide.
+# (This comment used to add "and Model must never be touched (it picks the family, not the
+# tier)". Dead as of 2026-09-03: the family is pinned deliberately now, by _select_family, which
+# addresses the radios directly and never goes through this submenu walk. The item-match here
+# still decides on TIER text alone, so a Model submenu opened first remains harmless.)
+# Verified live: hover
 # events alone (pointerover/pointerenter/mouseover/mousemove) did NOT open the submenu; only
 # following them with the same pointer-down/up gesture used to open the top-level menu (_GESTURE)
 # did.
@@ -1239,6 +1336,90 @@ def _submenu_try(c, target):
         c.key("Escape", "Escape", 27)
         time.sleep(0.25)
     return False
+
+
+# ---- model FAMILY path (new dimension; see the law at the top of this section) ----
+# Live 2026-09-06: the open picker carries the MODEL itself as [role="menuitemradio"] items —
+# "Latest" (aria-checked=true), "GPT-5.6 Sol", "GPT-5.5" — in the SAME menu as the power slider.
+# Read as {label, checked} pairs so the "already correct" case can be distinguished from the
+# "must click" case without a click: this is the one control in the picker where a redundant
+# gesture is not free (a Radix radio click also closes the menu, which would drop the slider out
+# from under the tier walk that runs next).
+# `var FAMS=` is deliberately distinctive: it is how the offline fakes in tests/test_model_picker.py
+# tell this read apart from _click_item_js, which queries menuitemradio too.
+_FAMILY_STATE_JS = (
+    "(function(){var FAMS=[].slice.call(document.querySelectorAll("
+    "'[role=\"menu\"] [role=\"menuitemradio\"]'));"
+    "return FAMS.map(function(r){return {"
+    "label:((r.innerText||'').trim().split('\\n')[0]),"
+    "checked:r.getAttribute('aria-checked')==='true'};});})()")
+
+
+def _click_family_js(target):
+    """Select the radio whose FIRST LINE is exactly `target` (case-insensitive; never a loose
+    contains — 'GPT-5.5' must not be able to match 'GPT-5.6 Sol' or a description line). Same
+    _GESTURE as everything else in this menu: these are Radix items and a bare .click() does not
+    select them."""
+    t = json.dumps((target or "").strip().lower())
+    return ("(function(){var T=%s;var FAMS=[].slice.call(document.querySelectorAll("
+            "'[role=\"menu\"] [role=\"menuitemradio\"]'));"
+            "var EL=FAMS.find(function(r){"
+            "return ((r.innerText||'').trim().toLowerCase().split('\\n')[0])===T;});"
+            "if(!EL)return false;%s return true;})()" % (t, _GESTURE))
+
+
+def _family_entries(c):
+    """The radio group as a list of (label, checked), or [] when this build has no such control.
+    Defensive about the shape because a Runtime.evaluate can return anything: only real dicts with
+    a non-empty label count, so a null/garbage read is indistinguishable from 'no radios' — which
+    is the safe reading, since the alternative is refusing a consult over a misparse."""
+    read = c.eval(_FAMILY_STATE_JS)
+    out = []
+    for r in read if isinstance(read, list) else []:
+        if isinstance(r, dict) and str(r.get("label") or "").strip():
+            out.append((str(r["label"]).strip(), bool(r.get("checked"))))
+    return out
+
+
+def _select_family(c, target):
+    """Pin the model FAMILY inside the currently-open picker menu. Returns (ok, detail).
+
+    Fail-closed like the tier, with ONE deliberate exception: a build with no radio group at all
+    is a pre-GPT-6 composer that cannot express this dimension, so it is a SILENT NO-OP — an old
+    account must never be refused over a control its ChatGPT does not render. A build that DOES
+    render the group and does not offer `target` is a hard miss, and `detail` names the families
+    actually offered, because "this account no longer has GPT-6" and "CGC_MODEL_FAMILY is a typo"
+    are indistinguishable without that list.
+
+    An already-checked target is left ALONE — no click at all. Clicking a checked Radix radio is
+    not a guaranteed no-op (it commits the menu closed), and there is nothing to change.
+
+    On a real change this returns only after re-reading aria-checked and seeing it flip: the click
+    is a gesture dispatch, not a promise."""
+    if not target or target.strip().lower() == "skip":
+        return True, None
+    entries = _family_entries(c)
+    if not entries:
+        return True, None                       # pre-GPT-6 build — no such control, nothing to pin
+    want = target.strip().lower()
+    hit = next(((lab, chk) for lab, chk in entries if lab.lower() == want), None)
+    if hit is None:
+        return False, ("model family '%s' is not offered in this picker (offered: %s)"
+                       % (target, ", ".join(lab for lab, _ in entries)))
+    if hit[1]:
+        return True, hit[0]                     # already on it — do not touch a checked radio
+    if not c.eval(_click_family_js(target)):
+        return False, "model family '%s' is listed but its radio could not be clicked" % target
+    # A family change re-renders the whole picker, slider included; the tier walk that follows
+    # re-reads _SLIDER_STATE_JS from scratch, so it sees the NEW slider, not a stale position.
+    time.sleep(0.6)
+    for lab, chk in _family_entries(c):
+        if lab.lower() == want:
+            if chk:
+                return True, lab
+            break
+    return False, ("model family '%s' did not take — aria-checked never flipped after the click"
+                   % target)
 
 
 def _cand_labels_js():
@@ -1280,11 +1461,46 @@ def _model_verdict(labels, target):
     return False, (labels[0] if labels else None)
 
 
-def _select_model(c, target):
-    """Switch the composer to `target` by trying each switcher menu; within each open menu, try
-    the slider, then the flat item, then each submenu trigger, in that order — the three forms
-    ChatGPT is known to serve for the same setting depending on rollout stage. Returns
-    (confirmed, shown). Fully automated — no human step.
+_ModelPick = collections.namedtuple("_ModelPick", "confirmed shown badge error")
+"""The whole verdict of one selection attempt, in one value, because it is now more than one fact:
+
+  confirmed  the TIER is pinned to the target (and no family miss vetoed the run)
+  shown      the tier label the composer is actually left on
+  badge      what the composer's own switcher reads with its menus CLOSED. On the GPT-6 build
+             (live 2026-09-06) that is the model badge "6", which is the receipt this whole
+             change exists to produce: it says WHICH MODEL answered, not merely how hard it
+             thought. On older builds the same button showed a tier, or the Chat/Agent mode
+             toggle; it is recorded verbatim either way, because a receipt that invents a model
+             name is strictly worse than one that quotes the button.
+  error      a human sentence when a FAMILY miss is what failed the run (the tier's own failure
+             is already fully described by `shown` + the caller's target). Kept on the same
+             value rather than a second channel so a caller cannot report one and miss the other.
+"""
+
+
+def _select_model(c, target, family=None):
+    """Switch the composer to `target` (tier) and `family` (model) by trying each switcher menu;
+    within each open menu pin the FAMILY first, then try the slider, the flat item, and each
+    submenu trigger in that order — the three forms ChatGPT is known to serve for the tier
+    depending on rollout stage. Returns a _ModelPick. Fully automated — no human step.
+
+    FAMILY FIRST is not a preference: changing the model re-renders the picker and can reset the
+    slider, so a tier pinned before a family change is not a tier that survives it. A family miss
+    fails the whole selection immediately — it is the same class of harm as a tier miss (the
+    consult would answer on a model the receipt does not name), so it must not be recoverable by
+    trying another switcher, and the caller must not send.
+
+    When a family IS being enforced the "composer already shows the target tier" shortcut is
+    skipped: the radios are only readable inside an OPEN menu, so a tier-only early return would
+    be exactly the unguarded-family hole this change closes.
+
+    CONFIRMATION AUTHORITY moved with the DOM. The switcher label used to carry the tier, so
+    _model_verdict over the closed composer's labels could confirm one. On the GPT-6 build that
+    button shows the MODEL BADGE instead ("6" live 2026-09-06) and no button anywhere reads the
+    tier, so the label verdict alone can never confirm and a correctly pinned Pro would be
+    refused forever. A _slider_set that returned True therefore confirms in its own right — it
+    only does so after matching a label taken from the slider control's own, shape-validated
+    accessibility announcement, which is a stronger source than the button ever was.
 
     Candidates are read as LABELS, not positions, and each is opened by identity in a single
     evaluation (see _open_cand_by_label_js) — never by an index into a NodeList read in an
@@ -1305,13 +1521,23 @@ def _select_model(c, target):
     ("switcher shows '{model_now}'") would otherwise report the mode toggle — useless for
     diagnosing a tier problem, and live-verified to happen. With the slider's own fail-closed
     restore (see _slider_set) that label is also the tier the composer is actually left on."""
-    ok, shown = _model_verdict(c.eval(_cand_labels_js()), target)
-    if ok:
-        return True, shown
+    want_family = bool(family) and family.strip().lower() != "skip"
+    labels = [x for x in (c.eval(_cand_labels_js()) or []) if x]
+    badge = labels[0] if labels else None
+    ok, shown = _model_verdict(labels, target)
+    if ok and not want_family:
+        return _ModelPick(True, shown, badge, None)
     last_slider_label = None
+    # Whether the family dimension was actually INSPECTED (inside a menu that really opened), as
+    # opposed to merely not having failed. Without this, a composer already sitting on the target
+    # tier whose picker never opens at all would return confirmed=True with the model unverified —
+    # a fail-OPEN in the middle of a fail-closed guard, and the exact hole this change closes.
+    family_checked = not want_family
     exhausted = set()
     for _ in range(2):
         labels = [x for x in (c.eval(_cand_labels_js()) or []) if x]
+        if labels:
+            badge = labels[0]
         for lab in labels:
             if lab in exhausted:
                 continue
@@ -1319,22 +1545,49 @@ def _select_model(c, target):
             if opened != lab:
                 continue  # addressing miss — nothing opened is trustworthy, try the next label
             time.sleep(1.0)  # Radix menu renders async after the gesture
+            fam_ok, fam_detail = _select_family(c, family)
+            if not fam_ok:
+                # The radio group EXISTS here and does not offer the family we promised. No other
+                # switcher can undo that, so stop: leave the menu closed and refuse, naming what
+                # the account actually offers.
+                c.key("Escape", "Escape", 27)
+                time.sleep(0.15)
+                c.key("Escape", "Escape", 27)
+                time.sleep(0.15)
+                return _ModelPick(False, last_slider_label or shown, badge, fam_detail)
+            family_checked = True
             slid_ok, slid_label = _slider_set(c, target)
             if slid_label:
                 last_slider_label = slid_label
             hit = slid_ok or c.eval(_click_item_js(target)) or _submenu_try(c, target)
             if hit:
                 time.sleep(0.5)
-                ok, shown = _model_verdict(c.eval(_cand_labels_js()), target)
                 # Leave the composer clean before the paste that follows, success or not. Two
                 # Escapes cover the submenu path's second [role=menu] level; an Escape when
                 # nothing is open is a verified no-op, so this never harms the flat/slider cases.
+                # This runs BEFORE the confirming read, not after: with the menu still open the
+                # GPT-6 composer button reads "Thinking effort" (live 2026-09-06), so a verdict
+                # taken mid-menu would judge the composer by a transient label that is not a
+                # model or a tier at all. The verdict must describe the RESTING composer.
                 c.key("Escape", "Escape", 27)
                 time.sleep(0.15)
                 c.key("Escape", "Escape", 27)
                 time.sleep(0.15)
+                post = [x for x in (c.eval(_cand_labels_js()) or []) if x]
+                if post:
+                    badge = post[0]
+                ok, shown = _model_verdict(post, target)
+                if not ok and slid_ok:
+                    # The switcher label can no longer confirm a TIER on the GPT-6 build: that
+                    # button now shows the MODEL BADGE ("6" live 2026-09-06), so _model_verdict
+                    # scans a list that never contains a tier and would refuse a correctly-pinned
+                    # Pro forever. The slider's own state is the authority in that case, and it is
+                    # a stronger one than the button ever was: _slider_set returns True only after
+                    # _matches() accepted a label that came out of the control's own, shape-
+                    # validated accessibility announcement (see _slider_state_label).
+                    ok, shown = True, slid_label
                 if ok:
-                    return True, shown
+                    return _ModelPick(True, shown, badge, None)
                 continue
             # this WAS the candidate asked for, and it genuinely does not carry target — budget
             # must not be spent reopening it.
@@ -1342,10 +1595,17 @@ def _select_model(c, target):
             c.key("Escape", "Escape", 27)
             time.sleep(0.25)
         time.sleep(0.4)
-    ok, shown = _model_verdict(c.eval(_cand_labels_js()), target)
+    final = [x for x in (c.eval(_cand_labels_js()) or []) if x]
+    if final:
+        badge = final[0]
+    ok, shown = _model_verdict(final, target)
     if not ok and last_slider_label:
         shown = last_slider_label
-    return ok, shown
+    if ok and not family_checked:
+        return _ModelPick(False, shown, badge,
+                          "model family '%s' could not be verified — the composer's picker menu "
+                          "never opened, so the radios were never readable" % family)
+    return _ModelPick(ok, shown, badge, None)
 
 
 # A real code-source URL: https:// on github.com / gist.github.com / raw.githubusercontent.com,
@@ -1749,19 +2009,29 @@ def cmd_submit(a) -> int:
         # is selected. FAIL-CLOSED: if it genuinely cannot select the target, do NOT send.
         model_confirmed = None
         model_now = None
+        model_badge = None
         if a.model and a.model.lower() != "skip":
             target = a.model
-            model_confirmed, model_now = _select_model(c, target)
+            pick = _select_model(c, target, a.model_family)
+            model_confirmed, model_now, model_badge = pick.confirmed, pick.shown, pick.badge
             if not model_confirmed and not a.allow_model_mismatch:
                 if not a.reuse_tab:
                     c.close_tab()  # don't orphan the dedicated tab we opened for this submit
                 c.close()
                 print(json.dumps({"ok": False, "submitted": False,
-                                  "modelConfirmed": False, "model": model_now, "wanted": target}))
+                                  "modelConfirmed": False, "model": model_now,
+                                  "modelBadge": model_badge, "wanted": target,
+                                  "wantedFamily": a.model_family, "detail": pick.error}))
+                # pick.error is set only when the MODEL FAMILY is what failed — a different
+                # problem with a different fix than a tier miss, so it gets its own sentence
+                # instead of being flattened into the tier wording.
+                why = pick.error or (f"wanted '{target}', switcher shows '{model_now}' and it "
+                                     f"could not be changed")
+                fix = ("set CGC_MODEL_FAMILY to a family this account offers (or 'skip')"
+                       if pick.error else f"set a '{target}' tier in the ChatGPT window")
                 sys.stderr.write(
-                    f"CGC_ERROR model_not_selectable: wanted '{target}', switcher shows "
-                    f"'{model_now}' and it could not be changed — NOT submitting. Set a "
-                    f"'{target}' tier in the ChatGPT window, or pass --allow-model-mismatch.\n")
+                    f"CGC_ERROR model_not_selectable: {why} — NOT submitting. Fix: {fix}, or "
+                    f"pass --allow-model-mismatch.\n")
                 return 3
             if not model_confirmed:
                 sys.stderr.write(f"CGC_WARN proceeding on '{model_now}' not '{target}' "
@@ -1865,6 +2135,7 @@ def cmd_submit(a) -> int:
         n = 1
         if not conv:
             print(json.dumps({"ok": False, "userMsgs": n, "model": model_now,
+                              "modelBadge": model_badge,
                               "modelConfirmed": model_confirmed, "conversation_id": ""}))
             sys.stderr.write(
                 "CGC_ERROR no_conversation_id: the message sent but the tab never transitioned to "
@@ -1875,6 +2146,7 @@ def cmd_submit(a) -> int:
             return 2
         _write_state(conversation=conv, rid=a.rid)  # so `followup`/`wait` can auto-resolve
         print(json.dumps({"ok": True, "userMsgs": n, "model": model_now, "adapter": adapter,
+                          "modelBadge": model_badge,
                           "modelConfirmed": model_confirmed, "conversation_id": conv}))
         out = os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
         # Hand the agent the exact waiter to run (run_in_background:true). It holds the whole
@@ -2039,15 +2311,19 @@ def cmd_followup(a) -> int:
                 _settle = time.time() + 8
                 while not (c.eval(_cand_labels_js()) or []) and time.time() < _settle:
                     time.sleep(0.5)
-            _fu_ok, model_now = _select_model(c, target)
+            pick = _select_model(c, target, a.model_family)
+            _fu_ok, model_now = pick.confirmed, pick.shown
             if not _fu_ok and not a.allow_model_mismatch:
                 print(json.dumps({"ok": False, "followup": True, "conversation_id": conv,
                                   "rid": rid, "modelConfirmed": False, "model": model_now,
-                                  "wanted": target}))
+                                  "modelBadge": pick.badge, "wanted": target,
+                                  "wantedFamily": a.model_family, "detail": pick.error}))
+                why = pick.error or (f"thread offers '{model_now}', not '{target}'")
+                fix = ("set CGC_MODEL_FAMILY to a family this account offers (or 'skip')"
+                       if pick.error else f"restore the '{target}' tier in the ChatGPT window")
                 sys.stderr.write(
-                    f"CGC_ERROR model_not_selectable: thread offers '{model_now}', not '{target}' "
-                    f"— NOT sending this follow-up (it would answer on a DEGRADED model, the "
-                    f"Instant-stall failure). Restore the '{target}' tier in the ChatGPT window, "
+                    f"CGC_ERROR model_not_selectable: {why} — NOT sending this follow-up (it "
+                    f"would answer on a DEGRADED model, the Instant-stall failure). Fix: {fix}, "
                     f"or pass --allow-model-mismatch to override.\n")
                 return 2
         # Count user messages BEFORE sending so we can confirm a NEW one landed (the
@@ -2538,6 +2814,12 @@ def main() -> int:
                     help="target model tier (default $CGC_MODEL or 'Pro'). A 'Pro*' target is satisfied "
                          "by any Pro tier the switcher shows (Pro / Pro Extended) but never by "
                          "Medium/Instant/etc. Pass 'skip' to leave as-is.")
+    su.add_argument("--model-family", default=CGC_MODEL_FAMILY,
+                    help="MODEL to pin in the same picker menu, a separate dimension from the tier "
+                         "(default $CGC_MODEL_FAMILY or 'Latest'). GPT-6's composer lists the model "
+                         "as radios beside the power slider, so 'Pro on GPT-5.5' is reachable and "
+                         "would otherwise pass the tier check silently. 'skip' = don't check. A "
+                         "build with no such radios ignores this.")
     su.add_argument("--reuse-tab", action="store_true",
                     help="navigate the existing single tab instead of opening a dedicated one "
                          "(default: own tab per consult, for safe concurrency)")
@@ -2569,6 +2851,10 @@ def main() -> int:
                          "follow-up no longer blindly inherits a thread that silently downgraded to "
                          "Instant — it re-selects the target and fails closed if it can't. 'skip' = "
                          "leave as-is (old behavior).")
+    fu.add_argument("--model-family", default=CGC_MODEL_FAMILY,
+                    help="MODEL to re-assert on the thread alongside the tier (default "
+                         "$CGC_MODEL_FAMILY or 'Latest'). 'skip' = don't check; a build without the "
+                         "model radios ignores it.")
     fu.add_argument("--allow-model-mismatch", action="store_true",
                     help="send the follow-up even if the target tier can't be selected (default: "
                          "fail-closed — do NOT answer on a degraded model).")
@@ -2602,7 +2888,7 @@ def main() -> int:
     w.add_argument("--timeout", type=int, default=STUCK_AFTER_S,
                    help=f"seconds to wait for the answer (default {STUCK_AFTER_S} = "
                         f"{STUCK_AFTER_S // 60} min — the point past which the job is stuck rather "
-                        "than slow; a deep GPT-5.6 Pro round can reason ~60 min).")
+                        "than slow; a deep GPT-6 Astra Pro round can reason ~60 min).")
     w.add_argument("--keep-tab", action="store_true",
                    help="do not close the consult's tab after retrieving (default: close it, so "
                         "concurrent consults' tabs don't accumulate)")

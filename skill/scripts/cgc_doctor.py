@@ -43,6 +43,10 @@ PORT = int(os.environ.get("CGC_PORT", "9333"))
 PROFILE = os.environ.get("CGC_PROFILE", os.path.expanduser("~/.cgc-chrome"))
 STATE_DIR = os.environ.get("CGC_STATE_DIR", "/tmp/cgc")
 MODEL = os.environ.get("CGC_MODEL", "Pro")
+# The MODEL, as distinct from the reasoning tier. GPT-6's composer (2026-09-03) exposes both in
+# one picker, so the tier alone no longer says which model answered — the doctor reports both or
+# it reports a half-truth. See the model-selection law in cdp_consult.py.
+MODEL_FAMILY = os.environ.get("CGC_MODEL_FAMILY", "Latest")
 PROJECT_URL = os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/ (new chat)")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -357,7 +361,7 @@ def run(deep: bool, secure: bool = False) -> Report:
         r.fail("skill files", detail, "re-run install.sh from the repo")
 
     # 9. Config summary (never a failure — just what's in effect)
-    r.ok("config", f"port={PORT} model={MODEL!r} profile={PROFILE}")
+    r.ok("config", f"port={PORT} model={MODEL!r} family={MODEL_FAMILY!r} profile={PROFILE}")
     r.ok("project", PROJECT_URL)
 
     # 10. Egress daemon (user-started, like the debug Chrome). Required for the auto-mode-safe

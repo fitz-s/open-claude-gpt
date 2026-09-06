@@ -236,7 +236,7 @@ def test_cmd_await_failed_exits_1(spool, tmp_path, monkeypatch):
 
 
 def test_await_keeps_waiting_while_a_live_daemon_works_the_job(spool, tmp_path, monkeypatch):
-    """The normal path for a GPT-5.6 Pro consult: still reasoning. Waiting longer is the waiter's
+    """The normal path for a GPT-6 Astra Pro consult: still reasoning. Waiting longer is the waiter's
     job, so it must NOT return early — that would turn every healthy round into something the
     caller had to notice and manually retry."""
     monkeypatch.setattr(spool, "daemon_alive", lambda: True)
@@ -294,7 +294,7 @@ def test_gate_still_refuses_prose_without_the_no_code_declaration(spool):
 
 
 def test_one_timeout_and_it_means_stuck_not_slow(spool):
-    """There is exactly ONE deadline. A GPT-5.6 Pro round reasons ~25 min, so any deadline at or
+    """There is exactly ONE deadline. A GPT-6 Astra Pro round reasons ~25 min, so any deadline at or
     near that kills healthy consults; the deadline must sit far enough past the work that reaching
     it means malfunction, not slowness. Regression guard against re-introducing a second clock."""
     assert spool.STUCK_AFTER_S >= 3600

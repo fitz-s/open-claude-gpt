@@ -18,7 +18,7 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py prep \
 - `list_connected_browsers` → `select_browser` (deviceId) if not already connected → `tabs_context_mcp`.
 - `navigate` the tab to the project URL (SKILL.md → Fixed configuration). Navigating there presents a fresh "New chat in <project>" composer — there's no separate "New chat" button; use the composer.
 - Run `preflight_js` via `javascript_tool` (returns `{isChatGPT,composer,loginLike,captchaLike}` — metadata only). Proceed when `isChatGPT` and `composer` are true; surface the blocker to the user if `loginLike`/`captchaLike` is true or `composer` is false.
-- Confirm the model by script (scanner-safe `javascript_tool`): scan composer buttons for one whose first line is a Pro tier; if it's not Pro, click that switcher then the Pro item; if the React menu won't drive from JS, ask the user to set it.
+- Confirm the model by script (scanner-safe `javascript_tool`). The current composer splits this in two: a power slider (`Instant / Medium / High / Extra High / Pro`) and a model list (`Latest` / `GPT-5.6 Sol` / `GPT-5.5`) — we want **`Latest` + `Pro`**, and the older `Pro Extended` item no longer exists. Scan the composer controls for both, set whichever is wrong, and if the React menus won't drive from JS, ask the user to set them. This layout changed at the GPT-6 rollout and can change again; treat a mismatch as a blocker to surface, not something to work around.
 
 ## 3. Deliver + submit
 - Deliver code by link/gist via SKILL.md → File delivery. Keep code out of the prompt; large pastes auto-file and are often unreadable.
@@ -27,7 +27,7 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py prep \
 
 ## 4. Monitor (ScheduleWakeup poll-wake)
 - **Cost model:** each wake = one full main-context reload (a `ScheduleWakeup` sleep >5 min misses the prompt cache), so cost ≈ `wake_count × context_size`. Waking early on an unfinished answer burns a reload; being late is free. Bias the schedule **long**; target ≤4 wakes.
-- Use the wake plan from prep: `first_wake_seconds` (≈85% of expected latency) then `repoll_seconds`. `--expect-minutes` now defaults to **25** (GPT-5.6 Pro reasons that long), so the first wake already lands near completion — the biggest token lever. Raise it further only for a genuinely huge review. Let the wake chain run; don't poll early.
+- Use the wake plan from prep: `first_wake_seconds` (≈85% of expected latency) then `repoll_seconds`. `--expect-minutes` now defaults to **25** (a GPT-6 Astra Pro round reasons that long), so the first wake already lands near completion — the biggest token lever. Raise it further only for a genuinely huge review. Let the wake chain run; don't poll early.
 - Each wake: run `poll_js` verbatim via `javascript_tool` (returns `{generating,done,blocker,assistantCount,len}` — metadata only). `done` is line-anchored (standalone `BEGIN_RESPONSE:<id>` before standalone `END_RESPONSE:<id>`, not generating). The first 1–2 polls may show `len:0`/`done:false` while the node hydrates — keep polling, never resubmit.
   - `blocker` non-null (login/captcha/rate_limit) → stop, tell the user.
   - **Settled-without-sentinel:** `generating:false` AND `len>0` AND `done:false` AND `len` unchanged from the prior wake → it finished without `END_RESPONSE:<id>`. Read the last assistant message via `get_page_text`: real just-unwrapped answer → use it; junk/partial → re-submit. (Mirror of CDP exit 5.)

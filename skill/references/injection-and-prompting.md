@@ -1,6 +1,6 @@
 <!-- Source: ChatGPT Pro consult REQ-20260612-082838, 2026-06-12. -->
 
-> **AUTHORITY (read first).** This doc predates `consult.py`'s `deliver` (which now automates scenario detection + ref selection) and the adoption of the official GPT-5.6 prompting guide. So:
+> **AUTHORITY (read first).** This doc predates `consult.py`'s `deliver` (which now automates scenario detection + ref selection) and the adoption of the official GPT-6 Astra prompting guide (`references/gpt-6-astra-prompting-principles.md`). So:
 > - The live `PROMPT_TEMPLATE` in `scripts/consult.py` is the **authoritative prompt** — it overrides anything here.
 > - **Live, still-useful value:** §2 (URL-type catalog) and §9 (high-signal file selection). Use these.
 > - **Superseded / historical:** §1 "Core Contract", §3 "Deliver-Step Decision Procedure", §10 "Master Template", §12 "Implementation Checklist" — these describe the manual, pre-`deliver` workflow and a second prompt skeleton that no longer matches the tooling. Don't compose prompts from them.

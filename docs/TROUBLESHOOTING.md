@@ -92,12 +92,21 @@ error firing on a `--no-code` consult meant the send-time backstop had drifted o
 of sync with the spool gate; the two now share one predicate.)
 
 ## `CGC_ERROR model_not_selectable`
-The target model tier (`CGC_MODEL`) isn't offered in the composer for this
-account/thread. The picker is driven by whatever the live UI exposes — the
-current build's power slider (`Instant / Medium / High / Extra High / Pro`), its
-`Effort` submenu, or an older build's flat menu — so this error means none of
-those carried the target, not that one particular widget was missing. Options,
-in order of preference:
+Something the send was supposed to pin isn't offered in the composer for this
+account/thread. Since GPT-6 that is **two** settings, both enforced, both able to
+raise this error — read the sentence after the colon to see which one failed.
+
+**The GPT-6 picker (2026-09-03 onward).** Opening the composer's switcher shows
+one menu carrying both dimensions: a power slider for the reasoning tier
+(`Instant / Medium / High / Extra High / Pro`) and, beside it, radio items for the
+model itself (`Latest` / `GPT-5.6 Sol` / `GPT-5.5`). The switcher button no longer
+reads a tier at all — it shows the model badge (`6`). Older accounts still get the
+pre-GPT-6 forms (slider alone, an `Effort` submenu, or a flat menu), all of which
+are still driven; a build with no model radios has the family check skipped rather
+than failed.
+
+**Tier miss** — `wanted 'Pro', switcher shows '<tier>' and it could not be
+changed`. None of the picker forms carried the target tier:
 
 - **Set a tier your account actually has:** `export CGC_MODEL="High"` (or
   whichever tier your plan offers).
@@ -105,9 +114,26 @@ in order of preference:
   whatever tier is currently shown, no picking/enforcement.
 - **Per-command override:** `--model skip` — skip model selection for just this
   one call, without changing your env config.
-- **Only when you deliberately want to proceed on a mismatched tier:**
-  `--allow-model-mismatch` — sends on whatever is shown even though the
-  requested tier couldn't be selected.
+
+**Family miss** — `model family '<name>' is not offered in this picker (offered:
+Latest, GPT-5.6 Sol, GPT-5.5)`. The radios are there and none of them is the model
+you pinned — usually a rename on OpenAI's side, a spelling that doesn't match the
+radio's own label exactly, or a plan that no longer lists that model. The error
+always names what the account actually offers, so copy one of those verbatim:
+
+- **Pin a model that is listed:** `export CGC_MODEL_FAMILY="GPT-5.6 Sol"`.
+- **Stop enforcing the model, keep enforcing the tier:**
+  `export CGC_MODEL_FAMILY=skip` (or `--model-family skip` for one call). Accepts
+  the risk this check exists to remove: the answer may come from a different model
+  than the receipt implies.
+
+**Either miss** — **only when you deliberately want to proceed on a mismatch:**
+`--allow-model-mismatch` sends on whatever is shown even though the requested
+tier/model couldn't be selected.
+
+The `modelBadge` field in `submit`'s JSON records what the composer's switcher
+read at send time (`"6"` on the GPT-6 build) — that is the receipt for which model
+actually answered.
 
 ## `CGC_ERROR ambiguous_followup`
 Several consults are active and `--conversation auto` can't pick. Pass the exact

@@ -25,6 +25,15 @@ _spec.loader.exec_module(_CDP)
 _WANT_RE = _re.compile(r'var want=(".*?");')
 
 
+def _pick(client, target, family=None):
+    """_select_model returns a _ModelPick (confirmed/shown/badge/error) as of 2026-09-06 — it now
+    reports the composer's model badge and a family-miss sentence alongside the tier verdict. The
+    tests that predate the family dimension only ever asserted on the tier verdict, so they go
+    through this two-value view; the family tests below read the full pick."""
+    p = _CDP._select_model(client, target, family)
+    return p.confirmed, p.shown
+
+
 def _wanted_label(expr):
     """Pull the label _open_cand_by_label_js asked to open out of its generated JS text — the
     fakes below dispatch on substrings of the generated JS rather than running a JS engine (see
@@ -111,6 +120,8 @@ class _FakeSliderClient:
             return False
         if 'aria-haspopup="menu"' in expr:                 # _submenu_count_js
             return 0
+        if "var FAMS=" in expr:                            # _FAMILY_STATE_JS / _click_family_js
+            return []                                       # pre-GPT-6: no model radios at all
         if "menuitemradio" in expr:                        # _click_item_js — no flat item here
             return False
         if "var EL=c[" in expr:                             # _open_cand_by_label_js
@@ -139,7 +150,7 @@ class _FakeSliderClient:
 def test_slider_reaches_pro_from_high_with_bounded_presses(monkeypatch):
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
     client = _FakeSliderClient(start=2, keys_work=True)  # starts on High
-    ok, shown = _CDP._select_model(client, "Pro")
+    ok, shown = _pick(client, "Pro")
     assert ok is True and shown == "Pro"
     # worst case is 2*(valuemax-valuemin) = 8 arrow presses, plus a couple of Escapes to leave
     # the composer clean — nowhere near a hang.
@@ -152,7 +163,7 @@ def test_slider_keys_swallowed_does_not_hang_and_fails_closed(monkeypatch):
     full walk for nothing."""
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
     client = _FakeSliderClient(start=2, keys_work=False)  # High, but ArrowLeft/Right do nothing
-    ok, shown = _CDP._select_model(client, "Pro")
+    ok, shown = _pick(client, "Pro")
     assert ok is False
     assert shown == "High", "verdict must fall through to the unmatched switcher's real label"
     # Must bail after the very first unproductive press per attempt, not walk the full range.
@@ -201,7 +212,7 @@ class _FakeFlatMenuClient:
 def test_old_flat_menu_still_selects_pro(monkeypatch):
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
     client = _FakeFlatMenuClient()
-    ok, shown = _CDP._select_model(client, "Pro")
+    ok, shown = _pick(client, "Pro")
     assert ok is True and shown == "Pro"
 
 
@@ -269,7 +280,7 @@ class _FakeUnreachableTargetClient:
 def test_unreachable_target_restores_slider_to_entry_position(monkeypatch):
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
     client = _FakeUnreachableTargetClient(start=2)  # High
-    ok, _shown = _CDP._select_model(client, "Ultra")
+    ok, _shown = _pick(client, "Ultra")
     assert ok is False
     assert client.now == 2, (
         "a failed walk must leave the composer on the tier it FOUND, not wherever the "
@@ -279,7 +290,7 @@ def test_unreachable_target_restores_slider_to_entry_position(monkeypatch):
 def test_unreachable_target_reports_the_sliders_tier_not_the_mode_toggle(monkeypatch):
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
     client = _FakeUnreachableTargetClient(start=2)  # High
-    ok, shown = _CDP._select_model(client, "Ultra")
+    ok, shown = _pick(client, "Ultra")
     assert ok is False
     assert shown == "High", "must report the tier switcher's real label, not the mode toggle"
 
@@ -352,7 +363,7 @@ class _FakeLaggingSliderClient:
 def test_settle_poll_tolerates_a_lagging_read_without_bailing(monkeypatch):
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
     client = _FakeLaggingSliderClient(start=2)  # High
-    ok, shown = _CDP._select_model(client, "Pro")
+    ok, shown = _pick(client, "Pro")
     assert ok is True and shown == "Pro", "a one-tick-late read must not be mistaken for stuck keys"
 
 
@@ -417,7 +428,7 @@ class _FakeAlwaysMismatchedOpenClient:
 def test_mismatched_open_is_never_acted_on(monkeypatch):
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
     client = _FakeAlwaysMismatchedOpenClient()
-    ok, shown = _CDP._select_model(client, "Pro")
+    ok, shown = _pick(client, "Pro")
     assert ok is False
     assert client.slider_reads == 0, "an open that didn't land on the requested label must never be searched"
 
@@ -499,7 +510,7 @@ class _FakeFlappingCandidatesClient:
 def test_flapping_candidate_list_still_reaches_pro(monkeypatch):
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
     client = _FakeFlappingCandidatesClient()
-    ok, shown = _CDP._select_model(client, "Pro")
+    ok, shown = _pick(client, "Pro")
     assert ok is True and shown == "Pro"
 
 
@@ -562,7 +573,7 @@ def test_bare_label_form_still_reaches_pro(monkeypatch):
     already showing the right value."""
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
     client = _FakeBareLabelSliderClient(start=2)  # High
-    ok, shown = _CDP._select_model(client, "Pro")
+    ok, shown = _pick(client, "Pro")
     assert ok is True and shown == "Pro"
 
 
@@ -616,8 +627,238 @@ class _FakeGroupMissingButtonLabelClient:
 def test_group_text_missing_falls_back_to_button_label(monkeypatch):
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
     client = _FakeGroupMissingButtonLabelClient(start=2)  # High
-    ok, shown = _CDP._select_model(client, "Pro")
+    ok, shown = _pick(client, "Pro")
     assert ok is True and shown == "Pro"
+
+
+# ---- the GPT-6 composer (live 2026-09-06) ------------------------------------------------
+#
+# The previous picker break shipped with a green suite because the FIXTURES encoded the same
+# wrong assumption as the code (the tier is the picker group's first line). The fake below is
+# therefore transcribed from a DOM dump of the user's own logged-in tab on 2026-09-06 rather
+# than from what the code expects to find:
+#
+#   [data-testid="composer-intelligence-picker-content"] innerText lines:
+#     0 "6"                                              <- the MODEL BADGE, where the tier used
+#     1 "Pro"                                               to be. This one line is the entire
+#     2 "Pro, 5 of 5."                                      regression.
+#     3 "Use Left and Right arrow keys to adjust power."
+#     4 "Latest"      role=menuitemradio aria-checked=true
+#     5 "GPT-5.6 Sol" role=menuitemradio aria-checked=false
+#     6 "GPT-5.5"     role=menuitemradio aria-checked=false
+#   span[role=slider] aria-valuemin=0 aria-valuemax=4 aria-valuenow=4, textContent "", no
+#     aria-valuetext. Its [role=menuitem] ancestor: aria-label="Power", innerText AND textContent
+#     both EMPTY, aria-describedby="_r_cn_ _r_co_" -> "Pro, 5 of 5." and the arrow-keys prose.
+#   the composer switcher button: "6" while closed, "Thinking effort" while its menu is OPEN.
+#   _submenu_count_js() -> 0.
+#
+# Measured against the pre-fix code, live: _cand_labels_js() -> ["6"], _model_verdict(["6"],
+# "Pro") -> (False, '6'), _select_model(c, "Pro") -> (False, '6') in 4.0s. Every consult refused.
+
+class _FakeGpt6PickerClient:
+    """The 2026-09-06 GPT-6 composer. `describedby=False` drops the aria-describedby source so the
+    ", N of M." line scan (source 2 of _slider_state_label's chain) has to carry the read alone —
+    which is also the pre-GPT-6 shape, where that announcement WAS line 0."""
+
+    LABELS = ["Instant", "Medium", "High", "Extra High", "Pro"]
+    FAMILIES = ["Latest", "GPT-5.6 Sol", "GPT-5.5"]
+
+    def __init__(self, start=4, checked="Latest", describedby=True, radios=True):
+        self.now = start
+        self.checked = checked
+        self.describedby = describedby
+        self.radios = radios
+        self.menu_open = False
+        self.key_presses = 0
+        self.family_clicks = 0
+
+    def _tier(self):
+        return self.LABELS[self.now]
+
+    def _announce(self):
+        return "%s, %d of 5." % (self._tier(), self.now + 1)
+
+    def _group_lines(self):
+        # NOTE the ordering: the badge first, the bare tier second, the announcement THIRD. The
+        # tier is not at any fixed index, which is the whole point.
+        lines = ["6", self._tier(), self._announce(),
+                 "Use Left and Right arrow keys to adjust power."]
+        if self.radios:
+            lines += list(self.FAMILIES)
+        return lines
+
+    def eval(self, expr):
+        if "var FAMS=" in expr:
+            if not self.radios or not self.menu_open:
+                return []
+            if "var T=" in expr:                                # _click_family_js
+                want = _json.loads(_re.search(r'var T=(".*?");', expr).group(1))
+                for f in self.FAMILIES:
+                    if f.lower() == want:
+                        self.family_clicks += 1
+                        self.checked = f
+                        return True
+                return False
+            return [{"label": f, "checked": f == self.checked} for f in self.FAMILIES]
+        if "aria-valuenow" in expr:                             # _SLIDER_STATE_JS
+            if not self.menu_open:
+                return None
+            lines = self._group_lines()
+            return {"first": lines[0], "lines": lines,
+                    # the Power menuitem's own text is EMPTY on this build; everything the tier
+                    # can be read from lives behind aria-describedby.
+                    "descs": ([self._announce(),
+                               "Use Left and Right arrow keys to adjust power."]
+                              if self.describedby else []),
+                    "btnLabel": "Thinking effort",              # the OPEN button, not a tier
+                    "now": self.now, "min": 0, "max": 4}
+        if ".focus();return true" in expr:                      # _SLIDER_FOCUS_JS
+            return self.menu_open
+        if "pointerover" in expr:                                # _open_submenu_js
+            return False
+        if 'aria-haspopup="menu"' in expr:                       # _submenu_count_js -> 0 live
+            return 0
+        if "menuitemradio" in expr:                              # _click_item_js: no flat tier item
+            return False
+        if "var EL=c[" in expr:                                   # _open_cand_by_label_js
+            if _wanted_label(expr) != "6":
+                return None
+            self.menu_open = True
+            return "6"
+        if ".map(function(b){" in expr:                           # _cand_labels_js
+            return ["Thinking effort"] if self.menu_open else ["6"]
+        return 1
+
+    def key(self, key_name, code, keycode):
+        self.key_presses += 1
+        if key_name == "Escape":
+            self.menu_open = False
+            return
+        if not self.menu_open:
+            return
+        if key_name == "ArrowLeft":
+            self.now = max(0, self.now - 1)
+        elif key_name == "ArrowRight":
+            self.now = min(4, self.now + 1)
+
+
+def test_gpt6_picker_confirms_pro_where_it_already_sits(monkeypatch):
+    """The live tab verbatim: slider at 4, family Latest. Pre-fix this returned (False, '6') and
+    refused to send; it must confirm without touching anything."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeGpt6PickerClient(start=4, checked="Latest")
+    pick = _CDP._select_model(client, "Pro", "Latest")
+    assert (pick.confirmed, pick.shown) == (True, "Pro")
+    assert client.now == 4
+    assert pick.badge == "6", "the receipt must record WHICH MODEL answered, not just the tier"
+
+
+def test_gpt6_picker_walks_the_slider_to_pro(monkeypatch):
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeGpt6PickerClient(start=2, checked="Latest")   # High
+    pick = _CDP._select_model(client, "Pro", "Latest")
+    assert (pick.confirmed, pick.shown) == (True, "Pro")
+    assert client.now == 4
+
+
+def test_gpt6_tier_survives_a_missing_describedby(monkeypatch):
+    """Source 1 of the chain gone: the tier is then only in the group's ', N of M.' line — which
+    on this build is line 2, not line 0, so it has to be FOUND by shape, not read by index."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeGpt6PickerClient(start=2, checked="Latest", describedby=False)
+    pick = _CDP._select_model(client, "Pro", "Latest")
+    assert (pick.confirmed, pick.shown) == (True, "Pro")
+
+
+def test_gpt6_family_already_checked_is_not_clicked(monkeypatch):
+    """A checked Radix radio must be left alone: clicking one is not a guaranteed no-op (it
+    commits the menu closed), and there is nothing to change."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeGpt6PickerClient(start=4, checked="Latest")
+    pick = _CDP._select_model(client, "Pro", "Latest")
+    assert pick.confirmed is True
+    assert client.family_clicks == 0, "no gesture may be dispatched at an already-correct family"
+
+
+def test_gpt6_family_is_switched_off_gpt55_and_confirmed(monkeypatch):
+    """The hole this closes: 'Pro tier on GPT-5.5' passes every tier check while being a
+    different model than the receipt names."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeGpt6PickerClient(start=4, checked="GPT-5.5")
+    pick = _CDP._select_model(client, "Pro", "Latest")
+    assert (pick.confirmed, pick.shown) == (True, "Pro")
+    assert client.family_clicks == 1
+    assert client.checked == "Latest", "the click must be confirmed by re-reading aria-checked"
+
+
+def test_gpt6_missing_family_fails_closed_and_names_what_is_offered(monkeypatch):
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeGpt6PickerClient(start=4, checked="Latest")
+    pick = _CDP._select_model(client, "Pro", "GPT-7")
+    assert pick.confirmed is False, "an unavailable family must refuse, exactly like a tier miss"
+    assert pick.error and "GPT-7" in pick.error
+    for offered in _FakeGpt6PickerClient.FAMILIES:
+        assert offered in pick.error, "the error must name the families the account actually has"
+    assert client.family_clicks == 0
+    assert client.now == 4, "a family refusal must not leave the tier moved"
+
+
+def test_gpt6_unreachable_tier_restores_the_slider(monkeypatch):
+    """The side-effect-free property, on the new DOM: a target this account does not have must
+    leave the slider exactly where the walk found it, never at whatever tier it gave up on."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeGpt6PickerClient(start=3, checked="Latest")   # Extra High
+    pick = _CDP._select_model(client, "Ultra", "Latest")
+    assert pick.confirmed is False
+    assert client.now == 3, "a doomed walk must restore the entry position"
+    assert pick.shown == "Extra High", "and report the tier the composer is actually left on"
+
+
+def test_old_build_without_model_radios_ignores_the_family(monkeypatch):
+    """A pre-GPT-6 account has no radio group at all. Enforcing a family there must be a SILENT
+    no-op — never a refusal over a control that build does not render."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeSliderClient(start=2, keys_work=True)          # the 2026-08-18 build
+    pick = _CDP._select_model(client, "Pro", "Latest")
+    assert (pick.confirmed, pick.shown) == (True, "Pro")
+    assert pick.error is None
+
+
+def test_family_unverifiable_does_not_confirm(monkeypatch):
+    """A composer already sitting on the target tier whose picker never opens must NOT report
+    success while enforcing a family: the radios are only readable inside an open menu, so
+    "the tier looks right" is not evidence about the model. Fail-open in the middle of a
+    fail-closed guard is the whole bug class this change exists to remove."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeAlwaysMismatchedOpenClient()          # every open lands on the wrong label
+    client.eval = _never_opens(client)
+    pick = _CDP._select_model(client, "Extra High", "Latest")
+    assert pick.confirmed is False
+    assert pick.error and "Latest" in pick.error
+    assert client.slider_reads == 0
+
+
+def _never_opens(client):
+    """`_FakeAlwaysMismatchedOpenClient` with its switcher label made to equal the target tier, so
+    the tier verdict passes on the very first read while every open still misses."""
+    inner = client.eval
+
+    def eval_(expr):
+        if ".map(function(b){" in expr:
+            return ["Extra High"]
+        if "var FAMS=" in expr:
+            return []
+        return inner(expr)
+    return eval_
+
+
+def test_family_skip_disables_the_check(monkeypatch):
+    """`CGC_MODEL_FAMILY=skip` mirrors `CGC_MODEL=skip`: the dimension is simply not enforced."""
+    monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
+    client = _FakeGpt6PickerClient(start=4, checked="GPT-5.5")
+    pick = _CDP._select_model(client, "Pro", "skip")
+    assert pick.confirmed is True
+    assert client.checked == "GPT-5.5" and client.family_clicks == 0
 
 
 if __name__ == "__main__":
