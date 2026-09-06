@@ -58,7 +58,7 @@ Note: ChatGPT's browse tool collapses newlines reading gist *raw* URLs, so it ma
 
 ### The monitor (wake)
 
-The default CDP backend uses a detached `wait` process (polls every ~20 s, re-invokes the agent on completion). The MCP fallback instead uses an agent-side **`ScheduleWakeup` poll loop** whose cadence comes from `prep`'s wake-plan (`--expect-minutes`, default 25 — sized for GPT-5.6 Pro's ~25-min reasoning — → first wake ≈21 min, then re-poll); `poll_js` is line-anchored (standalone `BEGIN_RESPONSE`/`END_RESPONSE` lines + not generating) and detects login/captcha/rate-limit blockers. (Authoritative wake numbers live in `prep`'s state output, not in prose.)
+The default CDP backend uses a detached `wait` process (polls every ~20 s, re-invokes the agent on completion). The MCP fallback instead uses an agent-side **`ScheduleWakeup` poll loop** whose cadence comes from `prep`'s wake-plan (`--expect-minutes`, default 25 — sized for a GPT-6 Astra Pro round; measured p50 across 63 prior 5.6 rounds was ~33 min — → first wake ≈21 min, then re-poll); `poll_js` is line-anchored (standalone `BEGIN_RESPONSE`/`END_RESPONSE` lines + not generating) and detects login/captcha/rate-limit blockers. (Authoritative wake numbers live in `prep`'s state output, not in prose.)
 
 ### Large answers (the 50 000-char tool-output cap)
 
@@ -74,7 +74,7 @@ The default CDP backend uses a detached `wait` process (polls every ~20 s, re-in
 | `scripts/cdp_launch.sh` | One-time dedicated debug-Chrome launcher (login probe + loopback origin) |
 | `scripts/retrieval_window.js` | MCP-fallback DOM-windowing state machine (`install`/`show(i)`/`status`/`restore`/`setTarget`) |
 | `references/injection-and-prompting.md` | Full info-injection catalog + per-scenario prompt templates + output contract (composed by ChatGPT; read when building a non-trivial consult) |
-| `references/gpt-5.6-prompting-principles.md` | OpenAI's official GPT-5.x prompt guidance distilled for the GPT-5.6 family — the outcome-first structure the live `PROMPT_TEMPLATE` follows |
+| `references/gpt-6-astra-prompting-principles.md` | OpenAI's "Using GPT-6 Astra" guidance distilled — the outcome-first structure the live `PROMPT_TEMPLATE` follows, plus the two Astra deltas it encodes (unattended authorization, instruction precedence over browsed files) |
 | `README.md` | This file |
 
 ## Safety

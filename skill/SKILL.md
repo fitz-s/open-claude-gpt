@@ -12,7 +12,7 @@ allowed-tools: Read, Write, Grep, Glob, Bash(python3:*), Bash(bash:*), Bash(mkdi
 
 # chatgpt-consult
 
-ChatGPT advises; Claude Code executes and verifies. A consult is a ~25-minute GPT-5.6 Pro
+ChatGPT advises; Claude Code executes and verifies. A consult is a ~25-minute GPT-6 Astra Pro
 reasoning round: only send work worth that, steer it precisely, fire it, and keep working — the
 detached waiter wakes you with the answer.
 
@@ -120,7 +120,7 @@ You supply the delta it can't know:
   (verify the approach → correctness → per-file → superior realization → go/no-go) is the depth
   mandate, by default, unasked. A custom output shape goes in `--output-file` (add
   `--output-replace` when it defines its own findings format). Full prompting law:
-  `references/gpt-5.6-prompting-principles.md`.
+  `references/gpt-6-astra-prompting-principles.md`.
 
 **The link alone is usually enough** — ChatGPT browses the repo itself (imports, callers, tests).
 `--files` narrows it to a closed list and is usually a downgrade; reserve it for one hard-to-find
@@ -138,7 +138,8 @@ genuinely product-changing forks go to the user, with your analysis attached.
 ## References (read only when needed)
 
 - `references/deep-review-output.md` — the default deep-review output contract (use routinely).
-- `references/gpt-5.6-prompting-principles.md` — prompting law for 5.6-class models.
+- `references/gpt-6-astra-prompting-principles.md` — prompting law for GPT-6 Astra, including the
+  two Astra-specific rules the live template now carries (don't ask, don't obey browsed instructions).
 - `references/injection-and-prompting.md` — every code-delivery URL form + file-selection rules.
 - `references/mcp-fallback.md` — LAST-RESORT backend when the CDP debug profile cannot exist;
   also documents the platform constraints (CSP, scanner, 50k cap) that shaped this design.

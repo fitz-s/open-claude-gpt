@@ -74,7 +74,9 @@ DAEMON_GRACE_S = 60
 
 # THE timeout — the only deadline in this system.
 #
-# A GPT-5.6 Pro round reasons ~25 minutes. That is how long the work TAKES; it is an expectation,
+# A GPT-6 Astra Pro round reasons ~25 minutes; this store's own completion latency over 63
+# GPT-5.6 rounds was p50 1993s / p90 4802s, so ~25 min is the shape of a typical round, not its
+# ceiling. That is how long the work TAKES; it is an expectation,
 # not a deadline, and nothing may be killed for reaching it. A deadline answers a different
 # question: past what point is waiting no longer explained by the work? An hour. Beyond that the
 # answer is not late — something is broken — and the right response is to read the job log, not to
@@ -84,7 +86,7 @@ DAEMON_GRACE_S = 60
 # wrong name: a 1500s per-consult budget (an expectation) and an 870s agent window (an observation
 # interval). Both killed healthy consults for the crime of taking as long as they take.
 #
-# 90 min, not 60: a deep GPT-5.6 Pro round — especially a follow-up that triggers fresh re-reasoning
+# 90 min, not 60: a deep GPT-6 Astra Pro round — especially a follow-up that triggers fresh re-reasoning
 # — was observed to think for ~62 min before emitting its answer. At the old 3600s the waiter timed
 # out minutes BEFORE the answer landed, stranded the round as possibly_accepted, and only the
 # read-only auto-retrieve recovered it (a wasted hour + a detour). The completion signal itself is

@@ -36,7 +36,8 @@ Any of these can be set in the environment (they win over the config file), in a
 | `CGC_PROJECT_URL` | `https://chatgpt.com/` (new chat) | URL a fresh consult opens. Set to **your** ChatGPT project (`…/g/g-p-<id>-<slug>/project`) to keep every consult grouped in one project. Easiest: `cgc set-project <url>` (above). |
 | `CGC_CONFIG` | `~/.config/cgc/config` | Path to the persistent config file that `cgc set-project` writes and every script reads. |
 | `CGC_AUTO_MODEL` | `1` | Auto model-selection toggle (see below). `1`/`true`/`on` = pick `CGC_MODEL` and fail closed if unavailable; `0`/`false`/`off` = don't touch the picker. |
-| `CGC_MODEL` | `Pro` | Which tier auto-select targets (only used when `CGC_AUTO_MODEL` is on). ChatGPT's current composer offers `Instant / Medium / High / Extra High / Pro` on a power slider; a `Pro*` target is satisfied by any Pro tier the build offers (`Pro`, or `Pro Extended` on older builds) but never by a weaker tier. Per-consult override: `--model "High"` / `--model skip`. |
+| `CGC_MODEL` | `Pro` | Which **reasoning tier** auto-select targets (only used when `CGC_AUTO_MODEL` is on). ChatGPT's composer offers `Instant / Medium / High / Extra High / Pro` on a power slider; a `Pro*` target is satisfied by any Pro tier the build offers (`Pro`, or `Pro Extended` on older builds) but never by a weaker tier. This is the tier only — since GPT-6 it no longer says *which model* answered; see `CGC_MODEL_FAMILY`. Per-consult override: `--model "High"` / `--model skip`. |
+| `CGC_MODEL_FAMILY` | `Latest` | Which **model** to pin, a separate dimension from the tier. GPT-6's composer (shipped 2026-09-03) lists the model itself as radio items beside the power slider (`Latest` / `GPT-5.6 Sol` / `GPT-5.5`), so "Pro tier on GPT-5.5" is reachable and would otherwise satisfy every tier check while answering on a different model than the receipt names. Selected before the tier (changing the model re-renders the slider) and fails closed, naming the families the account actually offers. A build with no such radios ignores this entirely — an older account is never refused over a control it does not have. `skip` disables the check; per-consult override: `--model-family "GPT-5.6 Sol"` / `--model-family skip`. |
 | `CGC_PORT` | `9333` | Remote-debugging port of the dedicated Chrome. Must be free. |
 | `CGC_PROFILE` | `~/.cgc-chrome` | Dedicated Chrome profile dir. Kept separate from your normal Chrome (CDP is disallowed on the default profile since Chrome 136). |
 | `CGC_CHROME` | auto-detect | Explicit browser binary. Auto-detected across Chrome/Chromium/Edge on macOS + Linux; set only if detection fails. |
@@ -49,27 +50,40 @@ Any of these can be set in the environment (they win over the config file), in a
 | `CLAUDE_SKILLS_DIR` | `~/.claude/skills` | Where `install.sh` puts the skill. |
 
 Any variable can also be overridden per-invocation with a flag, e.g. `--port`,
-`--project-url`, `--model` on the relevant subcommand. The flag wins over the env
+`--project-url`, `--model`, `--model-family` on the relevant subcommand. The flag wins over the env
 var; the env var wins over the built-in default.
 
 ### Auto model-selection (toggle)
 
 ChatGPT sometimes auto-downgrades a chat to a lighter model; a consult would then
-silently get a weaker answer. With `CGC_AUTO_MODEL=1` (default) the composer's
-model tier is **selected before every send and fails closed if it can't be
-picked** — so a send either uses the tier you asked for or is refused, instead of
-silently downgrading. This is where you actually spend your ChatGPT Pro plan's
-usage allowance: set `CGC_MODEL` to the strongest tier your plan includes, subject
-to whatever limits/availability your plan has.
+silently get a weaker answer. With `CGC_AUTO_MODEL=1` (default) **both** halves of
+"which model answered" are selected before every send and fail closed if they
+can't be picked — so a send either runs on what you asked for or is refused,
+instead of silently downgrading:
+
+- the **reasoning tier** (`CGC_MODEL`, default `Pro`) — the power slider, and
+- the **model** (`CGC_MODEL_FAMILY`, default `Latest`) — the radio items GPT-6's
+  composer added beside that slider on 2026-09-03.
+
+The family matters because the tier alone stopped identifying the model: `Pro` on
+`GPT-5.5` passes every tier check while being a different model than the consult
+claims to have used. The family is picked first (changing it re-renders the
+slider), and a build that has no such radios simply ignores it.
+
+This is where you actually spend your ChatGPT Pro plan's usage allowance: set
+`CGC_MODEL` to the strongest tier your plan includes, subject to whatever
+limits/availability your plan has.
 
 ```bash
-CGC_AUTO_MODEL=1  CGC_MODEL="Pro"   # on: enforce Pro (default)
-CGC_AUTO_MODEL=1  CGC_MODEL="High"           # on: enforce a tier your plan has
-CGC_AUTO_MODEL=0                             # off: send on whatever is shown
+CGC_AUTO_MODEL=1  CGC_MODEL="Pro"   CGC_MODEL_FAMILY="Latest"       # default: newest model, Pro tier
+CGC_AUTO_MODEL=1  CGC_MODEL="High"                                  # a tier your plan has
+CGC_AUTO_MODEL=1  CGC_MODEL_FAMILY="GPT-5.6 Sol"                    # pin an older model deliberately
+CGC_AUTO_MODEL=1  CGC_MODEL_FAMILY=skip                             # tier enforced, model left alone
+CGC_AUTO_MODEL=0                                                    # off: send on whatever is shown
 ```
 
-Off is equivalent to `--model skip`. The per-consult `--model` flag overrides both
-for a single call. Turn it off if you don't have a Pro plan and don't want the
+Off is equivalent to `--model skip`, and disables the family check with it. The
+per-consult `--model` / `--model-family` flags override both for a single call. Turn it off if you don't have a Pro plan and don't want the
 fail-closed guard, or if you manage the model manually in the ChatGPT UI.
 
 ### Private repos (only with a ChatGPT GitHub connector)
@@ -164,7 +178,7 @@ unfenced standalone line) breaks answer retrieval.
 `--timeout` on `cgc enqueue`, `cgc await`, `cdp_consult.py wait`, and `followup
 --watch`).
 
-It is not a budget for the consult. A GPT-5.6 Pro round reasons for about 25 minutes;
+It is not a budget for the consult. A GPT-6 Astra Pro round reasons for about 25 minutes;
 that is how long the work *takes* — an expectation, not a deadline — and nothing is
 killed for reaching it. The deadline answers a different question: past what point is
 waiting no longer explained by the work? Beyond 90 minutes the answer is not late,
@@ -190,7 +204,7 @@ Deeper prompt/injection guidance the templates are derived from lives in
 [`skill/references/`](../skill/references/):
 
 - `injection-and-prompting.md` — the URL catalog (every GitHub injection method, when to use it, failure modes) and file-selection rules.
-- `gpt-5.6-prompting-principles.md` — prompting principles for the current model (GPT-5.6 family).
+- `gpt-6-astra-prompting-principles.md` — prompting principles for the current model (GPT-6 Astra).
 - `deep-review-output.md` — the review output contract.
 - `mcp-fallback.md` — the zero-setup MCP path (see below).
 

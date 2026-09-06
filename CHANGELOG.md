@@ -6,6 +6,102 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — GPT-6 broke the picker, and pinning a tier stopped meaning pinning a model
+
+OpenAI shipped GPT-6 ("GPT-6 Astra") on 2026-09-03 and the composer's picker changed under us.
+Measured live on 2026-09-06 against a logged-in Pro tab: `_select_model(c, "Pro")` returned
+`(False, '6')` in 4.0s. Every consult refused to send. The guard failed closed, which is the
+behaviour it was built for — but it failed closed on a perfectly good Pro tab, which is a total
+outage of the tool.
+
+- **The tier is now read by identity, never by line position.** The picker group's first line used
+  to *be* the tier announcement (`"Pro, 5 of 5."`); on the GPT-6 build it is the model badge
+  (`"6"`), and the tier moved to line 2. `_slider_label("6")` returned `"6"`, `_matches("6", "Pro")`
+  is false, so the walk matched at no slider position and the flat-click and submenu fallbacks found
+  nothing. The tier now comes from the slider control's OWN `aria-describedby` — on this build the
+  `[role=menuitem]` wrapper's `innerText` and `textContent` are both empty, so that description is
+  the only place the tier is written down at all — falling back to a shape-validated scan for the
+  `", N of M."` announcement wherever it sits, then the legacy bare form, and only last of all to
+  the switcher button, which now reads `"Thinking effort"` while its menu is open and can no longer
+  be trusted to name a tier. Every pre-GPT-6 shape still resolves; the fixtures for them are kept.
+- **Confirmation moved with the DOM.** The switcher button used to carry the tier, so scanning
+  button labels could confirm one. It now shows the model badge, so that scan can never confirm and
+  would refuse a correctly pinned Pro forever. A slider walk that matched is now a confirmation in
+  its own right — it only matches on a label taken from the control's own accessibility
+  announcement, which is a stronger source than the button ever was. The confirming read also moved
+  to *after* the menu closes, so the verdict describes the resting composer rather than a transient
+  `"Thinking effort"`.
+
+### Added — the model itself is pinned now, not just how hard it thinks
+
+The same menu that carries the power slider now carries the model as radio items (`Latest`,
+`GPT-5.6 Sol`, `GPT-5.5`), and nothing in this tool asserted which one was checked. "Pro tier on
+GPT-5.5" satisfied every check we made while being a different model than the receipt named — the
+core promise, broken quietly. The rule this file used to state, *"Model must never be touched (it
+picks the family, not the tier)"*, was true only while the model was unselectable; it is now
+exactly backwards and has been rewritten in place.
+
+- **`CGC_MODEL_FAMILY`** (default `Latest`, `skip` to disable, `--model-family` per consult) is
+  selected with the tier's own discipline: fail closed, and name the families the account actually
+  offers when the target is absent. It is picked FIRST, because changing the model re-renders the
+  picker and can reset the slider.
+- **An already-correct model is not clicked.** Clicking a checked Radix radio is not a guaranteed
+  no-op — it commits the menu closed, which would drop the slider out from under the tier walk.
+- **A build with no model radios is a silent no-op, never a refusal.** ChatGPT is mid-rollout and
+  older accounts still serve the pre-GPT-6 picker; refusing them over a control their composer does
+  not render would be a second outage in the shape of a fix.
+- **"The tier already looks right" is not evidence about the model.** With a family enforced, a
+  run whose picker never opens cannot confirm: the radios are only readable inside an open menu,
+  so that path refuses rather than reporting success on an unverified model — a fail-open in the
+  middle of a fail-closed guard is the bug class this whole change exists to remove.
+- **`submit` now reports `modelBadge`** — what the composer's switcher read at send time (`"6"`
+  here) — so a receipt says which model answered, not only how hard it thought. `cgc doctor`'s
+  config line reports the family alongside the tier for the same reason.
+- The new fixtures are transcribed from a DOM dump of the live tab rather than from what the code
+  expects to find, and were checked to fail against the pre-fix parser. The last picker break
+  shipped green precisely because the fixtures agreed with the bug.
+
+### Changed — the prompt now defends against what Astra does differently
+
+Retargeting the prompting layer from GPT-5.6 to GPT-6 Astra is mostly a rename, except for two
+documented behaviour changes that this system is unusually exposed to. Both come from OpenAI's own
+"Using GPT-6 Astra" guide (fetched 2026-09-06); `references/gpt-5.6-prompting-principles.md` is
+renamed to `references/gpt-6-astra-prompting-principles.md` and records an accept-or-reject verdict,
+with the reasoning, for every block that guide recommends.
+
+- **Astra asks clarifying questions where 5.6 assumed.** The guide says it is "more likely to ask the
+  user a question when additional input could materially change the result," which "can cause it to
+  stop when the user may expect it to make reasonable assumptions and persist." A consult is
+  unattended by construction: nobody is reading the thread for the ~25 minutes it runs, so a
+  clarifying question is not a slower answer, it is a round that returns nothing. The stop rule now
+  says so outright and grants the authorization explicitly, replacing the old rule rather than
+  stacking on it.
+- **Our own repository is an instruction surface, and Astra reads it more literally.** The guide
+  warns that Astra "can be more sensitive to instructions contained in skills and other files, such
+  as `AGENTS.md`," and strongly recommends auditing what the model can reach. Every consult ships
+  public GitHub links to this repo — which contains `SKILL.md` and `ACTIVATION.md`, both written as
+  imperatives aimed at an agent. The prompt now states that instructions found in anything browsed
+  are evidence to review, never directives to follow.
+- **Style guidance was adopted; brevity guidance was not.** Astra defaults to heavier formatting and
+  stock phrasing, and the guide ships blocks for both. The 5.6 rule that a brevity instruction makes
+  the model substitute a shorter artifact for the one you asked for still stands and was not
+  retracted, so the form half is in and the length half stays out.
+- **Not adopted, with the reasoning recorded rather than the suggestion silently dropped:** the
+  subagent-delegation and testing-verification blocks (no subagents and no test runner exist on the
+  ChatGPT side of a consult), and async tool calling, mid-turn steering, `configuration_update`, the
+  dropped `none` reasoning effort and the removed sampling parameters (all Responses-API mechanisms;
+  we drive a web tab and send no request body).
+- **The ~25-minute sizing is unchanged, and now says where it comes from.** OpenAI publishes no
+  per-turn figure for either model; the one official latency number (OSWorld 2.0, ~40 min/task for
+  Astra against ~75 for Sol) measures multi-step agentic tasks and is the wrong quantity for sizing a
+  chat timeout. This store's own 63 completed rounds are the real evidence: p50 1993s, p90 4802s.
+  Prose that cited "a GPT-5.6 Pro round" as the justification now cites that instead.
+
+Note for anyone reading the 2026-07 entry below: its claim that model selection "targets the switcher
+*label*, so it survived the 5.5→5.6 swap untouched" was falsified by the GPT-6 build documented above.
+Addressing by label survived a model swap; it did not survive the picker being redesigned.
+
+
 ### Changed — work that makes no progress now costs nothing and says nothing
 
 A first-principles efficiency pass, driven by counting what the running system actually did rather
