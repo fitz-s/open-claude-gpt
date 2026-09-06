@@ -24,6 +24,21 @@ _spec.loader.exec_module(_CDP)
 
 _WANT_RE = _re.compile(r'var want=(".*?");')
 
+# The tier read and the family read became ONE snapshot on 2026-09-06 (_PICKER_STATE_JS), because
+# a (family, tier) pair stitched from two Runtime.evaluate round-trips is a pair that was never
+# simultaneously true. Every fake below therefore answers the slider read with a `fam` field.
+#
+#   _LEGACY_FAM  a picker that positively renders NO family control: it exists (owners == 1), its
+#                radio list read back (an empty list, not null), and there is no radio-group
+#                scaffolding either. This is the pre-GPT-6 composer, and the ONLY shape that earns
+#                the silent family exemption. Note it is NOT the same value as an unreadable probe
+#                — that distinction is the whole of defect 1.
+#   _NO_PICKER   no intelligence picker is open at all (a mode-toggle menu, or a closed composer).
+_LEGACY_FAM = {"owners": 1, "menus": 1, "radios": [], "scaffold": 0}
+_NO_PICKER = {"fam": {"owners": 0, "menus": 1, "radios": None, "scaffold": 0},
+              "first": "", "lines": [], "descs": [], "btnLabel": "",
+              "now": None, "min": None, "max": None}
+
 
 def _pick(client, target, family=None):
     """_select_model returns a _ModelPick (confirmed/shown/badge/error) as of 2026-09-06 — it now
@@ -109,11 +124,15 @@ class _FakeSliderClient:
         return self.LABELS[self.now]
 
     def eval(self, expr):
-        if "aria-valuenow" in expr:                      # _SLIDER_STATE_JS
+        if "KeyboardEvent" in expr:                        # _DISMISS_JS
+            # These fakes model builds whose Escape genuinely dismisses (verified pre-GPT-6): by
+            # the time _close_menus checks, nothing reads aria-expanded any more.
+            return 0
+        if "aria-valuenow" in expr:                      # _PICKER_STATE_JS
             if not self.menu_open:
                 return None
             return {"first": "%s, %d of 5." % (self._label(), self.now + 1),
-                    "now": self.now, "min": 0, "max": 4}
+                    "fam": _LEGACY_FAM, "now": self.now, "min": 0, "max": 4}
         if ".focus();return true" in expr:                # _SLIDER_FOCUS_JS
             return self.menu_open
         if "pointerover" in expr:                          # _open_submenu_js — none in this build
@@ -182,6 +201,10 @@ class _FakeFlatMenuClient:
         self.selected = False
 
     def eval(self, expr):
+        if "KeyboardEvent" in expr:                        # _DISMISS_JS
+            # These fakes model builds whose Escape genuinely dismisses (verified pre-GPT-6): by
+            # the time _close_menus checks, nothing reads aria-expanded any more.
+            return 0
         if "aria-valuenow" in expr:                         # no slider in this build
             return None
         if ".focus();return true" in expr:
@@ -240,11 +263,15 @@ class _FakeUnreachableTargetClient:
         return self.LABELS[self.now]
 
     def eval(self, expr):
-        if "aria-valuenow" in expr:                          # _SLIDER_STATE_JS
+        if "KeyboardEvent" in expr:                        # _DISMISS_JS
+            # These fakes model builds whose Escape genuinely dismisses (verified pre-GPT-6): by
+            # the time _close_menus checks, nothing reads aria-expanded any more.
+            return 0
+        if "aria-valuenow" in expr:                          # _PICKER_STATE_JS
             if self.opened_i != 1:
-                return None                                    # mode-toggle menu has no slider
+                return _NO_PICKER                              # mode-toggle menu has no slider
             return {"first": "%s, %d of 5." % (self._label(), self.now + 1),
-                    "now": self.now, "min": 0, "max": 4}
+                    "fam": _LEGACY_FAM, "now": self.now, "min": 0, "max": 4}
         if ".focus();return true" in expr:                    # _SLIDER_FOCUS_JS
             return self.opened_i == 1
         if "pointerover" in expr:                              # _open_submenu_js
@@ -316,6 +343,10 @@ class _FakeLaggingSliderClient:
         return self.LABELS[now]
 
     def eval(self, expr):
+        if "KeyboardEvent" in expr:                        # _DISMISS_JS
+            # These fakes model builds whose Escape genuinely dismisses (verified pre-GPT-6): by
+            # the time _close_menus checks, nothing reads aria-expanded any more.
+            return 0
         if "aria-valuenow" in expr:
             if not self.menu_open:
                 return None
@@ -328,7 +359,7 @@ class _FakeLaggingSliderClient:
             else:
                 now = self.now
             return {"first": "%s, %d of 5." % (self._label(now), now + 1),
-                    "now": now, "min": 0, "max": 4}
+                    "fam": _LEGACY_FAM, "now": now, "min": 0, "max": 4}
         if ".focus();return true" in expr:
             return self.menu_open
         if "pointerover" in expr:
@@ -404,9 +435,13 @@ class _FakeAlwaysMismatchedOpenClient:
         self.slider_reads = 0
 
     def eval(self, expr):
+        if "KeyboardEvent" in expr:                        # _DISMISS_JS
+            # These fakes model builds whose Escape genuinely dismisses (verified pre-GPT-6): by
+            # the time _close_menus checks, nothing reads aria-expanded any more.
+            return 0
         if "aria-valuenow" in expr:
             self.slider_reads += 1
-            return {"first": "Pro, 5 of 5.", "now": 4, "min": 0, "max": 4}
+            return {"first": "Pro, 5 of 5.", "fam": _LEGACY_FAM, "now": 4, "min": 0, "max": 4}
         if ".focus();return true" in expr:
             return True
         if "pointerover" in expr:
@@ -457,11 +492,15 @@ class _FakeFlappingCandidatesClient:
         return self.LABELS[self.now]
 
     def eval(self, expr):
-        if "aria-valuenow" in expr:                          # _SLIDER_STATE_JS
+        if "KeyboardEvent" in expr:                        # _DISMISS_JS
+            # These fakes model builds whose Escape genuinely dismisses (verified pre-GPT-6): by
+            # the time _close_menus checks, nothing reads aria-expanded any more.
+            return 0
+        if "aria-valuenow" in expr:                          # _PICKER_STATE_JS
             if not self.menu_open or self.opened_chat:
-                return None
+                return _NO_PICKER
             return {"first": "%s, %d of 5." % (self._tier_label(), self.now + 1),
-                    "now": self.now, "min": 0, "max": 4}
+                    "fam": _LEGACY_FAM, "now": self.now, "min": 0, "max": 4}
         if ".focus();return true" in expr:                    # _SLIDER_FOCUS_JS
             return self.menu_open and not self.opened_chat
         if "pointerover" in expr:                              # _open_submenu_js
@@ -535,10 +574,15 @@ class _FakeBareLabelSliderClient:
         return self.LABELS[self.now]
 
     def eval(self, expr):
-        if "aria-valuenow" in expr:                        # _SLIDER_STATE_JS
+        if "KeyboardEvent" in expr:                        # _DISMISS_JS
+            # These fakes model builds whose Escape genuinely dismisses (verified pre-GPT-6): by
+            # the time _close_menus checks, nothing reads aria-expanded any more.
+            return 0
+        if "aria-valuenow" in expr:                        # _PICKER_STATE_JS
             if not self.menu_open:
                 return None
-            return {"first": self._label(), "now": self.now, "min": 0, "max": 4}
+            return {"first": self._label(), "fam": _LEGACY_FAM,
+                    "now": self.now, "min": 0, "max": 4}
         if ".focus();return true" in expr:
             return self.menu_open
         if "pointerover" in expr:
@@ -593,10 +637,15 @@ class _FakeGroupMissingButtonLabelClient:
         return self.LABELS[self.now]
 
     def eval(self, expr):
-        if "aria-valuenow" in expr:                        # _SLIDER_STATE_JS
+        if "KeyboardEvent" in expr:                        # _DISMISS_JS
+            # These fakes model builds whose Escape genuinely dismisses (verified pre-GPT-6): by
+            # the time _close_menus checks, nothing reads aria-expanded any more.
+            return 0
+        if "aria-valuenow" in expr:                        # _PICKER_STATE_JS
             if not self.menu_open:
                 return None
-            return {"first": "", "btnLabel": self._label(), "now": self.now, "min": 0, "max": 4}
+            return {"first": "", "btnLabel": self._label(), "fam": _LEGACY_FAM,
+                    "now": self.now, "min": 0, "max": 4}
         if ".focus();return true" in expr:
             return self.menu_open
         if "pointerover" in expr:
@@ -687,24 +736,34 @@ class _FakeGpt6PickerClient:
             lines += list(self.FAMILIES)
         return lines
 
+    def _fam(self):
+        if not self.menu_open:
+            return {"owners": 0, "menus": 0, "radios": None, "scaffold": 0}
+        if not self.radios:
+            return dict(_LEGACY_FAM)
+        return {"owners": 1, "menus": 1, "scaffold": 1,
+                "radios": [{"label": f, "checked": f == self.checked} for f in self.FAMILIES]}
+
     def eval(self, expr):
-        if "var FAMS=" in expr:
+        if "KeyboardEvent" in expr:                        # _DISMISS_JS
+            # These fakes model builds whose Escape genuinely dismisses (verified pre-GPT-6): by
+            # the time _close_menus checks, nothing reads aria-expanded any more.
+            return 0
+        if "var FAMS=" in expr:                                 # _click_family_js
             if not self.radios or not self.menu_open:
-                return []
-            if "var T=" in expr:                                # _click_family_js
-                want = _json.loads(_re.search(r'var T=(".*?");', expr).group(1))
-                for f in self.FAMILIES:
-                    if f.lower() == want:
-                        self.family_clicks += 1
-                        self.checked = f
-                        return True
                 return False
-            return [{"label": f, "checked": f == self.checked} for f in self.FAMILIES]
-        if "aria-valuenow" in expr:                             # _SLIDER_STATE_JS
+            want = _json.loads(_re.search(r'var T=(".*?");', expr).group(1))
+            for f in self.FAMILIES:
+                if f.lower() == want:
+                    self.family_clicks += 1
+                    self.checked = f
+                    return True
+            return False
+        if "aria-valuenow" in expr:                             # _PICKER_STATE_JS
             if not self.menu_open:
-                return None
+                return _NO_PICKER
             lines = self._group_lines()
-            return {"first": lines[0], "lines": lines,
+            return {"first": lines[0], "lines": lines, "fam": self._fam(),
                     # the Power menuitem's own text is EMPTY on this build; everything the tier
                     # can be read from lives behind aria-describedby.
                     "descs": ([self._announce(),

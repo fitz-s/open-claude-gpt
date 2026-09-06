@@ -12,9 +12,11 @@ allowed-tools: Read, Write, Grep, Glob, Bash(python3:*), Bash(bash:*), Bash(mkdi
 
 # chatgpt-consult
 
-ChatGPT advises; Claude Code executes and verifies. A consult is a ~25-minute GPT-6 Astra Pro
-reasoning round: only send work worth that, steer it precisely, fire it, and keep working — the
-detached waiter wakes you with the answer.
+ChatGPT advises; Claude Code executes and verifies. A consult is a deep reasoning round on your
+configured model and tier — GPT-6 Astra Pro by default, ~25 minutes — or whichever family/tier
+`CGC_MODEL`/`CGC_MODEL_FAMILY` target instead, including an older family you've deliberately
+pinned or a legacy picker that only offers a tier: only send work worth that, steer it precisely,
+fire it, and keep working — the detached waiter wakes you with the answer.
 
 **Safety gate.** Every consult ships PUBLIC GitHub links (or content you'd comfortably send to
 ChatGPT outright). NEVER secrets, `.env`, tokens, private-repo content, customer data, or

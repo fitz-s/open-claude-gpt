@@ -6,6 +6,69 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Added — which model *answered*, read from the answer
+
+Everything above pins the composer *before* a send, and a composer read before a send can only ever
+say what was requested. It was being published as if it said who replied. The two are demonstrably
+different: OpenAI documents a Thinking rate-limit fallback onto a model that is not even a picker
+option, so a correct badge and a different serving model coexist by design. Three properties were
+being run together as one — *capability* (was the strongest permitted tier requested), *continuity*
+(is this an identity the installation already approved), and *attribution* (which model does the
+provider say produced **this** response). Only the first two were ever established, and the third
+was being asserted from the second.
+
+A completed assistant turn carries the answer. Measured live on 2026-09-06, one build, one page
+load: our GPT-6 consult thread reported `data-message-model-slug="gpt-6-pro"`, an earlier consult
+`"gpt-5-6-pro"`, a hand-typed chat `"gpt-5-6-thinking"` — per-conversation, stable across a reload,
+not a build-wide constant.
+
+- **`wait` reads that attribute off the SAME node it just extracted the answer from**, scoped by the
+  round's own rid and turn interval, never "the last assistant message" — a stale tab under-reports
+  how many assistant turns exist, and a last-node read would attribute another turn's producer to
+  this answer. It rides back on `wait`'s stdout receipt exactly as `submit`'s conversation id does.
+- **`model_slug` is its own field and never merges with `modelBadge`.** The badge is selection
+  evidence; the slug is producer attribution. Neither substitutes for the other, and no code path
+  lets one stand in for the missing other.
+- **Absent is a third outcome, not an error.** It was never established that the attribute is
+  populated the instant streaming ends, so a missing one reads as `attribution: unknown` and a
+  consult that otherwise succeeded still succeeds. Inventing a value there would be the original
+  defect with a new name.
+- **One gate, and it is opt-in by policy, not by guesswork.** `CGC_MODEL_SLUG` is an explicit
+  fnmatch allow-list over the provider's own slugs (`gpt-6-*,gpt-5-6-pro`). A round whose slug
+  matches nothing is `attribution: mismatched`: `await` still writes the answer out, but exits 3
+  with no follow-up command, so nothing auto-chains on it. It is deliberately NOT derived from
+  `CGC_MODEL` / `CGC_MODEL_FAMILY` — those are the composer's UI labels, slugs are the provider's
+  identifiers, nothing local knows the mapping, and a label→slug table would rot into fabricating
+  the exact certainty this whole change exists to stop fabricating.
+- **No new terminal state, and `completed_verified` still means only what it meant.** It says the
+  answer's own rid sentinel verified. A mismatched attribution does not make a verified answer
+  unverified; conflating those two properties is the original sin here. The verdict is recorded on
+  the round at completion and never re-derived on read, so a later policy change cannot
+  retroactively reclassify a finished round, and rows written before this carry NULL — "predates
+  attribution", never "mismatch".
+- **Schema 5** adds `rounds.model_badge`, `rounds.model_slug`, `rounds.attribution`. Three
+  `ALTER TABLE ADD COLUMN`s and nothing else, so a daemon mid-flight against the live DB survives
+  it, exactly as migration 4 was built to allow; verified on a copy of the live v4 control DB (97
+  rounds, 70 of them `completed_verified`, all unchanged). `threads.model` — NULL in every row since
+  it was created — is left alone on purpose rather than repurposed: a thread can span a model
+  change, so there is no true value at that grain, and the evidence belongs on the round.
+
+### Fixed — a queued round was pinned by the daemon's environment, not by the request
+
+The queued spec carried `model` but no family, and the daemon's child argv passed `--model` alone,
+so `cdp_consult` read `CGC_MODEL_FAMILY` out of whatever environment the daemon happened to be
+started with, at send time. A config change between firing a consult and it running silently
+retargeted it. The follow-up path was worse: it passed neither dimension, so a thread's re-asserted
+tier came from ambient environment too.
+
+- `model_family` is resolved once, in the caller's process, and frozen into the round's spec — the
+  same place `model` already lived. Both are now named on the submit AND follow-up child argv.
+- It joins the request-key fingerprint, for the reason `model` already was in it: a different family
+  is a different logical request, so the same key under a different family **conflicts** rather than
+  handing back the old round's receipt. One-time consequence, stated plainly: a key fired before
+  this change and re-fired after it conflicts, because the stored fingerprint has no family in it —
+  and truthfully, that round was not pinned to one.
+
 ### Fixed — GPT-6 broke the picker, and pinning a tier stopped meaning pinning a model
 
 OpenAI shipped GPT-6 ("GPT-6 Astra") on 2026-09-03 and the composer's picker changed under us.
@@ -19,11 +82,11 @@ outage of the tool.
   (`"6"`), and the tier moved to line 2. `_slider_label("6")` returned `"6"`, `_matches("6", "Pro")`
   is false, so the walk matched at no slider position and the flat-click and submenu fallbacks found
   nothing. The tier now comes from the slider control's OWN `aria-describedby` — on this build the
-  `[role=menuitem]` wrapper's `innerText` and `textContent` are both empty, so that description is
-  the only place the tier is written down at all — falling back to a shape-validated scan for the
-  `", N of M."` announcement wherever it sits, then the legacy bare form, and only last of all to
-  the switcher button, which now reads `"Thinking effort"` while its menu is open and can no longer
-  be trusted to name a tier. Every pre-GPT-6 shape still resolves; the fixtures for them are kept.
+  `[role=menuitem]` wrapper's `innerText` and `textContent` are both empty, so that accessible
+  description is the primary source, read first. The group-line `", N of M."` scan, the legacy
+  bare form, and the switcher-button read are all still in the code and still tried in order after
+  it — kept for the builds where the description isn't there, not removed by this change. Every
+  pre-GPT-6 shape still resolves; the fixtures for them are kept.
 - **Confirmation moved with the DOM.** The switcher button used to carry the tier, so scanning
   button labels could confirm one. It now shows the model badge, so that scan can never confirm and
   would refuse a correctly pinned Pro forever. A slider walk that matched is now a confirmation in
@@ -54,8 +117,9 @@ exactly backwards and has been rewritten in place.
   run whose picker never opens cannot confirm: the radios are only readable inside an open menu,
   so that path refuses rather than reporting success on an unverified model — a fail-open in the
   middle of a fail-closed guard is the bug class this whole change exists to remove.
-- **`submit` now reports `modelBadge`** — what the composer's switcher read at send time (`"6"`
-  here) — so a receipt says which model answered, not only how hard it thought. `cgc doctor`'s
+- **`submit` now reports `modelBadge`** — what the composer's switcher read *before* send (`"6"`
+  here) — selection evidence for which model was requested, not a receipt for which model
+  answered: a pre-send DOM read cannot attest to what actually served the response. `cgc doctor`'s
   config line reports the family alongside the tier for the same reason.
 - The new fixtures are transcribed from a DOM dump of the live tab rather than from what the code
   expects to find, and were checked to fail against the pre-fix parser. The last picker break

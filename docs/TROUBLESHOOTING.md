@@ -132,8 +132,36 @@ always names what the account actually offers, so copy one of those verbatim:
 tier/model couldn't be selected.
 
 The `modelBadge` field in `submit`'s JSON records what the composer's switcher
-read at send time (`"6"` on the GPT-6 build) — that is the receipt for which model
-actually answered.
+read *before* send (`"6"` on the GPT-6 build). That is selection evidence — which
+model was **requested** — and it can never be a receipt for which model answered:
+OpenAI's own release notes describe a Thinking-mode rate-limit fallback to a model
+that isn't even a picker option, so selection and serving identity are demonstrably
+different things.
+
+Which model **answered** is read from the answer itself. When `wait` extracts a
+round's reply it also reads `data-message-model-slug` off that same assistant node
+— the provider's own attribution — and `await`'s JSON reports it:
+
+| field | means |
+|---|---|
+| `model_badge` | the composer's pre-send reading. Selection evidence. |
+| `model_slug` | the producing model per ChatGPT, e.g. `gpt-6-pro`. `null` = the provider stamped nothing. |
+| `attribution` | `matched` / `mismatched` / `unknown` / `unchecked`; `null` on rounds that predate this field. |
+
+`unknown` is a real outcome, not an error: the attribute is sometimes simply not
+there, and a consult that otherwise succeeded is not failed over it. `unchecked`
+means you have set no `CGC_MODEL_SLUG` policy, so nothing judged the slug.
+
+## `CGC_ATTRIBUTION_MISMATCH`
+The answer verified against its own `END_RESPONSE:<rid>` sentinel — it is complete
+and it is this round's — but ChatGPT attributes it to a model no `CGC_MODEL_SLUG`
+pattern admits. `await` writes the answer out and exits 3 (human-review) with no
+follow-up command, so nothing auto-chains on it. Read it yourself, or re-fire.
+Two honest fixes: widen `CGC_MODEL_SLUG` if the producer is one you actually
+accept, or find out why your account was served that model (a rate-limit fallback
+is the documented cause). `completion_confidence` stays `verified` throughout —
+"the sentinel checked out" and "the right model produced it" are separate
+properties and this tool keeps them separate.
 
 ## `CGC_ERROR ambiguous_followup`
 Several consults are active and `--conversation auto` can't pick. Pass the exact

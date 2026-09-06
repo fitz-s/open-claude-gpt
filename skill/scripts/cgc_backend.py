@@ -255,6 +255,22 @@ def stats_report() -> int:
 
 
 # ---- enqueue -----------------------------------------------------------------
+def _spec_model_family(a) -> str:
+    """The model family this round is PINNED to, resolved ONCE at enqueue and frozen into its spec.
+
+    It used to be resolved nowhere: the queued spec carried `model` but no family, the daemon's
+    child argv passed only `--model`, and cdp_consult read CGC_MODEL_FAMILY out of the DAEMON's
+    ambient environment at send time. So a round was pinned to whatever the daemon's config said
+    when it happened to run, not to what the caller had configured when they fired it — and a
+    daemon config change between enqueue and send silently retargeted every queued round. Reading
+    the environment HERE, in the caller's process, is what makes the family part of the request
+    instead of part of the runtime.
+
+    `a` may legitimately not carry the attribute (consult.py's `fire` builds its enqueue namespace
+    without one); the env default then applies, which is the same value that CLI flag defaults to."""
+    return getattr(a, "model_family", None) or os.environ.get("CGC_MODEL_FAMILY", "Latest")
+
+
 def _request_fingerprint(a, prompt: str) -> str:
     """The identity of one LOGICAL request — canonical JSON over every CALLER-side field that
     routes or shapes it: kind, the rid-independent prompt identity, project, model, and the
@@ -272,9 +288,17 @@ def _request_fingerprint(a, prompt: str) -> str:
     in caller-supplied content could be erased and forge a false match)."""
     logical = getattr(a, "logical_sha", None) or store_mod.sha256(prompt or "")
     conv = getattr(a, "conversation", None)
+    # model_family joins the fingerprint for exactly the reason `model` is already in it: it routes
+    # the request to a different model, so the same key under a different family is a DIFFERENT
+    # logical request and must CONFLICT rather than hand back the old round's receipt. fp stays 1:
+    # the field's presence already changes every hash, and bumping the marker would only add a
+    # second reason for the same break. Consequence, deliberate and one-time: a request-key fired
+    # before this change and re-fired after it conflicts, because the stored fingerprint predates
+    # the field. That is the honest report — the old round genuinely was not pinned to a family.
     return store_mod.sha256(json.dumps({
         "fp": 1, "kind": a.kind, "prompt": logical,
         "project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
+        "model_family": _spec_model_family(a),
         "parent": getattr(a, "parent", None),
         "conversation": None if conv in (None, "auto", "last") else conv,
     }, sort_keys=True))
@@ -394,6 +418,7 @@ def _enqueue_transfer(s, a, prompt: str, out: str, prior: dict, fingerprint: str
     inh_conv = pspec.get("conversation")
     inh_parent = pspec.get("parent_rid") or prior.get("parent_rid")
     spec = {"project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
+            "model_family": _spec_model_family(a),
             "conversation": inh_conv, "parent_rid": inh_parent, "poll": getattr(a, "poll", None),
             "timeout": getattr(a, "timeout", None), "request_fingerprint": fingerprint}
     thread = inh_conv if inh_conv not in (None, "auto", "last") else None
@@ -558,6 +583,7 @@ def enqueue_round(a, prompt: str, out: str) -> int:
                         f" find-conversation --rid {parent}\n")
                     return 2
         spec = {"project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
+                "model_family": _spec_model_family(a),
                 "conversation": conv, "parent_rid": parent, "poll": getattr(a, "poll", None),
                 "timeout": getattr(a, "timeout", None), "request_fingerprint": fingerprint}
         thread = conv if conv not in (None, "auto", "last") else None
@@ -690,6 +716,9 @@ def refire_round(old_rid: str) -> int:
     a = types.SimpleNamespace(
         rid=new_rid, kind=prior["kind"],
         project_url=pspec.get("project_url"), model=pspec.get("model", "Pro"),
+        # INHERIT the recorded family, never re-read the environment: a refire replays a stored
+        # request, and re-resolving from env would silently retarget it to today's config.
+        model_family=pspec.get("model_family"),
         conversation=pspec.get("conversation"),
         parent=pspec.get("parent_rid") or prior.get("parent_rid"),
         poll=pspec.get("poll"), timeout=pspec.get("timeout"),
@@ -704,7 +733,8 @@ def refire_round(old_rid: str) -> int:
 # Every await exit prints ONE machine-readable JSON line on stdout (prose stays on stderr): an
 # agent should never have to infer state by scraping prose. schema=1 is the envelope's version.
 def _emit(rid, state, *, retryable, human_action=None, next_command=None, answer_path=None,
-          parent_rid=None, confidence=None, error=None, source_rid=None, observed_rid=None):
+          parent_rid=None, confidence=None, error=None, source_rid=None, observed_rid=None,
+          model_badge=None, model_slug=None, attribution=None):
     import cgc_spool as _spool
     # Envelope invariant: retryable=true must always name the retry — an agent told "retryable"
     # with no next_command/human_action has a verdict but no move. Enforced structurally so no
@@ -726,6 +756,14 @@ def _emit(rid, state, *, retryable, human_action=None, next_command=None, answer
         # failure, the rid the CDP layer actually found on the page instead, so a human/agent can
         # see WHAT it refused to substitute, not just that it refused.
         "source_rid": source_rid, "observed_rid": observed_rid,
+        # THREE separate model facts, never collapsed (SHARED CONTRACT #4 in cdp_consult.py):
+        #   model_badge — what the composer's switcher read BEFORE the send. Selection evidence.
+        #   model_slug  — data-message-model-slug off the answer's own node. Producer attribution.
+        #                 null = the provider stamped nothing; it is NOT a mismatch.
+        #   attribution — the verdict recorded when the round completed: matched / mismatched /
+        #                 unknown / unchecked, or null for a round that predates this field.
+        # `confidence` remains strictly about the rid sentinel and says nothing about identity.
+        "model_badge": model_badge, "model_slug": model_slug, "attribution": attribution,
     }))
 
 
@@ -848,14 +886,41 @@ def _await_round(a) -> int:
             consult = os.path.join(os.path.dirname(os.path.abspath(__file__)), "consult.py")
             followup_cmd = (f"python3 {consult} fire --followup --parent {a.rid} --no-code "
                             "--task \"<local results + the next question>\" --title \"<what's new>\"")
+            attribution = r.get("attribution")
+            model_slug, model_badge = r.get("model_slug"), r.get("model_badge")
+            # THE GATE, and the only one. The answer verified against its own rid sentinel — that
+            # property is untouched, the state stays completed_verified, confidence stays
+            # "verified". What fails here is a DIFFERENT property: the provider says a model this
+            # installation does not accept produced it. So the answer is still materialized for a
+            # human, but it is not handed back as automatically-consumable: no next_command to
+            # chain a follow-up onto, and exit 3 (the existing "a human must look" outcome) rather
+            # than a new terminal state nothing else would mean. `unknown` does NOT gate — a
+            # provider that stamps nothing has told us nothing, and refusing an otherwise good
+            # consult over silence would be inventing a verdict.
+            if attribution == store_mod.ATTR_MISMATCHED:
+                _, why = _attribution_verdict(model_slug)
+                sys.stderr.write(
+                    f"CGC_ATTRIBUTION_MISMATCH {a.rid}: {why}. The answer ({n} bytes) IS written to:\n"
+                    f"  {out}\nRead it as a human would; do NOT auto-chain a follow-up on it.\n")
+                _emit(a.rid, state, retryable=False, parent_rid=parent, answer_path=out,
+                      confidence="verified", source_rid=src_rid, model_badge=model_badge,
+                      model_slug=model_slug, attribution=attribution,
+                      human_action=f"answer produced by {model_slug!r}, which {_ATTR_GATE_ENV} "
+                                   "does not admit — judge it yourself before using it")
+                return 3
             sys.stderr.write(
                 f"CGC_DONE {a.rid}: answer ready ({n} bytes). READ IT AT:\n  {out}\n"
-                "CGC_NEXT to CONTINUE this thread (re-review after your changes, re-check a fix, next "
+                + (f"Producer attribution: {model_slug} (selection evidence: {model_badge or 'none'}).\n"
+                   if model_slug else
+                   "Producer attribution: UNKNOWN — the provider stamped no model on this answer; "
+                   "which model served it is not established.\n")
+                + "CGC_NEXT to CONTINUE this thread (re-review after your changes, re-check a fix, next "
                 "phase) — a FOLLOW-UP keeps ChatGPT's context; a fresh consult throws it away:\n"
                 f"  {followup_cmd}\n"
                 f"  (--parent {a.rid} pins THIS consult's thread causally; add --refs-file for a fresh diff link.)\n")
             _emit(a.rid, state, retryable=False, parent_rid=parent, answer_path=out,
-                  confidence="verified", next_command=followup_cmd, source_rid=src_rid)
+                  confidence="verified", next_command=followup_cmd, source_rid=src_rid,
+                  model_badge=model_badge, model_slug=model_slug, attribution=attribution)
             return 0
         if state == store_mod.COMPLETED_UNVERIFIED:
             text = r["result_text"] or ""
@@ -868,8 +933,13 @@ def _await_round(a) -> int:
                 "answer — an unwrapped salvage can pick up a different message if another consult ran "
                 "on the same thread. Do NOT auto-chain a follow-up on it; re-run the consult if in "
                 "doubt.\n")
+            # Already a human outcome, so the attribution gate has nothing to add to the verdict —
+            # but the evidence still rides along, since a human judging a salvaged answer wants to
+            # know who produced it as much as anyone.
             _emit(a.rid, state, retryable=False, parent_rid=parent, answer_path=out,
                   confidence="unverified", source_rid=src_rid,
+                  model_badge=r.get("model_badge"), model_slug=r.get("model_slug"),
+                  attribution=r.get("attribution"),
                   human_action="verify the salvaged answer is complete and belongs to this round")
             return 3
         if state == store_mod.BLOCKED:
@@ -1059,7 +1129,12 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             # SEND only (not send+wait): so the round reaches `waiting` promptly and is reattach-able on
             # a restart, exactly like submit. A combined followup --watch would leave it `sending` for
             # the whole ~25-min answer, where a restart would strand it as possibly_accepted.
-            send = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt)
+            # model/model_family come from the SPEC, frozen at enqueue — not from the daemon's
+            # ambient environment, which is what a queued round used to be re-pinned by at send
+            # time. The followup path passed NEITHER before, so both are named here.
+            send = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
+                           model=spec.get("model") or "Pro",
+                           model_family=spec.get("model_family") or "Latest")
         finally:
             if hasattr(conv_lease, "close"):
                 conv_lease.close()  # mutating region done — the read-only wait below needs no lease
@@ -1069,7 +1144,8 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                                               f"{_EXIT_NOT_SENT_PRECLICK}): {(send.get('stderr') or '').strip()[:300]}")
             return store_mod.FAILED
         if send.get("code") == 0:
-            store.mark_accepted(attempt, conv)       # same thread, confirmed
+            # same thread, confirmed — with the composer reading it selected before this send
+            store.mark_accepted(attempt, conv, model_badge=send.get("model_badge"))
             store.mark_waiting(rid)
             return _wait_phase(store, rid, conv, spec, run_cdp)
         if any(m.lower() in stderr for m in _NOT_SENT_BLOCK):
@@ -1105,7 +1181,8 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                                daemon_instance_id=daemon_instance_id)
     sub = run_cdp("submit", rid=rid, prompt=prompt,
                   project_url=spec.get("project_url") or "https://chatgpt.com/",
-                  model=spec.get("model") or "Pro")
+                  model=spec.get("model") or "Pro",
+                  model_family=spec.get("model_family") or "Latest")
     conv = sub.get("conversation")
     stderr = (sub.get("stderr") or "").lower()
 
@@ -1115,7 +1192,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         return store_mod.FAILED
 
     if conv and sub.get("code") == 0:
-        store.mark_accepted(attempt, conv)
+        store.mark_accepted(attempt, conv, model_badge=sub.get("model_badge"))
         store.mark_waiting(rid)
         return _wait_phase(store, rid, conv, spec, run_cdp)
 
@@ -1209,6 +1286,47 @@ def _no_live_worker(rid: str) -> bool:
         return False   # cannot prove it is free → do not touch it
 
 
+# ---- THE attribution gate (one gate, one place) -------------------------------
+# The policy is an explicit allow-list of PRODUCER SLUGS, CGC_MODEL_SLUG, matched case-insensitively
+# with fnmatch globs (e.g. "gpt-6-*,gpt-5-6-pro"). Empty (the default) means the slug is recorded
+# and reported but nothing judges it — `unchecked`.
+#
+# It is deliberately NOT derived from CGC_MODEL / CGC_MODEL_FAMILY. Those are the composer's UI
+# labels ("Pro", "Latest", "GPT-5.6 Sol"); a slug is the provider's own identifier ("gpt-6-pro",
+# "gpt-5-6-thinking"). Nothing local knows the mapping between them, OpenAI changes both sides
+# without notice, and a label->slug table would be a rot machine that fabricates a verdict from a
+# guess — which is the exact failure this whole change exists to remove. So the installation
+# declares which producers it accepts, or it declares nothing and gets an honest `unchecked`.
+_ATTR_GATE_ENV = "CGC_MODEL_SLUG"
+
+
+def _attribution_policy() -> list[str]:
+    raw = os.environ.get(_ATTR_GATE_ENV, "") or ""
+    return [p.strip().lower() for p in raw.split(",") if p.strip()]
+
+
+def _attribution_verdict(slug):
+    """(verdict, detail) for one round's producer attribution. detail is None unless a human needs
+    a sentence. Never raises, and ABSENCE is never a failure: a consult that otherwise succeeded
+    must not be broken by the provider declining to stamp its own answer."""
+    import fnmatch
+    policy = _attribution_policy()
+    slug = (slug or "").strip()
+    if not slug:
+        return store_mod.ATTR_UNKNOWN, (
+            "the answer node carried no data-message-model-slug — which model served this answer "
+            "is unknown (not wrong, not missing an answer: simply not stated by the provider)")
+    if not policy:
+        return store_mod.ATTR_UNCHECKED, None
+    low = slug.lower()
+    if any(fnmatch.fnmatchcase(low, pat) for pat in policy):
+        return store_mod.ATTR_MATCHED, None
+    return store_mod.ATTR_MISMATCHED, (
+        f"the provider attributes this answer to {slug!r}, which no {_ATTR_GATE_ENV} pattern "
+        f"({', '.join(policy)}) admits — the answer is intact and its rid sentinel verified, but "
+        "it was NOT produced by a model this installation accepts")
+
+
 def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=False) -> str:
     out_tmp = os.path.join(store_mod.CGC_STATE_DIR, f"_wait_{rid}.txt")
     # Clear any stale answer + .raw sidecar from a PRIOR wait on this rid (e.g. a timed-out first
@@ -1227,8 +1345,16 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
     answer = _read_answer(answer_path)
     if code == 0 and answer.strip():
         unverified = os.path.exists(answer_path + ".raw")
+        # Producer attribution, committed with the answer. The verdict is computed HERE, once, and
+        # stored — never re-derived when the round is later read, because the policy can change and
+        # a round's identity finding is a fact about the moment it ran. Rows written before this
+        # existed keep NULL and stay valid; nothing reclassifies them.
+        slug = res.get("model_slug")
+        attribution, attr_detail = _attribution_verdict(slug)
+        if attribution == store_mod.ATTR_MISMATCHED:
+            sys.stderr.write(f"CGC_ATTRIBUTION_MISMATCH {rid}: {attr_detail}\n")
         store.finish(rid, store_mod.COMPLETED_UNVERIFIED if unverified else store_mod.COMPLETED_VERIFIED,
-                     result_text=answer)
+                     result_text=answer, model_slug=slug, attribution=attribution)
         # After the commit, never before: a file that appears ahead of the round's terminal state
         # would let a watcher read an answer for a round that then fails to commit.
         _publish_answer(store, rid, answer)
@@ -1239,7 +1365,8 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
             # uncertain with its answer already in hand is a lie the next reader has to re-litigate
             # (and, since uncertainty holds the tab sweep, one that keeps costing). Only a verified
             # sentinel may do this: an unwrapped salvage cannot prove which turn it came from.
-            if store.adopt_retrieved_answer(wait_rid, answer, conversation_id=conv):
+            if store.adopt_retrieved_answer(wait_rid, answer, conversation_id=conv,
+                                            model_slug=slug, attribution=attribution):
                 sys.stderr.write(f"CGC_RECONCILED {wait_rid}: resolved from retrieve {rid} "
                                  "(sentinel-verified on the thread).\n")
                 # The SOURCE round completes here too, and its own waiter is long gone by

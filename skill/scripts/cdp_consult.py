@@ -885,6 +885,64 @@ def _extract_js(rid: str, turn_index=None) -> str:
     )
 
 
+# ---- SHARED CONTRACT #4: producer attribution (which model served THIS answer) ---------------
+# THE THIRD PROPERTY. Selecting a model in the composer and being served by that model are two
+# different facts, and this file could only ever read the first one. `modelBadge` is a PRE-SEND
+# read of the switcher: it is evidence of what was REQUESTED. It cannot attest to what answered —
+# OpenAI's release notes document a Thinking rate-limit fallback onto a model that is not even a
+# picker option, so a correct badge and a different serving model coexist by design.
+#
+# A completed assistant turn carries the provider's own answer: data-message-model-slug. Measured
+# live on 2026-09-06, three conversations on the same build, same page load:
+#   consult 6a9d16b7-bb9c-83ea-8665-400615e369bd -> "gpt-6-pro"        (32254-char node)
+#   an earlier consult                           -> "gpt-5-6-pro"
+#   a hand-typed chat                            -> "gpt-5-6-thinking"
+# So it is per-conversation, not a build-wide constant, and it survives a reload.
+#
+# ABSENT is a real, expected third outcome (reported as null), never an error and never a
+# substitute for the badge. Measured on that same thread while a consult was mid-flight: three
+# assistant TURN nodes existed, and exactly ONE carried the attribute — the finished 32155-char
+# answer. The still-streaming turn had none. So the attribute arrives with the completed message
+# node, not with the turn wrapper, and reading it early legitimately yields nothing.
+#
+# Read off the SAME node __cgcNode already resolved for this rid, never "the last assistant
+# message". A stale tab under-reports how many assistant turns exist, so a last-node read can
+# attribute a different turn's producer to this answer — and on that live thread two user turns
+# carried the SAME rid (a resend), with only the second one's interval holding the answer. The
+# rid-and-interval scoping picked it; an unscoped "latest" read would have been a coin flip.
+# The attribute lives on the MESSAGE node while __cgcNode may legitimately resolve the TURN
+# wrapper (_SEL_A matches either shape) — hence self -> descendant -> ancestor, all three confined
+# to that one resolved node.
+def _model_slug_js(rid: str, turn_index=None) -> str:
+    """JS returning the producing model's slug for the rid's OWN answer node, or '' when the
+    provider has not written one (a legitimate outcome — see SHARED CONTRACT #4)."""
+    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
+    node_call = f"__cgcNode({begin})" if turn_index is None else f"__cgcNode({begin},{int(turn_index)})"
+    return ("(function(){" + _NODE_FN + "var A='data-message-model-slug';"
+            "var n=" + node_call + ";if(!n)return '';"
+            "var v=n.getAttribute(A);if(v)return v;"
+            "var d=n.querySelector('['+A+']');if(d){v=d.getAttribute(A);if(v)return v;}"
+            "var p=n.closest?n.closest('['+A+']'):null;"
+            "return (p&&p.getAttribute(A))||'';})()")
+
+
+def _read_attribution(c, rid, turn_index=None):
+    """The producing model's slug for this rid's answer, or None when absent/unreadable. Never
+    raises: attribution is evidence ABOUT an answer, so failing to read it must not fail a consult
+    that otherwise succeeded — it degrades to 'unknown', reported honestly as null."""
+    try:
+        return (c.eval(_model_slug_js(rid, turn_index)) or "").strip() or None
+    except Exception:
+        return None
+
+
+def _wait_receipt(rid, out, slug):
+    """The ONE stdout line `wait` prints, mirroring what `submit` already does: the daemon parses
+    it for attribution. modelSlug is the provider's own producer attribution (SHARED CONTRACT #4);
+    null means the attribute was absent, which is NOT a failure and NOT a mismatch."""
+    print(json.dumps({"rid": rid, "out": out, "modelSlug": slug}))
+
+
 def _scoped_raw(c, rid, strict, turn_index):
     """Fetch unwrapped-salvage raw text via _last_assistant_js, honoring the [S3] interval
     guarantee. STRICT (source-pinned) mode: the answer may come ONLY from the source turn's own
@@ -1050,14 +1108,26 @@ def _open_cand_by_label_js(label):
     sitting right there the whole time. Searching for `label` INSIDE the same evaluation that
     also builds the candidate list and dispatches the gesture means there is only ever one live
     snapshot in play; nothing about the addressing can survive — or be invalidated by — a round
-    trip, so it can never land on a button other than the one actually named `label` right now."""
+    trip, so it can never land on a button other than the one actually named `label` right now.
+
+    The echo is captured BEFORE the gesture, not after. Live 2026-09-06: this build's switcher
+    RENAMES ITSELF on open — closed it reads the model badge "6", open it reads "Thinking effort" —
+    and React had already committed that rename by the time a post-gesture read ran in the same
+    evaluation. The echo then disagreed with `label` for the correct button, the caller discarded
+    its own successful open as an addressing miss, and _select_model refused with the picker it had
+    just opened sitting right there ("the composer's picker menu never opened", measured live).
+    A post-gesture read cannot say anything the pre-gesture one cannot: the element gestured is the
+    element found, inside one evaluation. So the echo answers the only question it ever really
+    answered — was a button named `label` found — and no longer doubles as a claim about what that
+    button reads after being clicked."""
     t = json.dumps(label)
     return (
         "(function(){var c=%s;var want=%s;var idx=-1;"
         "for(var k=0;k<c.length;k++){"
         "if(((c[k].innerText||'').trim().split('\\n')[0])===want){idx=k;break;}}"
-        "var EL=c[idx];if(!EL)return null;%s"
-        "return (EL.innerText||'').trim().split('\\n')[0];})()"
+        "var EL=c[idx];if(!EL)return null;"
+        "var got=(EL.innerText||'').trim().split('\\n')[0];%s"
+        "return got;})()"
         % (_ALL_CAND_JS, t, _GESTURE)
     )
 
@@ -1176,15 +1246,51 @@ def _slider_state_label(st):
     return _slider_label(st.get("btnLabel") or "")
 
 
-# One snapshot, every source _slider_state_label might need — never a label stitched together
-# from two Runtime.evaluate round-trips, across which React can re-render the picker.
+# ONE snapshot carrying BOTH dimensions the guard pins — the tier sources _slider_state_label
+# needs AND the model-family radio group — because they must be judged as a TUPLE. Two separate
+# Runtime.evaluate calls can only ever produce two observations that were never simultaneously
+# true, and React re-renders this picker between round-trips (live-verified 2026-08-28: the
+# candidate set itself flapped across reads two seconds apart).
+#
+# Reading them together also removes a whole fail-open by construction: the family read used to be
+# able to come back null/empty *while the slider read fine*, and an empty family read was taken as
+# "this build has no family control". In one snapshot that combination cannot arise — the slider
+# lives INSIDE the picker, so a readable slider always yields an owning picker (see `own` below).
+#
+# Tier fields (unchanged meanings):
 #   descs     textContent of each aria-describedby target of the slider's [role=menuitem] wrapper
 #   lines     every non-empty line of the picker group (the announcement can sit at any of them)
 #   first     that group's first line — the legacy bare form, and on GPT-6 the model badge "6"
 #   btnLabel  the open switcher's label ("Thinking effort" while open, on GPT-6)
-_SLIDER_STATE_JS = (
-    "(function(){var s=document.querySelector('[role=\"menu\"] [role=\"slider\"]');"
-    "if(!s)return null;var mi=s.closest('[role=\"menuitem\"]');"
+#
+# Family field `fam`, deliberately NOT a bare list (see _family_obs for why an empty list is not a
+# usable signal):
+#   owners    how many elements are the composer's intelligence PICKER right now. The family is
+#             read out of that one element only — never out of "every open menu's radios" — so an
+#             unrelated menu (the Chat/Agent mode toggle) that happens to contain no radios can no
+#             longer be mistaken for "the picker, inspected, has no family control".
+#   menus     how many [role=menu] are open at all, for the ambiguity report.
+#   radios    {label, checked} per [role=menuitemradio] INSIDE the owner — null when there is no
+#             unique owner to read them out of, which is a different fact from "there are none".
+#   scaffold  radio-group chrome ([role=radiogroup] / [role=radio]) inside the owner. A picker
+#             with scaffolding but zero readable radios is a half-rendered group, not a build
+#             that has no such control.
+_PICKER_STATE_JS = (
+    "(function(){"
+    "var own=[].slice.call(document.querySelectorAll("
+    "'[data-testid=\"composer-intelligence-picker-content\"]'));"
+    "if(!own.length){own=[].slice.call(document.querySelectorAll('[role=\"menu\"]'))"
+    ".filter(function(m){return !!m.querySelector('[role=\"slider\"]');});}"
+    "var fam={owners:own.length,menus:document.querySelectorAll('[role=\"menu\"]').length,"
+    "radios:null,scaffold:0};"
+    "if(own.length===1){var o=own[0];"
+    "fam.radios=[].slice.call(o.querySelectorAll('[role=\"menuitemradio\"]')).map(function(r){"
+    "return {label:((r.innerText||'').trim().split('\\n')[0]),"
+    "checked:r.getAttribute('aria-checked')==='true'};});"
+    "fam.scaffold=o.querySelectorAll('[role=\"radiogroup\"],[role=\"radio\"]').length;}"
+    "var s=document.querySelector('[role=\"menu\"] [role=\"slider\"]');"
+    "if(!s)return {fam:fam,first:'',lines:[],descs:[],btnLabel:'',now:null,min:null,max:null};"
+    "var mi=s.closest('[role=\"menuitem\"]');"
     "var grp=document.querySelector('[data-testid=\"composer-intelligence-picker-content\"]');"
     "var src=grp||mi;"
     "var lines=((src&&src.innerText)||'').split('\\n').map(function(x){return x.trim();})"
@@ -1194,7 +1300,7 @@ _SLIDER_STATE_JS = (
     "if(e)descs.push((e.textContent||'').trim());});"
     "var trig=(document.querySelector('form')||document).querySelector('button[aria-expanded=\"true\"]');"
     "var btnLabel=((trig&&trig.innerText)||'').trim().split('\\n')[0];"
-    "return {first:lines[0]||'',lines:lines,descs:descs,btnLabel:btnLabel,"
+    "return {fam:fam,first:lines[0]||'',lines:lines,descs:descs,btnLabel:btnLabel,"
     "now:parseInt(s.getAttribute('aria-valuenow'),10),"
     "min:parseInt(s.getAttribute('aria-valuemin'),10),max:parseInt(s.getAttribute('aria-valuemax'),10)};"
     "})()")
@@ -1203,6 +1309,97 @@ _SLIDER_FOCUS_JS = (
     "(function(){var s=document.querySelector('[role=\"menu\"] [role=\"slider\"]');"
     "if(!s)return false;var mi=s.closest('[role=\"menuitem\"]');"
     "if(!mi)return false;mi.focus();return true;})()")
+
+
+# A restore/goto walk must END, and "loop until the value equals the target" is not a bound. Live
+# reasoning behind the three bounds in _slider_goto: a control that ALTERNATES (0 -> 2 -> 0 -> 2
+# while the destination is 1) satisfies neither "arrived" nor "did not move", so the old
+# `while pos != entry_now` loop had no exit at all — only the outer subprocess timeout ended it,
+# which is a process being killed, not an algorithm terminating.
+_SLIDER_WALK_SECONDS = 20.0
+
+
+def _press_slider(c, key, prev_now):
+    """One arrow press plus the bounded settle poll. Returns (now, label, state) — (None,None,None)
+    when the control stopped reading at all.
+
+    Re-read up to 3 times at ~0.2s and take the first read that actually differs from prev_now.
+    Only 3 unchanged reads in a row count as no-move: a live probe found single presses settle in
+    0.35-0.45s, and one flat 0.3s sleep read that as "stuck keys" on a merely-slow frame."""
+    key_name, code, keycode = key
+    c.key(key_name, code, keycode)
+    st = None
+    for _ in range(3):
+        time.sleep(0.2)
+        st = c.eval(_PICKER_STATE_JS)
+        if isinstance(st, dict) and st.get("now") is not None and st["now"] != prev_now:
+            break
+    if not isinstance(st, dict) or st.get("now") is None:
+        return None, None, None
+    return st["now"], _slider_state_label(st), st
+
+
+_SliderWalk = collections.namedtuple("_SliderWalk", "pos label proven")
+"""Where a bounded walk actually ENDED, as an observation rather than a hope:
+
+  pos     the last position genuinely OBSERVED (None when the control stopped reading)
+  label   the tier observed at `pos` — None when unproven or unreadable. NEVER a remembered
+          entry label: presenting historical evidence as an observation of what is selected now
+          is how a restore that did not happen reads as one that did.
+  proven  whether `pos == dest` was actually witnessed. Anything else is dirty/unknown.
+"""
+
+
+def _slider_goto(c, dest, deadline=None):
+    """Walk the OPEN picker's slider to the ABSOLUTE position `dest`. Bounded by construction, on
+    three independent axes — any one of them alone is insufficient:
+
+      * an OPERATION budget: at most one press per position between here and `dest`, plus two
+        presses of slack for a press that lands late;
+      * a wall-clock DEADLINE, so a control that answers every read but never settles still ends;
+      * MONOTONIC PROGRESS IN RANGE: every observed position must lie inside [min,max] and be
+        strictly closer to `dest` than the one before it. This is the one that terminates the
+        alternating control described above — 0 -> 2 with dest 1 is not progress, so the walk
+        stops and reports `proven=False` instead of pressing forever.
+
+    Reports UNKNOWN rather than guessing. A caller that cannot prove the restoration must say the
+    composer is dirty; "probably back where it was" is exactly the claim this whole guard exists
+    to refuse to make."""
+    st = c.eval(_PICKER_STATE_JS)
+    if not isinstance(st, dict) or st.get("now") is None:
+        return _SliderWalk(None, None, False)
+    lo, hi, pos = st.get("min"), st.get("max"), st["now"]
+    label = _slider_state_label(st)
+    if pos == dest:
+        return _SliderWalk(pos, label, True)
+    if not isinstance(lo, int) or not isinstance(hi, int) or lo > hi or not lo <= dest <= hi:
+        return _SliderWalk(pos, None, False)  # the destination is not on this control's scale
+    if deadline is None:
+        deadline = time.time() + _SLIDER_WALK_SECONDS
+    if not c.eval(_SLIDER_FOCUS_JS):
+        return _SliderWalk(pos, label, False)  # cannot drive it — nothing pressed, nothing moved
+    budget = abs(dest - pos) + 2
+    while budget > 0 and time.time() < deadline:
+        budget -= 1
+        gap = dest - pos
+        key = ("ArrowRight", "ArrowRight", 39) if gap > 0 else ("ArrowLeft", "ArrowLeft", 37)
+        new_pos, new_label, _st = _press_slider(c, key, pos)
+        if new_pos is None:
+            return _SliderWalk(pos, None, False)          # stopped reading — position unknown now
+        if not lo <= new_pos <= hi:
+            return _SliderWalk(new_pos, None, False)      # off its own scale — not this control
+        if abs(dest - new_pos) >= abs(gap):
+            return _SliderWalk(new_pos, new_label, False)  # no progress: stuck, or alternating
+        pos, label = new_pos, new_label
+        if pos == dest:
+            return _SliderWalk(pos, label, True)
+    return _SliderWalk(pos, label, pos == dest)
+
+
+_TierPick = collections.namedtuple("_TierPick", "ok label pos dirty")
+"""One tier-walk attempt. `pos` is the slider position last observed (None when unreadable) and
+`dirty` says the walk moved the control and could NOT prove it put it back — a property the caller
+must be able to report separately from "nothing was sent"."""
 
 
 def _slider_set(c, target):
@@ -1214,83 +1411,59 @@ def _slider_set(c, target):
 
     Bails the moment a press that SHOULD have moved valuenow (i.e. we were not already sitting
     on the boundary it presses toward) does not move it, per a short bounded poll rather than a
-    single fixed sleep — a live probe found single presses settle in 0.35-0.45s, and one flat
-    0.3s sleep read that as "stuck" on a merely-slow frame. See _press below.
+    single fixed sleep — see _press_slider.
 
     FAIL-CLOSED MUST BE SIDE-EFFECT-FREE. Live-verified: a target this account does not have
     (walk saturates left, then right to the ceiling, never matches) used to leave the slider
     wherever the walk gave up — the composer silently ended up retargeted to the HIGHEST tier
     it happened to pass through, even though the caller's own message says "could not be
     changed". So every failure return that happens after at least one press actually landed
-    now walks back toward the ENTRY valuenow (bounded, same landing check as the forward walk —
-    a restore press that does not land stops the restore instead of looping) and reports
-    whatever label is genuinely showing at wherever that walk ends up, not the transient label
-    from mid-walk. The success path never restores — there is nothing to undo.
+    now walks back to the ENTRY valuenow via _slider_goto, which is bounded on three axes and
+    reports whether it ARRIVED. An unproven restore returns label=None and dirty=True: the
+    caller then says the composer is dirty instead of quoting a label nobody observed. The
+    success path never restores — there is nothing to undo.
     """
-    st = c.eval(_SLIDER_STATE_JS)
-    if not st or st.get("now") is None:
-        return False, None
-    lo, hi, now = st["min"], st["max"], st["now"]
+    st = c.eval(_PICKER_STATE_JS)
+    if not isinstance(st, dict) or st.get("now") is None:
+        return _TierPick(False, None, None, False)
+    lo, hi, now = st.get("min"), st.get("max"), st["now"]
+    if not isinstance(lo, int) or not isinstance(hi, int) or lo > hi:
+        return _TierPick(False, None, now, False)
     entry_now = now
     label = _slider_state_label(st)
-    entry_label = label
     if _matches(label, target):
-        return True, label
+        return _TierPick(True, label, now, False)
     if not c.eval(_SLIDER_FOCUS_JS):
-        return False, None  # nothing pressed yet — nothing to restore
+        return _TierPick(False, label, now, False)  # nothing pressed yet — nothing to restore
+    deadline = time.time() + _SLIDER_WALK_SECONDS
 
-    def _press(key_name, code, keycode, prev_now):
-        c.key(key_name, code, keycode)
-        # Bounded settle poll: re-read up to 3 times at ~0.2s and take the first read that
-        # actually differs from prev_now. Only 3 unchanged reads in a row counts as no-move —
-        # a single stale read (the value hasn't landed yet) is not mistaken for stuck keys.
-        st2 = None
-        for _ in range(3):
-            time.sleep(0.2)
-            st2 = c.eval(_SLIDER_STATE_JS)
-            if st2 and st2.get("now") is not None and st2["now"] != prev_now:
-                break
-        if not st2 or st2.get("now") is None:
-            return None, None
-        return st2["now"], _slider_state_label(st2)
-
-    def _restore(pos):
-        """Best-effort walk back to entry_now. Same bail discipline as the forward walk: a
-        restore press that does not land stops the restore rather than looping — a partial
-        restore is still strictly better than none, and a stuck restore must not hang. Returns
-        the label actually observed after the attempt, which is the ground truth for what the
-        composer is left on (whether or not the restore fully succeeded)."""
-        while pos != entry_now:
-            key_name, code, keycode = (
-                ("ArrowLeft", "ArrowLeft", 37) if pos > entry_now else ("ArrowRight", "ArrowRight", 39))
-            new_pos, _ = _press(key_name, code, keycode, pos)
-            if new_pos is None or new_pos == pos:
-                break  # stuck — leave it where it is rather than hang
-            pos = new_pos
-        st_final = c.eval(_SLIDER_STATE_JS)
-        if st_final and st_final.get("now") is not None:
-            return _slider_state_label(st_final)
-        return entry_label
+    def _give_up():
+        back = _slider_goto(c, entry_now)
+        return _TierPick(False, back.label if back.proven else None, back.pos, not back.proven)
 
     span = hi - lo
     for _ in range(span):
+        if time.time() >= deadline:
+            return _give_up()
         expect_move = now > lo
-        new_now, new_label = _press("ArrowLeft", "ArrowLeft", 37, now)
+        new_now, new_label, _st = _press_slider(c, ("ArrowLeft", "ArrowLeft", 37), now)
         if new_now is None or (expect_move and new_now == now):
-            return False, _restore(now if new_now is None else new_now)
+            return _give_up()
         now, label = new_now, new_label
     if _matches(label, target):
-        return True, label
+        return _TierPick(True, label, now, False)
 
     for _ in range(span):
+        if time.time() >= deadline:
+            return _give_up()
         expect_move = now < hi
-        new_now, new_label = _press("ArrowRight", "ArrowRight", 39, now)
+        new_now, new_label, _st = _press_slider(c, ("ArrowRight", "ArrowRight", 39), now)
         if new_now is None or (expect_move and new_now == now):
-            return False, _restore(now if new_now is None else new_now)
+            return _give_up()
         now, label = new_now, new_label
         if _matches(label, target):
-            return True, label
-    return False, _restore(now)
+            return _TierPick(True, label, now, False)
+    return _give_up()
 
 
 # ---- submenu path (fallback #3) ----
@@ -1300,7 +1473,7 @@ def _slider_set(c, target):
 # _click_item_js once open. Never hardcode which trigger by name ('Effort') — a future build
 # could relocate it — so every haspopup trigger is tried and left to the item-match to decide.
 # (This comment used to add "and Model must never be touched (it picks the family, not the
-# tier)". Dead as of 2026-09-03: the family is pinned deliberately now, by _select_family, which
+# tier)". Dead as of 2026-09-03: the family is pinned deliberately now, by _apply_family, which
 # addresses the radios directly and never goes through this submenu walk. The item-match here
 # still decides on TIER text alone, so a Model submenu opened first remains harmless.)
 # Verified live: hover
@@ -1345,81 +1518,230 @@ def _submenu_try(c, target):
 # "must click" case without a click: this is the one control in the picker where a redundant
 # gesture is not free (a Radix radio click also closes the menu, which would drop the slider out
 # from under the tier walk that runs next).
-# `var FAMS=` is deliberately distinctive: it is how the offline fakes in tests/test_model_picker.py
-# tell this read apart from _click_item_js, which queries menuitemradio too.
-_FAMILY_STATE_JS = (
-    "(function(){var FAMS=[].slice.call(document.querySelectorAll("
-    "'[role=\"menu\"] [role=\"menuitemradio\"]'));"
-    "return FAMS.map(function(r){return {"
-    "label:((r.innerText||'').trim().split('\\n')[0]),"
-    "checked:r.getAttribute('aria-checked')==='true'};});})()")
+# The read itself lives in _PICKER_STATE_JS (one snapshot, both dimensions). `var FAMS=` survives
+# only in _click_family_js below, and is deliberately distinctive: it is how the offline fakes in
+# tests/ tell the family CLICK apart from _click_item_js, which queries menuitemradio too.
 
 
 def _click_family_js(target):
     """Select the radio whose FIRST LINE is exactly `target` (case-insensitive; never a loose
-    contains — 'GPT-5.5' must not be able to match 'GPT-5.6 Sol' or a description line). Same
-    _GESTURE as everything else in this menu: these are Radix items and a bare .click() does not
-    select them."""
+    contains — 'GPT-5.5' must not be able to match 'GPT-5.6 Sol' or a description line). Scoped to
+    the OWNING picker by the same rule _PICKER_STATE_JS reads it with, so the element clicked is
+    the element observed; a radio in some other open menu is not this control. Same _GESTURE as
+    everything else in this menu: these are Radix items and a bare .click() does not select them."""
     t = json.dumps((target or "").strip().lower())
-    return ("(function(){var T=%s;var FAMS=[].slice.call(document.querySelectorAll("
-            "'[role=\"menu\"] [role=\"menuitemradio\"]'));"
+    return ("(function(){var T=%s;"
+            "var own=[].slice.call(document.querySelectorAll("
+            "'[data-testid=\"composer-intelligence-picker-content\"]'));"
+            "if(!own.length){own=[].slice.call(document.querySelectorAll('[role=\"menu\"]'))"
+            ".filter(function(m){return !!m.querySelector('[role=\"slider\"]');});}"
+            "if(own.length!==1)return false;"
+            "var FAMS=[].slice.call(own[0].querySelectorAll('[role=\"menuitemradio\"]'));"
             "var EL=FAMS.find(function(r){"
             "return ((r.innerText||'').trim().toLowerCase().split('\\n')[0])===T;});"
             "if(!EL)return false;%s return true;})()" % (t, _GESTURE))
 
 
-def _family_entries(c):
-    """The radio group as a list of (label, checked), or [] when this build has no such control.
-    Defensive about the shape because a Runtime.evaluate can return anything: only real dicts with
-    a non-empty label count, so a null/garbage read is indistinguishable from 'no radios' — which
-    is the safe reading, since the alternative is refusing a consult over a misparse."""
-    read = c.eval(_FAMILY_STATE_JS)
-    out = []
-    for r in read if isinstance(read, list) else []:
-        if isinstance(r, dict) and str(r.get("label") or "").strip():
-            out.append((str(r["label"]).strip(), bool(r.get("checked"))))
-    return out
+_FamilyObs = collections.namedtuple("_FamilyObs", "status entries detail")
+"""A TYPED observation of the family dimension, replacing the old list-or-empty-list signal.
+
+The old signal was a fail-open: the list-shaped family read turned a null read, a non-list read
+and a malformed read all into [], and [] meant "this build has no family control — exempt".
+The reachable counterexample: a composer sitting on GPT-5.5 whose family probe returns null during
+a React render transition while the Pro slider reads fine. Nothing established `Latest`, and the
+guard reported the model confirmed. An unreadable control is not evidence that the control is
+right; it is the absence of evidence, which is the one thing a fail-closed guard must never treat
+as a pass.
+
+  family      a unique owning picker with a COHERENT radio group (every item labelled, at most one
+              checked). `entries` is ((label, checked), ...). The only status that can be acted on.
+  legacy      a unique owning picker that positively renders NO family control at all: zero radios
+              AND zero radio-group scaffolding. The pre-GPT-6 composer. The ONLY status that earns
+              the silent no-op exemption on its own.
+  absent      no element is the composer's intelligence picker right now — this open menu is not
+              it (the Chat/Agent mode toggle), or the whole read came back null. NOT an exemption
+              by itself: it earns one only from a build that then proves it predates the picker
+              entirely by serving the tier as a flat menuitem (see _select_model).
+  ambiguous   more than one picker is open; none of them uniquely owns the radios.
+  failed      the picker IS open and its radio group did not read back coherently — null radios, an
+              unlabelled item, two items checked at once, or scaffolding with no items. Refuse.
+"""
 
 
-def _select_family(c, target):
-    """Pin the model FAMILY inside the currently-open picker menu. Returns (ok, detail).
+def _family_obs(st):
+    """Read the family dimension out of ONE _PICKER_STATE_JS snapshot. Pure — no round-trip of its
+    own, so the family it reports and the tier `st` reports were true at the same instant."""
+    fam = st.get("fam") if isinstance(st, dict) else None
+    if not isinstance(fam, dict):
+        return _FamilyObs("absent", (), None)
+    owners = fam.get("owners")
+    if not isinstance(owners, int) or owners < 0:
+        return _FamilyObs("failed", (), "the composer picker probe returned no owner count")
+    if owners == 0:
+        return _FamilyObs("absent", (), None)
+    if owners > 1:
+        return _FamilyObs("ambiguous", (), (
+            "%d composer pickers are open at once, so none of them uniquely owns the model radios "
+            "— the model cannot be established from an ambiguous picker" % owners))
+    radios = fam.get("radios")
+    if not isinstance(radios, list):
+        return _FamilyObs("failed", (), (
+            "the composer picker is open but its model radio group did not read back"))
+    entries = []
+    for r in radios:
+        if not isinstance(r, dict) or not str(r.get("label") or "").strip():
+            return _FamilyObs("failed", (), (
+                "the composer picker's model radio group read back malformed (an item with no "
+                "label) — an unreadable model control is not evidence that the model is right"))
+        entries.append((str(r["label"]).strip(), bool(r.get("checked"))))
+    if entries:
+        checked = sum(1 for _lab, chk in entries if chk)
+        if checked > 1:
+            return _FamilyObs("failed", (), (
+                "the composer picker's model radio group is incoherent: %d items read "
+                "aria-checked=true at once" % checked))
+        return _FamilyObs("family", tuple(entries), None)
+    scaffold = fam.get("scaffold")
+    if not isinstance(scaffold, int) or scaffold > 0:
+        return _FamilyObs("failed", (), (
+            "the composer picker renders radio-group scaffolding but no readable radio — a "
+            "half-rendered group is not a build that has no model control"))
+    return _FamilyObs("legacy", (), None)
 
-    Fail-closed like the tier, with ONE deliberate exception: a build with no radio group at all
-    is a pre-GPT-6 composer that cannot express this dimension, so it is a SILENT NO-OP — an old
-    account must never be refused over a control its ChatGPT does not render. A build that DOES
-    render the group and does not offer `target` is a hard miss, and `detail` names the families
-    actually offered, because "this account no longer has GPT-6" and "CGC_MODEL_FAMILY is a typo"
-    are indistinguishable without that list.
+
+def _family_checked(obs):
+    """The label the radio group currently reads as checked, or None (including when the group
+    offers no checked item at all, which is itself a state we cannot restore TO)."""
+    return next((lab for lab, chk in obs.entries if chk), None)
+
+
+def _reopen_picker(c, lab):
+    """Reopen the composer's picker and return a fresh snapshot, or None.
+
+    Radix commits a radio selection by CLOSING the menu, so every read that must happen after a
+    click needs this. The old code re-read the radios without reopening, saw none (the menu was
+    gone), and reported the click had failed AFTER its mutation had actually landed — a false
+    failure that then left the composer on a family nobody restored.
+
+    `lab` is tried first, then whatever the composer's switchers read RIGHT NOW, because the very
+    commit being confirmed can RENAME the button that owns the picker: the GPT-6 badge is the model
+    family (live 2026-09-06 it reads "6"), and the pre-GPT-6 switcher reads the tier it is on. An
+    open that lands on a menu with no picker in it (the Chat/Agent mode toggle) is closed again and
+    does not count."""
+    tried = []
+    for cand in [lab] + [x for x in (c.eval(_cand_labels_js()) or []) if x]:
+        if not cand or cand in tried or len(tried) >= 3:
+            continue
+        tried.append(cand)
+        if c.eval(_open_cand_by_label_js(cand)) != cand:
+            continue                    # addressing miss — nothing opened, nothing to close
+        time.sleep(1.0)                 # Radix menu renders async after the gesture
+        st = c.eval(_PICKER_STATE_JS)
+        if isinstance(st, dict) and (st.get("now") is not None
+                                     or _family_obs(st).status != "absent"):
+            return st
+        _close_menus(c)
+    return None
+
+
+_FamilyPick = collections.namedtuple("_FamilyPick", "ok label detail touched")
+"""`touched` means a gesture was DISPATCHED at the radio group — whether or not it was confirmed.
+Anything touched must be restored on a later failure, because a click whose confirmation could not
+be read is not a click that provably did nothing."""
+
+
+def _apply_family(c, lab, obs, target):
+    """Pin the model FAMILY inside the currently-open picker, given its already-taken observation.
 
     An already-checked target is left ALONE — no click at all. Clicking a checked Radix radio is
     not a guaranteed no-op (it commits the menu closed), and there is nothing to change.
 
-    On a real change this returns only after re-reading aria-checked and seeing it flip: the click
-    is a gesture dispatch, not a promise."""
-    if not target or target.strip().lower() == "skip":
-        return True, None
-    entries = _family_entries(c)
-    if not entries:
-        return True, None                       # pre-GPT-6 build — no such control, nothing to pin
+    A real change returns only after re-reading aria-checked and seeing it flip; when the click
+    committed the menu closed, the menu is REOPENED first so that re-read can happen at all."""
     want = target.strip().lower()
-    hit = next(((lab, chk) for lab, chk in entries if lab.lower() == want), None)
+    hit = next(((l, chk) for l, chk in obs.entries if l.lower() == want), None)
     if hit is None:
-        return False, ("model family '%s' is not offered in this picker (offered: %s)"
-                       % (target, ", ".join(lab for lab, _ in entries)))
+        return _FamilyPick(False, None, (
+            "model family '%s' is not offered in this picker (offered: %s)"
+            % (target, ", ".join(l for l, _ in obs.entries))), False)
     if hit[1]:
-        return True, hit[0]                     # already on it — do not touch a checked radio
+        return _FamilyPick(True, hit[0], None, False)
     if not c.eval(_click_family_js(target)):
-        return False, "model family '%s' is listed but its radio could not be clicked" % target
+        return _FamilyPick(False, None,
+                           "model family '%s' is listed but its radio could not be clicked" % target,
+                           False)
     # A family change re-renders the whole picker, slider included; the tier walk that follows
-    # re-reads _SLIDER_STATE_JS from scratch, so it sees the NEW slider, not a stale position.
+    # re-reads _PICKER_STATE_JS from scratch, so it sees the NEW slider, not a stale position.
     time.sleep(0.6)
-    for lab, chk in _family_entries(c):
-        if lab.lower() == want:
-            if chk:
-                return True, lab
-            break
-    return False, ("model family '%s' did not take — aria-checked never flipped after the click"
-                   % target)
+    obs2 = _family_obs(c.eval(_PICKER_STATE_JS))
+    if obs2.status != "family":
+        obs2 = _family_obs(_reopen_picker(c, lab))
+    if obs2.status != "family":
+        return _FamilyPick(False, None, (
+            "model family '%s' was clicked but the picker could not be re-read to confirm it"
+            % target), True)
+    cur = _family_checked(obs2)
+    if cur is not None and cur.lower() == want:
+        return _FamilyPick(True, cur, None, True)
+    return _FamilyPick(False, cur, (
+        "model family '%s' did not take — aria-checked never flipped after the click" % target),
+        True)
+
+
+def _restore_family(c, lab, orig):
+    """Put the radio group back on `orig` after a LATER step failed. Returns True only when the
+    restoration was WITNESSED (aria-checked back on `orig`).
+
+    This is the missing half of the transaction. `_slider_set` restores only its own entry
+    position, and it captures that position AFTER the family change — so a run that switched the
+    family and then failed the tier used to return "could not be changed" while leaving the
+    composer on the new family. Two properties, not one: "no send occurred" and "no state
+    changed"."""
+    if not orig:
+        return False  # never knew what it was — a restoration cannot be proven to a place unknown
+    obs = _family_obs(c.eval(_PICKER_STATE_JS))
+    if obs.status != "family":
+        obs = _family_obs(_reopen_picker(c, lab))
+    if obs.status != "family":
+        return False
+    cur = _family_checked(obs)
+    if cur is not None and cur.lower() == orig.lower():
+        return True
+    if not c.eval(_click_family_js(orig)):
+        return False
+    time.sleep(0.6)
+    obs = _family_obs(c.eval(_PICKER_STATE_JS))
+    if obs.status != "family":
+        obs = _family_obs(_reopen_picker(c, lab))
+    if obs.status != "family":
+        return False
+    cur = _family_checked(obs)
+    return bool(cur and cur.lower() == orig.lower())
+
+
+def _restore_original(c, lab, orig_family, orig_tier_pos, restore_family):
+    """Put the composer back on the (family, tier) tuple it was FOUND on. Returns (proven, label):
+    `proven` only when every half attempted was witnessed, `label` the tier observed at the end (or
+    None when that could not be established).
+
+    FAMILY FIRST, then the tier — a family change re-renders the picker and rebuilds the slider, so
+    restoring the tier before the family restores it onto a control that is about to be replaced.
+    This is also why the tier is always restored to the ORIGINAL absolute position rather than left
+    to _slider_set's own undo: _slider_set captures its entry position AFTER the family change, so
+    on a build where the family reset the slider its "restore" faithfully returns the control to a
+    position the composer was never on."""
+    proven = True
+    if restore_family:
+        proven = _restore_family(c, lab, orig_family) and proven
+    if orig_tier_pos is None:
+        return proven, None
+    st = c.eval(_PICKER_STATE_JS)
+    if not isinstance(st, dict) or st.get("now") is None:
+        st = _reopen_picker(c, lab)
+    if not isinstance(st, dict) or st.get("now") is None:
+        return False, None
+    back = _slider_goto(c, orig_tier_pos)
+    return (back.proven and proven), (back.label if back.proven else None)
 
 
 def _cand_labels_js():
@@ -1461,7 +1783,112 @@ def _model_verdict(labels, target):
     return False, (labels[0] if labels else None)
 
 
-_ModelPick = collections.namedtuple("_ModelPick", "confirmed shown badge error")
+_Confirm = collections.namedtuple("_Confirm", "verdict tier detail")
+"""The post-commit joint read. `verdict` is one of:
+
+  ok             the authoritative controls, observed TOGETHER after the selection settled, carry
+                 the (family, tier) tuple that was asked for.
+  contradiction  they carry something else. A VETO — never a tie an earlier observation wins.
+  unreadable     they could not be read at all; the caller falls back to the resting composer's
+                 own labels, which is the authoritative surface on the builds that have one.
+"""
+
+
+def _confirm_pinned(c, lab, target, family, want_family):
+    """Reopen the picker after the commit/settle transition and read (family, tier) ONCE, together.
+
+    This replaces `if not ok and slid_ok: ok = True`. That line could not tell "the resting button
+    carries no tier on this schema, as expected" (GPT-6: the button reads the model badge "6")
+    apart from "the resting surface actively CONTRADICTS the tier we just set" — so a slider that
+    announced Pro mid-walk and reverted to High on commit still passed, on the strength of an
+    observation that was no longer true. It also never re-read the FAMILY after the tier walk,
+    so a tier change that reset the family passed on two observations that were never
+    simultaneously true.
+
+    Restoring "the closed button must read Pro" is NOT the fix — that requirement is what took the
+    tool down when the badge replaced the tier on that button. The fix is to go back to the
+    controls that actually hold the state, after they have settled, and read both at once.
+
+    Read-only: it opens, reads, and closes. `lab` is the label the selection was made through; the
+    resting labels are tried after it because pinning a tier can rename that very button (the
+    pre-GPT-6 switcher shows the tier it is on)."""
+    # Read the controls WHERE THEY ARE first. Live 2026-09-06: Radix leaves this picker MOUNTED
+    # after dismissal (data-state="closed", contents still queryable and still tracking the real
+    # state — a closed read returned checked=Latest, valuenow=4, "Pro, 5 of 5.", matching the
+    # resting badge "6"). When the controls can be read without touching anything, reopening them
+    # is not a stronger observation, only a more disruptive one — and reopening is where the flake
+    # lives, because the trigger renames itself on open. Reopen only when there is nothing to read.
+    st = c.eval(_PICKER_STATE_JS)
+    if not (isinstance(st, dict)
+            and (st.get("now") is not None or _family_obs(st).status != "absent")):
+        st = _reopen_picker(c, lab)
+        if st is None:
+            return _Confirm("unreadable", None, None)
+    obs = _family_obs(st)
+    tier = _slider_state_label(st) if st.get("now") is not None else None
+    _close_menus(c)
+    if obs.status in ("failed", "ambiguous"):
+        return _Confirm("unreadable", tier, obs.detail)
+    if want_family and obs.status == "family":
+        chk = _family_checked(obs)
+        if not chk or chk.strip().lower() != family.strip().lower():
+            return _Confirm("contradiction", tier, (
+                "the composer settled on model family '%s', not '%s' — the tier walk did not "
+                "leave the model where it was pinned" % (chk or "nothing", family)))
+    if tier is None:
+        return _Confirm("unreadable", None, None)
+    if not _matches(tier, target):
+        return _Confirm("contradiction", tier, (
+            "the composer settled on tier '%s', not '%s' — the selection did not survive the menu "
+            "closing" % (tier, target)))
+    return _Confirm("ok", tier, None)
+
+
+# Dispatch Escape AT the open menu, and report how many switchers still read aria-expanded="true".
+# Two dispatch targets because Radix's dismissable layer listens on the layer node, not the
+# document: the currently focused element (which IS that layer while the menu is open — live
+# 2026-09-06 activeElement was the picker's own popover div) and every open [role=menu].
+_DISMISS_JS = (
+    "(function(){var E={key:'Escape',code:'Escape',keyCode:27,which:27,"
+    "bubbles:true,cancelable:true};"
+    "[document.activeElement].concat([].slice.call(document.querySelectorAll("
+    "'[role=\"menu\"][data-state=\"open\"],[role=\"menu\"]:not([data-state])')))"
+    ".forEach(function(t){if(t)t.dispatchEvent(new KeyboardEvent('keydown',E));});"
+    # COMPOSER-SCOPED, exactly like _PICKER_STATE_JS's own btnLabel read. A document-wide count is
+    # useless: live 2026-09-06 a RESTING ChatGPT page already carries four button[aria-expanded=
+    # "true"] (sidebar and account disclosures), so "did the composer's menu close" measured
+    # page-wide never reads zero and the dismissal loop can never see success.
+    "return (document.querySelector('form')||document)"
+    ".querySelectorAll('button[aria-expanded=\"true\"]').length;})()")
+
+
+def _close_menus(c):
+    """Leave the composer RESTING, and say whether it got there.
+
+    Two dismissal mechanisms, not one. Live-measured 2026-09-06 on a logged-in Pro tab: a CDP
+    Input.dispatchKeyEvent Escape does NOT dismiss this build's picker — the trigger stayed
+    aria-expanded="true" across two of them — while a KeyboardEvent('keydown',{key:'Escape'})
+    dispatched at the focused dismissable layer closed it on the first try. The CDP key is kept
+    because it is what works on the pre-GPT-6 builds, where the JS form is a harmless extra event.
+
+    This matters far more than tidiness now: the verdict is taken from the RESTING composer (with
+    the menu open, this build's switcher reads "Thinking effort", which is neither a model nor a
+    tier), so a menu that never closes makes every confirming read describe a transient. The old
+    `if not ok and slid_ok: ok = True` line hid exactly that — it confirmed on a mid-walk
+    observation and never noticed the composer had not actually settled.
+
+    Repeated because the submenu path can stack a second [role=menu], and because dismissal is a
+    React state update that is not visible in the same tick as the event that causes it."""
+    for _ in range(3):
+        c.key("Escape", "Escape", 27)
+        time.sleep(0.15)
+        if c.eval(_DISMISS_JS) == 0:
+            return True
+        time.sleep(0.35)
+    return c.eval(_DISMISS_JS) == 0
+
+
+_ModelPick = collections.namedtuple("_ModelPick", "confirmed shown badge error dirty")
 """The whole verdict of one selection attempt, in one value, because it is now more than one fact:
 
   confirmed  the TIER is pinned to the target (and no family miss vetoed the run)
@@ -1472,9 +1899,15 @@ _ModelPick = collections.namedtuple("_ModelPick", "confirmed shown badge error")
              thought. On older builds the same button showed a tier, or the Chat/Agent mode
              toggle; it is recorded verbatim either way, because a receipt that invents a model
              name is strictly worse than one that quotes the button.
-  error      a human sentence when a FAMILY miss is what failed the run (the tier's own failure
-             is already fully described by `shown` + the caller's target). Kept on the same
-             value rather than a second channel so a caller cannot report one and miss the other.
+  error      a human sentence when a FAMILY miss, an unreadable model control or a post-commit
+             contradiction is what failed the run (a plain tier miss is already fully described by
+             `shown` + the caller's target). Kept on the same value rather than a second channel
+             so a caller cannot report one and miss the other.
+  dirty      the composer's model controls were MUTATED and could not be proven restored. "No send
+             occurred" and "no state changed" are separate properties: a caller that only reports
+             the first leaves a human believing an untouched tab. Never a receipt field — it is
+             appended to the refusal sentence, because the receipt schema belongs to another
+             change.
 """
 
 
@@ -1498,9 +1931,16 @@ def _select_model(c, target, family=None):
     _model_verdict over the closed composer's labels could confirm one. On the GPT-6 build that
     button shows the MODEL BADGE instead ("6" live 2026-09-06) and no button anywhere reads the
     tier, so the label verdict alone can never confirm and a correctly pinned Pro would be
-    refused forever. A _slider_set that returned True therefore confirms in its own right — it
-    only does so after matching a label taken from the slider control's own, shape-validated
-    accessibility announcement, which is a stronger source than the button ever was.
+    refused forever. The authority is therefore the CONTROLS, re-read together after they settle
+    (see _confirm_pinned) — not the mid-walk observation, which is exactly as stale as the button
+    was wrong. A contradiction there VETOES; only an unreadable confirming read falls back to the
+    resting labels, and only when the family was positively settled first.
+
+    TRANSACTIONAL FAILURE. Everything mutated inside a menu is snapshotted before it is touched —
+    the checked family AND the slider position, from one snapshot — and a failure restores the
+    family first (a family change re-renders the slider, so the reverse order restores a tier onto
+    a control that is about to be rebuilt), then the original tier, then verifies both. What
+    cannot be verified is reported as `dirty` rather than assumed.
 
     Candidates are read as LABELS, not positions, and each is opened by identity in a single
     evaluation (see _open_cand_by_label_js) — never by an index into a NodeList read in an
@@ -1526,13 +1966,16 @@ def _select_model(c, target, family=None):
     badge = labels[0] if labels else None
     ok, shown = _model_verdict(labels, target)
     if ok and not want_family:
-        return _ModelPick(True, shown, badge, None)
+        return _ModelPick(True, shown, badge, None, False)
     last_slider_label = None
-    # Whether the family dimension was actually INSPECTED (inside a menu that really opened), as
-    # opposed to merely not having failed. Without this, a composer already sitting on the target
-    # tier whose picker never opens at all would return confirmed=True with the model unverified —
-    # a fail-OPEN in the middle of a fail-closed guard, and the exact hole this change closes.
+    # Whether the family dimension was actually ESTABLISHED (inside a menu that really opened, on a
+    # schema whose family control was positively recognized), as opposed to merely not having
+    # failed. Without this, a composer already sitting on the target tier whose picker never opens
+    # at all would return confirmed=True with the model unverified — a fail-OPEN in the middle of a
+    # fail-closed guard, and the exact hole this guard exists to close.
     family_checked = not want_family
+    fam_detail = None      # the last reason the family could not be established, for the refusal
+    dirty = False          # the composer was mutated and the mutation could not be proven undone
     exhausted = set()
     for _ in range(2):
         labels = [x for x in (c.eval(_cand_labels_js()) or []) if x]
@@ -1545,55 +1988,106 @@ def _select_model(c, target, family=None):
             if opened != lab:
                 continue  # addressing miss — nothing opened is trustworthy, try the next label
             time.sleep(1.0)  # Radix menu renders async after the gesture
-            fam_ok, fam_detail = _select_family(c, family)
-            if not fam_ok:
-                # The radio group EXISTS here and does not offer the family we promised. No other
-                # switcher can undo that, so stop: leave the menu closed and refuse, naming what
-                # the account actually offers.
-                c.key("Escape", "Escape", 27)
-                time.sleep(0.15)
-                c.key("Escape", "Escape", 27)
-                time.sleep(0.15)
-                return _ModelPick(False, last_slider_label or shown, badge, fam_detail)
-            family_checked = True
-            slid_ok, slid_label = _slider_set(c, target)
-            if slid_label:
-                last_slider_label = slid_label
-            hit = slid_ok or c.eval(_click_item_js(target)) or _submenu_try(c, target)
+            # THE TRANSACTION'S OPENING SNAPSHOT: the family and the tier as they were found, read
+            # together, before anything is touched. Restoration has to aim at the ORIGINAL tuple —
+            # _slider_set's own entry position is captured after any family change, so it alone
+            # cannot undo a run that changed the family and then failed the tier.
+            st0 = c.eval(_PICKER_STATE_JS)
+            obs0 = _family_obs(st0)
+            orig_tier_pos = st0.get("now") if isinstance(st0, dict) else None
+            orig_family = _family_checked(obs0)
+            if want_family and obs0.status in ("failed", "ambiguous"):
+                # The picker is open and its model control did not read back coherently. That is
+                # not a build without one, and it is not a licence to drive the tier behind it:
+                # touch nothing here, keep the reason, and let another candidate or pass try.
+                fam_detail = obs0.detail
+                _close_menus(c)
+                continue
+            fam = _FamilyPick(True, None, None, False)
+            if want_family and obs0.status == "family":
+                fam = _apply_family(c, lab, obs0, family)
+                if not fam.ok:
+                    # This picker's radio group EXISTS and could not be put on the family we
+                    # promised. No other switcher can undo that, so stop — but first undo whatever
+                    # this attempt already did.
+                    if fam.touched:
+                        proven, _lab = _restore_original(c, lab, orig_family, orig_tier_pos, True)
+                        dirty = dirty or not proven
+                    _close_menus(c)
+                    return _ModelPick(False, last_slider_label or shown, badge, fam.detail, dirty)
+            tier = _slider_set(c, target)
+            if tier.label:
+                last_slider_label = tier.label
+            hit = tier.ok or c.eval(_click_item_js(target)) or _submenu_try(c, target)
+            # What positively settles the family for THIS candidate:
+            #   family  the radios were read and put (or found) on the target;
+            #   legacy  a picker that renders no family control at all — the pre-GPT-6 composer;
+            #   absent  no picker element exists here AND the tier was reached by the FLAT/submenu
+            #           path, which is the pre-picker composer generation: a build that serves the
+            #           tier as a plain menuitem and renders no intelligence picker predates the
+            #           family control entirely. `absent` alone never settles anything — that is
+            #           what let an unrelated menu with no radios satisfy the bookkeeping.
+            settled = ((not want_family)
+                       or (obs0.status == "family" and fam.ok)
+                       or obs0.status == "legacy"
+                       or (obs0.status == "absent" and hit and not tier.ok))
+            family_checked = family_checked or settled
             if hit:
                 time.sleep(0.5)
-                # Leave the composer clean before the paste that follows, success or not. Two
-                # Escapes cover the submenu path's second [role=menu] level; an Escape when
-                # nothing is open is a verified no-op, so this never harms the flat/slider cases.
-                # This runs BEFORE the confirming read, not after: with the menu still open the
+                # Leave the composer resting BEFORE any verdict: with the menu still open the
                 # GPT-6 composer button reads "Thinking effort" (live 2026-09-06), so a verdict
-                # taken mid-menu would judge the composer by a transient label that is not a
-                # model or a tier at all. The verdict must describe the RESTING composer.
-                c.key("Escape", "Escape", 27)
-                time.sleep(0.15)
-                c.key("Escape", "Escape", 27)
-                time.sleep(0.15)
+                # taken mid-menu would judge the composer by a transient label that is not a model
+                # or a tier at all.
+                rested = _close_menus(c)
+                conf = _confirm_pinned(c, lab, target, family, want_family)
                 post = [x for x in (c.eval(_cand_labels_js()) or []) if x]
                 if post:
                     badge = post[0]
-                ok, shown = _model_verdict(post, target)
-                if not ok and slid_ok:
-                    # The switcher label can no longer confirm a TIER on the GPT-6 build: that
-                    # button now shows the MODEL BADGE ("6" live 2026-09-06), so _model_verdict
-                    # scans a list that never contains a tier and would refuse a correctly-pinned
-                    # Pro forever. The slider's own state is the authority in that case, and it is
-                    # a stronger one than the button ever was: _slider_set returns True only after
-                    # _matches() accepted a label that came out of the control's own, shape-
-                    # validated accessibility announcement (see _slider_state_label).
-                    ok, shown = True, slid_label
-                if ok:
-                    return _ModelPick(True, shown, badge, None)
+                ok_rest, shown_rest = _model_verdict(post, target)
+                if conf.verdict == "contradiction":
+                    # A veto, not a tie the earlier observation wins. Retrying cannot make an
+                    # observed contradiction untrue, so this ends the run — and because the
+                    # composer is provably NOT where the walk thought it left it, the whole
+                    # transaction is rolled back to the tuple it was found on. The family half is
+                    # restored whether or not this attempt is what moved it: a family that drifted
+                    # under the tier walk is still a family this run is responsible for.
+                    proven, back_label = _restore_original(
+                        c, lab, orig_family, orig_tier_pos, bool(orig_family))
+                    _close_menus(c)
+                    return _ModelPick(False, conf.tier or back_label or shown_rest, badge,
+                                      conf.detail, dirty or not proven)
+                if settled and conf.verdict == "ok":
+                    return _ModelPick(True, conf.tier, badge, None, dirty)
+                if settled and ok_rest and rested:
+                    # The confirming read could not reach the controls; the RESTING composer is the
+                    # authoritative surface on every build whose button carries the tier (the flat
+                    # and pre-GPT-6 slider composers). Never the mid-walk slider observation — and
+                    # only when the composer IS resting: `post` describes an open menu otherwise,
+                    # and on this build an open switcher reads "Thinking effort".
+                    return _ModelPick(True, shown_rest, badge, None, dirty)
+                # The tier landed, but this attempt cannot be CONFIRMED: either the family behind
+                # it was never established, or the authoritative controls could not be re-read and
+                # the resting composer carries no tier to fall back on. Either way the attempt is
+                # not a success, so the tier it moved goes back — a refusal that silently
+                # retargets the composer is the same harm as the tier walk's own abandoned state.
+                fam_detail = fam_detail or (None if settled else conf.detail)
+                proven, back_label = _restore_original(
+                    c, lab, orig_family, orig_tier_pos, fam.touched)
+                dirty = dirty or not proven
+                last_slider_label = back_label or last_slider_label
+                _close_menus(c)
                 continue
             # this WAS the candidate asked for, and it genuinely does not carry target — budget
-            # must not be spent reopening it.
+            # must not be spent reopening it. Undo the whole transaction: the family this attempt
+            # changed AND the tier, back to the ORIGINAL position rather than to _slider_set's own
+            # entry, which was captured after the family change rebuilt the slider.
+            if fam.touched or tier.dirty:
+                proven, back_label = _restore_original(
+                    c, lab, orig_family, orig_tier_pos, fam.touched)
+                dirty = dirty or not proven
+                last_slider_label = back_label or last_slider_label
             exhausted.add(lab)
-            c.key("Escape", "Escape", 27)
-            time.sleep(0.25)
+            _close_menus(c)
         time.sleep(0.4)
     final = [x for x in (c.eval(_cand_labels_js()) or []) if x]
     if final:
@@ -1601,11 +2095,15 @@ def _select_model(c, target, family=None):
     ok, shown = _model_verdict(final, target)
     if not ok and last_slider_label:
         shown = last_slider_label
-    if ok and not family_checked:
+    if not family_checked:
+        # The family reason outranks the tier's here even when the tier ALSO failed: an unreadable
+        # or unlocatable model control means the tier was deliberately never driven behind it, so
+        # "wanted Pro, switcher shows X" would describe a walk that never happened.
         return _ModelPick(False, shown, badge,
+                          fam_detail or
                           "model family '%s' could not be verified — the composer's picker menu "
-                          "never opened, so the radios were never readable" % family)
-    return _ModelPick(ok, shown, badge, None)
+                          "never opened, so the radios were never readable" % family, dirty)
+    return _ModelPick(bool(ok), shown, badge, None, dirty)
 
 
 # A real code-source URL: https:// on github.com / gist.github.com / raw.githubusercontent.com,
@@ -2027,6 +2525,12 @@ def cmd_submit(a) -> int:
                 # instead of being flattened into the tier wording.
                 why = pick.error or (f"wanted '{target}', switcher shows '{model_now}' and it "
                                      f"could not be changed")
+                if pick.dirty:
+                    # "Nothing was sent" and "nothing was changed" are separate properties. A
+                    # refusal that only reports the first leaves a human believing an untouched
+                    # tab, and the next run inherits a composer nobody knows the state of.
+                    why += (" (and the composer's model controls could NOT be proven restored to "
+                            "the state they were found in — the tab is left dirty)")
                 fix = ("set CGC_MODEL_FAMILY to a family this account offers (or 'skip')"
                        if pick.error else f"set a '{target}' tier in the ChatGPT window")
                 sys.stderr.write(
@@ -2298,6 +2802,7 @@ def cmd_followup(a) -> int:
         # tier on the thread BEFORE inserting the prompt; refuse to send on the wrong model
         # unless --allow-model-mismatch. Runs before insert so the menu clicks can't clobber
         # composer text.
+        model_badge = None
         if a.model and a.model.lower() != "skip":
             target = a.model
             if reopened:
@@ -2312,13 +2817,16 @@ def cmd_followup(a) -> int:
                 while not (c.eval(_cand_labels_js()) or []) and time.time() < _settle:
                     time.sleep(0.5)
             pick = _select_model(c, target, a.model_family)
-            _fu_ok, model_now = pick.confirmed, pick.shown
+            _fu_ok, model_now, model_badge = pick.confirmed, pick.shown, pick.badge
             if not _fu_ok and not a.allow_model_mismatch:
                 print(json.dumps({"ok": False, "followup": True, "conversation_id": conv,
                                   "rid": rid, "modelConfirmed": False, "model": model_now,
                                   "modelBadge": pick.badge, "wanted": target,
                                   "wantedFamily": a.model_family, "detail": pick.error}))
                 why = pick.error or (f"thread offers '{model_now}', not '{target}'")
+                if pick.dirty:
+                    why += (" (and the composer's model controls could NOT be proven restored to "
+                            "the state they were found in — the tab is left dirty)")
                 fix = ("set CGC_MODEL_FAMILY to a family this account offers (or 'skip')"
                        if pick.error else f"restore the '{target}' tier in the ChatGPT window")
                 sys.stderr.write(
@@ -2421,8 +2929,12 @@ def cmd_followup(a) -> int:
                 return 2
         _write_state(conversation=conv, rid=rid)  # keep the active thread current
         default_out = os.path.join(CGC_STATE_DIR, f"answer_{rid}.txt" if rid else "answer_followup.txt")
+        # modelBadge here is the same PRE-SEND selection evidence submit reports (SHARED CONTRACT
+        # #4): a follow-up re-asserts the tier/family on the thread, so it has its own selection
+        # evidence and its own round row to carry it. It is NOT attribution — `wait`'s modelSlug is.
         print(json.dumps({"ok": True, "userMsgs": n, "conversation_id": conv, "rid": rid,
-                          "followup": True, "wait_out": default_out, "watching": bool(a.watch)}))
+                          "followup": True, "modelBadge": model_badge,
+                          "wait_out": default_out, "watching": bool(a.watch)}))
     finally:
         c.close()
     if a.watch:
@@ -2558,6 +3070,9 @@ def cmd_wait(a) -> int:
             if st.get("done"):
                 ans = c.eval(_extract_js(rid, turn_index)) or ""
                 _write_private(a.out, ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
+                # Attribution is read from the SAME turn_index that produced `ans`, and BEFORE the
+                # tab is closed below — afterwards the node is gone and the fact is unrecoverable.
+                _wait_receipt(rid, a.out, _read_attribution(c, rid, turn_index))
                 sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out}\n")
                 conv = conv or c.conversation_id()
                 _write_state(conversation=conv, status="answered")  # mark this job answered
@@ -2596,6 +3111,7 @@ def cmd_wait(a) -> int:
                     ans = c.eval(_extract_js(rid, turn_index)) or ""
                     if ans:
                         _write_private(a.out, ans)
+                        _wait_receipt(rid, a.out, _read_attribution(c, rid, turn_index))
                         sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out} (recovered at settle)\n")
                         if not a.keep_tab:
                             c.close_tab()
@@ -2611,6 +3127,7 @@ def cmd_wait(a) -> int:
                     if allowed and len(raw) >= a.min_unwrapped:
                         _write_private(a.out, raw)
                         _write_private(a.out + ".raw", raw)
+                        _wait_receipt(rid, a.out, _read_attribution(c, rid, fresh_turn_index))
                         sys.stderr.write(
                             f"CGC_UNWRAPPED wrote {len(raw)} chars to {a.out} (also saved to {a.out}.raw): "
                             f"the model did NOT emit BEGIN/END_RESPONSE:{rid}, so the whole last message "
@@ -2657,6 +3174,7 @@ def cmd_wait(a) -> int:
         rescue = c.eval(_extract_js(rid, turn_index)) or ""
         if rescue:
             _write_private(a.out, rescue)
+            _wait_receipt(rid, a.out, _read_attribution(c, rid, turn_index))
             sys.stderr.write(f"CGC_DONE wrote {len(rescue)} chars to {a.out} (rescued at timeout)\n")
             if not a.keep_tab:
                 c.close_tab()
@@ -2674,6 +3192,7 @@ def cmd_wait(a) -> int:
         if allowed and len(raw) >= a.min_unwrapped:
             _write_private(a.out, raw)
             _write_private(a.out + ".raw", raw)
+            _wait_receipt(rid, a.out, _read_attribution(c, rid, fresh_turn_index))
             sys.stderr.write(
                 f"CGC_UNWRAPPED wrote {len(raw)} chars to {a.out} (also saved to {a.out}.raw): the "
                 f"model did NOT emit BEGIN/END_RESPONSE:{rid} — best-effort salvage at timeout; "
