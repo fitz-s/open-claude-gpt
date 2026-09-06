@@ -59,6 +59,8 @@ outcome names the artifact it produced. Act on the fields, never on the code alo
 
 - `answer_path` set → Read it. `confidence:"unverified"` → a human verifies the answer is complete
   and belongs to this round before you act on it; never auto-chain a follow-up on it.
+- Success carries `next_command:null` by design — a follow-up costs one of the week's few Pro
+  messages, so it is a decision you make FROM the answer, never a step the envelope proposes.
 - `human_action` set → relay exactly that to the user (login/captcha/rate-limit/safeguard
   refusal), then do `next_command` once it's cleared.
 - `retryable:true` → re-run the SAME fire (use the same `--request-key`). `retryable:false` with

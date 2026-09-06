@@ -185,7 +185,8 @@ class TestAwaitGate:
         assert env_json["attribution"] == "matched"
         assert env_json["model_slug"] == SLUG_GPT6_PRO
         assert env_json["model_badge"] == "6"
-        assert env_json["next_command"], "a clean round still names the follow-up"
+        assert env_json["next_command"] is None, \
+            "even a clean round proposes no paid follow-up (2026-09-06)"
 
     def test_unknown_does_not_gate(self, env, capsys):
         """Silence from the provider is not evidence of a wrong model. Refusing an otherwise good

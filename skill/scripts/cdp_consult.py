@@ -158,6 +158,31 @@ STATE_LOCK_PATH = STATE_PATH + ".lock"
 # tail; the read-only auto-retrieve backstops anything beyond it.
 STUCK_AFTER_S = 5400
 
+# READ-side stale-tab recovery (see cmd_wait). A CDP-attached ChatGPT tab can keep serving a DOM
+# that has fallen behind the server-side conversation — observed 2026-09-06 on
+# REQ-20260906-025243-c975c2, where the tab reported 3 assistant turns for a conversation that had
+# 4 and never re-rendered; the answer existed the whole time. A waiter pinned to such a tab burns
+# its entire timeout (90 min there) and returns a false stuck/timeout_no_answer on a round that
+# actually succeeded. The signal the waiter already has is that the round's OWN source turn is not
+# in the DOM: if it is still missing after this window, the tab is stale, not the send slow.
+STALE_TURN_AFTER_S = 60
+# Post-reload settle before the next probe. ChatGPT rebuilds the turn list asynchronously; probing
+# immediately reads an empty <main> and wastes the one recovery on a page that had not painted yet.
+STALE_RELOAD_SETTLE_S = 8
+# The SECOND stale trigger (see cmd_wait's watch loop). The same dead DOM also strands a waiter
+# AFTER the source turn resolved, so the missing-turn window above never fires: on
+# REQ-20260906-025243-c975c2 generation began normally (gen=True, ac=4), the tab then dropped an
+# assistant turn (ac 4->3) mid-stream and froze at 539 bytes for the remaining ~5200s, exiting 4
+# with timeout_no_answer while a finished 36446-char answer sat on the server — a later wait that
+# re-opened the conversation read it in 17s. The waiter already NAMES that state once per settle
+# window ("stub-stable"); it fired ~18 times per dead wait and meant nothing. So the unit here is
+# settle CYCLES, not polls: 3 x --settle-seconds (300s in production) = 15 minutes in which the tab
+# reported neither generation nor one new byte. Astra's classifier pauses are seconds and its
+# reasoning gaps are minutes, and both keep gen=True or the byte count moving — either of which
+# resets the streak before it can reach 3 — so 15 idle minutes sits far outside a live round while
+# costing ~1/6 of the 5400s actually lost.
+STALE_STUB_CYCLES = 3
+
 
 @contextlib.contextmanager
 def _state_lock():
@@ -941,6 +966,28 @@ def _wait_receipt(rid, out, slug):
     it for attribution. modelSlug is the provider's own producer attribution (SHARED CONTRACT #4);
     null means the attribute was absent, which is NOT a failure and NOT a mismatch."""
     print(json.dumps({"rid": rid, "out": out, "modelSlug": slug}))
+
+
+def _reload_stale_tab(c, reason):
+    """Reload the attached conversation ONCE because its DOM has stopped tracking the server-side
+    thread. `reason` is the caller's diagnosis — two independent symptoms reach the same tab
+    (the round's own user turn never rendering, and a frozen post-generation stub), and they share
+    this one mechanism and, in cmd_wait, one budget.
+
+    READ-SIDE ONLY, and structurally so: Page.reload re-fetches the conversation the tab is already
+    on. It does not touch the composer, does not paste, and cannot send — the at-most-once send
+    invariant is untouched, because nothing here can produce a send at all. The caller owns the
+    at-most-once budget for the reload itself, so a genuinely absent turn still reaches rid_absent
+    or the normal timeout instead of reloading in a loop."""
+    sys.stderr.write(
+        f"CGC_WAIT stale-tab: {reason} — reloading the conversation once (read-only; nothing is "
+        "re-sent) before committing to the rest of the watch.\n")
+    try:
+        c.call("Page.reload", {"ignoreCache": False})
+    except Exception as e:
+        sys.stderr.write(f"CGC_WAIT stale-tab: reload failed ({e}); continuing on the current DOM\n")
+        return
+    time.sleep(STALE_RELOAD_SETTLE_S)
 
 
 def _scoped_raw(c, rid, strict, turn_index):
@@ -3006,6 +3053,14 @@ def cmd_wait(a) -> int:
         # ([S3] fix). Stays None for 'auto' — the legacy unscoped lookup.
         turn_index = None
         rdl = time.time() + min(600, a.timeout)
+        # At most ONE stale-tab reload per WAIT (see _reload_stale_tab) — one budget shared by
+        # both triggers, the missing-source-turn one below and the frozen-stub one in the watch
+        # loop, whichever claims it first. Bounded deliberately: a turn that is genuinely absent —
+        # wrong --conversation, a round never sent here — must still fall through to rid_absent,
+        # and a round the model never answered must still reach timeout_no_answer, rather than
+        # reload-looping until the deadline.
+        stale_deadline = time.time() + STALE_TURN_AFTER_S
+        reloaded = False
         while time.time() < rdl:
             if strict:
                 try:
@@ -3020,6 +3075,12 @@ def cmd_wait(a) -> int:
                     rid = a.rid
                     turn_index = loc["turn_index"]
                     break
+                if not reloaded and time.time() >= stale_deadline:
+                    reloaded = True
+                    _reload_stale_tab(
+                        c, f"source_rid={a.rid} is still not in this tab's DOM (observed latest "
+                           f"{observed_rid or 'none'}) after {STALE_TURN_AFTER_S}s")
+                    continue
                 sys.stderr.write(f"CGC_WAIT resolving source turn… (not yet visible; observed "
                                  f"latest {observed_rid or 'none'})\n")
                 time.sleep(5)
@@ -3046,6 +3107,10 @@ def cmd_wait(a) -> int:
                          f"settle {a.settle_seconds}s)\n")
         last_len = -1
         settle_start = None  # wall-clock when the answer FIRST became non-generating + byte-stable
+        # Consecutive stub-stable verdicts and the byte count all of them were frozen at — the
+        # second stale-tab trigger (see STALE_STUB_CYCLES). Any movement resets the streak.
+        stub_cycles = 0
+        stub_len = None
         ticks = 0
         while time.time() < deadline:
             try:
@@ -3150,9 +3215,32 @@ def cmd_wait(a) -> int:
                             f"CGC_WAIT stub-stable: last assistant only {len(raw)} chars, no sentinel — "
                             f"likely a thinking/streaming gap; still waiting (raw saved to {a.out}.raw).\n")
                         settle_start = None
+                        # …unless the gap never closes. A streak of these, all at the SAME byte
+                        # count, is no longer a gap in a live round — it is a DOM that stopped
+                        # tracking the thread (the else-branch below resets the streak the instant
+                        # generation resumes or one byte moves, so a real pause cannot reach here).
+                        # Spend the wait's one reload on it instead of watching a dead tab out.
+                        stub_cycles = stub_cycles + 1 if len(raw) == stub_len else 1
+                        stub_len = len(raw)
+                        if not reloaded and stub_cycles >= STALE_STUB_CYCLES:
+                            reloaded = True
+                            _reload_stale_tab(
+                                c, f"{stub_cycles} consecutive stub-stable reads for {rid}, all "
+                                   f"frozen at {stub_len} chars with no generation "
+                                   f"(~{int(stub_cycles * a.settle_seconds)}s of a motionless DOM)")
+                            # The turn ordinal was read off the DOM we just declared untrustworthy;
+                            # re-locate the source turn on the rebuilt page rather than keep scoping
+                            # the answer by an ordinal that may have shifted.
+                            if strict:
+                                _ok, _obs, fresh_idx, fresh_present = _salvage_allowed(c, rid)
+                                if fresh_present:
+                                    turn_index = fresh_idx
             else:
+                # Generating, or the byte count moved: the round is alive. This is the reset that
+                # keeps the frozen-stub trigger off every legitimate thinking/streaming pause.
                 settle_start = None
                 last_len = cur_len
+                stub_cycles = 0
             time.sleep(a.poll)
         # Timeout: the answer is usually PRESENT but was virtualized out of the inactive tab's
         # DOM (the failure that returned "no answer" on a completed consult). Force-render by

@@ -797,7 +797,7 @@ def _stderr_error_line(stderr: str) -> str | None:
 # the diff-review showed its salvage can attribute a DIFFERENT round's answer to this rid under
 # concurrent same-thread sends, and handing automation a silent "success" there can corrupt
 # downstream autonomous work. Unverified answers are materialized for a human, but await returns
-# review-required and never emits the auto-followup nudge.
+# review-required rather than success.
 _TERMINAL_OK = (store_mod.COMPLETED_VERIFIED,)
 
 
@@ -883,9 +883,6 @@ def _await_round(a) -> int:
                 return 1
             _materialize(out, text)
             n = len(text.encode("utf-8"))
-            consult = os.path.join(os.path.dirname(os.path.abspath(__file__)), "consult.py")
-            followup_cmd = (f"python3 {consult} fire --followup --parent {a.rid} --no-code "
-                            "--task \"<local results + the next question>\" --title \"<what's new>\"")
             attribution = r.get("attribution")
             model_slug, model_badge = r.get("model_slug"), r.get("model_badge")
             # THE GATE, and the only one. The answer verified against its own rid sentinel — that
@@ -914,12 +911,19 @@ def _await_round(a) -> int:
                    if model_slug else
                    "Producer attribution: UNKNOWN — the provider stamped no model on this answer; "
                    "which model served it is not established.\n")
-                + "CGC_NEXT to CONTINUE this thread (re-review after your changes, re-check a fix, next "
-                "phase) — a FOLLOW-UP keeps ChatGPT's context; a fresh consult throws it away:\n"
-                f"  {followup_cmd}\n"
-                f"  (--parent {a.rid} pins THIS consult's thread causally; add --refs-file for a fresh diff link.)\n")
+                + "This round is closed. Read the answer and decide from it alone whether anything "
+                "further is warranted.\n")
+            # next_command stays NULL on success (2026-09-06 review). A ready-to-run follow-up
+            # command printed here landed at the exact instant the calling agent picked its next
+            # action, and recommended another paid round before anything had judged the answer —
+            # a ChatGPT Pro plan allows tens of messages A WEEK. It also fired for a completed
+            # `retrieve`, a read-only recovery that resolved nothing and so can have nothing to
+            # continue. Recovery outcomes below keep their commands: a blocked / failed / not-sent
+            # round genuinely needs the operator to run something, which is a move out of a hole,
+            # not a purchase. Continuing a thread is still supported — it is now a decision the
+            # caller makes from the answer, not a default the envelope proposes.
             _emit(a.rid, state, retryable=False, parent_rid=parent, answer_path=out,
-                  confidence="verified", next_command=followup_cmd, source_rid=src_rid,
+                  confidence="verified", source_rid=src_rid,
                   model_badge=model_badge, model_slug=model_slug, attribution=attribution)
             return 0
         if state == store_mod.COMPLETED_UNVERIFIED:

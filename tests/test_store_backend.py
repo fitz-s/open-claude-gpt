@@ -774,7 +774,41 @@ class TestOutcomeEnvelope:
         assert env_json["schema"] == 1 and env_json["rid"] == rid
         assert env_json["state"] == "completed_verified" and env_json["confidence"] == "verified"
         assert env_json["answer_path"] == str(out)
-        assert "fire --followup --parent" in env_json["next_command"]
+        assert env_json["next_command"] is None, \
+            "success must not propose spending another of the week's few Pro messages"
+
+    def test_a_completed_retrieve_recommends_no_paid_follow_up(self, env, capsys):
+        """A retrieve is a READ-ONLY recovery: it re-reads an answer the provider already produced
+        and resolves nothing on its own. Before 2026-09-06 its success envelope carried the same
+        ready-to-run `fire --followup` command a real consult got, so merely COMPLETING a recovery
+        recommended buying another round. Nothing on this path may name a paid command."""
+        import argparse
+        store_mod, backend, s, tmp_path = env
+        source_rid = "REQ-20260906-120000-0src01"
+        retrieve_rid = "REQ-20260906-121000-0rtr01"
+        s.create_round(retrieve_rid, "retrieve", thread_id="conv-nc", parent_rid=source_rid,
+                       spec_json=json.dumps({"conversation": "conv-nc", "parent_rid": source_rid}))
+        s.db.execute("UPDATE threads SET conversation_id='conv-nc' WHERE thread_id='conv-nc'")
+        s.set_state(retrieve_rid, store_mod.READY)
+
+        def cdp(kind, **kw):
+            with open(kw["out"], "w") as f:
+                f.write("the recovered answer")
+            return {"code": 0, "out": kw["out"], "stderr": ""}
+
+        assert backend.process_round(s, s.get_round(retrieve_rid), cdp, daemon_instance_id="d1",
+                                     validate=lambda p: (True, "ok")) == store_mod.COMPLETED_VERIFIED
+        capsys.readouterr()
+        out = tmp_path / "r.txt"
+        code = backend.await_round(argparse.Namespace(rid=retrieve_rid, out=str(out),
+                                                      poll=0.01, timeout=2))
+        assert code == 0
+        cap = capsys.readouterr()
+        env_json = json.loads(cap.out.strip().splitlines()[-1])
+        assert env_json["next_command"] is None
+        assert env_json["source_rid"] == source_rid, "a retrieve still names what it recovered"
+        assert "--followup" not in cap.err and "consult.py fire" not in cap.err, \
+            "no paid follow-up command may be printed on a completed recovery either"
 
     def test_await_failed_envelope_carries_retryability(self, env, capsys):
         import argparse

@@ -6,6 +6,7 @@ import argparse
 import importlib.util
 import json
 import os
+import pathlib
 import subprocess
 import sys
 
@@ -98,3 +99,66 @@ def test_fire_runs_end_to_end_from_the_command_line(tmp_path):
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
     assert out["rid"].startswith("REQ-") and out["out"] and out["await"]
+
+
+# ---- the output contract must survive the initial/continuation split ---------------------------
+# Until 2026-09-06 --output-file/--output-replace were resolved INSIDE prep's non-followup branch,
+# so a follow-up silently got FOLLOWUP_TEMPLATE's hardcoded findings prose no matter what the
+# caller asked for. Verified live: REQ-20260906-025243-c975c2 was fired with
+# `--output-file skill/references/deep-review-output.md --output-replace` and both flags were
+# dropped. Routing and CLI behaviour were covered here; contract propagation was not.
+
+def _rendered(mod, tmp, **over):
+    """Run prep and return the prompt it actually wrote — the only artifact that reaches ChatGPT."""
+    st = mod.cmd_prep(_ns(mod, tmp, **over))
+    return pathlib.Path(st["prompt_file"]).read_text(encoding="utf-8")
+
+
+def test_initial_and_continuation_honour_the_same_output_spec(tmp_path, monkeypatch):
+    mod = _load()
+    monkeypatch.setattr(mod, "CGC_STATE_DIR", str(tmp_path))
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Deliverable\nAn experiment design: hypothesis, procedure, kill criteria.\n")
+    initial = _rendered(mod, tmp_path, no_code=True, output_file=str(spec))
+    follow = _rendered(mod, tmp_path, no_code=True, followup=True, output_file=str(spec))
+    for name, text in (("initial", initial), ("follow-up", follow)):
+        assert "An experiment design: hypothesis, procedure, kill criteria." in text, \
+            f"the {name} render dropped the supplied output specification"
+
+
+def test_output_replace_drops_the_findings_contract_on_a_followup_too(tmp_path, monkeypatch):
+    """--output-replace means the spec OWNS the Output section. A follow-up that still appended the
+    default findings shape would hand the model two colliding contracts."""
+    mod = _load()
+    monkeypatch.setattr(mod, "CGC_STATE_DIR", str(tmp_path))
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Deliverable\nA decision memo. No severity scale.\n")
+    text = _rendered(mod, tmp_path, no_code=True, followup=True,
+                     output_file=str(spec), output_replace=True)
+    assert "A decision memo. No severity scale." in text
+    assert "BLOCKER / HIGH / MEDIUM / LOW / NIT" not in text, \
+        "the default findings contract must not collide with the caller's own shape"
+    assert mod.REPLACE_OUTPUT_CLOSE.split(".")[0] in text, "the universal close still applies"
+
+
+def test_a_followup_with_no_spec_still_gets_the_default_contract(tmp_path, monkeypatch):
+    mod = _load()
+    monkeypatch.setattr(mod, "CGC_STATE_DIR", str(tmp_path))
+    text = _rendered(mod, tmp_path, no_code=True, followup=True)
+    assert "BLOCKER / HIGH / MEDIUM / LOW / NIT" in text
+
+
+def test_an_unchanged_source_sha_is_not_described_as_new_or_updated(tmp_path, monkeypatch):
+    """prep is a pure renderer: it never sees the parent round's source ref, so it cannot know
+    whether anything moved. REQ-20260906-025243-c975c2 linked the SAME commit SHA as its parent and
+    was still told its sources were new and that Claude Code had applied a fix. Neither claim may
+    appear on a follow-up render."""
+    mod = _load()
+    monkeypatch.setattr(mod, "CGC_STATE_DIR", str(tmp_path))
+    same_sha = "c" * 40
+    refs = tmp_path / "refs.md"
+    refs.write_text(f"- https://github.com/acme/widgets/tree/{same_sha}\n")
+    text = _rendered(mod, tmp_path, followup=True, refs_file=str(refs))
+    assert same_sha in text, "the source still ships"
+    for claim in ("new or updated", "New or changed source", "acted on your last answer"):
+        assert claim not in text, f"renderer asserted {claim!r} it has no evidence for"
