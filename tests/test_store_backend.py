@@ -842,6 +842,45 @@ class TestStats:
         assert abs(rep["unverified_rate"] - 1 / 3) < 0.01
         assert rep["latency_s"]["n"] == 3
 
+    def test_the_message_ledger_charges_only_rounds_that_may_have_sent(self, env, capsys):
+        """Recording only, and derived from columns the store already had — no quota table, no
+        reservation, no admission control. A round is charged iff it crossed the send fence
+        (an `attempts` row) without a durable not-sent proof. Every other shape is free:
+        gate-rejected (pre-send by construction), a pre-click not-sent proof, and a `retrieve`,
+        which attaches read-only and never calls begin_send at all."""
+        store_mod, backend, s, tmp_path = env
+
+        def _mk(rid, kind="submit"):
+            s.create_round(rid, kind, prompt="p")
+            s.set_state(rid, store_mod.READY)
+            return rid
+
+        # 1. a completed submit — sent, charged.
+        rid = _mk("REQ-20260707-120000-0q0001")
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d")
+        s.mark_accepted(aid, "conv-a")
+        s.mark_waiting(rid)
+        s.finish(rid, store_mod.COMPLETED_VERIFIED, result_text="a")
+        # 2. an UNCERTAIN send — the click may have landed, so the honest ledger charges it.
+        rid = _mk("REQ-20260707-120000-0q0002")
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d")
+        s.mark_possibly_accepted(aid, "send failed after paste")
+        # 3. a pre-click not-sent proof — free.
+        rid = _mk("REQ-20260707-120000-0q0003")
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d")
+        s.mark_send_not_sent(aid, "exit 6: paste verify failed before the click")
+        # 4. gate-rejected before begin_send — free.
+        s.gate_reject(_mk("REQ-20260707-120000-0q0004"), "unverified: gh timed out")
+        # 5. a retrieve — read-only recovery, never enters `sending`. Free.
+        _mk("REQ-20260707-120000-0q0005", kind="retrieve")
+
+        assert backend.stats_report() == 0
+        rep = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert rep["messages"]["charged"] == 2, rep["messages"]
+        assert rep["messages"]["free"] == 3, rep["messages"]
+        assert rep["messages"]["by_kind"] == {"submit": 2}, \
+            "a retrieve must never appear in the ledger — it sends nothing"
+
 
 class TestRequestFingerprint:
     """The idempotency identity covers the LOGICAL request — every caller-side routing field —

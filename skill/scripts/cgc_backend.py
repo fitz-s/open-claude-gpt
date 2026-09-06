@@ -212,8 +212,12 @@ def stats_report() -> int:
             return None
 
     with store_mod.Store() as s:
+        # `charged` is DERIVED, not stored — see the ledger note below.
         rows = [dict(r) for r in s.db.execute(
-            "SELECT state, created_at, updated_at FROM rounds")]
+            "SELECT state, kind, created_at, updated_at, "
+            "       (EXISTS(SELECT 1 FROM attempts a WHERE a.rid = rounds.rid) "
+            "        AND (send_disposition IS NULL OR send_disposition <> ?)) AS charged "
+            "FROM rounds", (store_mod.NOT_SENT_PROVEN,))]
     total = len(rows)
     by = {}
     for r in rows:
@@ -230,13 +234,38 @@ def stats_report() -> int:
         return durations[min(len(durations) - 1, int(len(durations) * p))] if durations else None
 
     unv_rate = (unv / completed) if completed else None
+
+    # ---- the message ledger ----------------------------------------------------------------
+    # A ChatGPT Pro plan allows tens of messages a week, so "how many did we actually spend" is a
+    # fact worth being able to read. It needs NO new column: the store already answers it exactly.
+    # A round consumed a paid message iff it crossed the send fence and is not durably proven to
+    # have stopped short of the click — that is, an `attempts` row exists (begin_send is its only
+    # writer and the only path into `sending`) AND send_disposition is not NOT_SENT_PROVEN. Both
+    # halves are the same evidence _release_eligible already trusts to decide whether a retry may
+    # reuse a request-key, which is a strictly higher bar than accounting needs.
+    # Consequences, all correct and all deliberate: a `retrieve` counts zero (it attaches read-only
+    # and never calls begin_send, so it has no attempt row — no special case for it here); a
+    # gate-rejected or cancelled-while-queued round counts zero; an UNCERTAIN send counts one,
+    # because the click may have landed and the honest ledger charges for what may have been spent.
+    # RECORDING ONLY — nothing here reserves, admits, throttles or refuses. A number to read.
+    charged = sum(1 for r in rows if r["charged"])
+    charged_by_kind = {}
+    for r in rows:
+        if r["charged"]:
+            k = r["kind"] or "unknown"
+            charged_by_kind[k] = charged_by_kind.get(k, 0) + 1
+
     report = {
         "rounds": total, "by_state": by,
         "completed": completed, "failed": fail,
         "unverified_rate": round(unv_rate, 3) if unv_rate is not None else None,
         "latency_s": {"p50": _pct(0.50), "p90": _pct(0.90), "n": len(durations)},
+        "messages": {"charged": charged, "free": total - charged, "by_kind": charged_by_kind},
     }
     print(json.dumps(report))
+    if total:
+        sys.stderr.write(f"CGC_STATS {charged} of {total} rounds may have spent a paid message "
+                         f"({total - charged} provably did not) — {charged_by_kind or '{}'}.\n")
     if completed:
         sys.stderr.write(f"CGC_STATS {completed} completed ({ok} verified / {unv} unverified), "
                          f"{fail} failed, of {total} rounds.\n")

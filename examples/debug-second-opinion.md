@@ -24,32 +24,26 @@ Intermittent 500s on POST /orders, ~1 in 300, only under load.
 <stack trace here>
 EOF
 
-# 2. deliver the actual code + attach the evidence as supplementary context
-REFS_FILE="$(bin/cgc deliver --repo owner/repo --ref main --files src/orders/repo.py src/db/pool.py | python3 -c 'import json,sys; print(json.load(sys.stdin)["refs_file"])')"
-
-bin/cgc prep \
+# 2. fire: the code link + the evidence bundle, in one call
+bin/cgc fire --repo owner/repo --ref main --files src/orders/repo.py src/db/pool.py \
   --title "Intermittent 500s under load — connection pool starvation?" \
   --role "debugger doing root-cause analysis; competing hypotheses, evidence for/against each" \
   --task "Given the code and the failure evidence, rank the likely root causes most-to-least probable, each with the evidence for/against and the ONE cheapest probe that would confirm or kill it. Focus on the pool-wait >29s signal. Don't propose a fix until the top hypothesis is nailed." \
-  --refs-file "$REFS_FILE" \
-  --context-file /tmp/cgc/bug-context.md
+  --context-file /tmp/cgc/bug-context.md \
+  --request-key orders-pool-starvation
 
-bin/cgc submit --rid <RID> --prompt-file /tmp/cgc/prompt_<RID>.md
-# Copy the exact waiter command printed by submit — it includes the conversation id.
-timeout 899 bin/cgc wait --rid <RID> --conversation <CONVERSATION_ID> --out ./cgc_answers/answer_<RID>.txt --poll 20 --timeout 870
+bin/cgc await --rid <rid>   # detached (run_in_background: true) — its exit is the wake
 ```
 
-## Close the loop
-
-Claude runs the cheapest probe the answer names (e.g. log connections not returned
-to the pool), then follows up with the result — narrowing the hypotheses until one
-survives:
+## Close the loop — worth it because the probe result can confirm or kill the top hypothesis
 
 ```bash
-timeout 899 bin/cgc followup \
-  --task "Ran your probe #1: 3 connections per failing request are never returned — a missing `close()` on the error path in repo.py:88. That matches. Confirm this fully explains the >29s waits, and check whether the retry wrapper double-acquires." \
+bin/cgc fire --followup --parent <rid> --no-code \
   --title "Probe #1 result: leaked connections" \
-  --watch --conversation <CONVERSATION_ID> --out ./cgc_answers/answer_r2.txt --timeout 870
+  --task "Ran your probe #1: 3 connections per failing request are never returned — a missing close() on the error path in repo.py:88. That matches. Confirm this fully explains the >29s waits, and check whether the retry wrapper double-acquires." \
+  --request-key orders-pool-starvation-probe1
+
+bin/cgc await --rid <rid>
 ```
 
 > `--context-file` is for **supplementary** evidence (logs, traces, what you ruled
