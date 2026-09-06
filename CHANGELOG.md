@@ -6,6 +6,84 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Changed — a finished round no longer proposes buying the next one
+
+A ChatGPT Pro plan allows tens of messages a week, and `await`'s success envelope was ending every
+verified round with a ready-to-run `fire --followup` line — printed on stderr *and* set as the
+machine-readable `next_command`. It landed at the exact instant the calling agent chose its next
+action, and it recommended another paid interaction before anything had judged whether one was
+useful. It fired for a completed `retrieve` too: a read-only recovery that re-reads an answer the
+provider already produced, resolves nothing, and by construction has nothing to continue. A review
+counted it as a fourth instruction surface nobody had been counting.
+
+On success, `next_command` is now `null` and no follow-up command is printed; the remaining line
+says the round is closed and hands the decision to the reader. Recovery outcomes are untouched —
+a blocked, failed, or not-sent round genuinely needs the operator to run something, which is a move
+out of a hole, not a purchase. Continuing a thread is still fully supported and documented; it is
+now a decision made *from* the answer rather than a default the envelope proposes.
+
+### Fixed — a follow-up now honours the output contract it was handed
+
+`prep` resolved `--output-file` / `--output-replace` inside the non-follow-up branch only, so a
+continuation always got `FOLLOWUP_TEMPLATE`'s hardcoded findings-shaped prose no matter what the
+caller asked for. A follow-up that needs a different deliverable — an experiment design, a proof, a
+decision artifact — silently could not ask for one. Observed live: `REQ-20260906-025243-c975c2` was
+fired with `--output-file skill/references/deep-review-output.md --output-replace` and both flags
+were dropped on the floor. The contract is now resolved ONCE, above the initial-versus-continuation
+split, and both renderers interpolate the same resolved pair. The renderer was repaired; no prompt
+was told to obey harder.
+
+Two assertions in the same template were retired for the same reason. It declared "Claude Code
+acted on your last answer locally" unconditionally, and labelled follow-up sources "new or updated
+since your previous answer" — both false on that same round, which linked the *same* commit SHA as
+its parent after no local action. `prep` is a pure renderer and never sees the parent's source ref,
+so it cannot support either claim: the first is gone (the `## Local results since the last round`
+heading already says it, and only when a context file supplied them), and the second is now an
+instruction to establish what moved rather than a statement that something did.
+
+### Fixed — a waiter no longer watches a stale tab for ninety minutes
+
+A CDP-attached ChatGPT tab can keep serving a DOM that has fallen behind the conversation. On
+2026-09-06 one did: the waiter for `REQ-20260906-025243-c975c2` reported three assistant turns for
+a thread that had four and never re-rendered, held that reading for its entire 5400s timeout, and
+returned `timeout_no_answer` — an `error_code` on the row of a round that had actually succeeded. A
+second waiter started moments later re-opened the conversation and read the finished 36446-char
+answer in seventeen seconds. The answer had been there the whole time.
+
+The waiter already logged the signal (`resolving source turn… (not yet visible)`) and did nothing
+with it. Now, when the round's own source turn is still missing from the DOM after a bounded
+window, the tab is treated as stale and the conversation is reloaded once before the long watch
+begins. Once, and strictly: a turn that is genuinely absent still falls through to the existing
+`rid_absent` refusal instead of reload-looping. The recovery is READ-side by reach, not by care —
+`Page.reload` re-fetches the page the tab is already on, and no path through it can touch the
+composer, so the at-most-once send invariant is untouched.
+
+That covers a tab that never renders the round's own user turn — which is not how the incident
+actually failed. There the source turn resolved at `t+0` and generation began normally, four
+assistant turns and bytes moving; the tab then dropped a turn mid-stream and froze at 539 bytes for
+the remaining ~5200s. The waiter named that state on every settle window (`stub-stable: … likely a
+thinking/streaming gap`), roughly eighteen times per dead wait, and the observation had no
+consequence. It has one now: three consecutive `stub-stable` reads frozen at the same byte count,
+with no generation between them, spend the same single reload and then resume the normal watch.
+Three because `stub-stable` is emitted once per `--settle-seconds` — 300s in production — so the
+trigger prices at fifteen minutes of a motionless DOM. That is far outside a live round (Astra's
+classifier pauses are seconds and its reasoning gaps minutes, and both keep generation on or the
+byte count moving, either of which resets the streak) and roughly a sixth of the 5400s the incident
+burned. The budget is the wait's, not the trigger's: whichever symptom is seen first claims the one
+reload, the other finds it spent, and a round the model genuinely never answered still ends at the
+same timeout with the same exit code.
+
+### Fixed — the GPT-6 Pro quota note was half wrong
+
+`skill/references/gpt-6-astra-prompting-principles.md` carried a secondary-sourced claim that the
+weekly allowance is a pool shared with 5.6 Sol Pro on both Pro tiers. A primary check of OpenAI's
+help pages on 2026-09-06 confirms that for Pro $100 (50 messages/week, shared) and contradicts it
+for Pro $200, which has 200 GPT-6 Pro messages weekly plus a separate 170-message *daily* Sol Pro
+allowance under a combined 200-message daily cap. Corrected, with the provenance and the date on
+the record. The separate allowance is not a lane: this installation pins one model family and the
+attribution gate refuses an answer produced by anything else, so a round served by a substitute is
+a failed round, not a cheaper one.
+
 ### Added — which model *answered*, read from the answer
 
 Everything above pins the composer *before* a send, and a composer read before a send can only ever
