@@ -233,7 +233,7 @@ def _relocate_legacy_db_locked(target: str, legacy: str, d: str) -> None:
         os.close(dfd)
     os.replace(legacy, legacy + ".migrated")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Ordered, transactional migrations: _MIGRATIONS[n] upgrades a version-(n-1) DB to version n.
 # A fresh DB is created at SCHEMA_VERSION directly by _DDL, so each migration must produce exactly
@@ -264,7 +264,31 @@ _MIGRATIONS = {
         "ALTER TABLE rounds ADD COLUMN not_before TEXT",
         "ALTER TABLE rounds ADD COLUMN gate_retry_count INTEGER NOT NULL DEFAULT 0",
     ],
+    # model_badge / model_slug / attribution: the two model facts a round has, kept APART, plus the
+    # one verdict over them. model_badge is what the composer's switcher read BEFORE the send —
+    # selection evidence, "what was requested". model_slug is data-message-model-slug off the
+    # answer's own assistant node — the provider's attribution, "what actually served this". They
+    # were the same field in spirit until 2026-09-06, which is the whole defect: a pre-send read
+    # was being published as a receipt for the producer, and OpenAI's own rate-limit fallback makes
+    # those two demonstrably different. attribution is the verdict recorded AT THE TIME the round
+    # completed (matched/mismatched/unknown/unchecked — see cgc_backend._attribution_verdict), not
+    # re-derived on read: the policy can change, and a round's identity finding is a fact about the
+    # moment it ran. Every column is NULL on rows written before this migration, and NULL reads as
+    # "this round predates attribution" — never as a mismatch. Additive ALTERs only: a daemon
+    # mid-flight against this DB keeps working, exactly as migration 4 was designed to allow.
+    5: [
+        "ALTER TABLE rounds ADD COLUMN model_badge TEXT",
+        "ALTER TABLE rounds ADD COLUMN model_slug TEXT",
+        "ALTER TABLE rounds ADD COLUMN attribution TEXT",
+    ],
 }
+
+# The four values ever written to rounds.attribution. NULL is a fifth, implicit state that no code
+# writes: "this round ran before attribution existed".
+ATTR_MATCHED = "matched"        # a slug was read AND it satisfies the configured policy
+ATTR_MISMATCHED = "mismatched"  # a slug was read AND it does NOT — the one gate (see cgc_backend)
+ATTR_UNKNOWN = "unknown"        # no slug on the node: a real outcome, not an error, never a failure
+ATTR_UNCHECKED = "unchecked"    # a slug was read but no policy is configured, so nothing judged it
 
 # The only value ever stored in rounds.send_disposition: an explicit operator reconcile proving the
 # round's send never reached ChatGPT (e.g. browser inspection found no such message).
@@ -709,9 +733,14 @@ class Store:
         return row["rid"]
 
     def mark_accepted(self, attempt_id: str, conversation_id: str | None = None,
-                      evidence_json: str | None = None) -> None:
+                      evidence_json: str | None = None, model_badge: str | None = None) -> None:
         """The click landed: the RID (and ideally a conversation id) is observed. conversation_id may
-        be None if the RID landed but the URL has not stabilised yet — `accepted` tolerates that."""
+        be None if the RID landed but the URL has not stabilised yet — `accepted` tolerates that.
+
+        model_badge is the composer switcher's PRE-SEND reading, committed in the same transaction
+        as the accept because that is the only moment it is true: it describes the send that just
+        happened, and the composer has moved on by the time the answer arrives. It is selection
+        evidence and nothing more — the producer is recorded separately, at finish()."""
         rid = self._attempt_round(attempt_id)
         now = _now()
         with self._tx():
@@ -733,7 +762,7 @@ class Store:
                                 (conversation_id, now, tid))
                 if not r["thread_id"]:
                     self.db.execute("UPDATE rounds SET thread_id=? WHERE rid=?", (tid, rid))
-            self._apply_round_fields(rid, state=ACCEPTED)
+            self._apply_round_fields(rid, state=ACCEPTED, model_badge=model_badge)
             self._event("accepted", rid=rid, attempt_id=attempt_id,
                         detail=f"conv={conversation_id or 'pending'}")
 
@@ -776,18 +805,30 @@ class Store:
         self.set_state(rid, WAITING, expect=None)
 
     def finish(self, rid: str, state: str, *, result_text: str | None = None,
-               error_code: str | None = None) -> None:
+               error_code: str | None = None, model_slug: str | None = None,
+               attribution: str | None = None) -> None:
         """Terminal commit. A completed_verified/unverified MUST carry its result text in the same
-        transaction — status and result are one fact, never two files that can disagree."""
+        transaction — status and result are one fact, never two files that can disagree.
+
+        model_slug/attribution ride the SAME transaction for the same reason, and because a round
+        is terminal-immutable: there is no later moment at which its identity evidence could be
+        written. They are strictly ORTHOGONAL to `state` and `completion_confidence`, which keep
+        meaning exactly what they meant before — whether the answer's own rid sentinel verified.
+        A mismatched attribution does not make a verified answer unverified, and an unverified one
+        is not redeemed by a matching slug; conflating those two properties is the defect this
+        column exists to undo."""
         if state not in (COMPLETED_VERIFIED, COMPLETED_UNVERIFIED, BLOCKED, FAILED):
             raise ValueError(f"{state!r} is not a terminal finish state")
         confidence = ("verified" if state == COMPLETED_VERIFIED
                       else "unverified" if state == COMPLETED_UNVERIFIED else None)
         self.set_state(rid, state, result_text=result_text, error_code=error_code,
-                       completion_confidence=confidence)
+                       completion_confidence=confidence, model_slug=model_slug,
+                       attribution=attribution)
 
     def adopt_retrieved_answer(self, rid: str, result_text: str,
-                               conversation_id: str | None = None) -> bool:
+                               conversation_id: str | None = None,
+                               model_slug: str | None = None,
+                               attribution: str | None = None) -> bool:
         """Close an uncertain round with the answer a VERIFIED retrieve just proved is its own.
 
         The retrieve waiter matched END_RESPONSE:<rid> on the thread, which settles both open
@@ -799,7 +840,12 @@ class Store:
         owns the row.
 
         Only ever called with a sentinel-VERIFIED answer: an unwrapped salvage cannot prove which
-        turn it came from, so it must not close a round that no worker confirmed."""
+        turn it came from, so it must not close a round that no worker confirmed.
+
+        The attribution carries back with the answer for the same reason: the retrieve read the slug
+        off THIS round's own turn, so it is this round's fact. Dropping it would leave the source
+        NULL, and NULL means "predates attribution" — which would be a lie about a round whose
+        producer we actually saw."""
         now = _now()
         with self._tx():
             row = self.db.execute("SELECT state,thread_id FROM rounds WHERE rid=?", (rid,)).fetchone()
@@ -828,7 +874,8 @@ class Store:
                                 (conversation_id, now, tid))
                 self.db.execute("UPDATE rounds SET thread_id=? WHERE rid=?", (tid, rid))
             self._apply_round_fields(rid, state=COMPLETED_VERIFIED, result_text=result_text,
-                                     completion_confidence="verified")
+                                     completion_confidence="verified", model_slug=model_slug,
+                                     attribution=attribution)
             self._event("state", rid=rid, detail=f"-> {COMPLETED_VERIFIED} (adopted from retrieve)")
         return True
 
@@ -1030,6 +1077,14 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS threads (
   thread_id       TEXT PRIMARY KEY,
   conversation_id TEXT,
+  -- DELIBERATELY STILL UNWRITTEN, and not repurposed for the model evidence added in schema 5.
+  -- A thread is not a model: it can span a picker change between rounds, and — as the 2026-09-06
+  -- attribution work established — a single thread can be served by different models on different
+  -- turns without anything local changing at all. So there is no true value to put here; a
+  -- "thread's model" could only ever be one round's fact wearing the wrong grain. The evidence
+  -- lives on rounds (model_badge / model_slug / attribution), where it is true. Left in place
+  -- rather than dropped: it is NULL in every row, costs nothing, and dropping a column from a
+  -- live DB under a running daemon buys less than it risks.
   model           TEXT,
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL
@@ -1055,7 +1110,12 @@ CREATE TABLE IF NOT EXISTS rounds (
   gate_retry_count      INTEGER NOT NULL DEFAULT 0,
   created_at            TEXT NOT NULL,
   updated_at            TEXT NOT NULL,
-  schema_version        INTEGER NOT NULL DEFAULT 1
+  schema_version        INTEGER NOT NULL DEFAULT 1,
+  -- Schema 5. Declared LAST because ALTER TABLE ADD COLUMN appends, and a fresh DB must have the
+  -- identical column ORDER a migrated one gets — same shape, not merely the same column names.
+  model_badge           TEXT,   -- pre-send selection evidence (what was REQUESTED)
+  model_slug            TEXT,   -- provider attribution off the answer node (what SERVED it)
+  attribution           TEXT    -- the verdict at completion time; see _MIGRATIONS[5]
 );
 CREATE INDEX IF NOT EXISTS idx_rounds_state ON rounds(state);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_rounds_request_key

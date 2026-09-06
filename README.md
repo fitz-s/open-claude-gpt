@@ -139,12 +139,15 @@ Copyable `--output-file` / `--output-replace` contracts live in [examples/_specs
 
 ## Auto model-selection (toggleable)
 
-When ChatGPT silently auto-downgrades a chat to a lighter model, a consult gets a weaker answer for free. So the tool **pins both the model and its reasoning tier before every send and fails closed if it can't** — you always get the model you meant to use. Two dimensions, because since GPT-6 (2026-09-03) the composer picks the model and the tier in the same menu, and `Pro` on `GPT-5.5` would otherwise pass a tier-only check.
+When ChatGPT silently auto-downgrades a chat to a lighter model, a consult gets a weaker answer for free. So the tool **pins both the model and its reasoning tier before every send and fails closed if it can't**. Two dimensions, because since GPT-6 (2026-09-03) the composer picks the model and the tier in the same menu, and `Pro` on `GPT-5.5` would otherwise pass a tier-only check.
+
+That proves what was **requested**. What **answered** is a separate fact, read separately: when the answer lands, the tool takes the `data-message-model-slug` ChatGPT stamps on that very turn — `gpt-6-pro`, `gpt-5-6-thinking` — and reports it as `model_slug`, beside but never merged with the pre-send `model_badge`. Name the producers you accept in `CGC_MODEL_SLUG` and a round served by anything else comes back for a human instead of as an auto-consumable answer. Sometimes the provider stamps nothing; that is `attribution: unknown` — not a mismatch, and not a failed consult.
 
 ```bash
 CGC_AUTO_MODEL=1        # ON (default): select CGC_MODEL + CGC_MODEL_FAMILY, fail closed if unavailable
 CGC_MODEL="Pro"         # which reasoning tier to target (set the strongest your plan has)
 CGC_MODEL_FAMILY="Latest"   # which model to pin; "skip" to leave the model alone
+CGC_MODEL_SLUG=""       # producers you accept, e.g. "gpt-6-*,gpt-5-6-pro"; empty = record, don't judge
 CGC_AUTO_MODEL=0        # OFF: don't touch the picker, send on whatever is shown
 ```
 

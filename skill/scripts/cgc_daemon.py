@@ -75,6 +75,21 @@ _LAUNCH = os.path.join(_HERE, "cdp_launch.sh")
 EXIT_LEASE_REFUSED = 86
 
 
+def _last_json(stdout: str) -> dict:
+    """The LAST JSON object on a cdp_consult subprocess's stdout, or {}. Last, not first: a
+    `followup --watch` prints its send receipt and then its wait receipt into the same stream, and
+    a non-dict or unparseable line must degrade to "nothing was reported", never raise — every
+    caller here treats a missing field as an honest absence."""
+    for line in reversed((stdout or "").strip().splitlines()):
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return {}
+
+
 def _make_run_cdp():
     """The injected CDP driver for the store worker: drives the cdp_consult submit/wait
     subprocesses (the proven browser path) and returns the small dict cgc_backend.process_round
@@ -90,37 +105,49 @@ def _make_run_cdp():
         # restart (a non-CDP call) — a restarted Chrome must never inherit and pin the browser lease.
         fds = spool.live_lease_fds()
         if kind == "submit":
+            # --model-family comes from the round's SPEC (frozen at enqueue), not from this
+            # daemon's environment. It used to be passed nowhere at all, so cdp_consult read
+            # CGC_MODEL_FAMILY out of the ambient env of whatever daemon happened to run the
+            # round — a config change between enqueue and send silently retargeted every queued
+            # job. env={**os.environ, ...} in _run still exists and is still correct for
+            # everything else; the family is simply no longer one of those things.
             cmd = [sys.executable, _CDP, "submit", "--rid", kw["rid"], "--prompt-file", "-",
-                   "--project-url", kw["project_url"], "--model", kw["model"]]
+                   "--project-url", kw["project_url"], "--model", kw["model"],
+                   "--model-family", kw["model_family"]]
             # 300s, not 240: a submit's worst case is composer wait (60) + model select + paste +
             # the two contract windows (10+45) + the conversation-id poll (20), and that poll now
             # runs on the FAILURE paths too — where the id it captures is the only thing that makes
             # the round recoverable. A kill here loses stdout, which is exactly how the round this
             # budget protects became unrecoverable in the first place.
             code, so, se = _run(cmd, 300, kw["rid"], stdin_text=kw["prompt"], pass_fds=fds)
-            conv = ""
-            try:
-                conv = (json.loads(so.strip().splitlines()[-1]) if so.strip() else {}).get(
-                    "conversation_id", "") or ""
-            except Exception:
-                conv = ""
-            return {"code": code, "conversation": conv, "stderr": se}
+            rec = _last_json(so)
+            return {"code": code, "conversation": rec.get("conversation_id", "") or "",
+                    "model_badge": rec.get("modelBadge"), "stderr": se}
         if kind == "followup":
             # CONTINUE the existing conversation: attach to --conversation and SEND (no --watch, so it
             # returns after sending). The caller then runs a separate "wait", so the round reaches
             # `waiting` promptly and is reattach-able — never a 25-min `sending`. Never opens a new
             # thread.
+            # --model/--model-family from the SPEC for the same reason submit passes them: a
+            # follow-up re-asserts the tier and family on the thread before sending, and it used
+            # to take BOTH from ambient environment because neither was on the argv.
             cmd = [sys.executable, _CDP, "followup", "--conversation", kw["conversation"],
-                   "--prompt-file", "-", "--rid", kw["rid"]]
-            code, _so, se = _run(cmd, 240, kw["rid"], stdin_text=kw["prompt"], pass_fds=fds)
-            return {"code": code, "stderr": se}
+                   "--prompt-file", "-", "--rid", kw["rid"],
+                   "--model", kw["model"], "--model-family", kw["model_family"]]
+            code, so, se = _run(cmd, 240, kw["rid"], stdin_text=kw["prompt"], pass_fds=fds)
+            return {"code": code, "model_badge": _last_json(so).get("modelBadge"), "stderr": se}
         if kind == "wait":
             poll = str(kw.get("poll") or spool.POLL_S)
             timeout = int(kw.get("timeout") or spool.STUCK_AFTER_S)
             cmd = [sys.executable, _CDP, "wait", "--rid", kw["rid"], "--conversation", kw["conversation"],
                    "--out", kw["out"], "--poll", poll, "--timeout", str(timeout)]
-            code, _so, se = _run(cmd, timeout + 40, kw["rid"], pass_fds=fds)
-            return {"code": code, "out": kw["out"], "stderr": se}
+            code, so, se = _run(cmd, timeout + 40, kw["rid"], pass_fds=fds)
+            # `wait`'s stdout receipt carries the producer attribution read off the very node it
+            # extracted the answer from. None here means either "the provider stamped nothing" or
+            # "this wait produced no answer at all" — both resolve to attribution unknown, which is
+            # the honest reading in each case and never a reason to fail the round.
+            return {"code": code, "out": kw["out"],
+                    "model_slug": _last_json(so).get("modelSlug"), "stderr": se}
         raise ValueError(f"unknown cdp kind {kind!r}")
     return run_cdp
 

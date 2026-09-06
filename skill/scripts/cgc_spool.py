@@ -74,8 +74,9 @@ DAEMON_GRACE_S = 60
 
 # THE timeout — the only deadline in this system.
 #
-# A GPT-6 Astra Pro round reasons ~25 minutes; this store's own completion latency over 63
-# GPT-5.6 rounds was p50 1993s / p90 4802s, so ~25 min is the shape of a typical round, not its
+# This store's own completion latency over 63 GPT-5.6 rounds was p50 1993s / p90 4802s; no
+# GPT-6 Astra round has been measured yet, so "~25 min" is that GPT-5.6 data carried forward as
+# an expectation, not a figure measured for Astra itself — the shape of a typical round, not its
 # ceiling. That is how long the work TAKES; it is an expectation,
 # not a deadline, and nothing may be killed for reaching it. A deadline answers a different
 # question: past what point is waiting no longer explained by the work? An hour. Beyond that the
@@ -838,6 +839,11 @@ def main() -> int:
                                     "ITS conversation (causal, unambiguous under concurrency). "
                                     "Preferred over --conversation auto.")
     e.add_argument("--model", default=os.environ.get("CGC_MODEL", "Pro"))
+    e.add_argument("--model-family", default=os.environ.get("CGC_MODEL_FAMILY", "Latest"),
+                   help="model family to pin, FROZEN into the round's spec here rather than read "
+                        "from the daemon's environment at send time — so a queued round keeps the "
+                        "family it was fired with. Part of the request-key fingerprint: the same "
+                        "key under a different family CONFLICTS, it does not return the old receipt.")
     e.add_argument("--request-key",
                    help="caller-chosen logical-request id — same key + same content returns the "
                         "original receipt (idempotent retry); same key + different content refuses")
