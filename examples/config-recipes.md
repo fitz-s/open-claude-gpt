@@ -31,7 +31,7 @@ you don't want the fail-closed guard):
 export CGC_AUTO_MODEL=0
 ```
 
-Per-consult, without changing the global setting: `bin/cgc submit … --model skip`.
+Per-consult, without changing the global setting: `bin/cgc fire … --model skip`.
 
 ## Group every consult in your ChatGPT project
 
@@ -47,13 +47,13 @@ Find the URL: open your project in ChatGPT, copy the browser URL, keep the
 
 ## Run several consults at once (concurrency)
 
-Each `submit` opens its own tab by default, so 2–3 consults run in parallel and the
-10–30 min latency is free. `followup --conversation auto` resolves the active
-thread; when several are live it refuses ambiguously and lists them — pass the one
-you want:
+Each fired round gets its own daemon-driven tab, so 2–3 consults run in parallel
+and the 10–30 min latency is free. A bare `fire --followup` resolves the last
+completed thread and refuses ambiguously when several are live — pass `--parent
+<rid>` (preferred, causal) or an explicit `--conversation <id>` to pick one:
 
 ```bash
-bin/cgc followup --conversation <id> --task "…"
+bin/cgc fire --followup --parent <rid> --no-code --task "…"
 ```
 
 ## Use a specific browser / non-default port

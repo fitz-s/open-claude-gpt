@@ -1,84 +1,59 @@
 # Example: review a pull request
 
-End-to-end, by hand. In Claude Code the skill orchestrates all of this for you —
-this shows what happens under the hood.
+End-to-end, by hand. In Claude Code the skill runs the same `fire` call for you —
+this shows what it does.
 
-## 0. One-time setup
-
-```bash
-bin/cgc launch          # log into ChatGPT in the window, leave it open
-bin/cgc doctor --deep   # confirm ready + logged in
-```
-
-## 1. Deliver — resolve the code links
-
-Capture the refs file path from `deliver`'s JSON output — never a shell glob:
+## 0. One-time, once ever — not before every fire
 
 ```bash
-REFS_FILE="$(bin/cgc deliver --repo owner/repo --pr 123 | python3 -c 'import json,sys; print(json.load(sys.stdin)["refs_file"])')"
+bin/cgc install-daemon   # installs the egress daemon (launchd); starts at login, respawns if it dies
+bin/cgc launch            # log into ChatGPT Pro in the window it opens, once — the session persists
 ```
 
-`deliver`'s output (trimmed) looks like:
+This is setup, not a preflight: never run `doctor`/`queue`/`status` before firing
+a consult. If the daemon is genuinely down, `fire`/`await` say so themselves in
+one line.
 
-```json
-{
-  "mode": "explicit",
-  "slug": "owner/repo",
-  "visibility": "public",
-  "associated_pr": 123,
-  "refs_file": "/tmp/cgc/refs_20260701-120000.md",
-  "groups": {
-    "intent": [["https://github.com/owner/repo/pull/123", "PR description, discussion, CI"]],
-    "change_set": [["https://github.com/owner/repo/pull/123/files", "changed-file diff"]]
-  }
-}
-```
+## 1. Fire — resolve the code link, render the prompt, queue the round
 
-Note it leads with the **public PR link** — never a gist for pushed, public code.
-(`refs_file` itself lives under `/tmp/cgc` — tool-owned scratch — which is why
-`$REFS_FILE` captures it rather than hardcoding the path.)
-
-## 2. Prep — render the prompt
+`fire` is `deliver` + `prep` + `enqueue` in one process — there's no judgment call
+between those three stages, so there's nothing to hand-edit in the normal case:
 
 ```bash
-bin/cgc prep \
+bin/cgc fire --repo owner/repo --pr 123 \
   --title "Review PR 123" \
   --role "senior reviewer auditing correctness, migration safety, and concurrency" \
   --task "Review this PR. Verify the approach before the diff; flag silent breakage, ordering/concurrency, and rollback. Recommend a simpler design if one dominates." \
-  --refs-file "$REFS_FILE"
+  --output-file skill/references/deep-review-output.md --output-replace \
+  --request-key pr-123-review
 ```
 
-Prints a `request_id` (RID) and a `prompt_file` under `$CGC_STATE_DIR`.
+It leads with the **public PR link** (never a gist for pushed, public code) and
+prints a JSON receipt — `rid`, `out`, `await` — for a round now queued in the
+local store. No network call happens in this process; the user's launchd daemon
+re-validates the code is public and performs the actual send.
 
-## 3. Submit — open the chat and send
+## 2. Await — background, its exit is the wake
 
 ```bash
-bin/cgc submit --rid <RID> --prompt-file /tmp/cgc/prompt_<RID>.md
+bin/cgc await --rid <rid>
 ```
 
-It selects the model tier (`CGC_MODEL`), types, sends, and prints the exact
-**detached waiter** command to run in the background.
+In Claude Code this runs with `run_in_background: true`; the process exit wakes
+the agent, which reads the `answer_path` off `await`'s JSON outcome envelope.
 
-## 4. Wait — background, its exit is the wake
+## 3. Verify, then follow up only if something is still unresolved
 
-```bash
-# Copy the exact waiter command printed by submit — it includes the conversation id.
-timeout 899 bin/cgc wait --rid <RID> --conversation <CONVERSATION_ID> --out ./cgc_answers/answer_<RID>.txt --poll 20 --timeout 870
-```
-
-(In Claude Code this runs with `run_in_background: true`; the process exit wakes
-the agent, which then reads `--out`.)
-
-## 5. Verify, then follow up
-
-Read the answer, **verify each `verify locally: <check>` claim in your repo**,
-then feed results back in the same thread:
+Read the answer and **verify each `verify locally: <check>` claim in your repo**.
+A follow-up spends one of the account's few weekly Pro messages, so send one only
+when a finding is still open after checking — not to report back that everything
+was clean:
 
 ```bash
-timeout 899 bin/cgc followup \
-  --task "Confirmed findings 1-3 locally (tests pass). Finding 4 doesn't reproduce — here's why: … Re-assess." \
+bin/cgc fire --followup --parent <rid> --no-code \
   --title "Round 2: local results" \
-  --watch --conversation <CONVERSATION_ID> --out ./cgc_answers/answer_r2.txt --timeout 870
-```
+  --task "Confirmed findings 1-3 locally (tests pass). Finding 4 doesn't reproduce — here's why: … Re-assess." \
+  --request-key pr-123-review-round2
 
-Loop until the answer flags nothing new.
+bin/cgc await --rid <rid>
+```

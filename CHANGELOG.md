@@ -6,6 +6,117 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Changed — the prompt says each thing once, and a test keeps it that way
+
+A read-only inventory of the rendered prompt measured what a round actually pays for. Two thirds of
+an initial render was fixed scaffolding and a seventh was the caller's own question; of fourteen
+tracked obligations, seven were stated more than once to the same recipient. Four of those reached
+ChatGPT **twice inside a single rendered prompt** — lead-with-the-answer, challenge-the-premise,
+"commit to calls Claude Code can act on directly" (verbatim twice whenever `--followup` and
+`--output-replace` combined), and the verify-locally hedge rule, which landed exactly **three
+times in every render the tool could produce**. Three more — the instruction-precedence line, the
+stop rule, and the BEGIN/END wrap — were typed twice in `consult.py` itself, once per template.
+None of it was visible from reading either template: the copies lived in different layers and only
+met at render time.
+
+The rendered prompt is now split the way it always logically was. Control — the interaction
+contract, the stop rule, the selected output contract, the transport sentinels — is program-owned
+and stated exactly once, from one place in the source. Everything else carries task content. The
+three source-duplicated blocks are one constant each, interpolated into both templates; the Output
+section is composed by one function for every render kind, from the caller's spec (if any) plus
+exactly one shape arm plus a close that holds either way. `FOLLOWUP_TEMPLATE` no longer carries
+output rules of its own, which is what let that combination emit the same sentence twice.
+
+Measured through the real `prep` path, same caller inputs before and after: an initial review
+render goes 4,565 → 4,444 B, a follow-up 4,407 → 4,237 B, an initial `--output-replace` review
+6,279 → 6,029 B, and the follow-up + `--output-replace` worst case 6,121 → 5,822 B. Every tracked
+obligation now appears exactly once in all four. The saving is real but small; it is not the point.
+
+The point is `tests/test_prompt_invariants.py`. It renders all four kinds and fails if any tracked
+obligation appears anything other than exactly once, matching a stable marker per obligation so
+that rewording a rule passes and re-stating it in a second place does not. It also bounds the
+rendered bytes by origin, so scaffolding that grows one reasonable sentence at a time is visible
+instead of silent. A smaller prompt that can quietly re-bloat next quarter is worth much less than
+one whose shape is enforced.
+
+The source-duplicated three cost no tokens — the two copies were mutually exclusive at render
+time. They cost parity: a wording fix applied to one template and not the other would have made an
+initial round and its own follow-up obey different rules, with nothing to catch it.
+
+`skill/references/deep-review-output.md` lost one clause ("challenge the premise") that restated an
+obligation the template already carries; its §1 still names the section as the highest-value one and
+still asks for the superior architecture. Prompt bytes changed, so `logical_sha` changed: a
+`--request-key` fired before this commit and re-fired after it now CONFLICTS, because the stored
+fingerprint hashes the old prompt — the honest outcome, since the stored round genuinely carried a
+different request. Nothing already in the store is rehashed or invalidated.
+
+The same split has one more consequence, applied here: two Success-criteria bullets were never
+interaction contract at all. "For code/review tasks: cover correctness, security, migration/rollback,
+concurrency/ordering, and boundary cases" is the review deliverable's coverage list, and "For
+plans/research/design/math tasks: use the task's requested structure and name the assumptions that
+would change the answer" was already said elsewhere. Every render paid for both, so a mathematical
+proof carried a code-review checklist and a code review carried advice on proof structure. The
+review dimensions moved into the default findings arm — the arm that *is* the review shape, and the
+arm already selected is the profile: no task-kind enum, no registry, no selection machinery. The
+second bullet was deleted rather than relocated: that arm already routes non-review work to "the
+task's requested structure", `--output-replace` hands the structure to the caller outright, and the
+assumptions half is owned twice over by the stop rule and the output close.
+
+Because `--output-replace` does not render the default arm, `skill/references/deep-review-output.md`
+— the spec SKILL.md recommends for every code and PR review — now states the three dimensions no
+section of it owned (security, migration/rollback, concurrency/ordering); its §2 already owned
+correctness and the inputs that break it. Measured through the real `prep` path: an initial default
+render 4,444 → 4,292 B and an initial `--output-replace` review 6,029 → 5,936 B; the two follow-up
+kinds grow (4,237 → 4,331 and 5,822 → 5,975) because a continuation now carries review dimensions
+that had only ever lived in the initial template. The kind the move is for shows the effect plainly:
+a caller-owned NON-review deliverable (the plan spec under `examples/_specs`) goes 5,052 → 4,806 B
+and no longer ships a code-review checklist with a plan. The dimensions are now a tracked obligation
+in `tests/test_prompt_invariants.py`, so whichever shape is in force states them exactly once and
+neither shape can state them twice. Rendered bytes changed again, so `logical_sha` did too, with the
+same one-time `--request-key` consequence described above.
+
+### Fixed — `fire` no longer discards the refs file you handed it
+
+`fire` absorbs `prep`'s arguments, so it offers `--refs-file` — and then overwrote it
+unconditionally with its own internal `deliver` result, or with `None` under `--no-code`. A caller
+who hand-built a refs file for a source `deliver` cannot construct (a spec published elsewhere, a
+mirror, links assembled by hand — the documented way to cite exactly that) had it dropped in silence
+and paid for a round pointing at the wrong sources. `--refs-file` now decides the round's source:
+supplied, `deliver` is skipped and the file is used as given. Supplied *together with*
+`--repo`/`--pr`/`--ref`/`--compare`/`--files`/`--issues`/`--base`/`--pulls`/`--blobs`, the round is
+refused with `CGC_ERROR refs_source_conflict` before anything is queued — two flags naming two
+different sources is an ambiguous request, not a precedence question, and picking a winner would
+only move the silent discard onto the other flag. `--no-code` is not one of them: it names the
+absence of a built source rather than a second one, and SKILL.md's documented follow-up is exactly
+that pair ("`--no-code` … Add `--refs-file` for a fresh diff link") — the path the discard hurt
+most, since `fire` set `refs_file` to `None` outright there. Provenance is unaffected: the
+daemon's egress gate re-checks every link in the rendered prompt, whoever wrote the refs file. The
+`--refs-file` help text now says all of this, so it is true on `prep` and on `fire`.
+
+### Added — the message ledger, recording only
+
+A Pro plan allows tens of messages a week and nothing said how many had been spent. `stats` now
+reports `messages: {charged, free, by_kind}`. It needed **no new column**: a round consumed a paid
+message iff it crossed the send fence (an `attempts` row — `begin_send` is its only writer) without
+a durable not-sent proof, which is the same evidence `_release_eligible` already trusts to decide
+whether a retry may reuse a request-key. A `retrieve` counts zero because it attaches read-only and
+never calls `begin_send`; a gate-rejected round counts zero; an uncertain send counts one, because
+the click may have landed and an honest ledger charges for what may have been spent. Recording
+only — nothing reserves, admits, throttles, or refuses.
+
+### Changed — the activation note states the capability and its cost, and stops urging
+
+`skill/ACTIVATION.md` opened by telling Claude to reach for the skill proactively, and stated the
+"spot-check, don't re-audit" rule twice and the whole "take the answer seriously" argument a third
+time, duplicating `SKILL.md`'s "Act on the answer" section it is read alongside. Anthropic's
+current guidance for Claude Opus 5 is to remove proactivity and self-verification instructions —
+the model already over-verifies and over-scopes — so the exhortation is gone and the duplicated
+paragraph is now a pointer to the one full statement in `SKILL.md`. The remote-facing prompt keeps
+its bias-toward-action language, which is the opposite instruction for the opposite reason:
+OpenAI's Astra guide says Astra over-asks for clarification. The two axes are not symmetric and are
+no longer written as if they were. `README.md` and `SECURITY.md` keep their copies — a human
+deciding whether to trust the tool is a different reader.
+
 ### Changed — a finished round no longer proposes buying the next one
 
 A ChatGPT Pro plan allows tens of messages a week, and `await`'s success envelope was ending every
@@ -531,6 +642,39 @@ question; what failed is everything downstream of it.
   that is inside the prompt we sent. It is the last automated step before a human reads the screen,
   and `await`'s uncertain-round message now names it. Best-effort by construction (a virtualized
   thread can scroll the turn out of the DOM); a miss is reported as a miss, never as "not sent".
+
+### Docs — examples/ and SKILL-NOTES.md stopped teaching a send path `auto` mode denies
+
+Every file under `examples/` taught `bin/cgc submit --rid … && timeout 899 bin/cgc wait … --timeout
+870` — a direct send from the agent's own Bash call, which docs/ARCHITECTURE.md documents as hard-
+denied by Claude Code's auto-mode classifier, plus a `submit`/`wait` verb pair `bin/cgc` itself has
+retired. `review-a-pr.md`'s "one-time setup" also told the reader to run `doctor --deep` before every
+walkthrough, directly against SKILL.md's "never preflight" rule. All seven examples and the two
+`examples/_specs/*.md` contracts are rewritten around the current `fire` → `await` path, verified
+against `consult.py --help`/`cgc_spool.py --help` rather than copied from memory. `fire` folds
+`deliver`+`prep`+`enqueue` into one call, so the old `REFS_FILE=$(bin/cgc deliver … | python3 -c
+'...')` shell dance, the manual `--out ./cgc_answers/…`, and the `timeout N` wrapper all disappear —
+each example is shorter than before, not just corrected. `plan-a-feature.md`'s `--output-file` was
+missing the `--output-replace` its own `plan-output.md` spec needs (it defines a full findings shape
+of its own); added, closing one live instance of the two-competing-findings-formats bug consult.py's
+`REPLACE_OUTPUT_CLOSE` already warns against. `hard-reasoning.md`'s no-repo example dropped an
+unnecessary `gh gist create` step in favor of `--no-code` with the problem inline, which is what that
+flag is for.
+
+Every example that showed a follow-up round instead earns it: architecture-decision.md's spike result
+can flip the recommendation, debug-second-opinion.md's probe result can confirm or kill the top
+hypothesis, plan-a-feature.md's migration constraint invalidates part of the plan, review-a-pr.md
+sends round 2 only for a finding still open after checking it locally — never "verify, then follow up"
+as a default ending, since a follow-up spends one of the account's few weekly Pro messages.
+
+`SKILL-NOTES.md` still walked `prep → deliver → submit → monitor → retrieve → use → follow up` as a
+single agent-visible pipeline with no daemon, no store, and six of the ten `skill/scripts/*.py` files
+missing from its own "Files" table — accurate before the daemon/store refactor, silent about it since.
+Rewritten around the same fire/enqueue/daemon/await path docs/ARCHITECTURE.md documents, with one
+correction ARCHITECTURE.md doesn't carry: its file-delivery section claimed gist upload was "fully
+automatic given the allow rule," but `SKILL.md`'s current `allowed-tools` carries no `gh gist create`/
+`gh api gists` rule, and the egress gate refuses any gist link by default (`CGC_GATE_ALLOW_GIST=1` is
+opt-in) — gist delivery is human-initiated now.
 
 ## [0.2.1] — 2026-07-24
 

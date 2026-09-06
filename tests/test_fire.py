@@ -138,7 +138,8 @@ def test_output_replace_drops_the_findings_contract_on_a_followup_too(tmp_path, 
     assert "A decision memo. No severity scale." in text
     assert "BLOCKER / HIGH / MEDIUM / LOW / NIT" not in text, \
         "the default findings contract must not collide with the caller's own shape"
-    assert mod.REPLACE_OUTPUT_CLOSE.split(".")[0] in text, "the universal close still applies"
+    assert mod.REPLACE_OUTPUT_OPEN.split(".")[0] in text, "the spec-owns-the-shape arm still applies"
+    assert mod.OUTPUT_CLOSE in text, "the universal close still applies"
 
 
 def test_a_followup_with_no_spec_still_gets_the_default_contract(tmp_path, monkeypatch):
@@ -162,3 +163,60 @@ def test_an_unchanged_source_sha_is_not_described_as_new_or_updated(tmp_path, mo
     assert same_sha in text, "the source still ships"
     for claim in ("new or updated", "New or changed source", "acted on your last answer"):
         assert claim not in text, f"renderer asserted {claim!r} it has no evidence for"
+
+
+# `fire` absorbs prep's args, so it offers --refs-file — and used to overwrite it unconditionally
+# with its own internal deliver call (or with None under --no-code). A caller who hand-built a refs
+# file for a source deliver cannot construct had it silently dropped and paid for a round that
+# pointed at the wrong sources. These pin the two halves of the fix.
+
+def test_fire_honours_a_hand_built_refs_file_instead_of_calling_deliver(tmp_path, monkeypatch):
+    mod = _load()
+    monkeypatch.setattr(mod, "CGC_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "cmd_deliver", lambda a: pytest.fail(
+        "deliver ran anyway — the caller's refs file would have been overwritten"))
+    seen = {}
+    sys.path.insert(0, os.path.join(ROOT, "skill", "scripts"))
+    import cgc_spool as spool
+    monkeypatch.setattr(spool, "cmd_enqueue", lambda a: seen.update(vars(a)) or 0)
+    refs = tmp_path / "hand-built.md"
+    refs.write_text("- spec: https://github.com/acme/rfcs/blob/main/0042-drain.md\n")
+    r = mod.cmd_fire(_ns(mod, tmp_path, repo=None, ref=None, refs_file=str(refs)))
+    assert isinstance(r, dict), "an explicit refs file is a complete source, not a missing one"
+    text = pathlib.Path(seen["prompt_file"]).read_text(encoding="utf-8")
+    assert "0042-drain.md" in text, "the caller's source must reach the prompt that is paid for"
+
+
+def test_fire_refuses_a_refs_file_that_competes_with_the_deliver_args(tmp_path, monkeypatch):
+    """Two flags naming two different sources is an ambiguous request, not a precedence question.
+    Letting either win would just move the silent discard onto the other flag."""
+    mod = _load()
+    monkeypatch.setattr(mod, "CGC_STATE_DIR", str(tmp_path))
+    sys.path.insert(0, os.path.join(ROOT, "skill", "scripts"))
+    import cgc_spool as spool
+    monkeypatch.setattr(spool, "cmd_enqueue", lambda a: pytest.fail("an ambiguous round was queued"))
+    refs = tmp_path / "hand-built.md"
+    refs.write_text("- spec: https://github.com/acme/rfcs/blob/main/0042-drain.md\n")
+    for over in (dict(repo="acme/widgets", ref="a" * 40), dict(repo=None, ref=None, pr="406")):
+        assert mod.cmd_fire(_ns(mod, tmp_path, refs_file=str(refs), **over)) == 2
+
+
+def test_no_code_with_a_refs_file_is_the_documented_followup_not_a_conflict(tmp_path, monkeypatch):
+    """SKILL.md's follow-up is `fire --followup --parent <rid> --no-code ...`, then "Add --refs-file
+    for a fresh diff link". --no-code names the ABSENCE of a built source, not a competing one — and
+    that pair is the path the silent discard hurt most, since fire set refs_file to None outright."""
+    mod = _load()
+    monkeypatch.setattr(mod, "CGC_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(mod, "cmd_deliver", lambda a: pytest.fail("deliver ran under --no-code"))
+    seen = {}
+    sys.path.insert(0, os.path.join(ROOT, "skill", "scripts"))
+    import cgc_spool as spool
+    monkeypatch.setattr(spool, "cmd_enqueue", lambda a: seen.update(vars(a)) or 0)
+    refs = tmp_path / "fresh-diff.md"
+    refs.write_text("- https://github.com/acme/widgets/compare/aaaa...bbbb\n")
+    r = mod.cmd_fire(_ns(mod, tmp_path, repo=None, ref=None, followup=True, no_code=True,
+                         refs_file=str(refs)))
+    assert isinstance(r, dict)
+    text = pathlib.Path(seen["prompt_file"]).read_text(encoding="utf-8")
+    assert "compare/aaaa...bbbb" in text, "the fresh diff link must reach the follow-up prompt"
+    assert "references no code" not in text, "a round carrying a link is not a no-source round"

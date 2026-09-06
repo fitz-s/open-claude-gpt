@@ -4,32 +4,38 @@ Get an independent, code-grounded take on a design fork — with the strongest c
 *against* your preferred option — before committing to it.
 
 ```bash
-# whole-repo tree so it can see how the pieces fit today
-REFS_FILE="$(bin/cgc deliver --repo owner/repo --ref main | python3 -c 'import json,sys; print(json.load(sys.stdin)["refs_file"])')"
-
-bin/cgc prep \
+bin/cgc fire --repo owner/repo --ref main \
   --title "Event sourcing vs. a state table for the ledger?" \
   --role "distributed-systems architect; adversarial, not agreeable" \
   --task "We're deciding between (A) event-sourcing the ledger and (B) a mutable balances table + audit log. Given the actual code, which dominates for our constraints (strong consistency, ~2k tx/s, must reconstruct any historical balance)? Argue BOTH sides from the code, name the failure modes of each (rebuild cost, snapshotting, schema evolution, concurrent writes), then recommend one — and give the strongest case against your own recommendation." \
-  --refs-file "$REFS_FILE" \
-  --output-file examples/_specs/decision-matrix.md \
-  --output-replace
-
-bin/cgc submit --rid <RID> --prompt-file /tmp/cgc/prompt_<RID>.md
-# Copy the exact waiter command printed by submit — it includes the conversation id.
-timeout 899 bin/cgc wait --rid <RID> --conversation <CONVERSATION_ID> --out ./cgc_answers/answer_<RID>.txt --poll 20 --timeout 870
+  --output-file examples/_specs/decision-matrix.md --output-replace \
+  --request-key ledger-design-fork
 ```
 
-A custom `--output-file` (with `--output-replace`) is useful here: define a
-tradeoff matrix / decision-record shape instead of the default findings list.
-
-## Follow up with a spike result
+`fire` resolves the link, renders the prompt, and queues the round in one call —
+all local writes. It prints a JSON receipt with `rid` and a ready-to-run `await`
+line; copy the `rid`:
 
 ```bash
-timeout 899 bin/cgc followup \
-  --task "We prototyped option A. Rebuilding a balance from 2M events takes 6s uncached — too slow for the reconcile job. Does snapshotting every N events change your recommendation, and at what N?" \
+bin/cgc await --rid <rid>   # detached (run_in_background: true) — its exit is the wake
+```
+
+A whole-repo `--ref` (not `--files`) is right here: the model needs to see how the
+pieces fit today, not one file. `--output-file` + `--output-replace` swaps the
+default findings list for a tradeoff matrix / decision-record shape.
+
+## Follow up — only once the case actually changed
+
+Worth a second round here: a real spike number can flip the recommendation, which
+the first answer couldn't have known.
+
+```bash
+bin/cgc fire --followup --parent <rid> --no-code \
   --title "Spike: rebuild latency" \
-  --watch --conversation <CONVERSATION_ID> --out ./cgc_answers/answer_r2.txt --timeout 870
+  --task "We prototyped option A. Rebuilding a balance from 2M events takes 6s uncached — too slow for the reconcile job. Does snapshotting every N events change your recommendation, and at what N?" \
+  --request-key ledger-design-fork-spike
+
+bin/cgc await --rid <rid>
 ```
 
 > For any decision with a design or a plan, tell it to **verify the approach

@@ -1,6 +1,6 @@
 # Output spec: implementation plan
 
-Copyable contract for `bin/cgc prep --output-file`/`--output-replace` — pass this
+Copyable contract for `bin/cgc fire --output-file`/`--output-replace` — pass this
 file's path to shape the answer instead of the default findings list.
 
 Structure the answer as:
