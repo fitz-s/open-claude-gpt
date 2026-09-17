@@ -32,7 +32,12 @@
 #   cgc get-project                   print the stored project URL
 #   cgc config                        print the effective configuration
 #   cgc activation-hook               print an OPTIONAL SessionStart hook snippet
-#                                     (proactive offloading) — prints only, never edits settings
+#                                     (proactive offloading) — default is print-only, never edits
+#   cgc activation-hook --install     add/upgrade that hook in your Claude settings.json
+#                                     (backs up settings.json first)
+#   cgc activation-hook --remove      remove it again
+#   cgc activation-hook --status      report configured / broken / absent / unreadable
+#                                     (all four forward extra args, e.g. --settings, --json)
 #
 # Port: submit/followup/wait/status forward args as-is to cdp_consult.py, which
 # requires --port BEFORE the subcommand. Prefer the CGC_PORT env var instead,
@@ -177,31 +182,15 @@ PYEOF
     python3 "$S/cgc_config.py" show | sed 's/^/  /' || true
     ;;
   activation-hook)
-    # Print a ready-to-paste SessionStart hook that injects this skill's ACTIVATION.md
-    # every session, so Claude reaches for a consult proactively. PRINTS ONLY — it never
-    # edits your settings. You decide whether to add it to your own Claude settings.json.
-    ACT="$(cd "$S/.." && pwd)/ACTIVATION.md"
-    cat <<EOF
-Proactive activation (OPTIONAL) — this only PRINTS a snippet; it does not change any settings.
-
-On demand, the skill already activates on its own (Claude reads its SKILL.md description).
-Add the hook below ONLY if you also want Claude to consider offloading a consult at the
-start of every session. It injects: $ACT
-
-Merge this into the "hooks" object of your Claude settings.json
-(\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}/settings.json) — keep any existing SessionStart entries:
-
-  "SessionStart": [
-    {
-      "matcher": "",
-      "hooks": [
-        { "type": "command", "command": "cat '$ACT' 2>/dev/null || true", "timeout": 10 }
-      ]
-    }
-  ]
-
-To undo, remove that one entry again. See docs/INSTALL.md → "Proactive activation".
-EOF
+    # Delegates to cgc_activation.py — the ONE place that owns the hook command string and the
+    # settings.json edit logic. Default (no flag) is print-only, matching the old behavior: it
+    # never touches your settings unless you pass --install/--remove.
+    case "${1:-}" in
+      --install) shift; exec python3 "$S/cgc_activation.py" install "$@" ;;
+      --remove)  shift; exec python3 "$S/cgc_activation.py" remove "$@" ;;
+      --status)  shift; exec python3 "$S/cgc_activation.py" status "$@" ;;
+      *)         exec python3 "$S/cgc_activation.py" print "$@" ;;
+    esac
     ;;
   ""|-h|--help)
     grep '^#' "$0" | sed 's/^# \{0,1\}//'

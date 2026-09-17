@@ -94,7 +94,7 @@ bin/cgc install-daemon  # installs the egress daemon via launchd — run ONCE; i
 bin/cgc doctor --deep   # verify everything, including login state and daemon
 ```
 
-In Claude Code the skill activates automatically — Claude reads its `SKILL.md` and invokes it when a task fits. See [docs/INSTALL.md](docs/INSTALL.md) for on-demand vs. proactive activation.
+In Claude Code the skill activates automatically — Claude reads its `SKILL.md` and invokes it when a task fits. See [docs/INSTALL.md](docs/INSTALL.md) for on-demand vs. proactive activation (the proactive `SessionStart` hook can now be installed with `bin/cgc activation-hook --install`, not just hand-edited).
 
 ## First consult
 

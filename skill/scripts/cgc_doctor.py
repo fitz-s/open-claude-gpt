@@ -364,6 +364,34 @@ def run(deep: bool, secure: bool = False) -> Report:
     r.ok("config", f"port={PORT} model={MODEL!r} family={MODEL_FAMILY!r} profile={PROFILE}")
     r.ok("project", PROJECT_URL)
 
+    # 9b. Proactive activation hook (SessionStart). Delegates entirely to cgc_activation.py so
+    # this check can never drift from what `cgc activation-hook --status` reports. `absent` is a
+    # legitimate, supported configuration (on-demand activation still works) — never a warning;
+    # `broken` (hook present, ACTIVATION.md missing) is the failure mode this whole feature exists
+    # to surface, since a silent `|| true` used to make it invisible. `unreadable` (settings.json
+    # itself can't be parsed) is also a warning, not an `ok` — status not finding an entry in a
+    # file it couldn't read is not the same claim as genuinely finding none.
+    try:
+        import cgc_activation
+        act = cgc_activation.status(cgc_activation.default_settings_path(), cgc_activation.DEFAULT_ACTIVATION)
+        if act["state"] == "configured":
+            detail = "SessionStart hook present, ACTIVATION.md readable"
+            if act.get("stale"):
+                detail += " (stale form — `cgc activation-hook --install` would refresh it)"
+            r.ok("proactive activation", detail)
+        elif act["state"] == "broken":
+            r.warn("proactive activation", act.get("detail", "hook present but ACTIVATION.md missing"),
+                   "re-run install.sh from the repo, or: cgc activation-hook --install")
+        elif act["state"] == "unreadable":
+            r.warn("proactive activation", act.get("detail", "settings.json could not be parsed"),
+                   f"fix the JSON in {act.get('settings_path', '?')} (Claude Code ignores an "
+                   "unparseable settings file), then: cgc activation-hook --status")
+        else:
+            r.ok("proactive activation", "not installed — on-demand activation still works; "
+                 "`cgc activation-hook --install` enables the proactive hook")
+    except Exception as e:
+        r.warn("proactive activation", f"cgc_activation not importable ({e})", "re-run install.sh from the repo")
+
     # 10. Egress daemon (user-started, like the debug Chrome). Required for the auto-mode-safe
     # enqueue/await path; the direct submit/wait path still works without it, so this is a WARN.
     try:
