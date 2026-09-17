@@ -3,10 +3,12 @@
 # Copies (or symlinks) the skill into ~/.claude/skills/chatgpt-consult, checks
 # dependencies, and runs the doctor. Idempotent — safe to re-run to upgrade.
 #
-#   ./install.sh            # copy the skill into ~/.claude/skills
-#   ./install.sh --link     # symlink instead (dev: edits in the repo go live)
-#   ./install.sh --dir DIR  # install into a different skills root
-#   ./install.sh --force    # keep exit 0 even if the doctor reports not-ready
+#   ./install.sh                  # copy the skill into ~/.claude/skills
+#   ./install.sh --link           # symlink instead (dev: edits in the repo go live)
+#   ./install.sh --dir DIR        # install into a different skills root
+#   ./install.sh --force          # keep exit 0 even if the doctor reports not-ready
+#   ./install.sh --activation-hook  # also install the OPTIONAL proactive SessionStart hook
+#                                  # (backs up settings.json first) — default: not installed
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
@@ -14,12 +16,14 @@ SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
 NAME="chatgpt-consult"
 MODE="copy"
 FORCE=0
+ACTIVATION_HOOK=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --link) MODE="link"; shift ;;
     --dir)  SKILLS_DIR="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
+    --activation-hook) ACTIVATION_HOOK=1; shift ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -102,6 +106,15 @@ echo
 DOCTOR_STATUS=0
 CGC_STATE_DIR="${CGC_STATE_DIR:-/tmp/cgc}" python3 "$DEST/scripts/cgc_doctor.py" || DOCTOR_STATUS=$?
 
+# --- optional: install the proactive SessionStart hook -----------------------
+# Opt-in only, per --activation-hook. Default install.sh behavior is unchanged: without the
+# flag this block does not run and nothing about settings.json is touched.
+if [ "$ACTIVATION_HOOK" = "1" ]; then
+  echo
+  echo "• --activation-hook: installing the proactive SessionStart hook"
+  python3 "$DEST/scripts/cgc_activation.py" install || echo "  ! activation hook install failed — see above" >&2
+fi
+
 cat <<EOF
 
 Next steps
@@ -114,11 +127,12 @@ Next steps
   4. (optional) PROACTIVE background offloading — if you want Claude to reach for a
      consult on its own every session, add a SessionStart hook that injects this
      skill's activation note. This edits YOUR OWN Claude settings, so the installer
-     does NOT do it for you — print the ready-to-paste snippet with:
-       bin/cgc activation-hook
-     (See docs/INSTALL.md → "Proactive activation". The note lives at
+     does NOT do it for you by default — two ways to opt in:
+       bin/cgc activation-hook              # print the snippet (changes nothing)
+       bin/cgc activation-hook --install    # add it for you (backs up settings.json first)
+     (See docs/INSTALL.md → "Activation: on-demand vs. proactive". The note lives at
       $DEST/ACTIVATION.md.)
-     bin/cgc doctor         # re-check health anytime
+  5. bin/cgc doctor         # re-check health anytime
 
 Config lives in the environment — see docs/CONFIGURATION.md and .env.example.
 EOF

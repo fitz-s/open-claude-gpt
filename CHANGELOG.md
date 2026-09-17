@@ -6,6 +6,20 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Added — the proactive activation hook can now be installed, not just hand-edited
+
+`bin/cgc activation-hook` used to only print a copy-paste `SessionStart` snippet; the hook itself
+lived as an un-versioned manual edit to the user's `settings.json`, with no way back if it was ever
+lost. `skill/scripts/cgc_activation.py` is now the one place that owns the hook command and the
+settings.json logic: `--install` adds or upgrades it idempotently (backing up `settings.json`
+first, writing atomically, touching nothing else in the file), `--remove` takes it back out, and
+`--status` reports `configured` / `broken` / `absent`. `install.sh --activation-hook` runs the same
+install as an opt-in flag; the default install still never touches your settings. The hook itself
+changed from `cat '<path>' 2>/dev/null || true` to `... || echo 'WARNING: ... — run: cgc doctor'`,
+so a missing `ACTIVATION.md` shows up in the injected context instead of silently vanishing, and
+`cgc doctor` gained a "proactive activation" check that surfaces exactly that failure mode as a
+warning (an uninstalled hook is a supported configuration, not a warning).
+
 ## [0.3.0] — 2026-09-24
 
 ### Added — `fire --mention "<App>"`: @mention a ChatGPT app/plugin without a human

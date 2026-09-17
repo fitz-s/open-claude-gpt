@@ -29,6 +29,7 @@ Options:
 | --- | --- |
 | `--link` | Symlink instead of copy — edits in the clone go live. Good for development. |
 | `--dir DIR` | Install into a different skills root (default `~/.claude/skills`, or `$CLAUDE_SKILLS_DIR`). |
+| `--activation-hook` | Also install the optional proactive `SessionStart` hook (see below). Off by default. |
 
 ## First-run setup: log into ChatGPT once
 
@@ -66,16 +67,40 @@ works the moment the skill is installed — the agent knows when to use it.
 at the start of every session* — the aggressive "background ultra-everything"
 default — add a `SessionStart` hook that injects the skill's activation note
 (`~/.claude/skills/chatgpt-consult/ACTIVATION.md`). The installer does **not** do
-this for you, because it edits *your own* Claude settings; opt in yourself:
+this for you by default, because it edits *your own* Claude settings; opt in
+yourself, either by hand or with the CLI:
 
 ```bash
-bin/cgc activation-hook        # prints a ready-to-paste snippet — it does NOT edit anything
+bin/cgc activation-hook              # print a ready-to-paste snippet — changes nothing
+bin/cgc activation-hook --install    # add or upgrade it for you
+bin/cgc activation-hook --remove     # remove it again
+bin/cgc activation-hook --status     # report configured / broken / absent / unreadable
 ```
 
-Merge the printed `SessionStart` entry into the `hooks` object of your
-`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json` (keep any existing entries).
-To undo, delete that one entry. `ACTIVATION.md` is just the text the hook prints
-into context each session — edit it to tune how strongly Claude is nudged.
+`--install` is idempotent (safe to re-run; a second run with nothing to change
+touches nothing) and copies your existing `settings.json` to `settings.json.bak`
+before writing, atomically, the first time it actually changes something. It edits
+only its own `SessionStart` entry — every other hook and setting in the file is
+left untouched. `--install` also works as `install.sh --activation-hook`, run once
+at install time instead of as a separate step.
+
+If you'd rather edit `settings.json` by hand, merge the printed `SessionStart`
+entry into the `hooks` object of `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json`
+(keep any existing entries) and delete it to undo. `ACTIVATION.md` is just the text
+the hook prints into context each session — edit it to tune how strongly Claude is
+nudged.
+
+`cgc doctor` reports this hook's state under "proactive activation": `configured`
+when it's present and the note is readable, a **warning** when the hook is present
+but `ACTIVATION.md` is missing or unreadable (a silent no-op otherwise — this is
+the failure mode the CLI-managed install exists to make visible), and a clean pass
+when it's simply not installed (on-demand activation still works either way).
+
+**Scope limit: main session only.** This hook fires on `SessionStart` for the main
+Claude Code session — startup, resume, `/clear`, and `/compact`. A subagent spawned
+via the Agent tool starts with a fresh context and never receives it; subagents can
+only reach this skill through on-demand activation (Claude reading `SKILL.md`'s
+description). There is no proactive path for subagents.
 
 ## Upgrade
 
