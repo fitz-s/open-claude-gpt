@@ -391,6 +391,20 @@ def test_install_preserves_existing_file_mode(m, paths):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
+def test_backup_inherits_the_private_mode_of_the_file_it_copies(m, paths):
+    # A 0600 settings.json must not leave a 0644 duplicate of itself next to it.
+    settings, activation = paths
+    with open(settings, "w", encoding="utf-8") as f:
+        json.dump({}, f)
+    os.chmod(settings, 0o600)
+
+    m.install(settings, activation)
+
+    import stat
+    assert stat.S_IMODE(os.stat(settings + ".bak").st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits only")
 def test_install_new_file_defaults_to_0600(m, paths):
     settings, activation = paths
     assert not os.path.exists(settings)
