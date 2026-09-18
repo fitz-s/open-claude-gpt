@@ -124,13 +124,17 @@ def _write_atomic(path: str, data) -> None:
     mkstemp creates the temp file 0600, which os.replace would otherwise carry over the original
     file's mode — silently tightening an existing 0644 settings.json to 0600. That permission
     change isn't ours to make unasked, so an EXISTING file's mode is preserved; 0600 only applies
-    when we're creating settings.json fresh (a new file holding config is right to start private)."""
+    when we're creating settings.json fresh (a new file holding config is right to start private).
+
+    The backup is copy2, not copyfile: settings.json can be 0600 because it holds the user's own
+    configuration, and a copy that widens that to the umask default leaves a readable duplicate of
+    a private file sitting next to it."""
     d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
     existing_mode = None
     if os.path.exists(path):
         existing_mode = stat.S_IMODE(os.stat(path).st_mode)
-        shutil.copyfile(path, path + ".bak")
+        shutil.copy2(path, path + ".bak")
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".cgc_activation_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
