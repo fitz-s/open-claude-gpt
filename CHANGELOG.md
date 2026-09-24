@@ -6,6 +6,8 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-24
+
 ### Added — `fire --mention "<App>"`: @mention a ChatGPT app/plugin without a human
 
 An agent asked to run a consult "with @WebCodex Demo" had no way to do it: the daemon only pastes
