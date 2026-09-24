@@ -12,8 +12,8 @@ A round that used an app could stall on "WebCodex Demo — Allow file materializ
 once]" until someone clicked, and there is no standing grant: the plugin was already on "Allow all
 tools", which does not cover this card. The waiter is the one process already watching each consult's
 tab, so it now answers there: on each poll it looks for a visible "Allow once" button whose card also
-holds a visible "Deny", reads the card's own text (≤400 chars, so the conversation cannot lend it a
-name), and clicks "Allow once" only when that text names an app in `CGC_AUTO_APPROVE` (default
+holds a visible "Deny", reads the card's own text line by line (≤400 chars, so the conversation cannot lend it a
+name), and clicks "Allow once" only when one of its lines is exactly (case-insensitively) an app in `CGC_AUTO_APPROVE` (default
 `CGC_APPS`). The click is `element.click()` in that tab over CDP — no OS mouse, no focus change, no
 other tab — so parallel consults and local window focus are untouched, and nothing runs when no card
 is showing. An unlisted app's card, or one that survives 5 clicks, ends the wait as

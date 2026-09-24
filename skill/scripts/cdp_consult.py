@@ -3104,21 +3104,24 @@ def cmd_followup(a) -> int:
 def _approval_js(allow):
     # From each visible "Allow once": climb to the first ancestor that also holds a visible "Deny" (the
     # card's button row), then keep climbing while the text stays card-sized (<= 400 chars) until it
-    # names an allowlisted app. The size cap is what stops a foreign app's card from climbing into
-    # the conversation and matching "@WebCodex Demo" in the prompt.
+    # names an allowlisted app. "Names" is an exact, case-insensitive match against one LINE of the
+    # card's text (its header line is the app's label), never a substring — this click grants access,
+    # so "WebCodex Demo Clone" must not ride on "WebCodex Demo". The size cap stops a foreign card from
+    # climbing into the conversation and matching a line of the prompt.
     return ("(function(){var allow=" + json.dumps(allow) + ";"
             "function vis(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}"
             "function t(e){return (e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim();}"
             "function hasDeny(n){return Array.prototype.slice.call(n.querySelectorAll('button')).some("
             "function(b){return vis(b)&&/^(deny|\u62d2\u7edd)/i.test(t(b));});}"
-            "function named(x){var low=x.toLowerCase();return allow.filter(function(a){"
-            "return low.indexOf(a.toLowerCase())>=0;})[0]||null;}"
+            "function named(e){var ls=(e.innerText||'').split('\\n').map(function(l){"
+            "return l.replace(/\\s+/g,' ').trim().toLowerCase();});return allow.filter(function(a){"
+            "return ls.indexOf(a.toLowerCase())>=0;})[0]||null;}"
             "var ok=Array.prototype.slice.call(document.querySelectorAll('button')).filter(function(b){"
             "return vis(b)&&/^(allow once|\u5141\u8bb8\u4e00\u6b21)/i.test(t(b));});"
             "for(var i=0;i<ok.length;i++){var n=ok[i].parentElement,d=0;"
             "while(n&&d<6&&!hasDeny(n)){n=n.parentElement;d++;}if(!n||d>=6)continue;"
-            "var txt=t(n),app=named(txt);"
-            "for(var m=n.parentElement;!app&&m&&t(m).length<=400;m=m.parentElement){txt=t(m);app=named(txt);}"
+            "var txt=t(n),app=named(n);"
+            "for(var m=n.parentElement;!app&&m&&t(m).length<=400;m=m.parentElement){txt=t(m);app=named(m);}"
             "if(app)ok[i].click();return {app:app,text:txt.slice(0,300)};}return null;})()")
 
 

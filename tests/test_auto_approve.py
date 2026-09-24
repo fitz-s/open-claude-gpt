@@ -19,7 +19,7 @@ _spec.loader.exec_module(CDP)
 # any node returns its visible-or-not button descendants; parentElement links are wired by mk().
 _DOM = r"""
 function node(tag,text,kids){var n={tag:tag,own:text||'',children:kids||[],
-  get innerText(){return [this.own].concat(this.children.map(function(k){return k.innerText})).join(' ')},parentElement:null,clicked:0,
+  get innerText(){return [this.own].concat(this.children.map(function(k){return k.innerText})).join('\n')},parentElement:null,clicked:0,
   hidden:false,getBoundingClientRect:function(){return this.hidden?{width:0,height:0}:{width:1,height:1}},
   click:function(){this.clicked++},
   querySelectorAll:function(){var o=[];(function w(x){x.children.forEach(function(k){if(k.tag==='button')o.push(k);w(k);})})(this);return o;}};
@@ -39,8 +39,8 @@ def _run(setup, allow):
 
 
 CARD = ("var deny=btn('Deny Esc'),once=btn('Allow once ↩'),menu=btn('');"
-        "var card=node('div','WebCodex Demo Allow file materialization? ChatGPT needs your approval',"
-        "[node('div','',[deny,once,menu])]);"
+        "var card=node('div','',[node('div','WebCodex Demo'),node('div','Allow file materialization?')].concat("
+        "[node('div','',[deny,once,menu])]));"
         "var ROOT=node('body','',[node('div','',[btn('Send')]),card]);")
 
 
@@ -72,8 +72,17 @@ def test_off_disables(monkeypatch):
 
 def test_foreign_card_cannot_borrow_the_app_name_from_the_conversation():
     setup = ("var deny=btn('Deny'),once=btn('Allow once');"
-             "var card=node('div','Canva Allow file materialization?',[node('div','',[deny,once])]);"
+             "var card=node('div','',[node('div','Canva'),node('div','Allow file materialization?'),node('div','',[deny,once])]);"
              "var ROOT=node('main','" + "@WebCodex Demo please review this. " * 20 + "',[card]);")
     out = _run(setup, ["WebCodex Demo"])
     assert out["r"]["app"] is None and "Canva" in out["r"]["text"]
     assert sum(out["clicks"]) == 0
+
+
+def test_a_lookalike_app_name_is_not_approved():
+    setup = ("var deny=btn('Deny'),once=btn('Allow once');"
+             "var card=node('div','',[node('div','WebCodex Demo Clone'),node('div','Allow file materialization?'),"
+             "node('div','',[deny,once])]);var ROOT=node('body','',[card]);")
+    out = _run(setup, ["WebCodex Demo"])
+    assert out["r"]["app"] is None and sum(out["clicks"]) == 0
+    assert _run(setup, ["webcodex demo clone"])["r"]["app"] == "webcodex demo clone"
