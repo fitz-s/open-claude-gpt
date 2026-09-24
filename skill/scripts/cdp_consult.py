@@ -130,6 +130,12 @@ CGC_MODEL = os.environ.get("CGC_MODEL", "Pro") if CGC_AUTO_MODEL else "skip"
 # with GPT-6 (2026-09-03). Same toggle, same "skip" escape hatch as CGC_MODEL: auto-model OFF
 # means the picker is not touched at all, so neither dimension is enforced.
 CGC_MODEL_FAMILY = os.environ.get("CGC_MODEL_FAMILY", "Latest") if CGC_AUTO_MODEL else "skip"
+# App approval cards ("<App> — Allow file materialization? [Deny] [Allow once]") pause generation until
+# answered, and ChatGPT offers no standing grant for them (the plugin's "Allow all tools" does not cover
+# them). The waiter already polls the consult's own tab, so it answers them there: only for apps named
+# here (default CGC_APPS — the ones you @mention on purpose); any other app's card is a blocker for a
+# human. "off" disables it.
+CGC_AUTO_APPROVE = os.environ.get("CGC_AUTO_APPROVE", os.environ.get("CGC_APPS", "WebCodex Demo"))
 CGC_PROJECT_URL = os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/")
 
 # ---- per-rid job registry (makes follow-up zero-bookkeeping) ----------------
@@ -3091,6 +3097,52 @@ def cmd_followup(a) -> int:
     return 0
 
 
+# ---- app approval cards ------------------------------------------------------------------------
+# Found by what a person sees, not by an unprobed container class: a visible "Allow once" button whose
+# nearest ancestor (<= 6 up) also holds a visible "Deny" button is one card. The click is a page-level
+# element.click() over CDP — no mouse, no focus, no window activation — in this consult's own tab only.
+def _approval_js(allow):
+    # From each visible "Allow once": climb to the first ancestor that also holds a visible "Deny" (the
+    # card's button row), then keep climbing while the text stays card-sized (<= 400 chars) until it
+    # names an allowlisted app. "Names" is an exact, case-insensitive match against one LINE of the
+    # card's text (its header line is the app's label), never a substring — this click grants access,
+    # so "WebCodex Demo Clone" must not ride on "WebCodex Demo". The size cap stops a foreign card from
+    # climbing into the conversation and matching a line of the prompt.
+    return ("(function(){var allow=" + json.dumps(allow) + ";"
+            "function vis(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}"
+            "function t(e){return (e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim();}"
+            "function hasDeny(n){return Array.prototype.slice.call(n.querySelectorAll('button')).some("
+            "function(b){return vis(b)&&/^(deny|\u62d2\u7edd)/i.test(t(b));});}"
+            "function named(e){var ls=(e.innerText||'').split('\\n').map(function(l){"
+            "return l.replace(/\\s+/g,' ').trim().toLowerCase();});return allow.filter(function(a){"
+            "return ls.indexOf(a.toLowerCase())>=0;})[0]||null;}"
+            "var ok=Array.prototype.slice.call(document.querySelectorAll('button')).filter(function(b){"
+            "return vis(b)&&/^(allow once|\u5141\u8bb8\u4e00\u6b21)/i.test(t(b));});"
+            "for(var i=0;i<ok.length;i++){var n=ok[i].parentElement,d=0;"
+            "while(n&&d<6&&!hasDeny(n)){n=n.parentElement;d++;}if(!n||d>=6)continue;"
+            "var txt=t(n),app=named(n);"
+            "for(var m=n.parentElement;!app&&m&&t(m).length<=400;m=m.parentElement){txt=t(m);app=named(m);}"
+            "if(app)ok[i].click();return {app:app,text:txt.slice(0,300)};}return null;})()")
+
+
+def _approve_apps():
+    raw = CGC_AUTO_APPROVE or ""
+    if raw.strip().lower() in ("", "off", "0", "none", "false"):
+        return []
+    return [x for x in (p.strip().lstrip("@") for p in raw.split(",")) if x]
+
+
+def _answer_approval(c):
+    """None when no card is showing; else (app, text) — app None means the card is for an app not in
+    CGC_AUTO_APPROVE and was left untouched. A click is not proof: the caller's next poll sees the
+    card again if it did not take, and gives up after a few tries."""
+    try:
+        r = c.eval(_approval_js(_approve_apps()))
+    except Exception:
+        return None
+    return (r.get("app"), r.get("text") or "") if r else None
+
+
 def cmd_wait(a) -> int:
     deadline = time.time() + a.timeout
     conv = _resolve_conv(a.conversation)  # 'auto'/None → the active thread
@@ -3202,6 +3254,7 @@ def cmd_wait(a) -> int:
         stub_cycles = 0
         stub_len = None
         ticks = 0
+        approvals = 0
         while time.time() < deadline:
             try:
                 c.eval(_FORCE_RENDER_JS)  # materialize the virtualized answer node before reading
@@ -3219,6 +3272,19 @@ def cmd_wait(a) -> int:
                 sys.stderr.write(f"CGC_WAIT alive: gen={st.get('generating')} len={st.get('len')} "
                                  f"done={st.get('done')} begin={st.get('begin')} end={st.get('end')} "
                                  f"ac={st.get('ac')} t+{int(time.time()-(deadline-a.timeout))}s\n")
+            card = _answer_approval(c)
+            if card:
+                app, text = card
+                approvals += 1
+                if not app or approvals > 5:
+                    why = "not in CGC_AUTO_APPROVE" if not app else "still showing after 5 clicks"
+                    sys.stderr.write(f"CGC_BLOCKER approval_needed: {text[:160]!r} ({why}) — answer it "
+                                     "in the ChatGPT window, then retrieve\n")
+                    return 3
+                sys.stderr.write(f"CGC_APPROVED {app!r}: {text[:120]!r}\n")
+                settle_start, last_len = None, -1   # a paused stretch is not a settled answer
+                time.sleep(2)
+                continue
             if st.get("blocker"):
                 sys.stderr.write(f"CGC_BLOCKER {st['blocker']}\n")
                 return 3
