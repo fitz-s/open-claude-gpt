@@ -2456,7 +2456,68 @@ def _composer_text_js():
     return "(function(){var d=" + _composer_get_js() + ";return d?(d.innerText||''):null;})()"
 
 
-def _paste_prompt(c, prompt: str) -> None:
+# ---- @mention (ChatGPT apps/plugins) ------------------------------------------------------------
+# A plugin is not text: typing "@WebCodex Demo" as prose sends a literal string and the app is never
+# invoked. The composer turns "@<query>" into a popup of apps; picking one inserts a mention node.
+# So a mention is a composer ACTION done before the paste: type "@<name>", click the popup option
+# whose label matches, verify the composer changed. Unresolvable -> CGC_ERROR mention_not_found,
+# strictly pre-click (nothing sent), and a human fixes the name or enables the app.
+_MENTION_WAIT_S = 8.0
+_MENTION_OPT_SEL = ('[role="option"],[role="menuitem"],[role="menuitemradio"],'
+                    '[role="listbox"] li,[data-radix-popper-content-wrapper] button')
+
+
+class _MentionFailure(_PreClickFailure):
+    """The composer never offered/accepted the requested @mention — pre-click, a human must act."""
+
+
+def _norm_label(s):
+    return " ".join((s or "").split()).lower()
+
+
+def _mention_type_js(name):
+    return ("(function(){var d=" + _composer_get_js() + ";if(!d)return null;d.focus();"
+            "document.execCommand('insertText',false," + json.dumps("@" + name) + ");"
+            "return d.innerHTML;})()")
+
+
+def _mention_pick_js(name):
+    # Visible options only; exact label wins, else a UNIQUE prefix match (the popup may append a
+    # description line). Returns the picked label, or null. Never guesses between two candidates.
+    return ("(function(){var want=" + json.dumps(_norm_label(name)) + ";"
+            "var os=Array.prototype.slice.call(document.querySelectorAll(" + json.dumps(_MENTION_OPT_SEL) + "))"
+            ".filter(function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;});"
+            "function lab(e){return (e.innerText||e.textContent||'').split('\\n')[0].replace(/\\s+/g,' ')"
+            ".trim().replace(/^@/,'').toLowerCase();}"
+            "var ex=os.filter(function(e){return lab(e)===want;});"
+            "var pf=os.filter(function(e){return lab(e).indexOf(want)===0;});"
+            "var hit=ex.length?ex[0]:(pf.length===1?pf[0]:null);if(!hit)return null;"
+            "hit.click();return lab(hit);})()")
+
+
+def _composer_html_js():
+    return "(function(){var d=" + _composer_get_js() + ";return d?d.innerHTML:null;})()"
+
+
+def _insert_mention(c, name):
+    typed = c.eval(_mention_type_js(name), timeout=45)
+    if typed is None:
+        raise _PreClickFailure("composer not found while typing @mention")
+    end = time.time() + _MENTION_WAIT_S
+    while time.time() < end:
+        time.sleep(0.4)
+        if c.eval(_mention_pick_js(name), timeout=45):
+            time.sleep(0.4)
+            if c.eval(_composer_html_js(), timeout=45) != typed:
+                c.eval(_paste_chunk_js(" "), timeout=45)
+                return
+    c.eval(_clear_composer_js(), timeout=45)  # leave no half-typed "@name" behind
+    raise _MentionFailure(
+        f"mention_not_found: the composer offered no app named '{name}' for '@{name}' within "
+        f"{_MENTION_WAIT_S:.0f}s — check the exact app name in ChatGPT and that the app is enabled")
+
+
+def _paste_prompt(c, prompt: str, mentions=()) -> None:
     """Clear the composer and paste `prompt` in bounded chunks via execCommand('insertText') — kept
     (never a raw textContent/value assignment, which would not drive ChatGPT's React composer state)
     so a leftover draft from a previous failed attempt can never be PREPENDED to this paste. Every
@@ -2471,6 +2532,8 @@ def _paste_prompt(c, prompt: str) -> None:
         if cleared != 0:
             raise _PreClickFailure(f"composer still holds {cleared} chars after clear — refusing to "
                                    "paste onto a leftover draft")
+        for name in mentions or ():
+            _insert_mention(c, name)
         for i in range(0, len(prompt), _PASTE_CHUNK_CHARS):
             chunk = prompt[i:i + _PASTE_CHUNK_CHARS]
             got = c.eval(_paste_chunk_js(chunk), timeout=45)
@@ -2594,7 +2657,11 @@ def cmd_submit(a) -> int:
         # recorded field incident: an insertText's CDP reply outran the websocket read timeout and the
         # resulting exception used to be indistinguishable from a post-click crash).
         try:
-            _paste_prompt(c, prompt)
+            _paste_prompt(c, prompt, a.mention)
+        except _MentionFailure as e:
+            c.close_tab()
+            sys.stderr.write(f"CGC_ERROR {e} — NOT submitted.\n")
+            return 3
         except _PreClickFailure as e:
             c.close_tab()   # nothing was sent; don't leak the tab
             sys.stderr.write(f"CGC_ERROR not_sent_preclick: {e} — NOT submitted; safe to retry with "
@@ -2890,7 +2957,10 @@ def cmd_followup(a) -> int:
         # heavy conversation server-side, then a paste whose CDP reply outran the read timeout).
         # Model already gated above.
         try:
-            _paste_prompt(c, prompt)
+            _paste_prompt(c, prompt, a.mention)
+        except _MentionFailure as e:
+            sys.stderr.write(f"CGC_ERROR {e} — NOT sent.\n")
+            return 3
         except _PreClickFailure as e:
             sys.stderr.write(f"CGC_ERROR not_sent_preclick: {e} — NOT sent; safe to retry with the "
                              "same --request-key.\n")
@@ -3436,6 +3506,7 @@ def main() -> int:
     su.add_argument("--no-gate", action="store_true",
                     help="skip the automated Step-0 gate (don't auto-start/-check the debug Chrome). "
                          "Use only if you manage the debug Chrome yourself.")
+    su.add_argument("--mention", action="append", default=[], help="ChatGPT app/plugin to @mention before the prompt (repeatable), e.g. --mention \"WebCodex Demo\". Picked from the composer's @ popup; fails closed pre-click if absent.")
     su.set_defaults(fn=cmd_submit)
 
     fu = sub.add_parser("followup", help="continue a consult thread (keeps its context + model); "
@@ -3482,6 +3553,7 @@ def main() -> int:
     fu.add_argument("--settle-seconds", type=int, default=300, help="(--watch) unwrapped-answer settle window")
     fu.add_argument("--min-unwrapped", type=int, default=1500, help="(--watch) min chars to accept an unwrapped answer")
     fu.add_argument("--keep-tab", action="store_true", help="(--watch) keep the tab after retrieving")
+    fu.add_argument("--mention", action="append", default=[], help="ChatGPT app/plugin to @mention before the prompt (repeatable), e.g. --mention \"WebCodex Demo\". Picked from the composer's @ popup; fails closed pre-click if absent.")
     fu.set_defaults(fn=cmd_followup)
 
     w = sub.add_parser("wait")
