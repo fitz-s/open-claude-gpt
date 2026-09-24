@@ -1203,7 +1203,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             # round fixed for _NOT_SENT_RETRY recurring here.
             store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
                             send_disposition=store_mod.NOT_SENT_PROVEN,
-                            error_code=_first_marker(stderr, _NOT_SENT_BLOCK))
+                            error_code=_block_code(send.get("stderr")))
             return store_mod.BLOCKED
         if any(m.lower() in stderr for m in _NOT_SENT_RETRY):
             # Same evidence, same verdict as a submit's. These markers are emitted FAIL-CLOSED
@@ -1251,7 +1251,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         # noted here so it doesn't read as an accidental substring match.)
         store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
                         send_disposition=store_mod.NOT_SENT_PROVEN,
-                        error_code=_first_marker(stderr, _NOT_SENT_BLOCK))
+                        error_code=_block_code(sub.get("stderr")))
         return store_mod.BLOCKED
     if any(m.lower() in stderr for m in _NOT_SENT_RETRY):
         # provably not sent → safe to re-queue (this is NOT resending a possible send), bounded
@@ -1446,6 +1446,15 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
                     error_code=(f"wait produced no answer (exit {code}) — retrieve, don't resend"
                                 + (f"; original disposition: {prior}" if prior else "")))
     return store_mod.POSSIBLY_ACCEPTED
+
+
+def _block_code(raw_stderr: str) -> str:
+    """error_code for a pre-send BLOCKED round. A missing @mention keeps its whole line: it names
+    the apps the popup DID offer, which is the one fact the agent needs to re-fire correctly."""
+    for line in (raw_stderr or "").splitlines():
+        if "mention_not_found" in line:
+            return line.replace("CGC_ERROR ", "").strip()[:400]
+    return _first_marker((raw_stderr or "").lower(), _NOT_SENT_BLOCK)
 
 
 def _first_marker(stderr: str, markers) -> str:

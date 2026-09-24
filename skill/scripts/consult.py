@@ -943,11 +943,34 @@ def cmd_fire(a: argparse.Namespace) -> int:
             "await": " ".join(shlex.quote(x) for x in await_argv)}
 
 
+DEFAULT_APPS = "WebCodex Demo"
+
+
+def known_apps() -> list:
+    """The ChatGPT apps this user has told us about (CGC_APPS, comma-separated) — the list an agent
+    reads with `consult.py apps` instead of reasoning about what exists."""
+    raw = os.environ.get("CGC_APPS", DEFAULT_APPS)
+    return [x for x in (" ".join(p.split()).lstrip("@").strip() for p in raw.split(",")) if x]
+
+
 def _mention_name(v: str) -> str:
+    """Normalize a --mention; a case-insensitive exact or UNIQUE-prefix hit on a known app becomes
+    that app's canonical spelling ("webcodex" -> "WebCodex Demo"). Unknown names pass through — the
+    list may be stale, and the composer popup is the real authority (it fails closed)."""
     v = " ".join((v or "").split()).lstrip("@").strip()
     if not v or len(v) > 80:
         raise argparse.ArgumentTypeError("a --mention is the app's name as ChatGPT shows it, 1-80 chars")
-    return v
+    apps, low = known_apps(), v.lower()
+    exact = [x for x in apps if x.lower() == low]
+    pref = [x for x in apps if x.lower().startswith(low)]
+    return exact[0] if exact else (pref[0] if len(pref) == 1 else v)
+
+
+def cmd_apps(a) -> int:
+    print(json.dumps({"apps": known_apps(), "usage": 'fire ... --mention "<app>"',
+                      "configure": "python3 " + os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                       "cgc_config.py") + ' set CGC_APPS "App One,App Two"'}, ensure_ascii=False))
+    return 0
 
 
 def _add_prep_args(pp):
@@ -1063,6 +1086,9 @@ def main() -> int:
                          "--mention \"WebCodex Demo\". The daemon picks it from the composer's @ popup "
                          "before pasting the prompt; never write '@App' into --task.")
     pf.set_defaults(fn=cmd_fire)
+
+    sub.add_parser("apps", help="list the ChatGPT apps --mention knows (CGC_APPS); local, no network"
+                   ).set_defaults(fn=cmd_apps)
 
     pp = _add_prep_args(sub.add_parser("prep"))
     pp.set_defaults(fn=cmd_prep)

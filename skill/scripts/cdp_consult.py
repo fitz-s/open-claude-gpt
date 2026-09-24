@@ -2500,8 +2500,9 @@ def _mention_pick_js(name, token):
             ".trim().replace(/^@/,'').toLowerCase();}"
             "var ex=os.filter(function(e){return lab(e)===want;});"
             "var pf=os.filter(function(e){return lab(e).indexOf(want)===0;});"
-            "var hit=ex.length===1?ex[0]:(!ex.length&&pf.length===1?pf[0]:null);if(!hit)return null;"
-            "hit.click();return lab(hit);})()")
+            "var hit=ex.length===1?ex[0]:(!ex.length&&pf.length===1?pf[0]:null);"
+            "if(!hit)return {hit:null,seen:os.map(lab).filter(Boolean).slice(0,20)};"
+            "hit.click();return {hit:lab(hit),seen:[]};})()")
 
 
 def _composer_html_js():
@@ -2514,9 +2515,12 @@ def _insert_mention(c, name):
     if typed is None:
         raise _PreClickFailure("composer not found while typing @mention")
     end = time.time() + _MENTION_WAIT_S
+    seen = []
     while time.time() < end:
         time.sleep(0.4)
-        if c.eval(_mention_pick_js(name, token), timeout=45):
+        r = c.eval(_mention_pick_js(name, token), timeout=45) or {}
+        seen = r.get("seen") or seen
+        if r.get("hit"):
             time.sleep(0.4)
             if c.eval(_composer_html_js(), timeout=45) != typed:
                 c.eval(_paste_chunk_js(" "), timeout=45)
@@ -2528,8 +2532,9 @@ def _insert_mention(c, name):
     residue = "" if left == 0 else " (and the composer could not be proven cleared)"
     raise _MentionFailure(
         f"mention_not_found: the composer offered no app named '{name}' for '@{name}' within "
-        f"{_MENTION_WAIT_S:.0f}s{residue} — check the exact app name in ChatGPT and that the app "
-        "is enabled")
+        f"{_MENTION_WAIT_S:.0f}s{residue}. The popup offered: "
+        + (", ".join(repr(x) for x in dict.fromkeys(seen)) or "nothing")
+        + " — re-fire with one of those as --mention (and add it to CGC_APPS via cgc_config.py set), or enable the app")
 
 
 def _paste_prompt(c, prompt: str, mentions=()) -> None:

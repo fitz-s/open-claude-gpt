@@ -22,6 +22,11 @@ for a human (enable the app / fix the name), never auto-retried. The popup selec
 against the composer's generic ARIA roles, not a live DOM probe — the fail-closed path is what
 keeps a wrong guess from sending a mention-less round.
 
+Which apps exist is data, not reasoning: `CGC_APPS` (comma-separated, default `WebCodex Demo`) is
+printed by `consult.py apps`, and a `--mention` that case-insensitively matches or uniquely prefixes
+an entry snaps to its spelling (`--mention webcodex` → `WebCodex Demo`). When the popup has no match,
+the blocked envelope's `error` names what it *did* offer, so the next fire uses the real name.
+
 ### Changed — the prompt says each thing once, and a test keeps it that way
 
 A read-only inventory of the rendered prompt measured what a round actually pays for. Two thirds of
