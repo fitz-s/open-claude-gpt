@@ -37,7 +37,8 @@ import cgc_store as store_mod
 #       immediately succeed. Includes the "browser can't open a working tab" family (attach_failed /
 #       new_tab*) that the file-spool path handled via browser-repair — requeuing lets a transient
 #       tab-open glitch retry instead of stranding a provably-unsent round as uncertain.
-_NOT_SENT_BLOCK = ("login_needed", "CGC_LOGIN", "captcha", "rate_limit", "usage")
+_NOT_SENT_BLOCK = ("login_needed", "CGC_LOGIN", "captcha", "rate_limit", "usage",
+                   "mention_not_found")
 _NOT_SENT_RETRY = ("model_not_selectable", "composer_not_ready", "no_page_target",
                    "attach_failed", "new_tab", "wrong_page", "gate_refused")
 
@@ -300,6 +301,12 @@ def _spec_model_family(a) -> str:
     return getattr(a, "model_family", None) or os.environ.get("CGC_MODEL_FAMILY", "Latest")
 
 
+def _spec_mentions(a) -> list:
+    """ChatGPT apps to @mention before the prompt, frozen into the spec like the model: they route
+    the request to a different tool, so they are part of the request, not of the runtime."""
+    return [m for m in (getattr(a, "mentions", None) or []) if m]
+
+
 def _request_fingerprint(a, prompt: str) -> str:
     """The identity of one LOGICAL request — canonical JSON over every CALLER-side field that
     routes or shapes it: kind, the rid-independent prompt identity, project, model, and the
@@ -324,13 +331,16 @@ def _request_fingerprint(a, prompt: str) -> str:
     # second reason for the same break. Consequence, deliberate and one-time: a request-key fired
     # before this change and re-fired after it conflicts, because the stored fingerprint predates
     # the field. That is the honest report — the old round genuinely was not pinned to a family.
-    return store_mod.sha256(json.dumps({
+    fp = {
         "fp": 1, "kind": a.kind, "prompt": logical,
         "project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
         "model_family": _spec_model_family(a),
         "parent": getattr(a, "parent", None),
         "conversation": None if conv in (None, "auto", "last") else conv,
-    }, sort_keys=True))
+    }
+    if _spec_mentions(a):  # only when set, so every existing request-key keeps its fingerprint
+        fp["mentions"] = _spec_mentions(a)
+    return store_mod.sha256(json.dumps(fp, sort_keys=True))
 
 
 def _release_eligible(s, prior: dict) -> bool:
@@ -447,7 +457,7 @@ def _enqueue_transfer(s, a, prompt: str, out: str, prior: dict, fingerprint: str
     inh_conv = pspec.get("conversation")
     inh_parent = pspec.get("parent_rid") or prior.get("parent_rid")
     spec = {"project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
-            "model_family": _spec_model_family(a),
+            "model_family": _spec_model_family(a), "mentions": _spec_mentions(a),
             "conversation": inh_conv, "parent_rid": inh_parent, "poll": getattr(a, "poll", None),
             "timeout": getattr(a, "timeout", None), "request_fingerprint": fingerprint}
     thread = inh_conv if inh_conv not in (None, "auto", "last") else None
@@ -612,7 +622,7 @@ def enqueue_round(a, prompt: str, out: str) -> int:
                         f" find-conversation --rid {parent}\n")
                     return 2
         spec = {"project_url": getattr(a, "project_url", None), "model": getattr(a, "model", "Pro"),
-                "model_family": _spec_model_family(a),
+                "model_family": _spec_model_family(a), "mentions": _spec_mentions(a),
                 "conversation": conv, "parent_rid": parent, "poll": getattr(a, "poll", None),
                 "timeout": getattr(a, "timeout", None), "request_fingerprint": fingerprint}
         thread = conv if conv not in (None, "auto", "last") else None
@@ -747,7 +757,7 @@ def refire_round(old_rid: str) -> int:
         project_url=pspec.get("project_url"), model=pspec.get("model", "Pro"),
         # INHERIT the recorded family, never re-read the environment: a refire replays a stored
         # request, and re-resolving from env would silently retarget it to today's config.
-        model_family=pspec.get("model_family"),
+        model_family=pspec.get("model_family"), mentions=pspec.get("mentions") or [],
         conversation=pspec.get("conversation"),
         parent=pspec.get("parent_rid") or prior.get("parent_rid"),
         poll=pspec.get("poll"), timeout=pspec.get("timeout"),
@@ -1167,7 +1177,8 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             # time. The followup path passed NEITHER before, so both are named here.
             send = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
                            model=spec.get("model") or "Pro",
-                           model_family=spec.get("model_family") or "Latest")
+                           model_family=spec.get("model_family") or "Latest",
+                           mentions=spec.get("mentions") or [])
         finally:
             if hasattr(conv_lease, "close"):
                 conv_lease.close()  # mutating region done — the read-only wait below needs no lease
@@ -1192,7 +1203,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             # round fixed for _NOT_SENT_RETRY recurring here.
             store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
                             send_disposition=store_mod.NOT_SENT_PROVEN,
-                            error_code=_first_marker(stderr, _NOT_SENT_BLOCK))
+                            error_code=_block_code(send.get("stderr")))
             return store_mod.BLOCKED
         if any(m.lower() in stderr for m in _NOT_SENT_RETRY):
             # Same evidence, same verdict as a submit's. These markers are emitted FAIL-CLOSED
@@ -1215,7 +1226,8 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
     sub = run_cdp("submit", rid=rid, prompt=prompt,
                   project_url=spec.get("project_url") or "https://chatgpt.com/",
                   model=spec.get("model") or "Pro",
-                  model_family=spec.get("model_family") or "Latest")
+                  model_family=spec.get("model_family") or "Latest",
+                  mentions=spec.get("mentions") or [])
     conv = sub.get("conversation")
     stderr = (sub.get("stderr") or "").lower()
 
@@ -1239,7 +1251,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         # noted here so it doesn't read as an accidental substring match.)
         store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
                         send_disposition=store_mod.NOT_SENT_PROVEN,
-                        error_code=_first_marker(stderr, _NOT_SENT_BLOCK))
+                        error_code=_block_code(sub.get("stderr")))
         return store_mod.BLOCKED
     if any(m.lower() in stderr for m in _NOT_SENT_RETRY):
         # provably not sent → safe to re-queue (this is NOT resending a possible send), bounded
@@ -1434,6 +1446,15 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
                     error_code=(f"wait produced no answer (exit {code}) — retrieve, don't resend"
                                 + (f"; original disposition: {prior}" if prior else "")))
     return store_mod.POSSIBLY_ACCEPTED
+
+
+def _block_code(raw_stderr: str) -> str:
+    """error_code for a pre-send BLOCKED round. A missing @mention keeps its whole line: it names
+    the apps the popup DID offer, which is the one fact the agent needs to re-fire correctly."""
+    for line in (raw_stderr or "").splitlines():
+        if "mention_not_found" in line:
+            return line.replace("CGC_ERROR ", "").strip()[:400]
+    return _first_marker((raw_stderr or "").lower(), _NOT_SENT_BLOCK)
 
 
 def _first_marker(stderr: str, markers) -> str:
