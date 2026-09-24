@@ -6,6 +6,21 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Added — `fire --mention "<App>"`: @mention a ChatGPT app/plugin without a human
+
+An agent asked to run a consult "with @WebCodex Demo" had no way to do it: the daemon only pastes
+text, and `@WebCodex Demo` pasted as prose is a string, not an app invocation — so the agent fell
+back to hand-editing the ChatGPT window. A mention is a composer *action*, so it is now one flag
+carried like the model: `fire --mention NAME` (repeatable, `@` optional) → frozen into the round's
+spec and request fingerprint (only when set, so existing request-keys are unchanged) → the daemon
+passes `--mention` to `cdp_consult submit/followup` → after clearing the composer and before the
+paste, the driver types `@NAME`, clicks the popup option whose label matches (exact, else a unique
+prefix — never a guess between two), and checks the composer changed. If no option appears it clears
+the half-typed text and exits `mention_not_found` pre-click: provably not sent, filed as `blocked`
+for a human (enable the app / fix the name), never auto-retried. The popup selectors were written
+against the composer's generic ARIA roles, not a live DOM probe — the fail-closed path is what
+keeps a wrong guess from sending a mention-less round.
+
 ### Changed — the prompt says each thing once, and a test keeps it that way
 
 A read-only inventory of the rendered prompt measured what a round actually pays for. Two thirds of

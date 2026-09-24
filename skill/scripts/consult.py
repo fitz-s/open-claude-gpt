@@ -928,7 +928,7 @@ def cmd_fire(a: argparse.Namespace) -> int:
         rid=rid, prompt_file=prompt_file,
         kind="followup" if a.followup else "submit",
         project_url=a.project_url, conversation=(a.conversation or "auto"),
-        parent=getattr(a, "parent", None), model=a.model,
+        parent=getattr(a, "parent", None), model=a.model, mentions=getattr(a, "mention", None) or [],
         request_key=getattr(a, "request_key", None),
         logical_sha=st.get("logical_sha"),
         out=a.out, poll=spool.POLL_S, timeout=spool.STUCK_AFTER_S, quiet=True)
@@ -941,6 +941,13 @@ def cmd_fire(a: argparse.Namespace) -> int:
     # with a space or a shell metacharacter can't break or change the parsed command).
     return {"rid": rid, "out": out, "await_argv": await_argv,
             "await": " ".join(shlex.quote(x) for x in await_argv)}
+
+
+def _mention_name(v: str) -> str:
+    v = " ".join((v or "").split()).lstrip("@").strip()
+    if not v or len(v) > 80:
+        raise argparse.ArgumentTypeError("a --mention is the app's name as ChatGPT shows it, 1-80 chars")
+    return v
 
 
 def _add_prep_args(pp):
@@ -1051,6 +1058,10 @@ def main() -> int:
                          "content returns the original receipt instead of queuing a duplicate; the "
                          "same key with different content is refused. Use it whenever a retry after "
                          "lost output must not double-send.")
+    pf.add_argument("--mention", action="append", default=[], type=_mention_name,
+                    help="ChatGPT app/plugin to @mention (repeatable), name WITHOUT the '@', e.g. "
+                         "--mention \"WebCodex Demo\". The daemon picks it from the composer's @ popup "
+                         "before pasting the prompt; never write '@App' into --task.")
     pf.set_defaults(fn=cmd_fire)
 
     pp = _add_prep_args(sub.add_parser("prep"))
