@@ -6,6 +6,19 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — ChatGPT's third turn schema: sends and answers were invisible
+
+On 2026-09-24 ChatGPT stopped rendering both turn attributes the reader knew (`data-turn`,
+`data-message-author-role`). Each message is now a unit tagged
+`data-chatgpt-search-unit-key="<turn>:<n>:user|assistant"`. Live effect: a follow-up landed and its
+answer finished, but every read saw zero turns — the send reported `ok:false`, the waiter
+`rid_absent`, and the round was filed `possibly_accepted`. The unit key is now a third selector
+family (a separate `search-unit-v1` adapter, never unioned) and a third role source. A finished
+unit also holds attachment cards ("results.json Code Open file") after the markdown, which pushed
+`END_RESPONSE` off the last line; the answer node is now narrowed to the markdown body that holds the
+BEGIN sentinel. Checked on the live page: three finished rounds read `done:true`, and the stranded
+round's 26,130-char answer was retrieved read-only.
+
 ### Added — the waiter answers approval cards for the apps you @mention
 
 A round that used an app could stall on "WebCodex Demo — Allow file materialization? [Deny] [Allow
