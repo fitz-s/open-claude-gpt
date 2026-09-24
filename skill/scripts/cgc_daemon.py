@@ -119,6 +119,8 @@ def _make_run_cdp():
             # runs on the FAILURE paths too — where the id it captures is the only thing that makes
             # the round recoverable. A kill here loses stdout, which is exactly how the round this
             # budget protects became unrecoverable in the first place.
+            for m in kw.get("mentions") or ():
+                cmd += ["--mention", m]
             code, so, se = _run(cmd, 300, kw["rid"], stdin_text=kw["prompt"], pass_fds=fds)
             rec = _last_json(so)
             return {"code": code, "conversation": rec.get("conversation_id", "") or "",
@@ -134,6 +136,8 @@ def _make_run_cdp():
             cmd = [sys.executable, _CDP, "followup", "--conversation", kw["conversation"],
                    "--prompt-file", "-", "--rid", kw["rid"],
                    "--model", kw["model"], "--model-family", kw["model_family"]]
+            for m in kw.get("mentions") or ():
+                cmd += ["--mention", m]
             code, so, se = _run(cmd, 240, kw["rid"], stdin_text=kw["prompt"], pass_fds=fds)
             return {"code": code, "model_badge": _last_json(so).get("modelBadge"), "stderr": se}
         if kind == "wait":

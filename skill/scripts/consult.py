@@ -928,7 +928,7 @@ def cmd_fire(a: argparse.Namespace) -> int:
         rid=rid, prompt_file=prompt_file,
         kind="followup" if a.followup else "submit",
         project_url=a.project_url, conversation=(a.conversation or "auto"),
-        parent=getattr(a, "parent", None), model=a.model,
+        parent=getattr(a, "parent", None), model=a.model, mentions=getattr(a, "mention", None) or [],
         request_key=getattr(a, "request_key", None),
         logical_sha=st.get("logical_sha"),
         out=a.out, poll=spool.POLL_S, timeout=spool.STUCK_AFTER_S, quiet=True)
@@ -941,6 +941,36 @@ def cmd_fire(a: argparse.Namespace) -> int:
     # with a space or a shell metacharacter can't break or change the parsed command).
     return {"rid": rid, "out": out, "await_argv": await_argv,
             "await": " ".join(shlex.quote(x) for x in await_argv)}
+
+
+DEFAULT_APPS = "WebCodex Demo"
+
+
+def known_apps() -> list:
+    """The ChatGPT apps this user has told us about (CGC_APPS, comma-separated) — the list an agent
+    reads with `consult.py apps` instead of reasoning about what exists."""
+    raw = os.environ.get("CGC_APPS", DEFAULT_APPS)
+    return [x for x in (" ".join(p.split()).lstrip("@").strip() for p in raw.split(",")) if x]
+
+
+def _mention_name(v: str) -> str:
+    """Normalize a --mention; a case-insensitive exact or UNIQUE-prefix hit on a known app becomes
+    that app's canonical spelling ("webcodex" -> "WebCodex Demo"). Unknown names pass through — the
+    list may be stale, and the composer popup is the real authority (it fails closed)."""
+    v = " ".join((v or "").split()).lstrip("@").strip()
+    if not v or len(v) > 80:
+        raise argparse.ArgumentTypeError("a --mention is the app's name as ChatGPT shows it, 1-80 chars")
+    apps, low = known_apps(), v.lower()
+    exact = [x for x in apps if x.lower() == low]
+    pref = [x for x in apps if x.lower().startswith(low)]
+    return exact[0] if exact else (pref[0] if len(pref) == 1 else v)
+
+
+def cmd_apps(a) -> int:
+    print(json.dumps({"apps": known_apps(), "usage": 'fire ... --mention "<app>"',
+                      "configure": "python3 " + os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                       "cgc_config.py") + ' set CGC_APPS "App One,App Two"'}, ensure_ascii=False))
+    return 0
 
 
 def _add_prep_args(pp):
@@ -1051,7 +1081,14 @@ def main() -> int:
                          "content returns the original receipt instead of queuing a duplicate; the "
                          "same key with different content is refused. Use it whenever a retry after "
                          "lost output must not double-send.")
+    pf.add_argument("--mention", action="append", default=[], type=_mention_name,
+                    help="ChatGPT app/plugin to @mention (repeatable), name WITHOUT the '@', e.g. "
+                         "--mention \"WebCodex Demo\". The daemon picks it from the composer's @ popup "
+                         "before pasting the prompt; never write '@App' into --task.")
     pf.set_defaults(fn=cmd_fire)
+
+    sub.add_parser("apps", help="list the ChatGPT apps --mention knows (CGC_APPS); local, no network"
+                   ).set_defaults(fn=cmd_apps)
 
     pp = _add_prep_args(sub.add_parser("prep"))
     pp.set_defaults(fn=cmd_prep)

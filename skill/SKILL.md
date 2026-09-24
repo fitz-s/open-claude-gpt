@@ -42,6 +42,14 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid>
 
 - Reviewing `main`/a branch → `--ref <sha>` (commit-pinned; a branch can move mid-consult).
 - No code subject at all (a proof, research, writing) → add `--no-code`.
+- User names a ChatGPT app/plugin (`@WebCodex Demo`) → add `--mention "WebCodex Demo"` (no `@`,
+  repeatable, works with `--followup`). That is the whole job: the daemon picks it from the
+  composer's @ popup before pasting. Never write `@App` into `--task`, never touch the browser.
+  Which apps exist: known today = **`WebCodex Demo`**; the live list is
+  `python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py apps` (from `CGC_APPS`). A short or
+  lower-case name (`--mention webcodex`) snaps to the listed spelling. Envelope error
+  `mention_not_found` names what the popup DID offer → re-fire with that name, else relay
+  "enable the app" and stop.
 - Do NOT preflight: never run `doctor`/`queue`/`status` before firing. The daemon is installed
   once (`cgc install-daemon`, launchd keeps it alive); if it is genuinely down, fire/await say so
   in one line — relay `cgc install-daemon` to the user and stop.
