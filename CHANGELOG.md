@@ -6,6 +6,21 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Added — the waiter answers approval cards for the apps you @mention
+
+A round that used an app could stall on "WebCodex Demo — Allow file materialization? [Deny] [Allow
+once]" until someone clicked, and there is no standing grant: the plugin was already on "Allow all
+tools", which does not cover this card. The waiter is the one process already watching each consult's
+tab, so it now answers there: on each poll it looks for a visible "Allow once" button whose card also
+holds a visible "Deny", reads the card's own text (≤400 chars, so the conversation cannot lend it a
+name), and clicks "Allow once" only when that text names an app in `CGC_AUTO_APPROVE` (default
+`CGC_APPS`). The click is `element.click()` in that tab over CDP — no OS mouse, no focus change, no
+other tab — so parallel consults and local window focus are untouched, and nothing runs when no card
+is showing. An unlisted app's card, or one that survives 5 clicks, ends the wait as
+`CGC_BLOCKER approval_needed` (exit 3) for a human; `CGC_AUTO_APPROVE=off` disables the feature.
+Verified offline against a mock DOM (node) and a live ChatGPT page with an empty allowlist (69 buttons,
+no false match); the live card itself was not reproduced.
+
 ## [0.3.0] — 2026-09-24
 
 ### Added — `fire --mention "<App>"`: @mention a ChatGPT app/plugin without a human
