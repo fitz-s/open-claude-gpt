@@ -158,7 +158,7 @@ def test_both_schemas_are_kept_separate_never_unioned():
     """Unioning the two selector families double-counts wrapper and content nodes when both
     attributes exist at different DOM levels, and interleaves their order."""
     names = [n for n, _u, _a in _CDP._ADAPTERS]
-    assert names == ["data-turn-v1", "legacy-author-role-v1"]
+    assert names == ["data-turn-v1", "legacy-author-role-v1", "search-unit-v1"]
     for _n, u, a in _CDP._ADAPTERS:
         assert "," not in u and "," not in a, "each adapter must query ONE schema"
 

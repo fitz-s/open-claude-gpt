@@ -556,14 +556,20 @@ class CDP:
 # Match either shape. This is the single fact about ChatGPT's DOM that the whole file rests on, so
 # it is named once here instead of being retyped inside six JS string literals where a future
 # rename would again have to be found six times.
-_SEL_A = '[data-message-author-role="assistant"],[data-turn="assistant"]'
-_SEL_U = '[data-message-author-role="user"],[data-turn="user"]'
-_SEL_ANY = '[data-message-author-role],[data-turn]'
+# 2026-09-24: a third shape. Neither attribute exists any more; each message is a unit tagged
+# data-chatgpt-search-unit-key="<turn>:<n>:user|assistant" (one per message, no nested duplicate).
+# An in-progress answer has no assistant unit until it finishes, which reads as "not done yet".
+_SEL_A = ('[data-message-author-role="assistant"],[data-turn="assistant"],'
+          '[data-chatgpt-search-unit-key$=":assistant"]')
+_SEL_U = ('[data-message-author-role="user"],[data-turn="user"],'
+          '[data-chatgpt-search-unit-key$=":user"]')
+_SEL_ANY = '[data-message-author-role],[data-turn],[data-chatgpt-search-unit-key]'
 _JS_A, _JS_U, _JS_ANY = json.dumps(_SEL_A), json.dumps(_SEL_U), json.dumps(_SEL_ANY)
 
 # Whichever attribute this build uses, the role reads the same way.
 _ROLE_FN = ("function __cgcRole(el){return el.getAttribute('data-message-author-role')||"
-            "el.getAttribute('data-turn')||'';}")
+            "el.getAttribute('data-turn')||"
+            "((el.getAttribute('data-chatgpt-search-unit-key')||'').split(':').pop())||'';}")
 
 _NODE_FN = (
     _ROLE_FN +
@@ -577,6 +583,8 @@ _NODE_FN = (
     # token (e.g. the model echoing/quoting it). Returns null when turnIndex is scoped but that
     # ordinal's user node is not currently in the DOM (virtualized away) — the caller must fail
     # closed rather than search outside the (unresolvable) interval.
+    "function __cgcBody(n,BG){var m=n.querySelectorAll('[data-markdown-text-style=\"assistant-message\"]');"
+    "for(var i=m.length-1;i>=0;i--){if((m[i].textContent||'').indexOf(BG)>=0)return m[i];}return n;}"
     "function __cgcNode(BG,turnIndex){"
     "var nx=document.querySelectorAll(" + _JS_ANY + ");"
     "var scoped=(turnIndex!==undefined&&turnIndex!==null&&turnIndex>=0);"
@@ -590,7 +598,10 @@ _NODE_FN = (
     # 1) exact: any assistant node containing our (unique) BEGIN sentinel, newest-first. Scoped ->
     #    within [lo,hi) only. Unscoped -> the whole document (lo=-1,hi=nx.length), matching the
     #    original global search.
-    "for(var i=hi-1;i>lo;i--){if(__cgcRole(nx[i])==='assistant'&&(nx[i].textContent||'').indexOf(BG)>=0)return nx[i];}"
+    #    Narrowed to the message BODY: the search-unit build puts attachment cards ("x.py Code Open
+    #    file") after the markdown in the same unit, which would make END no longer the last line.
+    "for(var i=hi-1;i>lo;i--){if(__cgcRole(nx[i])==='assistant'&&(nx[i].textContent||'').indexOf(BG)>=0)"
+    "return __cgcBody(nx[i],BG);}"
     # 2) fallback (no sentinel yet): the LARGEST assistant node in the interval. Scoped -> the same
     #    [lo,hi). Unscoped -> only AFTER the last user node (NOT a[last], which is often a 1-char
     #    trailing streaming placeholder; NOT a global max, which would read a PRIOR round's answer).
@@ -599,7 +610,7 @@ _NODE_FN = (
     "var best=null,bl=-1;"
     "for(var k=flo+1;k<fhi;k++){if(__cgcRole(nx[k])==='assistant'){"
     "var L=(nx[k].textContent||'').length;if(L>bl){bl=L;best=nx[k];}}}"
-    "return best;}"
+    "return best?__cgcBody(best,''):best;}"
 )
 
 # Layout-independent innerText approximation: a textContent walk that re-inserts newlines at block
@@ -2208,6 +2219,8 @@ def _egress_gate(prompt: str):
 _ADAPTERS = (
     ("data-turn-v1", '[data-turn="user"]', '[data-turn="assistant"]'),
     ("legacy-author-role-v1", '[data-message-author-role="user"]', '[data-message-author-role="assistant"]'),
+    ("search-unit-v1", '[data-chatgpt-search-unit-key$=":user"]',
+     '[data-chatgpt-search-unit-key$=":assistant"]'),
 )
 
 # How long after the click the request's own user turn must appear, and how long after that some
