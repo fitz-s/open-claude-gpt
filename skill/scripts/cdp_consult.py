@@ -610,7 +610,7 @@ _NODE_FN = (
     "var best=null,bl=-1;"
     "for(var k=flo+1;k<fhi;k++){if(__cgcRole(nx[k])==='assistant'){"
     "var L=(nx[k].textContent||'').length;if(L>bl){bl=L;best=nx[k];}}}"
-    "return best;}"
+    "return best?__cgcBody(best,''):best;}"
 )
 
 # Layout-independent innerText approximation: a textContent walk that re-inserts newlines at block

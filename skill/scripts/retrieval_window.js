@@ -77,10 +77,15 @@
     // Either turn markup: older ChatGPT builds tag the message node
     // data-message-author-role="assistant", the current build tags the turn
     // data-turn="assistant". Mirrors _SEL_A in cdp_consult.py — all four parsers must agree.
+    // The search-unit build (2026-09-24) tags each message data-chatgpt-search-unit-key="…:assistant"
+    // and appends attachment cards after the markdown body, so read that body when present.
     var nodes = document.querySelectorAll(
-      '[data-message-author-role="assistant"],[data-turn="assistant"]');
+      '[data-message-author-role="assistant"],[data-turn="assistant"],' +
+      '[data-chatgpt-search-unit-key$=":assistant"]');
     for (var k = nodes.length - 1; k >= 0; k--) {
-      var t = cgcText(nodes[k]).replace(/\r\n/g, "\n");
+      var md = nodes[k].querySelectorAll ?
+        nodes[k].querySelectorAll('[data-markdown-text-style="assistant-message"]') : [];
+      var t = cgcText(md.length ? md[md.length - 1] : nodes[k]).replace(/\r\n/g, "\n");
       var lines = t.split("\n");
       var inFence = false;
       var i = -1;

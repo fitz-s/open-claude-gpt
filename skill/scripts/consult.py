@@ -806,10 +806,21 @@ def cmd_prep(a: argparse.Namespace) -> int:
         # data-turn="assistant". Matching only the old one selected nothing, so `done` could
         # never fire. Mirrors _SEL_A in cdp_consult.py — the parsers must agree.
         "var a=document.querySelectorAll('[data-message-author-role=\"assistant\"],"
-        "[data-turn=\"assistant\"]');"
+        "[data-turn=\"assistant\"],[data-chatgpt-search-unit-key$=\":assistant\"]');"
+        # The search-unit build appends attachment cards after the markdown in the same unit;
+        # read the last markdown body when there is one (mirrors __cgcBody in cdp_consult.py).
+        "function body(n){var m=n.querySelectorAll?n.querySelectorAll("
+        "'[data-markdown-text-style=\"assistant-message\"]'):[];return m.length?m[m.length-1]:n;}"
+        # Line structure from block boundaries, as cgcText/__cgcText do: in this build each line is
+        # its own <p> with no newline characters, so raw textContent never has a bare sentinel line.
+        "function txt(el){var B=/^(P|DIV|LI|UL|OL|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE|TABLE|TR|THEAD|TBODY|SECTION|ARTICLE|HR)$/,"
+        "o='';(function w(n){var c=n.childNodes||[];for(var i=0;i<c.length;i++){var x=c[i];"
+        "if(x.nodeType===3){o+=x.nodeValue;}else if(x.nodeType===1){if(x.tagName==='BR'){o+='\\n';continue;}"
+        "var b=B.test(x.tagName);if(b)o+='\\n';w(x);if(b)o+='\\n';}}})(el);"
+        "return el.childNodes?o:(el.textContent||'');}"
         "var res={done:false,len:0};"
         "for(var k=a.length-1;k>=0;k--){"
-        "var r=parse(a[k].textContent);"
+        "var r=parse(txt(body(a[k])));"
         "if(r.done){res=r;break;}"
         "if(k===a.length-1)res=r;"
         "}"
