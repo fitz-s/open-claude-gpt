@@ -38,7 +38,7 @@ class _FakeComposer:
         if "selectAll" in js:
             self.html = self.text = ""
             return 0
-        if "var want=" in js:
+        if "var want=" in js and "data-cgc-pre" in js:
             want = json.loads(js.split("var want=", 1)[1].split(";", 1)[0])
             if want in self.offers:
                 self.html = self.html.replace("@" + want, "") + f'<span data-mention>{want}</span>'
@@ -131,3 +131,40 @@ def test_daemon_passes_mentions_on_the_argv(monkeypatch):
                            mentions=["WebCodex Demo"])
     i = got["cmd"].index("--mention")
     assert got["cmd"][i + 1] == "WebCodex Demo"
+
+
+def _run_pick(js_setup, name, token="t0"):
+    """Run the real picker JS in node against a mock DOM; returns (picked, clicks)."""
+    import shutil, subprocess
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    src = ("function el(t,pre){var a={'data-cgc-pre':pre||null};return {innerText:t,clicked:0,"
+           "getAttribute:function(k){return a[k]},getBoundingClientRect:function(){return {width:1,height:1}},"
+           "click:function(){this.clicked++}}}\n" + js_setup +
+           "\nvar document={querySelectorAll:function(){return E}};"
+           "var r=" + CDP._mention_pick_js(name, token) + ";"
+           "console.log(JSON.stringify([r,E.map(function(e){return e.clicked})]));")
+    out = subprocess.run(["node", "-e", src], capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+def test_picker_exact_match_beats_prefix():
+    assert _run_pick("var E=[el('WebCodex Demo Pro'),el('WebCodex Demo\\nRuns code')];",
+                     "WebCodex Demo") == ["webcodex demo", [0, 1]]
+
+
+def test_picker_takes_a_unique_prefix():
+    assert _run_pick("var E=[el('WebCodex Demo — sandbox'),el('Canva')];",
+                     "WebCodex Demo") == ["webcodex demo — sandbox", [1, 0]]
+
+
+def test_picker_refuses_an_ambiguous_prefix():
+    assert _run_pick("var E=[el('WebCodex Demo Pro'),el('WebCodex Demo Lite')];",
+                     "WebCodex Demo") == [None, [0, 0]]
+
+
+def test_picker_ignores_controls_that_were_on_screen_before_the_typing():
+    # a same-label control that pre-dates the "@name" keystrokes is not the popup
+    assert _run_pick("var E=[el('WebCodex Demo','t0')];", "WebCodex Demo") == [None, [0]]
+    assert _run_pick("var E=[el('WebCodex Demo','t0'),el('WebCodex Demo')];",
+                     "WebCodex Demo") == ["webcodex demo", [0, 1]]
