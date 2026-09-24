@@ -56,7 +56,21 @@ class FakeTab:
     def _answer_visible(self):
         return RID in self._turns
 
+    card = None                  # app-approval card text on screen, if any
+    approved = 0
+
     def eval(self, expr, timeout=None):
+        if "var allow=" in expr:                              # _approval_js
+            if not self.card:
+                return None
+            allow = _json.loads(expr.split("var allow=", 1)[1].split(";", 1)[0])
+            text = self.card
+            lines = [ln.strip().lower() for ln in text.split("\n")]
+            app = next((x for x in allow if x.lower() in lines), None)
+            if app:
+                self.approved += 1
+                self.card = None
+            return {"app": app, "text": text}
         if "Array.prototype.map.call(u" in expr:
             return [_user_turn(r) for r in self._turns]
         if expr.startswith("(function(){try{var sc="):        # _FORCE_RENDER_JS
@@ -328,3 +342,22 @@ def test_a_genuinely_dead_round_still_reaches_the_existing_timeout(wait_env, cap
     assert tab.reloads == 1
     assert open(ns.out + ".raw").read() == FROZEN_STUB
     assert "timeout_no_answer" in capsys.readouterr().err
+
+
+def test_an_allowlisted_approval_card_is_answered_and_the_wait_completes(wait_env, capsys, monkeypatch):
+    monkeypatch.setattr(_CDP, "CGC_AUTO_APPROVE", "WebCodex Demo")
+    tab = FakeTab(turns_before_reload=[RID], turns_after_reload=[RID])
+    tab.card = "WebCodex Demo\nAllow file materialization?\nChatGPT needs your approval"
+    code, ns = wait_env(tab)
+    assert code == 0 and tab.approved == 1
+    assert "CGC_APPROVED 'WebCodex Demo'" in capsys.readouterr().err
+    assert tab.sends == [], "approving is a page click, never a key event into the composer"
+
+
+def test_a_card_for_an_unlisted_app_blocks_for_a_human(wait_env, capsys, monkeypatch):
+    monkeypatch.setattr(_CDP, "CGC_AUTO_APPROVE", "WebCodex Demo")
+    tab = FakeTab(turns_before_reload=[RID], turns_after_reload=[RID])
+    tab.card = "Canva\nAllow file materialization?"
+    code, _ = wait_env(tab)
+    assert code == 3 and tab.approved == 0
+    assert "approval_needed" in capsys.readouterr().err
