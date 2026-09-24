@@ -15,7 +15,8 @@ carried like the model: `fire --mention NAME` (repeatable, `@` optional) → fro
 spec and request fingerprint (only when set, so existing request-keys are unchanged) → the daemon
 passes `--mention` to `cdp_consult submit/followup` → after clearing the composer and before the
 paste, the driver types `@NAME`, clicks the popup option whose label matches (exact, else a unique
-prefix — never a guess between two), and checks the composer changed. If no option appears it clears
+prefix — never a guess between two; only options that appear after the `@NAME` keystrokes count, so a
+same-label control elsewhere on the page can never be picked), and checks the composer changed. If no option appears it clears
 the half-typed text and exits `mention_not_found` pre-click: provably not sent, filed as `blocked`
 for a human (enable the app / fix the name), never auto-retried. The popup selectors were written
 against the composer's generic ARIA roles, not a live DOM probe — the fail-closed path is what

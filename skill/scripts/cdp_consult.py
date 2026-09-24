@@ -2475,23 +2475,32 @@ def _norm_label(s):
     return " ".join((s or "").split()).lower()
 
 
-def _mention_type_js(name):
-    return ("(function(){var d=" + _composer_get_js() + ";if(!d)return null;d.focus();"
+def _mention_visible_js():
+    return ("Array.prototype.slice.call(document.querySelectorAll(" + json.dumps(_MENTION_OPT_SEL) + "))"
+            ".filter(function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;})")
+
+
+def _mention_type_js(name, token):
+    # Stamp every candidate ALREADY on screen with this attempt's token before typing: only what
+    # the "@name" keystrokes bring up is the composer's popup. Scoping by cause, not by a popup
+    # selector nobody has probed, so an unrelated same-label control can never be picked.
+    return ("(function(){var d=" + _composer_get_js() + ";if(!d)return null;"
+            + _mention_visible_js() + ".forEach(function(e){e.setAttribute('data-cgc-pre',"
+            + json.dumps(token) + ");});d.focus();"
             "document.execCommand('insertText',false," + json.dumps("@" + name) + ");"
             "return d.innerHTML;})()")
 
 
-def _mention_pick_js(name):
-    # Visible options only; exact label wins, else a UNIQUE prefix match (the popup may append a
-    # description line). Returns the picked label, or null. Never guesses between two candidates.
-    return ("(function(){var want=" + json.dumps(_norm_label(name)) + ";"
-            "var os=Array.prototype.slice.call(document.querySelectorAll(" + json.dumps(_MENTION_OPT_SEL) + "))"
-            ".filter(function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;});"
+def _mention_pick_js(name, token):
+    # Visible options the typing produced; exact label wins, else a UNIQUE prefix match (the popup
+    # may append a description line). Returns the picked label, or null. Never guesses.
+    return ("(function(){var want=" + json.dumps(_norm_label(name)) + ";var os=" + _mention_visible_js()
+            + ".filter(function(e){return e.getAttribute('data-cgc-pre')!==" + json.dumps(token) + ";});"
             "function lab(e){return (e.innerText||e.textContent||'').split('\\n')[0].replace(/\\s+/g,' ')"
             ".trim().replace(/^@/,'').toLowerCase();}"
             "var ex=os.filter(function(e){return lab(e)===want;});"
             "var pf=os.filter(function(e){return lab(e).indexOf(want)===0;});"
-            "var hit=ex.length?ex[0]:(pf.length===1?pf[0]:null);if(!hit)return null;"
+            "var hit=ex.length===1?ex[0]:(!ex.length&&pf.length===1?pf[0]:null);if(!hit)return null;"
             "hit.click();return lab(hit);})()")
 
 
@@ -2500,21 +2509,27 @@ def _composer_html_js():
 
 
 def _insert_mention(c, name):
-    typed = c.eval(_mention_type_js(name), timeout=45)
+    token = os.urandom(4).hex()
+    typed = c.eval(_mention_type_js(name, token), timeout=45)
     if typed is None:
         raise _PreClickFailure("composer not found while typing @mention")
     end = time.time() + _MENTION_WAIT_S
     while time.time() < end:
         time.sleep(0.4)
-        if c.eval(_mention_pick_js(name), timeout=45):
+        if c.eval(_mention_pick_js(name, token), timeout=45):
             time.sleep(0.4)
             if c.eval(_composer_html_js(), timeout=45) != typed:
                 c.eval(_paste_chunk_js(" "), timeout=45)
                 return
-    c.eval(_clear_composer_js(), timeout=45)  # leave no half-typed "@name" behind
+    try:  # leave no half-typed "@name" behind; either way the round is not sent
+        left = c.eval(_clear_composer_js(), timeout=45)
+    except Exception:
+        left = None
+    residue = "" if left == 0 else " (and the composer could not be proven cleared)"
     raise _MentionFailure(
         f"mention_not_found: the composer offered no app named '{name}' for '@{name}' within "
-        f"{_MENTION_WAIT_S:.0f}s — check the exact app name in ChatGPT and that the app is enabled")
+        f"{_MENTION_WAIT_S:.0f}s{residue} — check the exact app name in ChatGPT and that the app "
+        "is enabled")
 
 
 def _paste_prompt(c, prompt: str, mentions=()) -> None:
