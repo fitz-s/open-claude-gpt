@@ -43,8 +43,8 @@ class _FakeComposer:
             if want in self.offers:
                 self.html = self.html.replace("@" + want, "") + f'<span data-mention>{want}</span>'
                 self.text = self.text.lower().replace("@" + want, want)
-                return want
-            return None
+                return {"hit": want, "seen": []}
+            return {"hit": None, "seen": self.offers}
         if "execCommand('insertText'" in js:
             chunk = json.loads(js.split("execCommand('insertText',false,", 1)[1].rsplit(");", 1)[0])
             self.text += chunk
@@ -68,10 +68,11 @@ def test_mention_is_picked_before_the_prompt(monkeypatch):
 def test_unknown_mention_fails_closed_before_the_click(monkeypatch):
     monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
     monkeypatch.setattr(CDP, "_MENTION_WAIT_S", 0.05)
-    c = _FakeComposer([])
+    c = _FakeComposer(["canva"])
     with pytest.raises(CDP._MentionFailure) as e:
         CDP._paste_prompt(c, "review this", ["Nope App"])
     assert "mention_not_found" in str(e.value)
+    assert "'canva'" in str(e.value), "the error names what the popup did offer"
     assert isinstance(e.value, CDP._PreClickFailure), "never an uncertain post-click failure"
     assert c.text == "", "no half-typed @name left in the composer"
 
@@ -145,7 +146,8 @@ def _run_pick(js_setup, name, token="t0"):
            "var r=" + CDP._mention_pick_js(name, token) + ";"
            "console.log(JSON.stringify([r,E.map(function(e){return e.clicked})]));")
     out = subprocess.run(["node", "-e", src], capture_output=True, text=True, check=True).stdout
-    return json.loads(out)
+    r, clicks = json.loads(out)
+    return [r["hit"], clicks]
 
 
 def test_picker_exact_match_beats_prefix():
@@ -168,3 +170,44 @@ def test_picker_ignores_controls_that_were_on_screen_before_the_typing():
     assert _run_pick("var E=[el('WebCodex Demo','t0')];", "WebCodex Demo") == [None, [0]]
     assert _run_pick("var E=[el('WebCodex Demo','t0'),el('WebCodex Demo')];",
                      "WebCodex Demo") == ["webcodex demo", [0, 1]]
+
+
+def test_popup_offer_is_reported_when_nothing_matches():
+    import shutil, subprocess
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    src = ("var E=[{innerText:'Canva',getAttribute:function(){return null},"
+           "getBoundingClientRect:function(){return {width:1,height:1}},click:function(){}}];"
+           "var document={querySelectorAll:function(){return E}};console.log(JSON.stringify("
+           + CDP._mention_pick_js("WebCodex Demo", "t0") + "));")
+    out = json.loads(subprocess.run(["node", "-e", src], capture_output=True, text=True,
+                                    check=True).stdout)
+    assert out == {"hit": None, "seen": ["canva"]}
+
+
+def test_known_apps_default_and_snapping(monkeypatch):
+    consult = _load("consult")
+    monkeypatch.delenv("CGC_APPS", raising=False)
+    assert consult.known_apps() == ["WebCodex Demo"]
+    assert consult._mention_name("webcodex") == "WebCodex Demo", "unique prefix snaps"
+    assert consult._mention_name("@WEBCODEX DEMO") == "WebCodex Demo"
+    assert consult._mention_name("Canva") == "Canva", "unlisted names pass through"
+    monkeypatch.setenv("CGC_APPS", "WebCodex Demo, WebCodex Pro ,@Canva")
+    assert consult.known_apps() == ["WebCodex Demo", "WebCodex Pro", "Canva"]
+    assert consult._mention_name("webcodex") == "webcodex", "ambiguous prefix is left for the popup"
+
+
+def test_apps_command_prints_the_list(monkeypatch, capsys):
+    consult = _load("consult")
+    monkeypatch.setenv("CGC_APPS", "WebCodex Demo")
+    assert consult.cmd_apps(None) == 0
+    assert json.loads(capsys.readouterr().out)["apps"] == ["WebCodex Demo"]
+
+
+def test_blocked_round_keeps_the_offered_app_names():
+    backend = _load("cgc_backend")
+    raw = ("noise\nCGC_ERROR mention_not_found: the composer offered no app named 'X' for '@X' "
+           "within 8s. The popup offered: 'webcodex demo' — re-fire ... — NOT submitted.\n")
+    code = backend._block_code(raw)
+    assert code.startswith("mention_not_found") and "'webcodex demo'" in code
+    assert backend._block_code("CGC_ERROR login_needed: log in") == "login_needed"
