@@ -1394,20 +1394,26 @@ def _newer_send(store, rid, conv):
     """A submit/followup round in the same thread, created after `rid`, that has reached (or passed)
     begin_send. Its turn would sit after this round's, making "answer that same request" ambiguous."""
     return store.db.execute(
-        "SELECT rid FROM rounds WHERE thread_id=? AND rid<>? AND kind IN ('submit','followup') "
-        "AND created_at>(SELECT created_at FROM rounds WHERE rid=?) "
-        "AND state NOT IN ('queued','ready','gate_rejected') LIMIT 1", (conv, rid, rid)).fetchone()
+        "SELECT r.rid FROM rounds r WHERE r.thread_id=? AND r.rid<>? "
+        "AND r.kind IN ('submit','followup') "
+        "AND r.created_at>(SELECT created_at FROM rounds WHERE rid=?) "
+        "AND EXISTS (SELECT 1 FROM attempts a WHERE a.rid=r.rid) LIMIT 1",
+        (conv, rid, rid)).fetchone()
 
 
 def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
-    """Send the one automatic continue for a round whose turn ChatGPT marked failed. Returns:
+    """Send the one automatic continue for a round whose turn ChatGPT marked failed. Returns (and,
+    once claimed, durably records) the outcome:
       "landed"   the continue provably landed — re-wait on the same rid;
-      "not_sent" nothing left, provably (already spent, no lease, or a fail-closed pre-click exit);
-      "unsure"   the click may have happened (timeout, crash, unconfirmed echo) — the round must not
-                 be closed as failed, or a continue that is generating right now would be abandoned."""
+      "not_sent" nothing left, provably (checks refused, no lease, or a fail-closed pre-click exit);
+      "unsure"   the click may have happened (timeout, crash, unconfirmed echo)."""
     import cgc_spool as _spool
     prompt = _continue_prompt(rid)
     if not _spool.is_canonical_conversation(conv):
+        return "not_sent"
+    ok, why = _spool.validate_prompt(prompt)   # the same egress gate every send passes
+    if not ok:
+        sys.stderr.write(f"CGC_WARN {rid}: auto-continue refused by the egress gate ({why}).\n")
         return "not_sent"
     # "Answer that same request" must mean THIS round's request. If another round has been sent into
     # the thread since, a continue would be read as a retry of THAT one, yet wrapped in this rid and
@@ -1419,6 +1425,13 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
         return "not_sent"
     if not store.claim_auto_continue(rid, store_mod.sha256(prompt)):
         return "not_sent"                             # already spent — at most one per round
+    outcome = _send_continue(store, rid, conv, spec, run_cdp, prompt)
+    store.record_auto_continue(rid, outcome)
+    return outcome
+
+
+def _send_continue(store, rid, conv, spec, run_cdp, prompt) -> str:
+    import cgc_spool as _spool
     lease, end = None, time.time() + CONTINUE_LEASE_WAIT_S
     while lease is None and time.time() < end:
         lease = _spool.acquire_conversation_lease(conv)
@@ -1428,21 +1441,20 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
         sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — another send held conversation "
                          f"{conv} for {CONTINUE_LEASE_WAIT_S}s.\n")
         return "not_sent"
-    newer = _newer_send(store, rid, conv)    # again: a sibling may have sent while we waited
-    if newer:
-        if hasattr(lease, "close"):
-            lease.close()
-        sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — {newer['rid']} was sent into "
-                         f"{conv} while waiting for the conversation.\n")
-        return "not_sent"
     try:
-        sent = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
-                       model=spec.get("model") or "Pro",
-                       model_family=spec.get("model_family") or "Latest",
-                       mentions=spec.get("mentions") or [])
-    except Exception as e:                            # noqa: BLE001 — a crash may follow the click
-        sys.stderr.write(f"CGC_WARN {rid}: auto-continue crashed ({type(e).__name__}: {e}).\n")
-        return "unsure"
+        newer = _newer_send(store, rid, conv)    # again: a sibling may have sent while we waited
+        if newer:
+            sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — {newer['rid']} was sent into "
+                             f"{conv} while waiting for the conversation.\n")
+            return "not_sent"
+        try:
+            sent = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
+                           model=spec.get("model") or "Pro",
+                           model_family=spec.get("model_family") or "Latest",
+                           mentions=spec.get("mentions") or [])
+        except Exception as e:                        # noqa: BLE001 — a crash may follow the click
+            sys.stderr.write(f"CGC_WARN {rid}: auto-continue crashed ({type(e).__name__}: {e}).\n")
+            return "unsure"
     finally:
         if hasattr(lease, "close"):
             lease.close()
@@ -1477,7 +1489,17 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
     code = res.get("code")
     turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
     if turn_failed and not is_retrieve:
-        outcome = _auto_continue(store, rid, conv, spec, run_cdp)
+        prior = store.auto_continue_state(rid)
+        if prior is None:
+            outcome = _auto_continue(store, rid, conv, spec, run_cdp)
+        elif prior in ("claimed", "unsure"):
+            # An earlier continue may have landed (a worker died after its click, or it went
+            # unconfirmed), yet this rid's latest turn is still the failed one. The one-shot read-only
+            # retrieve settles it: before it has run, stay uncertain; on that retrieve pass, a freshly
+            # opened thread still showing only the failed turn means the continue never landed.
+            outcome = "not_sent" if store.was_auto_retrieved(rid) else "unsure"
+        else:
+            outcome = prior                       # landed → this is its failure; not_sent → nothing out
         if outcome == "unsure":
             # The continue may be generating right now. Uncertain, not failed: the one-shot read-only
             # auto-retrieve re-attaches, and since the continue carries this rid, it reads that
@@ -1540,12 +1562,11 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
         # Not uncertain: the send landed (its turn is on the page) and ChatGPT itself declared that
         # turn will never answer, after the one automatic continue. possibly_accepted would only
         # queue a retrieve that cannot find anything.
-        spent = store.db.execute("SELECT 1 FROM events WHERE rid=? AND kind='auto_continue' "
-                                 "LIMIT 1", (rid,)).fetchone() is not None
+        went_out = store.auto_continue_state(rid) == "landed"
         store.finish(rid, store_mod.FAILED,
                      error_code=(_stderr_error_line(res.get("stderr") or "") or "turn_failed")
-                     + (" — the one automatic continue was used" if spent else
-                        " — no automatic continue could be sent")
+                     + (" — the one automatic continue also failed" if went_out else
+                        " — no automatic continue went out")
                      + "; re-fire with a NEW --request-key only if the answer is still needed.")
         return store_mod.FAILED
     if is_retrieve:

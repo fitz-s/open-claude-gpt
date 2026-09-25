@@ -3032,6 +3032,13 @@ def cmd_followup(a) -> int:
             prev_last = c.eval(_last_user_text_js()) or ""
             if not prev_last:
                 time.sleep(0.5)
+        if u_before and not prev_last and rid and _turn_canonical_rid(
+                _read_prompt(prompt_file) if prompt_file else "") == rid:
+            # Nothing clicked yet. Without a baseline, a same-rid retry could later be "confirmed" by
+            # the OLD turn hydrating — refuse now, provably unsent, rather than risk that.
+            sys.stderr.write("CGC_ERROR not_sent_preclick: the thread's last turn never rendered, so "
+                             "a same-rid resend could not be told apart from it — NOT sent.\n")
+            return EXIT_NOT_SENT_PRECLICK
         # PRE-CLICK boundary (see _paste_prompt) — a failure here is provable proof the follow-up was
         # never sent, so it is reported via the distinct not-sent exit code instead of falling into
         # possibly_accepted (the recorded field incident happened on exactly this path: re-opening a

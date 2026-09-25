@@ -1025,6 +1025,21 @@ class Store:
             self._event("auto_continue", rid=rid, detail=f"sha256={prompt_sha256[:16]}")
         return True
 
+    def record_auto_continue(self, rid: str, outcome: str) -> None:
+        """The claimed continue's send outcome: landed | not_sent | unsure. A claim with no outcome
+        means the worker died somewhere between claim and result — i.e. possibly after the click."""
+        with self._tx():
+            self._event("auto_continue_result", rid=rid, detail=outcome)
+
+    def auto_continue_state(self, rid: str) -> str | None:
+        """None (never claimed) | claimed (no recorded outcome) | landed | not_sent | unsure."""
+        if self.db.execute("SELECT 1 FROM events WHERE rid=? AND kind='auto_continue' LIMIT 1",
+                           (rid,)).fetchone() is None:
+            return None
+        row = self.db.execute("SELECT detail FROM events WHERE rid=? AND kind='auto_continue_result' "
+                              "ORDER BY id DESC LIMIT 1", (rid,)).fetchone()
+        return row["detail"] if row else "claimed"
+
     def was_auto_retrieved(self, rid: str) -> bool:
         row = self.db.execute(
             "SELECT 1 FROM events WHERE rid=? AND kind='auto_retrieve' LIMIT 1", (rid,)).fetchone()
