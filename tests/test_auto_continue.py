@@ -85,12 +85,45 @@ def test_a_second_failure_ends_failed_not_uncertain(env):
 
 
 def test_at_most_one_continue_per_round_even_across_waits(env):
+    """A claim with no recorded outcome = a worker died after claiming, maybe after the click. The
+    next wait must neither send again nor call it failed: uncertain, for the read-only retrieve."""
     store_mod, backend, s = env
     assert s.claim_auto_continue(RID, "x")
     cdp = _script(FAILED_WAIT)
     final = backend._wait_phase(s, RID, CONV, {"model": "Pro"}, cdp)
-    assert final == store_mod.FAILED
+    assert final == store_mod.POSSIBLY_ACCEPTED
     assert [k for k, _ in cdp.calls] == ["wait"], "the continue was already spent — nothing sent"
+
+
+def test_a_recorded_not_sent_continue_ends_failed_on_the_next_wait(env):
+    store_mod, backend, s = env
+    assert s.claim_auto_continue(RID, "x")
+    s.record_auto_continue(RID, "not_sent")
+    cdp = _script(FAILED_WAIT)
+    assert backend._wait_phase(s, RID, CONV, {"model": "Pro"}, cdp) == store_mod.FAILED
+    assert [k for k, _ in cdp.calls] == ["wait"]
+
+
+def test_the_continue_goes_through_the_egress_gate(env, monkeypatch):
+    store_mod, backend, s = env
+    import cgc_spool as sp
+    monkeypatch.setattr(sp, "validate_prompt", lambda p: (False, "refused: test"))
+    cdp = _script(FAILED_WAIT)
+    assert backend._wait_phase(s, RID, CONV, {"model": "Pro"}, cdp) == store_mod.FAILED
+    assert [k for k, _ in cdp.calls] == ["wait"]
+    assert s.auto_continue_state(RID) is None, "refused before the claim — nothing spent"
+
+
+def test_a_newer_round_that_never_reached_begin_send_does_not_block_the_continue(env):
+    """Copilot: a follow-up blocked at the gate never sent; it must not count as the thread moving on."""
+    store_mod, backend, s = env
+    later = "REQ-20260925-121000-00000e"
+    s.create_round(later, "followup", prompt="q", thread_id=CONV, parent_rid=RID,
+                   spec_json=json.dumps({"model": "Pro"}))
+    s.set_state(later, store_mod.READY)
+    s.set_state(later, store_mod.BLOCKED)
+    cdp = _script(FAILED_WAIT, {"code": 0}, {"answer": "a"})
+    assert backend._wait_phase(s, RID, CONV, {"model": "Pro"}, cdp) == store_mod.COMPLETED_VERIFIED
 
 
 def test_a_continue_provably_not_sent_ends_failed_and_is_not_retried(env):
@@ -201,7 +234,7 @@ class _FollowupTab:
         pass
 
 
-def _run_followup(monkeypatch, tab, rid):
+def _run_followup(monkeypatch, tab, rid, blank_last=False):
     import types
     import cdp_consult as c
     monkeypatch.setattr(c, "CDP", lambda *a, **k: tab)
@@ -211,7 +244,8 @@ def _run_followup(monkeypatch, tab, rid):
     monkeypatch.setattr(c, "_last_user_text_js", lambda: "LAST")
     monkeypatch.setattr(c, "_write_state", lambda **k: None)
     orig = tab.eval
-    tab.eval = lambda e, timeout=None: (tab.turns[-1] if e == "LAST" else orig(e, timeout))
+    tab.eval = lambda e, timeout=None: ((("" if blank_last else tab.turns[-1])) if e == "LAST"
+                                        else orig(e, timeout))
     t = {"now": 0.0}
     monkeypatch.setattr(c.time, "time", lambda: t.__setitem__("now", t["now"] + 1) or t["now"])
     monkeypatch.setattr(c.time, "sleep", lambda s: None)
@@ -270,7 +304,7 @@ def test_no_continue_when_another_round_was_sent_into_the_thread_after(env):
     cdp = _script(FAILED_WAIT)
     assert backend._wait_phase(s, RID, CONV, {"model": "Pro"}, cdp) == store_mod.FAILED
     assert [k for k, _ in cdp.calls] == ["wait"]
-    assert "no automatic continue could be sent" in s.get_round(RID)["error_code"]
+    assert "no automatic continue went out" in s.get_round(RID)["error_code"]
 
 
 def test_the_second_wait_gets_what_is_left_of_the_budget(env):
@@ -325,3 +359,12 @@ def test_a_sibling_that_sends_while_the_continue_waits_for_the_lease_cancels_it(
     cdp = _script(FAILED_WAIT)
     assert backend._wait_phase(s, RID, CONV, {"model": "Pro"}, cdp) == store_mod.FAILED
     assert [k for k, _ in cdp.calls] == ["wait"]
+
+
+def test_a_same_rid_resend_without_a_baseline_refuses_before_clicking(env, monkeypatch):
+    """Copilot: if the last turn never renders, no baseline exists and a later hydration of the OLD
+    same-rid turn would read as the new echo. Refuse pre-click instead."""
+    import cdp_consult as c
+    tab = _FollowupTab([_turn(RID)], lands=_turn(RID) + "\n")
+    assert _run_followup(monkeypatch, tab, RID, blank_last=True) == c.EXIT_NOT_SENT_PRECLICK
+    assert not tab.clicked
