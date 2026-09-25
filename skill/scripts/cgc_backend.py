@@ -1386,15 +1386,18 @@ def _continue_prompt(rid: str) -> str:
             "that same request now, in full.\n\n" + RESPONSE_WRAP.format(rid=rid))
 
 
-def _auto_continue(store, rid, conv, spec, run_cdp) -> bool:
-    """Send the one automatic continue for a round whose turn ChatGPT marked failed. True only when
-    the continue provably landed; any other outcome leaves the round to be finished as failed."""
+def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
+    """Send the one automatic continue for a round whose turn ChatGPT marked failed. Returns:
+      "landed"   the continue provably landed — re-wait on the same rid;
+      "not_sent" nothing left, provably (already spent, no lease, or a fail-closed pre-click exit);
+      "unsure"   the click may have happened (timeout, crash, unconfirmed echo) — the round must not
+                 be closed as failed, or a continue that is generating right now would be abandoned."""
     import cgc_spool as _spool
     prompt = _continue_prompt(rid)
     if not _spool.is_canonical_conversation(conv):
-        return False
+        return "not_sent"
     if not store.claim_auto_continue(rid, store_mod.sha256(prompt)):
-        return False                                  # already spent — at most one per round
+        return "not_sent"                             # already spent — at most one per round
     lease, end = None, time.time() + CONTINUE_LEASE_WAIT_S
     while lease is None and time.time() < end:
         lease = _spool.acquire_conversation_lease(conv)
@@ -1403,20 +1406,27 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> bool:
     if lease is None:
         sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — another send held conversation "
                          f"{conv} for {CONTINUE_LEASE_WAIT_S}s.\n")
-        return False
+        return "not_sent"
     try:
         sent = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
                        model=spec.get("model") or "Pro",
                        model_family=spec.get("model_family") or "Latest",
                        mentions=spec.get("mentions") or [])
+    except Exception as e:                            # noqa: BLE001 — a crash may follow the click
+        sys.stderr.write(f"CGC_WARN {rid}: auto-continue crashed ({type(e).__name__}: {e}).\n")
+        return "unsure"
     finally:
         if hasattr(lease, "close"):
             lease.close()
     if sent.get("code") != 0:
-        sys.stderr.write(f"CGC_WARN {rid}: auto-continue did not land (exit {sent.get('code')}).\n")
-        return False
+        err = (sent.get("stderr") or "").lower()
+        proven = (sent.get("code") == _EXIT_NOT_SENT_PRECLICK
+                  or any(m.lower() in err for m in _NOT_SENT_BLOCK + _NOT_SENT_RETRY))
+        sys.stderr.write(f"CGC_WARN {rid}: auto-continue did not confirm (exit {sent.get('code')}, "
+                         f"{'provably not sent' if proven else 'may have been sent'}).\n")
+        return "not_sent" if proven else "unsure"
     sys.stderr.write(f"CGC_CONTINUED {rid}: ChatGPT failed the turn; sent one continue in {conv}.\n")
-    return True
+    return "landed"
 
 
 def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=False) -> str:
@@ -1438,12 +1448,22 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
                   idle_exit=RETRIEVE_IDLE_EXIT_S if is_retrieve else None)
     code = res.get("code")
     turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
-    if turn_failed and not is_retrieve and _auto_continue(store, rid, conv, spec, run_cdp):
-        # The continue carries this round's rid, so the same wait now reads the newer turn.
-        res = run_cdp("wait", rid=rid, conversation=conv, out=out_tmp,
-                      poll=spec.get("poll"), timeout=spec.get("timeout"))
-        code = res.get("code")
-        turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
+    if turn_failed and not is_retrieve:
+        outcome = _auto_continue(store, rid, conv, spec, run_cdp)
+        if outcome == "unsure":
+            # The continue may be generating right now. Uncertain, not failed: the one-shot read-only
+            # auto-retrieve re-attaches, and since the continue carries this rid, it reads that
+            # newer turn if it landed — or finds the old failed turn and closes the round then.
+            store.set_state(rid, store_mod.POSSIBLY_ACCEPTED,
+                            error_code="ChatGPT failed the turn; the automatic continue may have "
+                                       "been sent but was not confirmed — retrieve, don't resend")
+            return store_mod.POSSIBLY_ACCEPTED
+        if outcome == "landed":
+            # The continue carries this round's rid, so the same wait now reads the newer turn.
+            res = run_cdp("wait", rid=rid, conversation=conv, out=out_tmp,
+                          poll=spec.get("poll"), timeout=spec.get("timeout"))
+            code = res.get("code")
+            turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
     answer_path = res.get("out") or out_tmp
     answer = _read_answer(answer_path)
     if code == 0 and answer.strip():

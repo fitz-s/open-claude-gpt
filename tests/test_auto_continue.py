@@ -93,12 +93,49 @@ def test_at_most_one_continue_per_round_even_across_waits(env):
     assert [k for k, _ in cdp.calls] == ["wait"], "the continue was already spent — nothing sent"
 
 
-def test_a_continue_that_does_not_land_ends_failed_and_is_not_retried(env):
+def test_a_continue_provably_not_sent_ends_failed_and_is_not_retried(env):
     store_mod, backend, s = env
     cdp = _script(FAILED_WAIT, {"code": 2, "stderr": "CGC_ERROR model_not_selectable"})
     final = backend._wait_phase(s, RID, CONV, {"model": "Pro"}, cdp)
     assert final == store_mod.FAILED
     assert not s.claim_auto_continue(RID, "x"), "the marker was written before the send"
+
+
+@pytest.mark.parametrize("outcome", [
+    {"code": 124, "stderr": "timed out"},                                 # killed mid-send
+    {"code": 2, "stderr": "CGC_ERROR rid_echo_mismatch: sent follow-up"},  # post-click, unconfirmed
+    "raise",
+])
+def test_a_continue_that_may_have_landed_leaves_the_round_uncertain(env, outcome):
+    """Review finding: a continue that timed out or crashed AFTER its click may be generating now.
+    Closing the round FAILED would abandon it; it must stay uncertain for the read-only retrieve."""
+    store_mod, backend, s = env
+    if outcome == "raise":
+        calls = []
+
+        def cdp(kind, **kw):
+            calls.append(kind)
+            if kind == "followup":
+                raise ConnectionResetError("socket closed after click")
+            return dict(FAILED_WAIT)
+    else:
+        cdp = _script(FAILED_WAIT, outcome)
+    final = backend._wait_phase(s, RID, CONV, {"model": "Pro"}, cdp)
+    assert final == store_mod.POSSIBLY_ACCEPTED
+    assert "retrieve, don't resend" in s.get_round(RID)["error_code"]
+    assert not s.claim_auto_continue(RID, "x"), "still at most one continue"
+
+
+def test_the_retrieve_after_an_unsure_continue_reads_the_continue_or_closes_failed(env):
+    """The recovery the unsure path relies on: resume re-waits the same rid. Landed → its answer;
+    not landed → the old failed turn again → FAILED, with no second continue."""
+    store_mod, backend, s = env
+    assert s.claim_auto_continue(RID, "x")              # the continue was spent (unsure outcome)
+    s.set_state(RID, store_mod.POSSIBLY_ACCEPTED)
+    assert s.claim_auto_retrieve(RID)                   # the daemon's one-shot read-only reattach
+    cdp = _script(FAILED_WAIT)
+    assert backend._wait_phase(s, RID, CONV, {"model": "Pro"}, cdp) == store_mod.FAILED
+    assert [k for k, _ in cdp.calls] == ["wait"]
 
 
 def test_a_retrieve_never_sends_a_continue(env):
