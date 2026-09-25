@@ -436,11 +436,13 @@ class CDP:
                 # composer resting on Extra High could not be walked to Pro, every round refused
                 # model_not_selectable). Focus emulation makes THIS page report focused+visible to
                 # its own scripts. It is per-tab and per-session: no OS window, no focus steal.
-                # Best-effort — older Chrome without it is simply the previous behaviour.
+                # A Chrome that answers with a CDP error (method unknown) keeps the old behaviour; a
+                # timeout or broken socket is an attach failure and goes to the retry below.
                 try:
                     self.call("Emulation.setFocusEmulationEnabled", {"enabled": True})
-                except Exception:
-                    pass
+                except RuntimeError as e:
+                    if "Emulation.setFocusEmulationEnabled error:" not in str(e):
+                        raise
                 break
             except Exception as e:
                 last = e

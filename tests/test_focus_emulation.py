@@ -73,3 +73,22 @@ def test_a_chrome_without_focus_emulation_still_attaches(monkeypatch):
     ws = _WS(reject={"Emulation.setFocusEmulationEnabled"})
     c = _attach(monkeypatch, ws)
     assert c.ws is ws
+
+
+def test_a_transport_failure_during_focus_emulation_retries_the_attach(monkeypatch):
+    """Only a CDP error RESPONSE means "unsupported". A dropped socket there is an attach failure and
+    must go through the normal 3-try reattach, not leave a dead socket attached."""
+    class _Dead(_WS):
+        def recv(self):
+            if self.sent and self.sent[-1] == "Emulation.setFocusEmulationEnabled":
+                raise ConnectionResetError("socket closed")
+            return super().recv()
+    dead, good = _Dead(), _WS()
+    socks = [dead, good]
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    _attach(monkeypatch, good)                      # installs the urlopen stub (and one attach)
+    monkeypatch.setattr(CDP.websocket, "create_connection", lambda *a, **kw: socks.pop(0))
+    good.sent.clear()
+    c = CDP.CDP(9333, match="abc")
+    assert c.ws is good, "the broken socket was retried, and the second attach kept"
+    assert good.sent[:3] == ["Runtime.enable", "Page.enable", "Emulation.setFocusEmulationEnabled"]
