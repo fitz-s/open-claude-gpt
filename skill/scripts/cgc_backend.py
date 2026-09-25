@@ -1430,7 +1430,8 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
         return "not_sent"
     newer = _newer_send(store, rid, conv)    # again: a sibling may have sent while we waited
     if newer:
-        lease.close() if hasattr(lease, "close") else None
+        if hasattr(lease, "close"):
+            lease.close()
         sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — {newer['rid']} was sent into "
                          f"{conv} while waiting for the conversation.\n")
         return "not_sent"
@@ -1446,7 +1447,6 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
         if hasattr(lease, "close"):
             lease.close()
     if sent.get("code") != 0:
-        err = (sent.get("stderr") or "").lower()
         proven = (sent.get("code") == _EXIT_NOT_SENT_PRECLICK
                   or _not_sent_marker(sent, _NOT_SENT_BLOCK + _NOT_SENT_RETRY) is not None)
         sys.stderr.write(f"CGC_WARN {rid}: auto-continue did not confirm (exit {sent.get('code')}, "
@@ -1603,10 +1603,3 @@ def _not_sent_marker(res: dict, markers):
         if re.search(pat, err, re.M | re.I):
             return m
     return None
-
-
-def _first_marker(stderr: str, markers) -> str:
-    for m in markers:
-        if m.lower() in stderr:
-            return m
-    return "not_sent"
