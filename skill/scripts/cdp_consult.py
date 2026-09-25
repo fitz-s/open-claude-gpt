@@ -765,6 +765,12 @@ def _detect_js(rid: str, turn_index=None) -> str:
         "var a=document.querySelectorAll(" + _JS_A + ");"
         "var BG=" + begin + ",EN=" + end + ";"
         "var node=" + node_call + ";"
+        # ChatGPT's own "this turn will never answer" marker, read from the source turn's container.
+        "var failed=null;(function(){var us=document.querySelectorAll(" + _JS_U + ");"
+        "for(var i=us.length-1;i>=0;i--){if((us[i].textContent||'').indexOf(BG)<0)continue;"
+        "var t=us[i].closest('[data-turn-key]');if(!t)return;"
+        "var m=(t.innerText||'').match(/\\n(Thinking failed|Something went wrong[^\\n]*|"
+        "Network error[^\\n]*|Message stream error[^\\n]*)\\s*$/);if(m)failed=m[1];return;}})();"
         "var rawT=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
         "var res=" + sentinel + ";"
         "var hasB=rawT.indexOf(BG)>=0,hasE=rawT.indexOf(EN)>=0;"
@@ -774,7 +780,7 @@ def _detect_js(rid: str, turn_index=None) -> str:
         "else if(document.querySelector('iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]'))blocker='captcha';"
         "else{var al=document.querySelector('[role=\"alert\"]');if(al&&/rate limit|too many requests|usage limit/i.test(al.textContent||''))blocker='rate_limit';}"
         "var done=(res.done&&a.length>0);"
-        "return JSON.stringify({generating:stop,done:done,blocker:blocker,len:rawT.length,begin:hasB,end:hasE,ac:a.length});})()"
+        "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,len:rawT.length,begin:hasB,end:hasE,ac:a.length});})()"
     )
 
 
@@ -3280,6 +3286,8 @@ def cmd_wait(a) -> int:
         stub_len = None
         ticks = 0
         approvals = 0
+        idle_since, idle_len = time.time(), None
+        idle_exit = getattr(a, "idle_exit", 0) or 0   # followup --watch reuses this waiter
         while time.time() < deadline:
             try:
                 c.eval(_FORCE_RENDER_JS)  # materialize the virtualized answer node before reading
@@ -3313,6 +3321,32 @@ def cmd_wait(a) -> int:
             if st.get("blocker"):
                 sys.stderr.write(f"CGC_BLOCKER {st['blocker']}\n")
                 return 3
+            if st.get("failed") and not st.get("generating") and not st.get("done"):
+                sys.stderr.write(
+                    f"CGC_ERROR turn_failed: ChatGPT marked {rid}'s turn '{st['failed']}' — it will "
+                    "never produce an answer. Nothing to retrieve; re-send it as a new round.\n")
+                if not a.keep_tab:
+                    c.close_tab()
+                return 4
+            # Idleness must be CONTINUOUS: any generation or byte movement restarts the clock, so the
+            # gap between a thinking phase and the written answer can never end a live round.
+            if st.get("generating") or st.get("len", 0) != idle_len:
+                idle_since, idle_len = time.time(), st.get("len", 0)
+            if (idle_exit and not st.get("generating") and not st.get("done")
+                    and st.get("len", 0) < a.min_unwrapped
+                    and time.time() - idle_since >= idle_exit):
+                # A RECOVERY wait (retrieve) looks at a turn sent long ago: if it is not generating
+                # and holds no answer now, none is coming. Watching it for the full budget held a
+                # worker slot for 90 minutes each and starved new sends queued behind it.
+                raw = _scoped_raw(c, rid, strict, turn_index)
+                _write_private(a.out + ".raw", raw)
+                sys.stderr.write(
+                    f"CGC_ERROR timeout_no_answer: {rid}'s turn has no answer and has not moved for "
+                    f"{int(time.time() - idle_since)}s ({len(raw)} chars present) — nothing "
+                    "is coming; ending the recovery early.\n")
+                if not a.keep_tab:
+                    c.close_tab()
+                return 4
             if st.get("done"):
                 ans = c.eval(_extract_js(rid, turn_index)) or ""
                 _write_private(a.out, ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
@@ -3685,6 +3719,10 @@ def main() -> int:
     w.add_argument("--settle-seconds", type=int, default=300,
                    help="consider completion only after the answer is non-generating AND byte-stable "
                         "this long (default 300s — long enough not to trip on a Pro Thinking pause)")
+    w.add_argument("--idle-exit", type=int, default=0,
+                   help="recovery waits only: end with timeout_no_answer once the turn has been idle "
+                        "(not generating, no answer) this many seconds. 0 = off (a live round may "
+                        "legitimately sit in a long thinking pause).")
     w.add_argument("--min-unwrapped", type=int, default=1500,
                    help="if the model skips the BEGIN/END_RESPONSE wrapper, accept the whole last "
                         "message as the answer only when it is at least this many chars (default 1500 "
