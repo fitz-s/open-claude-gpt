@@ -279,3 +279,49 @@ def test_the_second_wait_gets_what_is_left_of_the_budget(env):
     backend._wait_phase(s, RID, CONV, {"model": "Pro", "timeout": 5400}, cdp)
     second = [kw for k, kw in cdp.calls if k == "wait"][1]
     assert 600 <= second["timeout"] <= 5400
+
+
+@pytest.mark.parametrize("res,want", [
+    ({"code": 124, "stderr": "subprocess timeout: Command '[.., '--mention', 'Usage Tracker']'"}, None),
+    ({"code": 2, "stderr": "CGC_ERROR rid_echo_mismatch: the captcha usage note"}, None),
+    ({"code": 2, "stderr": "Traceback (most recent call last):\nRuntimeError: rate_limit"}, None),
+    ({"code": 2, "stderr": "CGC_ERROR model_not_selectable: wanted 'Pro'"}, "model_not_selectable"),
+    ({"code": 1, "stderr": "CGC_ERROR cdp_attach_failed: opened a tab"}, "attach_failed"),
+    ({"code": 2, "stderr": "CGC_ERROR new_tab_no_ws"}, "new_tab"),
+    ({"code": 3, "stderr": "CGC_LOGIN needed\nCGC_ERROR login_needed: log in"}, "login_needed"),
+    ({"code": 2, "stderr": "usage: cdp_consult.py [-h] --port PORT"}, "usage"),
+])
+def test_only_a_driver_written_line_proves_not_sent(env, res, want):
+    """Re-review R1: a timeout's text (it embeds argv, so a mention named "Usage Tracker" appears)
+    or a traceback must never prove a send did not happen."""
+    _store_mod, backend, _s = env
+    assert backend._not_sent_marker(res, backend._NOT_SENT_BLOCK + backend._NOT_SENT_RETRY) == want
+
+
+def test_a_timed_out_continue_with_a_marker_word_in_its_argv_stays_uncertain(env):
+    store_mod, backend, s = env
+    cdp = _script(FAILED_WAIT, {"code": 124,
+                                "stderr": "subprocess timeout: '--mention', 'Usage Tracker'"})
+    final = backend._wait_phase(s, RID, CONV, {"model": "Pro", "mentions": ["Usage Tracker"]}, cdp)
+    assert final == store_mod.POSSIBLY_ACCEPTED
+
+
+def test_a_sibling_that_sends_while_the_continue_waits_for_the_lease_cancels_it(env, monkeypatch):
+    """Re-review R2: the newer-round check is repeated once the lease is held."""
+    store_mod, backend, s = env
+    import cgc_spool as sp
+    later = "REQ-20260925-121000-00000d"
+    s.create_round(later, "followup", prompt="q", thread_id=CONV, parent_rid=RID,
+                   spec_json=json.dumps({"model": "Pro"}))
+    s.set_state(later, store_mod.READY)
+
+    def lease(conv):          # the sibling takes the lease first and sends
+        if s.get_round(later)["state"] == store_mod.READY:
+            s.begin_send(later, "q", store_mod.sha256("q"), daemon_instance_id="d2")
+            return None
+        return object()
+    monkeypatch.setattr(sp, "acquire_conversation_lease", lease)
+    monkeypatch.setattr(backend.time, "sleep", lambda x: None)
+    cdp = _script(FAILED_WAIT)
+    assert backend._wait_phase(s, RID, CONV, {"model": "Pro"}, cdp) == store_mod.FAILED
+    assert [k for k, _ in cdp.calls] == ["wait"]
