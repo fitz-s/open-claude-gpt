@@ -240,3 +240,42 @@ def test_a_normal_followup_still_confirms_on_its_own_new_rid(env, monkeypatch):
     other = "REQ-20260925-110000-0000ff"
     tab = _FollowupTab([_turn(other)], lands=_turn(RID))
     assert _run_followup(monkeypatch, tab, RID) == 0
+
+
+def test_a_clean_answer_after_a_continue_is_verified_despite_a_stub_raw_from_the_failed_wait(env):
+    """Review S2: the failed wait can leave a stub .raw; the second wait must start clean."""
+    store_mod, backend, s = env
+
+    def cdp(kind, **kw):
+        cdp.calls.append(kind)
+        if kind == "wait" and cdp.calls.count("wait") == 1:
+            open(kw["out"] + ".raw", "w").write("stub")
+            return dict(FAILED_WAIT)
+        if kind == "followup":
+            return {"code": 0}
+        open(kw["out"], "w").write("clean answer")
+        return {"code": 0, "out": kw["out"], "stderr": ""}
+    cdp.calls = []
+    assert backend._wait_phase(s, RID, CONV, {"model": "Pro"}, cdp) == store_mod.COMPLETED_VERIFIED
+
+
+def test_no_continue_when_another_round_was_sent_into_the_thread_after(env):
+    """Review S3: 'answer that same request' would refer to the newer round's prompt."""
+    store_mod, backend, s = env
+    later = "REQ-20260925-121000-00000c"
+    s.create_round(later, "followup", prompt="q", thread_id=CONV, parent_rid=RID,
+                   spec_json=json.dumps({"model": "Pro"}))
+    s.set_state(later, store_mod.READY)
+    s.begin_send(later, "q", store_mod.sha256("q"), daemon_instance_id="d1")
+    cdp = _script(FAILED_WAIT)
+    assert backend._wait_phase(s, RID, CONV, {"model": "Pro"}, cdp) == store_mod.FAILED
+    assert [k for k, _ in cdp.calls] == ["wait"]
+    assert "no automatic continue could be sent" in s.get_round(RID)["error_code"]
+
+
+def test_the_second_wait_gets_what_is_left_of_the_budget(env):
+    store_mod, backend, s = env
+    cdp = _script(FAILED_WAIT, {"code": 0}, {"answer": "a"})
+    backend._wait_phase(s, RID, CONV, {"model": "Pro", "timeout": 5400}, cdp)
+    second = [kw for k, kw in cdp.calls if k == "wait"][1]
+    assert 600 <= second["timeout"] <= 5400
