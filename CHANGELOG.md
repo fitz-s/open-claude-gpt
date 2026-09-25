@@ -6,6 +6,22 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — a recovery wait could hold a worker slot for 90 minutes and starve new sends
+
+On 2026-09-25 an agent queued three read-only retrieves for old uncertain rounds. The daemon runs at
+most three workers, and each retrieve watched its turn for the full 5,400 s budget, so a real
+follow-up queued behind them waited ~40 minutes before anyone noticed, and could have waited 90.
+None of the three could ever have produced an answer: one turn showed ChatGPT's own "Thinking
+failed", one had been refused before sending, and one was a test whose reply had no wrapper.
+
+Two terminal states are now recognised instead of watched out. A turn ChatGPT marks
+"Thinking failed" (or "Something went wrong", "Network error", "Message stream error") ends the wait at
+once with `turn_failed`, so re-send it as a new round. A retrieve's turn was sent long ago, so an idle
+one there (not generating, no answer) ends after 180 s of continuous idleness with
+`timeout_no_answer`; any generation or byte movement restarts that clock. Normal submit/follow-up
+waits keep their full budget. Checked live: the failed turn reads `failed:"Thinking failed"`, and a
+finished answer reads `failed:null, done:true`.
+
 ### Fixed — Pro could not be selected in a background tab
 
 From 2026-09-25 03:00 every submit refused `model_not_selectable` ("switcher shows 'Extra High' and
