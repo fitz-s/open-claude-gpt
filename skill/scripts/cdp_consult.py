@@ -760,17 +760,23 @@ def _detect_js(rid: str, turn_index=None) -> str:
     end = json.dumps(f"END_RESPONSE:{rid}")
     sentinel = _sentinel_js(rid, "__cgcText(node)")
     node_call = f"__cgcNode({begin})" if turn_index is None else f"__cgcNode({begin},{int(turn_index)})"
+    ti_js = "-1" if turn_index is None else str(int(turn_index))
     return (
         "(function(){" + _NODE_FN + _TEXT_FN +
         "var a=document.querySelectorAll(" + _JS_A + ");"
         "var BG=" + begin + ",EN=" + end + ";"
         "var node=" + node_call + ";"
-        # ChatGPT's own "this turn will never answer" marker, read from the source turn's container.
-        "var failed=null;(function(){var us=document.querySelectorAll(" + _JS_U + ");"
-        "for(var i=us.length-1;i>=0;i--){if((us[i].textContent||'').indexOf(BG)<0)continue;"
-        "var t=us[i].closest('[data-turn-key]');if(!t)return;"
+        # ChatGPT's own "this turn will never answer" marker, read from the SOURCE turn's container:
+        # the user node at turn_index when the caller resolved one (a later prompt can quote the BEGIN
+        # token, so a substring match could read another turn's marker); the last user node carrying
+        # BG only for an unscoped 'auto' wait, which by definition watches the latest turn.
+        "var failed=null;(function(){var us=[].slice.call(document.querySelectorAll(" + _JS_ANY + "))"
+        ".filter(function(e){return __cgcRole(e)==='user';}),u=null,TI=" + ti_js + ";"
+        "if(TI>=0){u=us[TI]||null;}else{for(var i=us.length-1;i>=0;i--)"
+        "if((us[i].textContent||'').indexOf(BG)>=0){u=us[i];break;}}"
+        "var t=u&&u.closest('[data-turn-key]');if(!t)return;"
         "var m=(t.innerText||'').match(/\\n(Thinking failed|Something went wrong[^\\n]*|"
-        "Network error[^\\n]*|Message stream error[^\\n]*)\\s*$/);if(m)failed=m[1];return;}})();"
+        "Network error[^\\n]*|Message stream error[^\\n]*)\\s*$/);if(m)failed=m[1];})();"
         "var rawT=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
         "var res=" + sentinel + ";"
         "var hasB=rawT.indexOf(BG)>=0,hasE=rawT.indexOf(EN)>=0;"
