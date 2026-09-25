@@ -26,6 +26,33 @@ answer from the newer turn: no new rid, no retrieve, nothing for the caller to d
 The follow-up send's landed check now requires the echo to come from a NEW last user turn. A retry of
 the same rid would otherwise be "confirmed" by the previous turn's echo before anything landed.
 
+Hardened by two independent review passes before release:
+
+- **An unconfirmed continue stays uncertain.** A continue that timed out, crashed or was not echoed
+  after its click may be generating right now, so the round goes to `possibly_accepted`. The one-shot
+  read-only retrieve then reads that turn, and there is still no second send. Only a provably-not-sent
+  continue ends `failed`.
+- **No continue when the thread moved on.** If another round was sent into the same conversation
+  after this one, "answer that same request" would mean that round's prompt. This is checked before
+  the claim and again once the conversation lease is held.
+- **The failure marker is read from a lone status element**, outside any message body, so an answer
+  line that starts "Network error…" is never taken as a failed turn.
+- **The second wait starts clean and gets the remaining budget.** A stub `.raw` left by the failed
+  wait no longer downgrades a clean answer to unverified.
+
+### Fixed — a timeout could "prove" a send never happened
+
+The not-sent classifiers matched marker words anywhere in a subprocess's stderr. A timeout's stderr
+embeds the full argv, so a `--mention "Usage Tracker"` made a timed-out send read as provably
+unsent, and eligible for an automatic resend. One shared `_not_sent_marker` now accepts only a line
+the driver wrote (`CGC_ERROR <marker>`, `CGC_LOGIN needed`, argparse's `usage:` banner) and never
+treats exit 124 as proof. It is used by the submit, follow-up and continue paths alike.
+
+### Fixed — approval cards
+
+When two approval cards share a small parent, one card can no longer borrow the other's app name.
+The upward climb stops at any ancestor holding more than one "Allow once".
+
 ### Fixed — a recovery wait could hold a worker slot for 90 minutes and starve new sends
 
 On 2026-09-25 an agent queued three read-only retrieves for old uncertain rounds. The daemon runs at
