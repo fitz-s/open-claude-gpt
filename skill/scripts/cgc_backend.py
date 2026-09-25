@@ -1373,6 +1373,50 @@ def _attribution_verdict(slug):
 
 
 RETRIEVE_IDLE_EXIT_S = 180
+CONTINUE_LEASE_WAIT_S = 60
+
+
+def _continue_prompt(rid: str) -> str:
+    """The one automatic retry after ChatGPT marks a round's turn failed. It carries the round's OWN
+    rid in the standard wrapper, so the continue turn is that rid's latest canonical turn and the
+    round's wait reads the answer from it (the "legitimate resend" _locate_source_turn keeps)."""
+    from consult import RESPONSE_WRAP
+    return ("Continuing this consult.\n\n"
+            "Your reply to my previous message failed before it produced an answer. Please answer "
+            "that same request now, in full.\n\n" + RESPONSE_WRAP.format(rid=rid))
+
+
+def _auto_continue(store, rid, conv, spec, run_cdp) -> bool:
+    """Send the one automatic continue for a round whose turn ChatGPT marked failed. True only when
+    the continue provably landed; any other outcome leaves the round to be finished as failed."""
+    import cgc_spool as _spool
+    prompt = _continue_prompt(rid)
+    if not _spool.is_canonical_conversation(conv):
+        return False
+    if not store.claim_auto_continue(rid, store_mod.sha256(prompt)):
+        return False                                  # already spent — at most one per round
+    lease, end = None, time.time() + CONTINUE_LEASE_WAIT_S
+    while lease is None and time.time() < end:
+        lease = _spool.acquire_conversation_lease(conv)
+        if lease is None:
+            time.sleep(2)
+    if lease is None:
+        sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — another send held conversation "
+                         f"{conv} for {CONTINUE_LEASE_WAIT_S}s.\n")
+        return False
+    try:
+        sent = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
+                       model=spec.get("model") or "Pro",
+                       model_family=spec.get("model_family") or "Latest",
+                       mentions=spec.get("mentions") or [])
+    finally:
+        if hasattr(lease, "close"):
+            lease.close()
+    if sent.get("code") != 0:
+        sys.stderr.write(f"CGC_WARN {rid}: auto-continue did not land (exit {sent.get('code')}).\n")
+        return False
+    sys.stderr.write(f"CGC_CONTINUED {rid}: ChatGPT failed the turn; sent one continue in {conv}.\n")
+    return True
 
 
 def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=False) -> str:
@@ -1393,6 +1437,13 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
                   poll=spec.get("poll"), timeout=spec.get("timeout"),
                   idle_exit=RETRIEVE_IDLE_EXIT_S if is_retrieve else None)
     code = res.get("code")
+    turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
+    if turn_failed and not is_retrieve and _auto_continue(store, rid, conv, spec, run_cdp):
+        # The continue carries this round's rid, so the same wait now reads the newer turn.
+        res = run_cdp("wait", rid=rid, conversation=conv, out=out_tmp,
+                      poll=spec.get("poll"), timeout=spec.get("timeout"))
+        code = res.get("code")
+        turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
     answer_path = res.get("out") or out_tmp
     answer = _read_answer(answer_path)
     if code == 0 and answer.strip():
@@ -1428,6 +1479,15 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
     if code == 3:
         store.set_state(rid, store_mod.BLOCKED, error_code=(res.get("stderr") or "blocker")[:200])
         return store_mod.BLOCKED
+    if turn_failed and not is_retrieve:
+        # Not uncertain: the send landed (its turn is on the page) and ChatGPT itself declared that
+        # turn will never answer, after the one automatic continue. possibly_accepted would only
+        # queue a retrieve that cannot find anything.
+        store.finish(rid, store_mod.FAILED,
+                     error_code=(_stderr_error_line(res.get("stderr") or "") or "turn_failed")
+                     + " — one automatic continue was already spent; re-fire with a NEW "
+                       "--request-key only if the answer is still needed.")
+        return store_mod.FAILED
     if is_retrieve:
         # retrieve never sends anything, so a wait that cannot confirm/attribute the SOURCE turn's
         # answer (rid_absent — the turn was never sent here; rid_superseded/ambiguous — the thread
