@@ -1275,7 +1275,8 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
 
 def resume_round(store, r: dict, run_cdp) -> str:
     """Reattach to a round and resume polling its existing conversation — the store peer of the
-    spool's orphan recovery. It NEVER re-sends (attach + wait is read-only; the waiter's rid-sentinel
+    spool's orphan recovery. It never re-sends the round's prompt (the one exception is the single
+    automatic "continue" _wait_phase sends when ChatGPT itself marked the landed turn failed) (attach + wait is read-only; the waiter's rid-sentinel
     check means it completes only if THIS round's own answer is on the thread). Handles three inputs:
       - accepted / waiting          — a worker died mid-poll; resume it.
       - possibly_accepted + conv    — a ONE-SHOT auto-retrieve (recover() only offers these once): the
@@ -1373,6 +1374,11 @@ def _attribution_verdict(slug):
 
 
 RETRIEVE_IDLE_EXIT_S = 180
+
+
+def _spool_stuck_after() -> int:
+    import cgc_spool as _spool
+    return _spool.STUCK_AFTER_S
 CONTINUE_LEASE_WAIT_S = 60
 
 
@@ -1395,6 +1401,17 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
     import cgc_spool as _spool
     prompt = _continue_prompt(rid)
     if not _spool.is_canonical_conversation(conv):
+        return "not_sent"
+    # "Answer that same request" must mean THIS round's request. If another round has been sent into
+    # the thread since, a continue would be read as a retry of THAT one, yet wrapped in this rid and
+    # verified as this round's answer. Refuse rather than guess.
+    newer = store.db.execute(
+        "SELECT rid FROM rounds WHERE thread_id=? AND rid<>? AND kind IN ('submit','followup') "
+        "AND created_at>(SELECT created_at FROM rounds WHERE rid=?) "
+        "AND state NOT IN ('queued','ready','gate_rejected') LIMIT 1", (conv, rid, rid)).fetchone()
+    if newer:
+        sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — {newer['rid']} was sent into "
+                         f"{conv} after it, so 'answer that same request' would be ambiguous.\n")
         return "not_sent"
     if not store.claim_auto_continue(rid, store_mod.sha256(prompt)):
         return "not_sent"                             # already spent — at most one per round
@@ -1443,6 +1460,7 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
     # A recovery (retrieve) looks at a turn sent long ago, so an idle turn there is final, not a
     # thinking pause; bound it instead of holding one of the daemon's few worker slots for the full
     # 90-minute budget (three stuck retrieves starved a new send for ~40 min, 2026-09-25).
+    wait_started = time.time()
     res = run_cdp("wait", rid=wait_rid or rid, conversation=conv, out=out_tmp,
                   poll=spec.get("poll"), timeout=spec.get("timeout"),
                   idle_exit=RETRIEVE_IDLE_EXIT_S if is_retrieve else None)
@@ -1459,9 +1477,18 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
                                        "been sent but was not confirmed — retrieve, don't resend")
             return store_mod.POSSIBLY_ACCEPTED
         if outcome == "landed":
-            # The continue carries this round's rid, so the same wait now reads the newer turn.
+            # The continue carries this round's rid, so the same wait now reads the newer turn. Start
+            # it from a blank slate too: a stub .raw from the failed wait would downgrade a clean
+            # sentinel answer to unverified (the S2 defect the loop above exists for).
+            for _p in (out_tmp, out_tmp + ".raw"):
+                try:
+                    os.remove(_p)
+                except OSError:
+                    pass
+            budget = int(spec.get("timeout") or _spool_stuck_after())
+            left = max(600, budget - int(time.time() - wait_started))
             res = run_cdp("wait", rid=rid, conversation=conv, out=out_tmp,
-                          poll=spec.get("poll"), timeout=spec.get("timeout"))
+                          poll=spec.get("poll"), timeout=left)
             code = res.get("code")
             turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
     answer_path = res.get("out") or out_tmp
@@ -1503,10 +1530,13 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
         # Not uncertain: the send landed (its turn is on the page) and ChatGPT itself declared that
         # turn will never answer, after the one automatic continue. possibly_accepted would only
         # queue a retrieve that cannot find anything.
+        spent = store.db.execute("SELECT 1 FROM events WHERE rid=? AND kind='auto_continue' "
+                                 "LIMIT 1", (rid,)).fetchone() is not None
         store.finish(rid, store_mod.FAILED,
                      error_code=(_stderr_error_line(res.get("stderr") or "") or "turn_failed")
-                     + " — one automatic continue was already spent; re-fire with a NEW "
-                       "--request-key only if the answer is still needed.")
+                     + (" — the one automatic continue was used" if spent else
+                        " — no automatic continue could be sent")
+                     + "; re-fire with a NEW --request-key only if the answer is still needed.")
         return store_mod.FAILED
     if is_retrieve:
         # retrieve never sends anything, so a wait that cannot confirm/attribute the SOURCE turn's

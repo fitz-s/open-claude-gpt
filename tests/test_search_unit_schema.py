@@ -35,7 +35,7 @@ function E(tag,attrs,kids,text){var e={tagName:tag,nodeType:1,attrs:attrs||{},ch
  e.getBoundingClientRect=function(){return {width:1,height:1}};
  e.closest=function(sel){for(var n=this;n;n=n.parentElement)if(match(n,sel))return n;return null};
  return e;}
-function match(el,sel){return sel.split(',').some(function(s){s=s.trim();var m=s.match(/^([a-z]*)\[([\w-]+)(?:([$]?=)"?([^"\]]*)"?)?\]$/i);if(!m)return false;
+function match(el,sel){return sel.split(',').some(function(s){s=s.trim();if(s==='*')return true;var m=s.match(/^([a-z]*)\[([\w-]+)(?:([$]?=)"?([^"\]]*)"?)?\]$/i);if(!m)return false;
  if(m[1]&&el.tagName.toLowerCase()!==m[1].toLowerCase())return false;var v=el.getAttribute(m[2]);if(v==null)return false;
  if(!m[3])return true;return m[3]==='='?v===m[4]:v.slice(-m[4].length)===m[4];});}
 function P(t){return E('P',{},[],t)}
@@ -145,3 +145,11 @@ def test_a_failure_on_a_later_turn_is_not_attributed_to_an_earlier_one():
 
 def test_no_marker_means_no_failure():
     assert json.loads(_eval(CDP._detect_js(R2, 1), _turned()))["failed"] is None
+
+
+
+def test_an_answer_line_that_starts_like_a_failure_is_not_a_failure():
+    """Review S1: the marker is a lone status element outside any message body. An unwrapped answer
+    whose last line is "Network error handling is untested" must not read as a failed turn."""
+    setup = _turned(",unit('t2:2:assistant',[md(['Network error handling is untested in cgc_spool.'])])")
+    assert json.loads(_eval(CDP._detect_js(R2, 1), setup))["failed"] is None

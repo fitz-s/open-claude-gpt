@@ -775,8 +775,16 @@ def _detect_js(rid: str, turn_index=None) -> str:
         "if(TI>=0){u=us[TI]||null;}else{for(var i=us.length-1;i>=0;i--)"
         "if((us[i].textContent||'').indexOf(BG)>=0){u=us[i];break;}}"
         "var t=u&&u.closest('[data-turn-key]');if(!t)return;"
-        "var m=(t.innerText||'').match(/\\n(Thinking failed|Something went wrong[^\\n]*|"
-        "Network error[^\\n]*|Message stream error[^\\n]*)\\s*$/);if(m)failed=m[1];})();"
+        # The marker is a status element whose WHOLE text is the phrase (live 2026-09-25: a lone
+        # "Thinking failed" span in the turn's activity header). Matching an exact element text,
+        # outside any message body, means an answer line that merely starts "Network error…" can
+        # never read as a failed turn.
+        "var es=t.querySelectorAll('*');for(var k=0;k<es.length;k++){var p=es[k];"
+        "if(p.children&&p.children.length)continue;var v=(p.textContent||'').trim();"
+        "if(v.length>80||!/^(Thinking failed|Something went wrong|Network error|"
+        "Message stream error)\\b/.test(v))continue;"
+        "if(p.closest('[data-markdown-text-style],[data-message-author-role],[data-chatgpt-search-unit-key]'))continue;"
+        "failed=v;}})();"
         "var rawT=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
         "var res=" + sentinel + ";"
         "var hasB=rawT.indexOf(BG)>=0,hasE=rawT.indexOf(EN)>=0;"
@@ -3017,7 +3025,13 @@ def cmd_followup(a) -> int:
         # The last user turn's text before sending. A retry of the SAME rid (the automatic continue
         # after a failed turn) sends into a thread whose last turn already echoes that rid, so the
         # echo alone would "confirm" before anything landed; the echo must come from a NEW turn.
-        prev_last = c.eval(_last_user_text_js()) or ""
+        # A re-opened thread hydrates after the composer appears; read the baseline only once the
+        # last turn has rendered, or an empty baseline would let the OLD same-rid turn "confirm".
+        prev_last, _hdl = "", time.time() + 20
+        while not prev_last and u_before and time.time() < _hdl:
+            prev_last = c.eval(_last_user_text_js()) or ""
+            if not prev_last:
+                time.sleep(0.5)
         # PRE-CLICK boundary (see _paste_prompt) — a failure here is provable proof the follow-up was
         # never sent, so it is reported via the distinct not-sent exit code instead of falling into
         # possibly_accepted (the recorded field incident happened on exactly this path: re-opening a
@@ -3164,7 +3178,11 @@ def _approval_js(allow):
             "for(var i=0;i<ok.length;i++){var n=ok[i].parentElement,d=0;"
             "while(n&&d<6&&!hasDeny(n)){n=n.parentElement;d++;}if(!n||d>=6)continue;"
             "var txt=t(n),app=named(n);"
-            "for(var m=n.parentElement;!app&&m&&t(m).length<=400;m=m.parentElement){txt=t(m);app=named(m);}"
+            # Climb only while the ancestor still holds exactly ONE visible "Allow once": a parent of
+            # two stacked cards would otherwise lend the second card's app name to the first's button.
+            "function ones(e){return [].slice.call(e.querySelectorAll('button')).filter(function(b){"
+            "return vis(b)&&/^(allow once|\\u5141\\u8bb8\\u4e00\\u6b21)/i.test(t(b));}).length;}"
+            "for(var m=n.parentElement;!app&&m&&t(m).length<=400&&ones(m)===1;m=m.parentElement){txt=t(m);app=named(m);}"
             "if(app)ok[i].click();return {app:app,text:txt.slice(0,300)};}return null;})()")
 
 
