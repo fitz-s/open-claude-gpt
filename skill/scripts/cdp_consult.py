@@ -431,6 +431,16 @@ class CDP:
                 self.ws = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=timeout)
                 self.call("Runtime.enable")
                 self.call("Page.enable")
+                # Consult tabs live in a debug Chrome nobody looks at, so the page is hidden and
+                # unfocused. ChatGPT's power slider ignores arrow keys then (live 2026-09-25: a
+                # composer resting on Extra High could not be walked to Pro, every round refused
+                # model_not_selectable). Focus emulation makes THIS page report focused+visible to
+                # its own scripts. It is per-tab and per-session: no OS window, no focus steal.
+                # Best-effort — older Chrome without it is simply the previous behaviour.
+                try:
+                    self.call("Emulation.setFocusEmulationEnabled", {"enabled": True})
+                except Exception:
+                    pass
                 break
             except Exception as e:
                 last = e
