@@ -3014,6 +3014,10 @@ def cmd_followup(a) -> int:
         # Count user messages BEFORE sending so we can confirm a NEW one landed (the
         # thread already has >=1 user message, so an absolute >0 check would false-pass).
         u_before = c.eval("document.querySelectorAll(" + _JS_U + ").length") or 0
+        # The last user turn's text before sending. A retry of the SAME rid (the automatic continue
+        # after a failed turn) sends into a thread whose last turn already echoes that rid, so the
+        # echo alone would "confirm" before anything landed; the echo must come from a NEW turn.
+        prev_last = c.eval(_last_user_text_js()) or ""
         # PRE-CLICK boundary (see _paste_prompt) — a failure here is provable proof the follow-up was
         # never sent, so it is reported via the distinct not-sent exit code instead of falling into
         # possibly_accepted (the recorded field incident happened on exactly this path: re-opening a
@@ -3051,7 +3055,8 @@ def cmd_followup(a) -> int:
                 if grew:        # nothing to verify against; the count is all the evidence there is
                     break
                 continue
-            echoed = _turn_canonical_rid(c.eval(_last_user_text_js()) or "") or ""
+            last_text = c.eval(_last_user_text_js()) or ""
+            echoed = (_turn_canonical_rid(last_text) or "") if last_text != prev_last else ""
             if echoed == rid:
                 break
         # Count growth is a HINT, not an exit: the node can appear a beat before its text hydrates,
@@ -3096,7 +3101,8 @@ def cmd_followup(a) -> int:
         if rid and echoed != rid:
             # Only re-read when the loop never saw our echo — a match it already polled is the same
             # fact, and re-reading it can only lose to a turn that arrived in between.
-            echoed = _turn_canonical_rid(c.eval(_last_user_text_js()) or "") or ""
+            last_text = c.eval(_last_user_text_js()) or ""
+            echoed = (_turn_canonical_rid(last_text) or "") if last_text != prev_last else ""
         if rid:
             if echoed != rid:
                 print(json.dumps({"ok": False, "userMsgs": n, "conversation_id": conv,

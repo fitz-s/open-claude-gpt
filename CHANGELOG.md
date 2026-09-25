@@ -6,6 +6,26 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Added — a failed ChatGPT turn gets one automatic "continue"
+
+When ChatGPT marks a round's turn "Thinking failed" (or another of its own failure markers), the
+worker now sends one "continue" in the same conversation instead of leaving the round uncertain. The
+continue carries the round's own rid in the standard wrapper, so the same round's wait reads the
+answer from the newer turn: no new rid, no retrieve, nothing for the caller to do. Guarantees:
+
+- **At most one extra message per round.** An `auto_continue` event is claimed atomically before the
+  send, so a crash, a restart or a second wait can never produce a second continue.
+- **Only for a proven failure.** It fires only on ChatGPT's own failure marker, never on a plain
+  timeout (still `possibly_accepted` → retrieve, don't resend), and never for a `retrieve` round,
+  which sends nothing by definition.
+- **Same path as any follow-up:** the egress gate, the per-conversation send lease (waited up to 60 s),
+  and model/family enforcement all apply.
+- **A second failure ends `failed`, not uncertain.** The send landed and ChatGPT declared the turn
+  dead, so the round says so, and says to re-fire with a new `--request-key` if still needed.
+
+The follow-up send's landed check now requires the echo to come from a NEW last user turn. A retry of
+the same rid would otherwise be "confirmed" by the previous turn's echo before anything landed.
+
 ### Fixed — a recovery wait could hold a worker slot for 90 minutes and starve new sends
 
 On 2026-09-25 an agent queued three read-only retrieves for old uncertain rounds. The daemon runs at

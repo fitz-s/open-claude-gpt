@@ -75,6 +75,9 @@ outcome names the artifact it produced. Act on the fields, never on the code alo
   state `possibly_accepted` → the send may have landed: NEVER re-fire; follow `next_command`
   (retrieve by conversation).
 - Nothing useful → `log_path` is the full send+wait transcript; read it before guessing.
+- ChatGPT failing a turn ("Thinking failed") is handled for you: the daemon sends ONE "continue" in
+  the same thread and the same rid keeps waiting. If that also fails, the round ends `failed` with
+  `turn_failed` — re-fire with a NEW `--request-key` only if you still need the answer.
 - "Still running" is not an outcome — a round takes ~25 min and await just keeps waiting. It gives
   up only after 60+ min, which means broken, not slow.
 
