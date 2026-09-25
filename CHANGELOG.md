@@ -6,6 +6,17 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — Pro could not be selected in a background tab
+
+From 2026-09-25 03:00 every submit refused `model_not_selectable` ("switcher shows 'Extra High' and
+it could not be changed"). Consult tabs live in a debug Chrome nobody looks at, so their page is
+hidden and unfocused, and ChatGPT's power slider now ignores arrow keys in that state: the menu
+opened and the slider focused, but `ArrowRight` left it on Extra High. Every attach now enables
+`Emulation.setFocusEmulationEnabled`, which makes that one page report focused and visible to its own
+scripts; no OS window is raised and no focus is taken. Live on the project page: the real
+`_select_model` now walks Extra High → Pro (it failed identically before). A Chrome without the method
+still attaches.
+
 ### Fixed — ChatGPT's third turn schema: sends and answers were invisible
 
 On 2026-09-24 ChatGPT stopped rendering both turn attributes the reader knew (`data-turn`,
