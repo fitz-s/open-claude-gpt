@@ -6,6 +6,8 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-25
+
 ### Added — a failed ChatGPT turn gets one automatic "continue"
 
 When ChatGPT marks a round's turn "Thinking failed" (or another of its own failure markers), the
