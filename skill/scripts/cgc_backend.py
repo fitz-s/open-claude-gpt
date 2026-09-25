@@ -1372,6 +1372,9 @@ def _attribution_verdict(slug):
         "it was NOT produced by a model this installation accepts")
 
 
+RETRIEVE_IDLE_EXIT_S = 180
+
+
 def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=False) -> str:
     out_tmp = os.path.join(store_mod.CGC_STATE_DIR, f"_wait_{rid}.txt")
     # Clear any stale answer + .raw sidecar from a PRIOR wait on this rid (e.g. a timed-out first
@@ -1383,8 +1386,12 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
             os.remove(_p)
         except OSError:
             pass
+    # A recovery (retrieve) looks at a turn sent long ago, so an idle turn there is final, not a
+    # thinking pause; bound it instead of holding one of the daemon's few worker slots for the full
+    # 90-minute budget (three stuck retrieves starved a new send for ~40 min, 2026-09-25).
     res = run_cdp("wait", rid=wait_rid or rid, conversation=conv, out=out_tmp,
-                  poll=spec.get("poll"), timeout=spec.get("timeout"))
+                  poll=spec.get("poll"), timeout=spec.get("timeout"),
+                  idle_exit=RETRIEVE_IDLE_EXIT_S if is_retrieve else None)
     code = res.get("code")
     answer_path = res.get("out") or out_tmp
     answer = _read_answer(answer_path)

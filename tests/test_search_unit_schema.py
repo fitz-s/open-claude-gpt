@@ -29,7 +29,7 @@ function E(tag,attrs,kids,text){var e={tagName:tag,nodeType:1,attrs:attrs||{},ch
  e.getAttribute=function(a){return a in this.attrs?this.attrs[a]:null};
  e.hasAttribute=function(a){return a in this.attrs};
  Object.defineProperty(e,'textContent',{get:function(){return this.childNodes.map(function(c){return c.nodeType===3?c.nodeValue:c.textContent}).join('')}});
- Object.defineProperty(e,'innerText',{get:function(){return this.textContent}});
+ Object.defineProperty(e,'innerText',{get:function(){return this.childNodes.map(function(c){return c.nodeType===3?c.nodeValue:c.innerText}).filter(function(x){return x!==''}).join('\n')}});
  e.querySelectorAll=function(sel){var out=[];(function w(n){n.children.forEach(function(c){if(match(c,sel))out.push(c);w(c);})})(this);return out;};
  e.querySelector=function(sel){return this.querySelectorAll(sel)[0]||null};
  e.getBoundingClientRect=function(){return {width:1,height:1}};
@@ -116,3 +116,32 @@ def test_the_mcp_fallback_readers_see_the_new_schema():
     setup = (page + tags + "var BEGIN=" + json.dumps("BEGIN_RESPONSE:" + rid) + ",END="
              + json.dumps("END_RESPONSE:" + rid) + ";" + "\n".join(fns))
     assert _eval("extractAnswer()", setup).strip() == "the verdict"
+
+
+
+def _turned(extra_r2=""):
+    """Wrap each turn's units in a [data-turn-key] container, as the live page does, so the failure
+    probe can read the turn's own text. extra_r2 is appended to R2's turn (e.g. ChatGPT's marker)."""
+    t1 = ("E('DIV',{'data-turn-key':'k1'},[unit('t1:0:user',[P('# Round 5'),P('BEGIN_RESPONSE:%s'),"
+          "P('<full answer>'),P('END_RESPONSE:%s')]),unit('t1:2:assistant',[md(['BEGIN_RESPONSE:%s',"
+          "'the verdict','END_RESPONSE:%s']),card('results.json')])])" % (R1, R1, R1, R1))
+    t2 = ("E('DIV',{'data-turn-key':'k2'},[unit('t2:0:user',[P('# Round 6 (quotes BEGIN_RESPONSE:%s)'),"
+          "P('BEGIN_RESPONSE:%s'),P('<full answer>'),P('END_RESPONSE:%s')])%s])" % (R1, R2, R2, extra_r2))
+    return ("var ROOT=E('MAIN',{},[" + t1 + "," + t2 + "]);var document=ROOT;document.body=ROOT;"
+            "var location={pathname:'/c/x'};")
+
+
+def test_chatgpts_failure_marker_on_the_source_turn_is_read():
+    got = json.loads(_eval(CDP._detect_js(R2, 1), _turned(",E('SPAN',{},[],'Thinking failed')")))
+    assert got["failed"] == "Thinking failed" and got["done"] is False
+
+
+def test_a_failure_on_a_later_turn_is_not_attributed_to_an_earlier_one():
+    """R2's prompt quotes R1's BEGIN token and R2 failed. Pinned by turn_index, R1 is unaffected."""
+    setup = _turned(",E('SPAN',{},[],'Thinking failed')")
+    assert json.loads(_eval(CDP._detect_js(R1, 0), setup))["failed"] is None
+    assert json.loads(_eval(CDP._detect_js(R2, 1), setup))["failed"] == "Thinking failed"
+
+
+def test_no_marker_means_no_failure():
+    assert json.loads(_eval(CDP._detect_js(R2, 1), _turned()))["failed"] is None

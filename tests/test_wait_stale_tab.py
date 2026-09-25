@@ -57,6 +57,7 @@ class FakeTab:
         return RID in self._turns
 
     card = None                  # app-approval card text on screen, if any
+    failed = None                # ChatGPT's own "Thinking failed" marker on the source turn
     approved = 0
 
     def eval(self, expr, timeout=None):
@@ -78,6 +79,7 @@ class FakeTab:
         if "generating:stop,done:done" in expr:               # _detect_js
             vis = self._answer_visible()
             return _json.dumps({"generating": False, "done": vis, "blocker": None,
+                                "failed": self.failed,
                                 "len": len(self._answer) if vis else 539,
                                 "begin": vis, "end": vis, "ac": len(self._turns)})
         if "res.done?res.body" in expr:                       # _extract_js
@@ -361,3 +363,39 @@ def test_a_card_for_an_unlisted_app_blocks_for_a_human(wait_env, capsys, monkeyp
     code, _ = wait_env(tab)
     assert code == 3 and tab.approved == 0
     assert "approval_needed" in capsys.readouterr().err
+
+
+def test_a_turn_chatgpt_marked_failed_ends_the_wait_immediately(wait_env, capsys):
+    """2026-09-25: a retrieve watched a 'Thinking failed' turn for its full 90-minute budget. The
+    marker is ChatGPT's own statement that no answer is coming."""
+    tab = FakeTab(turns_before_reload=[RID], turns_after_reload=[RID], answer="")
+    tab.failed = "Thinking failed"
+    tab._answer_visible = lambda: False
+    code, _ = wait_env(tab, timeout=5400)
+    assert code == 4 and wait_env.clock.t < 1_000_000 + 60
+    assert "turn_failed" in capsys.readouterr().err
+
+
+def test_a_recovery_wait_on_an_idle_turn_ends_at_idle_exit(wait_env, capsys, monkeypatch):
+    """A retrieve's turn was sent long ago: idle for --idle-exit seconds means nothing is coming. It
+    must not hold a worker slot for the full budget (three of them starved a new send ~40 min)."""
+    tab = FakeTab(turns_before_reload=[RID], turns_after_reload=[RID], answer="")
+    tab._answer_visible = lambda: False
+    run = wait_env
+    monkeypatch.setattr(_CDP, "CDP", lambda *a, **kw: tab)
+    ns = types.SimpleNamespace(rid=RID, conversation=CONV, port=9333, out=str(run.clock and "/dev/null"),
+                               poll=20, timeout=5400, settle_seconds=300, min_unwrapped=2000,
+                               keep_tab=True, idle_exit=180)
+    ns.out = __import__("tempfile").mktemp()
+    code = _CDP.cmd_wait(ns)
+    assert code == 4
+    assert run.clock.t - 1_000_000 < 400, "ended near idle_exit, not at the 5400s budget"
+    assert "has not moved" in capsys.readouterr().err
+
+
+def test_a_live_round_without_idle_exit_is_not_cut_short(wait_env):
+    """idle_exit is recovery-only: a normal wait keeps its full budget through long quiet stretches."""
+    tab = FakeTab(turns_before_reload=[RID], turns_after_reload=[RID], answer="")
+    tab._answer_visible = lambda: False
+    code, _ = wait_env(tab, timeout=1000, poll=20, settle_seconds=300)
+    assert code == 4 and wait_env.clock.t - 1_000_000 >= 1000
