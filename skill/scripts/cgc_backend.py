@@ -1182,7 +1182,6 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         finally:
             if hasattr(conv_lease, "close"):
                 conv_lease.close()  # mutating region done — the read-only wait below needs no lease
-        stderr = (send.get("stderr") or "").lower()
         if send.get("code") == _EXIT_NOT_SENT_PRECLICK:
             store.mark_send_not_sent(attempt, f"followup failed before the click (exit "
                                               f"{_EXIT_NOT_SENT_PRECLICK}): {(send.get('stderr') or '').strip()[:300]}")
@@ -1192,7 +1191,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             store.mark_accepted(attempt, conv, model_badge=send.get("model_badge"))
             store.mark_waiting(rid)
             return _wait_phase(store, rid, conv, spec, run_cdp)
-        if any(m.lower() in stderr for m in _NOT_SENT_BLOCK):
+        if _not_sent_marker(send, _NOT_SENT_BLOCK):
             # Same proof shape as _NOT_SENT_RETRY below (module docstring, _NOT_SENT_BLOCK comment
             # above): login_needed/captcha/rate_limit fire from the preflight probe or
             # _composer_failure, both strictly before the click, in this send-phase classifier only
@@ -1205,7 +1204,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                             send_disposition=store_mod.NOT_SENT_PROVEN,
                             error_code=_block_code(send.get("stderr")))
             return store_mod.BLOCKED
-        if any(m.lower() in stderr for m in _NOT_SENT_RETRY):
+        if _not_sent_marker(send, _NOT_SENT_RETRY):
             # Same evidence, same verdict as a submit's. These markers are emitted FAIL-CLOSED
             # before the click, so the follow-up provably did not send and re-queuing duplicates
             # nothing. Omitting this check here (the submit branch always had it) filed a proven
@@ -1213,7 +1212,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             # automatic retry, burns a full auto-retrieve and then a manual one hunting an answer
             # that was never asked for, and leaves a human staring at "may have sent" with only a
             # resend left to try — under exactly the uncertainty the invariant exists to prevent.
-            return _requeue_or_block(store, rid, _first_marker(stderr, _NOT_SENT_RETRY))
+            return _requeue_or_block(store, rid, _not_sent_marker(send, _NOT_SENT_RETRY))
         store.mark_possibly_accepted(attempt, f"followup send failed (exit {send.get('code')}) — retrieve, don't resend")
         return store_mod.POSSIBLY_ACCEPTED
 
@@ -1229,7 +1228,6 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                   model_family=spec.get("model_family") or "Latest",
                   mentions=spec.get("mentions") or [])
     conv = sub.get("conversation")
-    stderr = (sub.get("stderr") or "").lower()
 
     if sub.get("code") == _EXIT_NOT_SENT_PRECLICK:
         store.mark_send_not_sent(attempt, f"submit failed before the click (exit "
@@ -1242,7 +1240,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         return _wait_phase(store, rid, conv, spec, run_cdp)
 
     # The click did not confirm. Distinguish PROVEN-not-sent from uncertain.
-    if any(m.lower() in stderr for m in _NOT_SENT_BLOCK):
+    if _not_sent_marker(sub, _NOT_SENT_BLOCK):
         # Both call sites of this branch run in the send-phase classifier (expect=SENDING, against
         # stderr _run scopes to this one invocation) — login_needed/captcha are raised before the
         # composer is even populated, so this is pre-click proof exactly like _NOT_SENT_RETRY below,
@@ -1253,9 +1251,9 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                         send_disposition=store_mod.NOT_SENT_PROVEN,
                         error_code=_block_code(sub.get("stderr")))
         return store_mod.BLOCKED
-    if any(m.lower() in stderr for m in _NOT_SENT_RETRY):
+    if _not_sent_marker(sub, _NOT_SENT_RETRY):
         # provably not sent → safe to re-queue (this is NOT resending a possible send), bounded
-        return _requeue_or_block(store, rid, _first_marker(stderr, _NOT_SENT_RETRY))
+        return _requeue_or_block(store, rid, _not_sent_marker(sub, _NOT_SENT_RETRY))
     # UNCERTAIN. A conversation reported by a FAILING submit is an address, not a confirmation (the
     # driver reports one whenever the post-click tab sits in a thread, including a reused tab it was
     # already in), so the state stays possibly_accepted — but recording it is what makes this round
@@ -1275,7 +1273,8 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
 
 def resume_round(store, r: dict, run_cdp) -> str:
     """Reattach to a round and resume polling its existing conversation — the store peer of the
-    spool's orphan recovery. It NEVER re-sends (attach + wait is read-only; the waiter's rid-sentinel
+    spool's orphan recovery. It never re-sends the round's prompt (the one exception is the single
+    automatic "continue" _wait_phase sends when ChatGPT itself marked the landed turn failed) (attach + wait is read-only; the waiter's rid-sentinel
     check means it completes only if THIS round's own answer is on the thread). Handles three inputs:
       - accepted / waiting          — a worker died mid-poll; resume it.
       - possibly_accepted + conv    — a ONE-SHOT auto-retrieve (recover() only offers these once): the
@@ -1375,6 +1374,100 @@ def _attribution_verdict(slug):
 RETRIEVE_IDLE_EXIT_S = 180
 
 
+def _spool_stuck_after() -> int:
+    import cgc_spool as _spool
+    return _spool.STUCK_AFTER_S
+CONTINUE_LEASE_WAIT_S = 60
+
+
+def _continue_prompt(rid: str) -> str:
+    """The one automatic retry after ChatGPT marks a round's turn failed. It carries the round's OWN
+    rid in the standard wrapper, so the continue turn is that rid's latest canonical turn and the
+    round's wait reads the answer from it (the "legitimate resend" _locate_source_turn keeps)."""
+    from consult import RESPONSE_WRAP
+    return ("Continuing this consult.\n\n"
+            "Your reply to my previous message failed before it produced an answer. Please answer "
+            "that same request now, in full.\n\n" + RESPONSE_WRAP.format(rid=rid))
+
+
+def _newer_send(store, rid, conv):
+    """A submit/followup round in the same thread, created after `rid`, that has reached (or passed)
+    begin_send. Its turn would sit after this round's, making "answer that same request" ambiguous."""
+    return store.db.execute(
+        "SELECT r.rid FROM rounds r WHERE r.thread_id=? AND r.rid<>? "
+        "AND r.kind IN ('submit','followup') "
+        "AND r.created_at>(SELECT created_at FROM rounds WHERE rid=?) "
+        "AND EXISTS (SELECT 1 FROM attempts a WHERE a.rid=r.rid) LIMIT 1",
+        (conv, rid, rid)).fetchone()
+
+
+def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
+    """Send the one automatic continue for a round whose turn ChatGPT marked failed. Returns (and,
+    once claimed, durably records) the outcome:
+      "landed"   the continue provably landed — re-wait on the same rid;
+      "not_sent" nothing left, provably (checks refused, no lease, or a fail-closed pre-click exit);
+      "unsure"   the click may have happened (timeout, crash, unconfirmed echo)."""
+    import cgc_spool as _spool
+    prompt = _continue_prompt(rid)
+    if not _spool.is_canonical_conversation(conv):
+        return "not_sent"
+    ok, why = _spool.validate_prompt(prompt)   # the same egress gate every send passes
+    if not ok:
+        sys.stderr.write(f"CGC_WARN {rid}: auto-continue refused by the egress gate ({why}).\n")
+        return "not_sent"
+    # "Answer that same request" must mean THIS round's request. If another round has been sent into
+    # the thread since, a continue would be read as a retry of THAT one, yet wrapped in this rid and
+    # verified as this round's answer. Refuse rather than guess.
+    newer = _newer_send(store, rid, conv)
+    if newer:
+        sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — {newer['rid']} was sent into "
+                         f"{conv} after it, so 'answer that same request' would be ambiguous.\n")
+        return "not_sent"
+    if not store.claim_auto_continue(rid, store_mod.sha256(prompt)):
+        return "not_sent"                             # already spent — at most one per round
+    outcome = _send_continue(store, rid, conv, spec, run_cdp, prompt)
+    store.record_auto_continue(rid, outcome)
+    return outcome
+
+
+def _send_continue(store, rid, conv, spec, run_cdp, prompt) -> str:
+    import cgc_spool as _spool
+    lease, end = None, time.time() + CONTINUE_LEASE_WAIT_S
+    while lease is None and time.time() < end:
+        lease = _spool.acquire_conversation_lease(conv)
+        if lease is None:
+            time.sleep(2)
+    if lease is None:
+        sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — another send held conversation "
+                         f"{conv} for {CONTINUE_LEASE_WAIT_S}s.\n")
+        return "not_sent"
+    try:
+        newer = _newer_send(store, rid, conv)    # again: a sibling may have sent while we waited
+        if newer:
+            sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — {newer['rid']} was sent into "
+                             f"{conv} while waiting for the conversation.\n")
+            return "not_sent"
+        try:
+            sent = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
+                           model=spec.get("model") or "Pro",
+                           model_family=spec.get("model_family") or "Latest",
+                           mentions=spec.get("mentions") or [])
+        except Exception as e:                        # noqa: BLE001 — a crash may follow the click
+            sys.stderr.write(f"CGC_WARN {rid}: auto-continue crashed ({type(e).__name__}: {e}).\n")
+            return "unsure"
+    finally:
+        if hasattr(lease, "close"):
+            lease.close()
+    if sent.get("code") != 0:
+        proven = (sent.get("code") == _EXIT_NOT_SENT_PRECLICK
+                  or _not_sent_marker(sent, _NOT_SENT_BLOCK + _NOT_SENT_RETRY) is not None)
+        sys.stderr.write(f"CGC_WARN {rid}: auto-continue did not confirm (exit {sent.get('code')}, "
+                         f"{'provably not sent' if proven else 'may have been sent'}).\n")
+        return "not_sent" if proven else "unsure"
+    sys.stderr.write(f"CGC_CONTINUED {rid}: ChatGPT failed the turn; sent one continue in {conv}.\n")
+    return "landed"
+
+
 def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=False) -> str:
     out_tmp = os.path.join(store_mod.CGC_STATE_DIR, f"_wait_{rid}.txt")
     # Clear any stale answer + .raw sidecar from a PRIOR wait on this rid (e.g. a timed-out first
@@ -1389,10 +1482,47 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
     # A recovery (retrieve) looks at a turn sent long ago, so an idle turn there is final, not a
     # thinking pause; bound it instead of holding one of the daemon's few worker slots for the full
     # 90-minute budget (three stuck retrieves starved a new send for ~40 min, 2026-09-25).
+    wait_started = time.time()
     res = run_cdp("wait", rid=wait_rid or rid, conversation=conv, out=out_tmp,
                   poll=spec.get("poll"), timeout=spec.get("timeout"),
                   idle_exit=RETRIEVE_IDLE_EXIT_S if is_retrieve else None)
     code = res.get("code")
+    turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
+    if turn_failed and not is_retrieve:
+        prior = store.auto_continue_state(rid)
+        if prior is None:
+            outcome = _auto_continue(store, rid, conv, spec, run_cdp)
+        elif prior in ("claimed", "unsure"):
+            # An earlier continue may have landed (a worker died after its click, or it went
+            # unconfirmed), yet this rid's latest turn is still the failed one. The one-shot read-only
+            # retrieve settles it: before it has run, stay uncertain; on that retrieve pass, a freshly
+            # opened thread still showing only the failed turn means the continue never landed.
+            outcome = "not_sent" if store.was_auto_retrieved(rid) else "unsure"
+        else:
+            outcome = prior                       # landed → this is its failure; not_sent → nothing out
+        if outcome == "unsure":
+            # The continue may be generating right now. Uncertain, not failed: the one-shot read-only
+            # auto-retrieve re-attaches, and since the continue carries this rid, it reads that
+            # newer turn if it landed — or finds the old failed turn and closes the round then.
+            store.set_state(rid, store_mod.POSSIBLY_ACCEPTED,
+                            error_code="ChatGPT failed the turn; the automatic continue may have "
+                                       "been sent but was not confirmed — retrieve, don't resend")
+            return store_mod.POSSIBLY_ACCEPTED
+        if outcome == "landed":
+            # The continue carries this round's rid, so the same wait now reads the newer turn. Start
+            # it from a blank slate too: a stub .raw from the failed wait would downgrade a clean
+            # sentinel answer to unverified (the S2 defect the loop above exists for).
+            for _p in (out_tmp, out_tmp + ".raw"):
+                try:
+                    os.remove(_p)
+                except OSError:
+                    pass
+            budget = int(spec.get("timeout") or _spool_stuck_after())
+            left = max(600, budget - int(time.time() - wait_started))
+            res = run_cdp("wait", rid=rid, conversation=conv, out=out_tmp,
+                          poll=spec.get("poll"), timeout=left)
+            code = res.get("code")
+            turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
     answer_path = res.get("out") or out_tmp
     answer = _read_answer(answer_path)
     if code == 0 and answer.strip():
@@ -1428,6 +1558,17 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
     if code == 3:
         store.set_state(rid, store_mod.BLOCKED, error_code=(res.get("stderr") or "blocker")[:200])
         return store_mod.BLOCKED
+    if turn_failed and not is_retrieve:
+        # Not uncertain: the send landed (its turn is on the page) and ChatGPT itself declared that
+        # turn will never answer, after the one automatic continue. possibly_accepted would only
+        # queue a retrieve that cannot find anything.
+        went_out = store.auto_continue_state(rid) == "landed"
+        store.finish(rid, store_mod.FAILED,
+                     error_code=(_stderr_error_line(res.get("stderr") or "") or "turn_failed")
+                     + (" — the one automatic continue also failed" if went_out else
+                        " — no automatic continue went out")
+                     + "; re-fire with a NEW --request-key only if the answer is still needed.")
+        return store_mod.FAILED
     if is_retrieve:
         # retrieve never sends anything, so a wait that cannot confirm/attribute the SOURCE turn's
         # answer (rid_absent — the turn was never sent here; rid_superseded/ambiguous — the thread
@@ -1461,11 +1602,25 @@ def _block_code(raw_stderr: str) -> str:
     for line in (raw_stderr or "").splitlines():
         if "mention_not_found" in line:
             return line.replace("CGC_ERROR ", "").strip()[:400]
-    return _first_marker((raw_stderr or "").lower(), _NOT_SENT_BLOCK)
+    return _not_sent_marker({"stderr": raw_stderr}, _NOT_SENT_BLOCK) or "not_sent"
 
 
-def _first_marker(stderr: str, markers) -> str:
+def _not_sent_marker(res: dict, markers):
+    """The marker proving a pre-click refusal, or None. A proof has to be a line the driver WROTE:
+    `CGC_ERROR <marker>` (or `CGC_LOGIN needed`) at the start of a stderr line. A plain substring
+    search let a timeout's own text prove it — `_run`'s exit-124 stderr embeds the full argv, so a
+    `--mention "Usage Tracker"` read as "usage" (not sent) on a send that may well have landed. A
+    killed subprocess (124) is never a proof of anything."""
+    if res.get("code") == 124:
+        return None
+    err = res.get("stderr") or ""
     for m in markers:
-        if m.lower() in stderr:
+        if m == "CGC_LOGIN":
+            pat = r"^CGC_LOGIN needed\b"
+        elif m == "usage":                  # argparse's own banner: a CLI misuse exits before anything
+            pat = r"^usage: \S+\.py\b"
+        else:                               # e.g. cdp_attach_failed, new_tab_failed, model_not_selectable
+            pat = r"^CGC_ERROR (?:[a-z_]+_)?" + re.escape(m) + r"(?:_[a-z_]+)?\b"
+        if re.search(pat, err, re.M | re.I):
             return m
-    return "not_sent"
+    return None
