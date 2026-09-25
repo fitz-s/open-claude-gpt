@@ -1009,6 +1009,37 @@ class Store:
                               f"{rows[1]['c']}). Pass --parent <rid>.")
         return rows[0]["c"], None
 
+    def claim_auto_continue(self, rid: str, prompt_sha256: str) -> bool:
+        """ATOMICALLY claim the one automatic "continue" a round gets after ChatGPT marked its turn
+        failed. The marker is written BEFORE the send, so a crash anywhere after it can never lead to
+        a second continue — at most one extra message per round, ever. The round stays `waiting`: the
+        original send landed (its failed turn is on the page), and the continue carries the same rid,
+        so the round's own wait simply moves to the newer turn."""
+        with self._tx():
+            row = self.db.execute("SELECT state FROM rounds WHERE rid=?", (rid,)).fetchone()
+            if row is None or row["state"] != WAITING:
+                return False
+            if self.db.execute("SELECT 1 FROM events WHERE rid=? AND kind='auto_continue' LIMIT 1",
+                               (rid,)).fetchone() is not None:
+                return False
+            self._event("auto_continue", rid=rid, detail=f"sha256={prompt_sha256[:16]}")
+        return True
+
+    def record_auto_continue(self, rid: str, outcome: str) -> None:
+        """The claimed continue's send outcome: landed | not_sent | unsure. A claim with no outcome
+        means the worker died somewhere between claim and result — i.e. possibly after the click."""
+        with self._tx():
+            self._event("auto_continue_result", rid=rid, detail=outcome)
+
+    def auto_continue_state(self, rid: str) -> str | None:
+        """None (never claimed) | claimed (no recorded outcome) | landed | not_sent | unsure."""
+        if self.db.execute("SELECT 1 FROM events WHERE rid=? AND kind='auto_continue' LIMIT 1",
+                           (rid,)).fetchone() is None:
+            return None
+        row = self.db.execute("SELECT detail FROM events WHERE rid=? AND kind='auto_continue_result' "
+                              "ORDER BY id DESC LIMIT 1", (rid,)).fetchone()
+        return row["detail"] if row else "claimed"
+
     def was_auto_retrieved(self, rid: str) -> bool:
         row = self.db.execute(
             "SELECT 1 FROM events WHERE rid=? AND kind='auto_retrieve' LIMIT 1", (rid,)).fetchone()

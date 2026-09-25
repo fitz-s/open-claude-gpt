@@ -86,3 +86,15 @@ def test_a_lookalike_app_name_is_not_approved():
     out = _run(setup, ["WebCodex Demo"])
     assert out["r"]["app"] is None and sum(out["clicks"]) == 0
     assert _run(setup, ["webcodex demo clone"])["r"]["app"] == "webcodex demo clone"
+
+
+
+def test_two_stacked_cards_never_lend_one_card_the_other_apps_name():
+    """Review S4: a Canva card above a WebCodex Demo card under one small parent. Canva's own button
+    must not be clicked just because the shared parent mentions WebCodex Demo."""
+    setup = ("var d1=btn('Deny'),o1=btn('Allow once'),d2=btn('Deny'),o2=btn('Allow once');"
+             "var c1=node('div','',[node('div','Canva'),node('div','Allow file materialization?'),node('div','',[d1,o1])]);"
+             "var c2=node('div','',[node('div','WebCodex Demo'),node('div','Allow file materialization?'),node('div','',[d2,o2])]);"
+             "var ROOT=node('body','',[node('div','',[c1,c2])]);")
+    out = _run(setup, ["WebCodex Demo"])
+    assert out["clicks"][1] == 0, "Canva's Allow once must never be clicked"
