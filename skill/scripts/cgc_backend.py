@@ -1182,7 +1182,6 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         finally:
             if hasattr(conv_lease, "close"):
                 conv_lease.close()  # mutating region done — the read-only wait below needs no lease
-        stderr = (send.get("stderr") or "").lower()
         if send.get("code") == _EXIT_NOT_SENT_PRECLICK:
             store.mark_send_not_sent(attempt, f"followup failed before the click (exit "
                                               f"{_EXIT_NOT_SENT_PRECLICK}): {(send.get('stderr') or '').strip()[:300]}")
@@ -1192,7 +1191,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             store.mark_accepted(attempt, conv, model_badge=send.get("model_badge"))
             store.mark_waiting(rid)
             return _wait_phase(store, rid, conv, spec, run_cdp)
-        if any(m.lower() in stderr for m in _NOT_SENT_BLOCK):
+        if _not_sent_marker(send, _NOT_SENT_BLOCK):
             # Same proof shape as _NOT_SENT_RETRY below (module docstring, _NOT_SENT_BLOCK comment
             # above): login_needed/captcha/rate_limit fire from the preflight probe or
             # _composer_failure, both strictly before the click, in this send-phase classifier only
@@ -1205,7 +1204,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                             send_disposition=store_mod.NOT_SENT_PROVEN,
                             error_code=_block_code(send.get("stderr")))
             return store_mod.BLOCKED
-        if any(m.lower() in stderr for m in _NOT_SENT_RETRY):
+        if _not_sent_marker(send, _NOT_SENT_RETRY):
             # Same evidence, same verdict as a submit's. These markers are emitted FAIL-CLOSED
             # before the click, so the follow-up provably did not send and re-queuing duplicates
             # nothing. Omitting this check here (the submit branch always had it) filed a proven
@@ -1213,7 +1212,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             # automatic retry, burns a full auto-retrieve and then a manual one hunting an answer
             # that was never asked for, and leaves a human staring at "may have sent" with only a
             # resend left to try — under exactly the uncertainty the invariant exists to prevent.
-            return _requeue_or_block(store, rid, _first_marker(stderr, _NOT_SENT_RETRY))
+            return _requeue_or_block(store, rid, _not_sent_marker(send, _NOT_SENT_RETRY))
         store.mark_possibly_accepted(attempt, f"followup send failed (exit {send.get('code')}) — retrieve, don't resend")
         return store_mod.POSSIBLY_ACCEPTED
 
@@ -1229,7 +1228,6 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                   model_family=spec.get("model_family") or "Latest",
                   mentions=spec.get("mentions") or [])
     conv = sub.get("conversation")
-    stderr = (sub.get("stderr") or "").lower()
 
     if sub.get("code") == _EXIT_NOT_SENT_PRECLICK:
         store.mark_send_not_sent(attempt, f"submit failed before the click (exit "
@@ -1242,7 +1240,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         return _wait_phase(store, rid, conv, spec, run_cdp)
 
     # The click did not confirm. Distinguish PROVEN-not-sent from uncertain.
-    if any(m.lower() in stderr for m in _NOT_SENT_BLOCK):
+    if _not_sent_marker(sub, _NOT_SENT_BLOCK):
         # Both call sites of this branch run in the send-phase classifier (expect=SENDING, against
         # stderr _run scopes to this one invocation) — login_needed/captcha are raised before the
         # composer is even populated, so this is pre-click proof exactly like _NOT_SENT_RETRY below,
@@ -1253,9 +1251,9 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                         send_disposition=store_mod.NOT_SENT_PROVEN,
                         error_code=_block_code(sub.get("stderr")))
         return store_mod.BLOCKED
-    if any(m.lower() in stderr for m in _NOT_SENT_RETRY):
+    if _not_sent_marker(sub, _NOT_SENT_RETRY):
         # provably not sent → safe to re-queue (this is NOT resending a possible send), bounded
-        return _requeue_or_block(store, rid, _first_marker(stderr, _NOT_SENT_RETRY))
+        return _requeue_or_block(store, rid, _not_sent_marker(sub, _NOT_SENT_RETRY))
     # UNCERTAIN. A conversation reported by a FAILING submit is an address, not a confirmation (the
     # driver reports one whenever the post-click tab sits in a thread, including a reused tab it was
     # already in), so the state stays possibly_accepted — but recording it is what makes this round
@@ -1392,6 +1390,15 @@ def _continue_prompt(rid: str) -> str:
             "that same request now, in full.\n\n" + RESPONSE_WRAP.format(rid=rid))
 
 
+def _newer_send(store, rid, conv):
+    """A submit/followup round in the same thread, created after `rid`, that has reached (or passed)
+    begin_send. Its turn would sit after this round's, making "answer that same request" ambiguous."""
+    return store.db.execute(
+        "SELECT rid FROM rounds WHERE thread_id=? AND rid<>? AND kind IN ('submit','followup') "
+        "AND created_at>(SELECT created_at FROM rounds WHERE rid=?) "
+        "AND state NOT IN ('queued','ready','gate_rejected') LIMIT 1", (conv, rid, rid)).fetchone()
+
+
 def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
     """Send the one automatic continue for a round whose turn ChatGPT marked failed. Returns:
       "landed"   the continue provably landed — re-wait on the same rid;
@@ -1405,10 +1412,7 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
     # "Answer that same request" must mean THIS round's request. If another round has been sent into
     # the thread since, a continue would be read as a retry of THAT one, yet wrapped in this rid and
     # verified as this round's answer. Refuse rather than guess.
-    newer = store.db.execute(
-        "SELECT rid FROM rounds WHERE thread_id=? AND rid<>? AND kind IN ('submit','followup') "
-        "AND created_at>(SELECT created_at FROM rounds WHERE rid=?) "
-        "AND state NOT IN ('queued','ready','gate_rejected') LIMIT 1", (conv, rid, rid)).fetchone()
+    newer = _newer_send(store, rid, conv)
     if newer:
         sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — {newer['rid']} was sent into "
                          f"{conv} after it, so 'answer that same request' would be ambiguous.\n")
@@ -1424,6 +1428,12 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
         sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — another send held conversation "
                          f"{conv} for {CONTINUE_LEASE_WAIT_S}s.\n")
         return "not_sent"
+    newer = _newer_send(store, rid, conv)    # again: a sibling may have sent while we waited
+    if newer:
+        lease.close() if hasattr(lease, "close") else None
+        sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — {newer['rid']} was sent into "
+                         f"{conv} while waiting for the conversation.\n")
+        return "not_sent"
     try:
         sent = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
                        model=spec.get("model") or "Pro",
@@ -1438,7 +1448,7 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
     if sent.get("code") != 0:
         err = (sent.get("stderr") or "").lower()
         proven = (sent.get("code") == _EXIT_NOT_SENT_PRECLICK
-                  or any(m.lower() in err for m in _NOT_SENT_BLOCK + _NOT_SENT_RETRY))
+                  or _not_sent_marker(sent, _NOT_SENT_BLOCK + _NOT_SENT_RETRY) is not None)
         sys.stderr.write(f"CGC_WARN {rid}: auto-continue did not confirm (exit {sent.get('code')}, "
                          f"{'provably not sent' if proven else 'may have been sent'}).\n")
         return "not_sent" if proven else "unsure"
@@ -1571,7 +1581,28 @@ def _block_code(raw_stderr: str) -> str:
     for line in (raw_stderr or "").splitlines():
         if "mention_not_found" in line:
             return line.replace("CGC_ERROR ", "").strip()[:400]
-    return _first_marker((raw_stderr or "").lower(), _NOT_SENT_BLOCK)
+    return _not_sent_marker({"stderr": raw_stderr}, _NOT_SENT_BLOCK) or "not_sent"
+
+
+def _not_sent_marker(res: dict, markers):
+    """The marker proving a pre-click refusal, or None. A proof has to be a line the driver WROTE:
+    `CGC_ERROR <marker>` (or `CGC_LOGIN needed`) at the start of a stderr line. A plain substring
+    search let a timeout's own text prove it — `_run`'s exit-124 stderr embeds the full argv, so a
+    `--mention "Usage Tracker"` read as "usage" (not sent) on a send that may well have landed. A
+    killed subprocess (124) is never a proof of anything."""
+    if res.get("code") == 124:
+        return None
+    err = res.get("stderr") or ""
+    for m in markers:
+        if m == "CGC_LOGIN":
+            pat = r"^CGC_LOGIN needed\b"
+        elif m == "usage":                  # argparse's own banner: a CLI misuse exits before anything
+            pat = r"^usage: \S+\.py\b"
+        else:                               # e.g. cdp_attach_failed, new_tab_failed, model_not_selectable
+            pat = r"^CGC_ERROR (?:[a-z_]+_)?" + re.escape(m) + r"(?:_[a-z_]+)?\b"
+        if re.search(pat, err, re.M | re.I):
+            return m
+    return None
 
 
 def _first_marker(stderr: str, markers) -> str:
