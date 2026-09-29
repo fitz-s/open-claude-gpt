@@ -27,10 +27,13 @@ CDP = _load("cdp_consult")
 class _FakeComposer:
     """Answers the JS the paste path evaluates. `offers` = app labels the @ popup shows."""
 
-    def __init__(self, offers, popup_open=True, unconnected=(), non_app=False, loading=False):
+    def __init__(self, offers, popup_open=True, unconnected=(), non_app=False, loading=False,
+                 late_by=0, drop_on_paste=False):
         self.offers = [o.lower() for o in offers]
         self.popup_open, self.unconnected, self.non_app = popup_open, list(unconnected), non_app
         self.loading = loading
+        self.late_by, self.drop_on_paste = late_by, drop_on_paste  # polls before the node shows
+        self._pending = 0
         self.html = ""
         self.text = ""
         self.mentions = 0
@@ -43,6 +46,11 @@ class _FakeComposer:
             self.mentions = 0
             return 0
         if "app-mention-name" in js:
+            if self._pending:                       # a click landed: the node shows after late_by reads
+                if self.late_by <= 0:
+                    self.mentions, self._pending = self.mentions + self._pending, 0
+                else:
+                    self.late_by -= 1
             return self.mentions
         if "var want=" in js and "data-cgc-pre" in js:
             want = json.loads(js.split("var want=", 1)[1].split(";", 1)[0])
@@ -50,17 +58,17 @@ class _FakeComposer:
                 if not self.non_app:  # a row that is not an app leaves the composer without a mention
                     self.html = self.html.replace("@" + want, "") + f'<span data-mention>{want}</span>'
                     self.text = self.text.lower().replace("@" + want, want)
-                    self.mentions += 1
+                    self._pending += 1
                 return {"hit": want, "open": True, "seen": [], "unconnected": []}
             return {"hit": None, "open": self.popup_open, "loading": self.loading,
                     "seen": self.offers, "unconnected": self.unconnected}
         if "execCommand('insertText'" in js:
             chunk = json.loads(js.split("execCommand('insertText',false,", 1)[1].rsplit(");", 1)[0])
+            if self.drop_on_paste and len(chunk) > 1:
+                self.mentions = 0          # a select-and-replace accident eats the mention node
             self.text += chunk
             self.html += chunk.lower()
-            return self.html if "return d.innerHTML" in js else len(self.text)
-        if "return d?d.innerHTML" in js:
-            return self.html
+            return True if "return true" in js else len(self.text)
         if "return d?(d.innerText" in js:
             return self.text
         raise AssertionError("unexpected js: " + js[:80])
@@ -301,6 +309,37 @@ def test_picker_never_clicks_an_unconnected_app():
     assert r["open"] is True and r["seen"] == ["canva"]
 
 
+def test_picker_never_substitutes_a_connected_prefix_sibling_for_an_unconnected_exact_app():
+    # 'Notion' is unconnected; 'Notion Calendar' is connected and starts with the same text. The
+    # exact app is refused, and the sibling is NOT clicked in its place (it would be the wrong app).
+    tree = _popup_tree("Plugins", ["Notion", "Notion docs", "Connect"], ["Notion Calendar", "Calendar"])
+    r, clicked = _run_pick_tree(tree, "Notion")
+    assert r["hit"] is None and clicked == [] and r["unconnected"] == ["notion"]
+    # asked for by its own name, the connected sibling is still pickable
+    assert _run_pick(tree, "Notion Calendar") == ["notion calendar", ["Notion Calendar"]]
+
+
+def test_picker_recognizes_an_unconnected_row_in_any_ui_language():
+    # the extra control's text is localized; the row's SHAPE (a third line) is not
+    tree = _popup_tree(["Notion", "Notion docs", "连接"])
+    r, clicked = _run_pick_tree(tree, "Notion")
+    assert r["hit"] is None and clicked == [] and r["unconnected"] == ["notion"]
+
+
+def test_picker_takes_no_bare_row_by_prefix_and_no_row_after_an_empty_spacer():
+    # a headerless popup may hold a lone FILE row: only an exact label counts there
+    r, clicked = _run_pick_tree(_popup_tree(["atlas_notes.md"]), "Atlas")
+    assert r["hit"] is None and clicked == []
+    assert _run_pick(_popup_tree(["Atlas"]), "Atlas") == ["atlas", ["Atlas"]]
+    # an empty-text spacer between the Files header and its rows must not hide the header
+    tree = _popup_tree("Plugins", ["Canva"], "Files", "", ["atlas_notes.md"])
+    r, clicked = _run_pick_tree(tree, "Atlas")
+    assert r["hit"] is None and clicked == []
+    # a header-less row in a popup that HAS headers belongs to no section: not a plugin
+    r, clicked = _run_pick_tree(_popup_tree(["Atlas"], "Files", ["a.md"]), "Atlas")
+    assert r["hit"] is None and clicked == []
+
+
 def test_popup_offer_is_reported_when_nothing_matches():
     r, clicked = _run_pick_tree(_popup_tree("Plugins", ["Canva"]), "WebCodex Demo")
     assert r == {"hit": None, "open": True, "loading": False, "seen": ["canva"],
@@ -334,15 +373,15 @@ def test_live_popup_rows_carry_no_aria_role_so_the_selector_cannot_be_role_based
 def test_live_popup_picks_the_named_app_and_nothing_else():
     assert _run_pick(_live("webcodex_demo"), "WebCodex Demo") == ["webcodex demo", ["WebCodex Demo"]]
     assert _run_pick(_live("all_plugins"), "WebCodex Demo") == ["webcodex demo", ["WebCodex Demo"]]
-    # 'Zeus' is a prefix of nothing else but a suffix of 'CodexPro Zeus' and the stem of Files rows
-    assert _run_pick(_live("zeus"), "Zeus") == ["zeus", ["Zeus"]]
-    assert _run_pick(_live("all_plugins"), "zeus") == ["zeus", ["Zeus"]], "case-insensitive"
+    # 'Atlas' is the exact label of one row, the tail of 'Demo Atlas' and the stem of Files rows
+    assert _run_pick(_live("atlas"), "Atlas") == ["atlas", ["Atlas"]]
+    assert _run_pick(_live("all_plugins"), "atlas") == ["atlas", ["Atlas"]], "case-insensitive"
 
 
 def test_live_popup_never_picks_a_file_row():
-    for c in FIXTURE["cases"]["zeus"]["rows"]:
+    for c in FIXTURE["cases"]["atlas"]["rows"]:
         if c["section"] == "Files":
-            r, clicked = _run_pick_tree(_live("zeus"), c["lines"][0])
+            r, clicked = _run_pick_tree(_live("atlas"), c["lines"][0])
             assert r["hit"] is None and clicked == []
 
 
@@ -355,7 +394,7 @@ def test_live_popup_with_no_match_is_open_empty_and_still_loading():
     r, clicked = _run_pick_tree(_live("no_match"), "Qzxvkw")
     assert r["hit"] is None and r["open"] is True and r["seen"] == [] and clicked == []
     assert r["loading"] is True, "a query nothing matches leaves the Loading suggestions skeleton"
-    assert _run_pick_tree(_live("zeus"), "Zeus")[0]["loading"] is False
+    assert _run_pick_tree(_live("atlas"), "Atlas")[0]["loading"] is False
 
 
 def test_live_picked_app_is_counted_by_the_composer_mention_probe():
@@ -385,6 +424,33 @@ def test_error_says_which_way_the_popup_failed(monkeypatch):
     assert "'canva'" in others and "never opened" not in others
     assert "NOT connected" in unconnected and "never authorizes" in unconnected
     assert len({never, empty, loading, others, unconnected}) == 5
+
+
+def test_a_mention_node_that_shows_late_is_still_a_success(monkeypatch):
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    c = _FakeComposer(["WebCodex Demo"], late_by=CDP._MENTION_SETTLE_POLLS - 1)
+    CDP._paste_prompt(c, "review this", ["WebCodex Demo"])
+    assert c.mentions == 1 and c.text.endswith("review this")
+
+
+def test_a_mention_node_that_never_shows_fails_closed_after_one_click(monkeypatch):
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    clicks = []
+    c = _FakeComposer(["WebCodex Demo"], late_by=10 ** 6)
+    real = c.eval
+    c.eval = lambda js, timeout=None: (clicks.append(1) if "var want=" in js and c.offers else None) or real(js, timeout)
+    with pytest.raises(CDP._MentionFailure):
+        CDP._paste_prompt(c, "review this", ["WebCodex Demo"])
+    assert len(clicks) == 1, "one click, ever: a slow node is polled for, never re-clicked"
+
+
+def test_a_prompt_paste_that_eats_the_mention_is_not_sent(monkeypatch):
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    c = _FakeComposer(["WebCodex Demo"], drop_on_paste=True)
+    with pytest.raises(CDP._MentionFailure) as e:
+        CDP._paste_prompt(c, "review this", ["WebCodex Demo"])
+    assert "0 of the 1 requested app mentions" in str(e.value)
+    assert isinstance(e.value, CDP._PreClickFailure)
 
 
 def test_a_click_that_yields_no_app_mention_fails_closed(monkeypatch):
