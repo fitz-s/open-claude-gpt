@@ -48,8 +48,9 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid>
   Which apps exist: known today = **`WebCodex Demo`**; the live list is
   `python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py apps` (from `CGC_APPS`). A short or
   lower-case name (`--mention webcodex`) snaps to the listed spelling. Envelope error
-  `mention_not_found` names what the popup DID offer → re-fire with that name, else relay
-  "enable the app" and stop.
+  `mention_not_found` says what the popup showed: other apps → re-fire with one of those names;
+  opened but empty, or listed with a Connect button → relay "enable/connect the app in ChatGPT"
+  and stop; never opened → a driver/DOM bug, relay it, do not retry.
 - Do NOT preflight: never run `doctor`/`queue`/`status` before firing. The daemon is installed
   once (`cgc install-daemon`, launchd keeps it alive); if it is genuinely down, fire/await say so
   in one line — relay `cgc install-daemon` to the user and stop.

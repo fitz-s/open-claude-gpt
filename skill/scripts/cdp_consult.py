@@ -2510,12 +2510,16 @@ def _composer_text_js():
 # ---- @mention (ChatGPT apps/plugins) ------------------------------------------------------------
 # A plugin is not text: typing "@WebCodex Demo" as prose sends a literal string and the app is never
 # invoked. The composer turns "@<query>" into a popup of apps; picking one inserts a mention node.
-# So a mention is a composer ACTION done before the paste: type "@<name>", click the popup option
-# whose label matches, verify the composer changed. Unresolvable -> CGC_ERROR mention_not_found,
-# strictly pre-click (nothing sent), and a human fixes the name or enables the app.
+# So a mention is a composer ACTION done before the paste: type "@<name>", click the popup Plugins
+# row whose label matches, verify the composer gained an APP mention. Unresolvable -> CGC_ERROR
+# mention_not_found, strictly pre-click (nothing sent); the error says whether the popup never
+# opened, opened empty, listed the app unconnected, or offered other entries.
 _MENTION_WAIT_S = 8.0
-_MENTION_OPT_SEL = ('[role="option"],[role="menuitem"],[role="menuitemradio"],'
-                    '[role="listbox"] li,[data-radix-popper-content-wrapper] button')
+# Probed live 2026-09-29: the popup carries NO ARIA roles. It is a floating panel whose scroll area
+# is [data-mention-list-scroll-area]; every row (plugin, file, ...) is a plain
+# <button data-list-navigation-item> inside it. The roles this once guessed matched nothing.
+_MENTION_POPUP_SEL = '[data-mention-list-scroll-area]'
+_MENTION_OPT_SEL = _MENTION_POPUP_SEL + ' [data-list-navigation-item]'
 
 
 class _MentionFailure(_PreClickFailure):
@@ -2544,48 +2548,105 @@ def _mention_type_js(name, token):
 
 def _mention_pick_js(name, token):
     # Visible options the typing produced; exact label wins, else a UNIQUE prefix match (the popup
-    # may append a description line). Returns the picked label, or null. Never guesses.
+    # may append a description line). Returns the picked label, or null. Never guesses. `open` says
+    # whether the popup exists at all, and `loading` whether it still shows its "Loading suggestions"
+    # skeleton (a query with no match leaves it there), so "never opened", "still loading" and
+    # "opened, nothing matched" stay distinct. Only the popup's Plugins rows are candidates: a query also lists Files (and, on an empty
+    # query, Add actions), and clicking one attaches something instead of invoking an app. A row
+    # with a "Connect" control is an app this account has NOT connected: clicking it starts an
+    # authorization flow, so it is never pickable and is reported as `unconnected`.
     return ("(function(){var want=" + json.dumps(_norm_label(name)) + ";var os=" + _mention_visible_js()
             + ".filter(function(e){return e.getAttribute('data-cgc-pre')!==" + json.dumps(token) + ";});"
             "function lab(e){return (e.innerText||e.textContent||'').split('\\n')[0].replace(/\\s+/g,' ')"
             ".trim().replace(/^@/,'').toLowerCase();}"
+            "function sec(e){var p=e.previousElementSibling;"
+            "while(p&&p.hasAttribute('data-list-navigation-item'))p=p.previousElementSibling;"
+            "return p?(p.innerText||'').trim().toLowerCase():'';}"
+            "function unc(e){return (e.innerText||'').split('\\n').slice(1).some(function(t){"
+            "return t.trim()==='Connect';});}"
+            "var open=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL) + ");"
+            "var loading=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL + ' [role="status"]') + ");"
+            "os=os.filter(function(e){var s=sec(e);return s===''||s==='plugins';});"
+            "var un=os.filter(unc);os=os.filter(function(e){return !unc(e);});"
             "var ex=os.filter(function(e){return lab(e)===want;});"
             "var pf=os.filter(function(e){return lab(e).indexOf(want)===0;});"
             "var hit=ex.length===1?ex[0]:(!ex.length&&pf.length===1?pf[0]:null);"
-            "if(!hit)return {hit:null,seen:os.map(lab).filter(Boolean).slice(0,20)};"
-            "hit.click();return {hit:lab(hit),seen:[]};})()")
+            "if(!hit)return {hit:null,open:open,loading:loading,seen:os.map(lab).filter(Boolean).slice(0,20),"
+            "unconnected:un.map(lab).filter(function(l){return l.indexOf(want)===0;})};"
+            "hit.click();return {hit:lab(hit),open:open,loading:false,seen:[],unconnected:[]};})()")
 
 
-def _composer_html_js():
-    return "(function(){var d=" + _composer_get_js() + ";return d?d.innerHTML:null;})()"
+def _composer_mentions_js():
+    # How many APP mentions the composer holds (a picked app becomes <span app-mention-name=...>; a
+    # picked file or any other row does not). -1: no composer.
+    return ("(function(){var d=" + _composer_get_js() + ";"
+            "return d?d.querySelectorAll('[app-mention-name]').length:-1;})()")
+
+
+def _mention_offer(popup_open, seen, unconnected=(), loading=False):
+    """What the popup showed, in words that say what to do: never opened (a code/DOM problem),
+    listed but not connected (a human connects it), still on its loading skeleton (nothing matched,
+    or ChatGPT is slow), opened empty (the app is not enabled here, or the name is wrong), or
+    offered other entries."""
+    if unconnected:
+        return ("The popup lists " + ", ".join(repr(x[:40]) for x in dict.fromkeys(unconnected))
+                + " but it is NOT connected on this account (its row shows Connect) — a human must "
+                  "connect it in ChatGPT; the daemon never authorizes an app")
+    if not popup_open:
+        return (f"The @ popup never opened ({_MENTION_POPUP_SEL} absent) — the composer's DOM changed "
+                "or it lost focus; that is a code fix, not an app to enable")
+    if not seen and loading:
+        return (f"The popup opened but only ever showed its loading skeleton — no app of that name "
+                f"came back in {_MENTION_WAIT_S:.0f}s: not enabled for this account/project, the name "
+                "is wrong, or ChatGPT is slow; a human must check in ChatGPT")
+    if not seen:
+        return ("The popup opened but nothing matched — no app of that name is enabled for this "
+                "account/project (or the name is wrong); a human must enable it in ChatGPT")
+    return ("The popup offered: " + ", ".join(repr(x[:40]) for x in dict.fromkeys(seen))
+            + " — re-fire with one of those as --mention (and add it to CGC_APPS via cgc_config.py "
+              "set), or enable the app")
+
+
+def _clear_after_mention_failure(c):
+    """Leave no half-typed "@name" behind; either way the round is not sent. Returns the residue note."""
+    try:
+        left = c.eval(_clear_composer_js(), timeout=45)
+    except Exception:
+        left = None
+    return "" if left == 0 else " (and the composer could not be proven cleared)"
 
 
 def _insert_mention(c, name):
     token = os.urandom(4).hex()
+    have = c.eval(_composer_mentions_js(), timeout=45)
     typed = c.eval(_mention_type_js(name, token), timeout=45)
     if typed is None:
         raise _PreClickFailure("composer not found while typing @mention")
     end = time.time() + _MENTION_WAIT_S
-    seen = []
+    seen, unconnected, popup_open, loading = [], [], False, False
     while time.time() < end:
         time.sleep(0.4)
         r = c.eval(_mention_pick_js(name, token), timeout=45) or {}
         seen = r.get("seen") or seen
+        unconnected = r.get("unconnected") or unconnected
+        popup_open = popup_open or bool(r.get("open"))
+        loading = bool(r.get("loading"))
         if r.get("hit"):
             time.sleep(0.4)
-            if c.eval(_composer_html_js(), timeout=45) != typed:
+            if (c.eval(_composer_mentions_js(), timeout=45) or 0) > have:
                 c.eval(_paste_chunk_js(" "), timeout=45)
                 return
-    try:  # leave no half-typed "@name" behind; either way the round is not sent
-        left = c.eval(_clear_composer_js(), timeout=45)
-    except Exception:
-        left = None
-    residue = "" if left == 0 else " (and the composer could not be proven cleared)"
+            # Clicked a row that is not an app (e.g. a file whose name starts with the query): the
+            # composer holds no new app mention, so sending would drop the app. Never retry a click.
+            residue = _clear_after_mention_failure(c)
+            raise _MentionFailure(
+                f"mention_not_found: the popup row {r['hit'][:40]!r} for '@{name}' is not an app — the "
+                f"composer took no app mention from it{residue}. Enable the app '{name}' in ChatGPT "
+                "or fix the name")
+    residue = _clear_after_mention_failure(c)
     raise _MentionFailure(
         f"mention_not_found: the composer offered no app named '{name}' for '@{name}' within "
-        f"{_MENTION_WAIT_S:.0f}s{residue}. The popup offered: "
-        + (", ".join(repr(x) for x in dict.fromkeys(seen)) or "nothing")
-        + " — re-fire with one of those as --mention (and add it to CGC_APPS via cgc_config.py set), or enable the app")
+        f"{_MENTION_WAIT_S:.0f}s{residue}. {_mention_offer(popup_open, seen, unconnected, loading)}")
 
 
 def _paste_prompt(c, prompt: str, mentions=()) -> None:

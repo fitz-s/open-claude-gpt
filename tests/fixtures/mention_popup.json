@@ -1,0 +1,133 @@
+{
+ "captured": "2026-09-29, chatgpt.com composer @ popup, real DOM and innerText; scrubbed of local paths, file names, tokens and icon urls; rows trimmed to a sample, section headers kept. no_match is the popup 3s after a query nothing matches: zero rows and a role=status 'Loading suggestions' skeleton.",
+ "cases": {
+  "all_plugins": {
+   "query": "",
+   "popup_html": "<div class=\"z-50 flex flex-col fixed [zoom:var(--codex-window-zoom)]\" style=\"--autocomplete-overlay-available-height: 947px; --composer-overlay-available-height: 947px; left: 699.25px; max-height: 947px; top: 188px; width: 632px;\"><div data-composer-overlay-floating-ui=\"true\" class=\"ComposerTopMenuShell-ZaKxCC max-h-[inherit]\"><div class=\"flex flex-col overflow-hidden border-default bg-surface-elevated-secondary relative w-full rounded-[var(--radius-suggestion-menu,var(--radius-2xl))] border-(length:--suggestion-menu-border-width,1px) shadow-(--suggestion-menu-shadow,none) text-sm suggestionMenu-EeXWU_ composer-home-top-menu\" style=\"--composer-top-menu-max-height: 951px;\"><div class=\"vertical-scroll-fade-mask flex w-full flex-1 flex-col overflow-y-auto\" data-mention-list-scroll-area=\"\"><div style=\"--mention-list-sticky-header-height: 28px;\"><div class=\"text-codex-description sticky top-0 z-10 px-row-x py-1 text-sm bg-surface-elevated-secondary\">Add</div><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] bg-primary-ghost-hover opacity-100 scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\" aria-current=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><span class=\"CompactSource-d7ZD01\" aria-hidden=\"true\"><svg/></span><span class=\"LeadingSource-d79mNZ\" aria-hidden=\"true\"><svg/></span></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate shrink-0\">Add photos &amp; files</span><span class=\"min-w-0 flex-1 truncate text-sm text-codex-description\">Upload from computer</span></span></span></div></button><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] menu-row-opacity scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><svg/></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate shrink-0\">Create image</span><span class=\"min-w-0 flex-1 truncate text-sm text-codex-description\">Visualize anything</span></span></span></div></button><div class=\"text-codex-description sticky top-0 z-10 px-row-x py-1 text-sm bg-surface-elevated-secondary pt-2\">Plugins</div><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] menu-row-opacity scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><img alt=\"\" class=\"object-contain rounded-2xs icon-xs shrink-0 object-contain\" src=\"https://chatgpt.com/images/ecosystem/apps/deep_research_app/icon.png\"></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate shrink-0\">Deep research</span><span class=\"min-w-0 flex-1 truncate text-sm text-codex-description\">Get a detailed report</span></span></span></div></button><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] menu-row-opacity scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><svg/></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate shrink-0\">CodexPro Zeus</span><span class=\"min-w-0 flex-1 truncate text-sm text-codex-description\">CodexPro bridge for /path/to/repo</span></span></span></div></button><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] menu-row-opacity scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><svg/></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate shrink-0\">WebCodex Demo</span><span class=\"min-w-0 flex-1 truncate text-sm text-codex-description\">Local isolated webcodex-demo project: read/write demo files and run demo tests.</span></span></span></div></button><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] menu-row-opacity scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><svg/></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate shrink-0\">Zeus</span><span class=\"min-w-0 flex-1 truncate text-sm text-codex-description\">WebCodex bridge for /path/to/repo.</span></span></span></div></button><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] menu-row-opacity scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><img alt=\"\" class=\"object-contain rounded-2xs icon-xs shrink-0 object-contain\" src=\"https://chatgpt.com/images/ecosystem/apps/github/icon.png\"></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate shrink-0\">GitHub</span><span class=\"min-w-0 flex-1 truncate text-sm text-codex-description\">Triage PRs, issues, CI, and publish flows</span></span></span></div></button><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] menu-row-opacity scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\"><span class=\"truncate\">Template Creator Create reusable templates saved as personal skills  </span></button><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] menu-row-opacity scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><img alt=\"\" class=\"icon-xs shrink-0 rounded-2xs\" src=\"icon.png\"></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate shrink-0\">Notion</span><span class=\"min-w-0 flex-1 truncate text-sm text-codex-description\">Notion docs and workflows</span></span></span>Connect</div></button><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] menu-row-opacity scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><img alt=\"\" class=\"icon-xs shrink-0 rounded-2xs\" src=\"icon.png\"></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate shrink-0\">Slack</span><span class=\"min-w-0 flex-1 truncate text-sm text-codex-description\">Read and manage Slack</span></span></span>Connect</div></button></div></div></div></div></div>",
+   "rows": [
+    {
+     "lines": [
+      "Add photos & files",
+      "Upload from computer"
+     ],
+     "section": "Add"
+    },
+    {
+     "lines": [
+      "Create image",
+      "Visualize anything"
+     ],
+     "section": "Add"
+    },
+    {
+     "lines": [
+      "Deep research",
+      "Get a detailed report"
+     ],
+     "section": "Plugins"
+    },
+    {
+     "lines": [
+      "CodexPro Zeus",
+      "CodexPro bridge for /path/to/repo"
+     ],
+     "section": "Plugins"
+    },
+    {
+     "lines": [
+      "WebCodex Demo",
+      "Local isolated webcodex-demo project: read/write demo files and run demo tests."
+     ],
+     "section": "Plugins"
+    },
+    {
+     "lines": [
+      "Zeus",
+      "WebCodex bridge for /path/to/repo."
+     ],
+     "section": "Plugins"
+    },
+    {
+     "lines": [
+      "GitHub",
+      "Triage PRs, issues, CI, and publish flows"
+     ],
+     "section": "Plugins"
+    },
+    {
+     "lines": [
+      "Template Creator Create reusable templates saved as personal skills"
+     ],
+     "section": "Plugins"
+    },
+    {
+     "lines": [
+      "Notion",
+      "Notion docs and workflows",
+      "Connect"
+     ],
+     "section": "Plugins"
+    },
+    {
+     "lines": [
+      "Slack",
+      "Read and manage Slack",
+      "Connect"
+     ],
+     "section": "Plugins"
+    }
+   ]
+  },
+  "zeus": {
+   "query": "Zeus",
+   "popup_html": "<div class=\"z-50 flex flex-col fixed [zoom:var(--codex-window-zoom)]\" style=\"--autocomplete-overlay-available-height: 947px; --composer-overlay-available-height: 947px; left: 699.25px; max-height: 947px; top: 188px; width: 632px;\"><div data-composer-overlay-floating-ui=\"true\" class=\"ComposerTopMenuShell-ZaKxCC max-h-[inherit]\"><div class=\"flex flex-col overflow-hidden border-default bg-surface-elevated-secondary relative w-full rounded-[var(--radius-suggestion-menu,var(--radius-2xl))] border-(length:--suggestion-menu-border-width,1px) shadow-(--suggestion-menu-shadow,none) text-sm suggestionMenu-EeXWU_ composer-home-top-menu\" style=\"--composer-top-menu-max-height: 951px;\"><div class=\"vertical-scroll-fade-mask flex w-full flex-1 flex-col overflow-y-auto\" data-mention-list-scroll-area=\"\"><div style=\"--mention-list-sticky-header-height: 28px;\"><div class=\"text-codex-description sticky top-0 z-10 px-row-x py-1 text-sm bg-surface-elevated-secondary\">Plugins</div><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] bg-primary-ghost-hover opacity-100 scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\" aria-current=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><svg/></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate shrink-0\">Zeus</span><span class=\"min-w-0 flex-1 truncate text-sm text-codex-description\">WebCodex bridge for /path/to/repo.</span></span></span></div></button><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] menu-row-opacity scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><svg/></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate shrink-0\">CodexPro Zeus</span><span class=\"min-w-0 flex-1 truncate text-sm text-codex-description\">CodexPro bridge for /path/to/repo</span></span></span></div></button><div class=\"text-codex-description sticky top-0 z-10 px-row-x py-1 text-sm bg-surface-elevated-secondary pt-2\">Files</div><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] menu-row-opacity scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><svg/></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate\">notes_a.md</span></span></span></div></button><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] menu-row-opacity scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><svg/></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate\">notes_b.md</span></span></span></div></button></div></div></div></div></div>",
+   "rows": [
+    {
+     "lines": [
+      "Zeus",
+      "WebCodex bridge for /path/to/repo."
+     ],
+     "section": "Plugins"
+    },
+    {
+     "lines": [
+      "CodexPro Zeus",
+      "CodexPro bridge for /path/to/repo"
+     ],
+     "section": "Plugins"
+    },
+    {
+     "lines": [
+      "notes_a.md"
+     ],
+     "section": "Files"
+    },
+    {
+     "lines": [
+      "notes_b.md"
+     ],
+     "section": "Files"
+    }
+   ]
+  },
+  "webcodex_demo": {
+   "query": "WebCodex Demo",
+   "popup_html": "<div class=\"z-50 flex flex-col fixed [zoom:var(--codex-window-zoom)]\" style=\"--autocomplete-overlay-available-height: 947px; --composer-overlay-available-height: 947px; left: 699.25px; max-height: 947px; top: 188px; width: 632px;\"><div data-composer-overlay-floating-ui=\"true\" class=\"ComposerTopMenuShell-ZaKxCC max-h-[inherit]\"><div class=\"flex flex-col overflow-hidden border-default bg-surface-elevated-secondary relative w-full rounded-[var(--radius-suggestion-menu,var(--radius-2xl))] border-(length:--suggestion-menu-border-width,1px) shadow-(--suggestion-menu-shadow,none) text-sm suggestionMenu-EeXWU_ composer-home-top-menu\" style=\"--composer-top-menu-max-height: 951px;\"><div class=\"vertical-scroll-fade-mask flex w-full flex-1 flex-col overflow-y-auto\" data-mention-list-scroll-area=\"\"><div><button class=\"text-default outline-hidden focus:bg-primary-ghost-hover cursor-interaction flex w-full min-h-[var(--app-menu-item-height,0px)] shrink-0 items-center overflow-hidden rounded-[var(--suggestion-menu-item-radius,var(--radius-xl))] p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-start text-sm [content-visibility:auto] [contain-intrinsic-block-size:auto_1lh] bg-primary-ghost-hover opacity-100 scroll-mt-[var(--mention-list-sticky-header-height,0px)]\" type=\"button\" data-list-navigation-item=\"true\" aria-current=\"true\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><svg/></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex min-w-0 items-center gap-menu-row-content\"><span class=\"min-w-0 truncate shrink-0\">WebCodex Demo</span><span class=\"min-w-0 flex-1 truncate text-sm text-codex-description\">Local isolated webcodex-demo project: read/write demo files and run demo tests.</span></span></span></div></button></div></div></div></div></div>",
+   "rows": [
+    {
+     "lines": [
+      "WebCodex Demo",
+      "Local isolated webcodex-demo project: read/write demo files and run demo tests."
+     ],
+     "section": null
+    }
+   ]
+  },
+  "no_match": {
+   "query": "Qzxvkw",
+   "popup_html": "<div class=\"z-50 flex flex-col fixed [zoom:var(--codex-window-zoom)]\" style=\"--autocomplete-overlay-available-height: 947px; --composer-overlay-available-height: 947px; left: 699.25px; max-height: 947px; top: 188px; width: 632px;\"><div data-composer-overlay-floating-ui=\"true\" class=\"ComposerTopMenuShell-ZaKxCC max-h-[inherit]\"><div class=\"flex flex-col overflow-hidden border-default bg-surface-elevated-secondary relative w-full rounded-[var(--radius-suggestion-menu,var(--radius-2xl))] border-(length:--suggestion-menu-border-width,1px) shadow-(--suggestion-menu-shadow,none) text-sm suggestionMenu-EeXWU_ composer-home-top-menu\" style=\"--composer-top-menu-max-height: 951px;\"><div class=\"vertical-scroll-fade-mask flex w-full flex-1 flex-col overflow-y-auto\" data-mention-list-scroll-area=\"\"><div role=\"status\"><span class=\"sr-only\">Loading suggestions</span><div aria-hidden=\"true\" class=\"flex min-h-[var(--app-menu-item-height,0px)] w-full items-center p-[var(--suggestion-menu-item-padding,var(--app-menu-item-padding,var(--padding-row-y)_var(--padding-row-x)))] text-sm text-codex-description\"><div data-menu-row-content=\"true\" class=\"flex w-full min-w-0 items-center gap-[var(--spacing-menu-item-content,calc(var(--spacing)*1.5))]\"><span class=\"leadingIcon-nJYd0H\"><div class=\"size-5 shrink-0 rounded-md bg-text/10 motion-safe:animate-pulse\"></div></span><span class=\"flex-1 min-w-0 truncate\"><span class=\"flex h-lh items-center\"><span class=\"h-4 max-w-full rounded-md bg-text/10 motion-safe:animate-pulse w-2/3\"></span></span></span></div></div></div></div></div></div></div>",
+   "rows": []
+  }
+ },
+ "composer_after_pick": "<p><span app-mention-name=\"webcodex-demo\" app-mention-display-name=\"WebCodex Demo\" app-mention-path=\"app://asdk_app_x\" app-mention-icon=\"connectors://asdk_app_x/logo?theme=light\" app-mention-brand-color=\"\" data-prompt-link-href=\"app://asdk_app_x\" data-prompt-link-label=\"$webcodex-demo\" class=\"Mention-hIgCkC\" data-layout=\"inline-flow\" data-font-weight=\"medium\" data-tone=\"accent\" data-interactive=\"\" data-underline-on-hover=\"\" contenteditable=\"false\"><span class=\"IconContainer-K62H88\" contenteditable=\"false\"><svg/></span><span class=\"Label-arpLwJ\">WebCodex Demo</span></span>  </p>"
+}

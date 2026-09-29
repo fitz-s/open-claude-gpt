@@ -6,6 +6,27 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — `fire --mention` found no popup entries, ever
+
+Every `--mention` failed `mention_not_found ... The popup offered: nothing`, for apps that were
+enabled. The picker looked for ARIA roles (`option`, `menuitem`, `listbox li`); the composer's @ popup
+has none. Probed live (2026-09-29), it is a floating panel whose scroll area is
+`[data-mention-list-scroll-area]`, and every row is a plain `<button data-list-navigation-item>`, so
+the old selector matched zero nodes. The picker now reads those rows, and hardens around them:
+
+- Only rows under the **Plugins** header (or headerless, as an exact-name query renders) are
+  candidates: a query also lists **Files**, and clicking one attaches a file instead of the app.
+- A row with a **Connect** button is an app this account has not connected; clicking it would start an
+  authorization flow, so it is never clicked and is reported as not connected.
+- Success is now "the composer gained an app mention node" (`[app-mention-name]`), not "the HTML
+  changed", which any stray click satisfies.
+- The failure names which of five things happened: popup never opened (a DOM/code bug), only its
+  loading skeleton (what ChatGPT leaves for a query that matches nothing), opened empty, app listed
+  but not connected, or other apps offered. A `WebCodex Demo`/`Zeus` mention now resolves.
+
+Pinned by `tests/fixtures/mention_popup.json`, a scrubbed capture of the live popup, run through the
+real picker JS in node against a DOM rebuilt from it.
+
 ## [0.4.0] — 2026-09-25
 
 ### Added — a failed ChatGPT turn gets one automatic "continue"
