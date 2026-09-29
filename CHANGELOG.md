@@ -6,6 +6,32 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — `fire --mention` found no popup entries, ever
+
+Every `--mention` failed `mention_not_found ... The popup offered: nothing`, for apps that were
+enabled. The picker looked for ARIA roles (`option`, `menuitem`, `listbox li`); the composer's @ popup
+has none. Probed live (2026-09-29), it is a floating panel whose scroll area is
+`[data-mention-list-scroll-area]`, and every row is a plain `<button data-list-navigation-item>`, so
+the old selector matched zero nodes. The picker now reads those rows, and hardens around them:
+
+- Only apps are candidates: rows under the **Plugins** header, or in a popup with no header at all
+  (a lone result renders bare, and there only an exact name counts, since a bare row may be a file).
+  A query also lists **Files**, and clicking one attaches a file instead of the app.
+- A row with more than a label and a description carries an extra control (**Connect**): an app this
+  account has not connected, whose click would start an authorization flow. It is never clicked and is
+  reported as not connected. The test is the row's shape, so it holds in any UI language. The name is
+  matched first, so an unconnected exact app is refused, never replaced by a connected app that
+  merely starts with the same text.
+- Success is "the composer gained an app mention node" (`[app-mention-name]`), polled for ~2.4s after
+  the one click, not "the HTML changed", which any stray click satisfies. The same count is re-checked
+  after the prompt is pasted, so a paste that eats a mention is not sent.
+- The failure names which thing happened: popup never opened (a DOM/code bug), only its loading
+  skeleton (what ChatGPT leaves for a query that matches nothing), opened empty, app listed but not
+  connected, other apps offered, or a row was clicked that turned out not to be an app.
+
+Pinned by `tests/fixtures/mention_popup.json`, a scrubbed capture of the live popup (private app names
+replaced), run through the real picker JS in node against a DOM rebuilt from it.
+
 ## [0.4.0] — 2026-09-25
 
 ### Added — a failed ChatGPT turn gets one automatic "continue"
