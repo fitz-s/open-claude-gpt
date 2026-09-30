@@ -237,3 +237,128 @@ def test_the_heartbeat_names_an_unrendered_source_turn(wait, capsys):
     assert code == 4
     beats = [ln for ln in err.splitlines() if "CGC_WAIT alive:" in ln]
     assert "node=none" in beats[0] and "node=source_unrendered" in beats[-1], beats
+
+
+# ---- a wrapped answer is graded verified, whichever exit of the wait finds it -----------------
+# The daemon grades a round completed_unverified by the mere presence of the `<out>.raw` sidecar
+# (cgc_backend._wait_phase). Before this, a wrapped answer could reach the caller as unverified two
+# ways: the timeout salvage read it and wrote it as CGC_UNWRAPPED (the extract and the salvage read
+# are separate evals, and on the incident's tab only the salvage one found the node), or an earlier
+# stub-stable dump left a .raw behind that the verified exit never removed.
+
+class ForceRenderTab(NodeTab):
+    """A virtualized tab: the answer node is only in the DOM after `renders` scroll-to-bottom
+    force-renders — the timeout path's own scroll is the one that materializes it."""
+
+    def __init__(self, before, after, renders):
+        super().__init__([(None, before)])
+        self.after, self.renders = after, renders
+
+    def _page(self):
+        return self.after if self.renders <= 0 else self.stages[0][1]
+
+    def eval(self, expr, timeout=None):
+        if expr.startswith("(function(){try{var sc="):
+            self.renders -= 1
+            return None
+        return super().eval(expr, timeout)
+
+
+def _wait_then_await(wait, tab, rid, tmp_path, monkeypatch, capsys, **kw):
+    """Drive the real waiter through the daemon's own verdict (_wait_phase) and then `await`: the
+    code, the stored state and the envelope the caller sees."""
+    import sys as _sys
+    scripts = os.path.join(ROOT, "skill", "scripts")
+    monkeypatch.syspath_prepend(scripts)
+    monkeypatch.setenv("CGC_STATE_DIR", str(tmp_path))
+    for m in ("cgc_store", "cgc_spool", "cgc_backend"):
+        _sys.modules.pop(m, None)
+    import cgc_backend as backend
+    import cgc_spool as spool
+    import cgc_store as store_mod
+    monkeypatch.setattr(spool, "daemon_alive", lambda: True)
+    s = store_mod.Store()
+    s.create_round(rid, "submit", prompt="p")
+    s.set_state(rid, store_mod.READY)
+    s.mark_accepted(s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d1"), CONV)
+    s.mark_waiting(rid)
+
+    def run_cdp(kind, **k):
+        assert kind == "wait"
+        monkeypatch.setattr(CDP, "CDP", lambda *a, **kw_: tab)
+        ns = types.SimpleNamespace(rid=k["rid"], conversation=k["conversation"], port=9333,
+                                   out=k["out"], poll=20, timeout=kw.get("timeout", 600),
+                                   settle_seconds=300, min_unwrapped=2000, keep_tab=False)
+        return {"code": CDP.cmd_wait(ns), "out": k["out"], "model_slug": None, "stderr": ""}
+    state = backend._wait_phase(s, rid, CONV, {}, run_cdp)
+    s.close()
+    capsys.readouterr()
+    code = backend.await_round(types.SimpleNamespace(rid=rid, out=str(tmp_path / "got.txt"),
+                                                     timeout=5, poll=1))
+    cap = capsys.readouterr()
+    return state, code, json.loads(cap.out.strip().splitlines()[-1]), cap.err
+
+
+def test_a_wrapped_answer_rendered_only_by_the_timeout_scroll_is_verified(
+        wait, tmp_path, monkeypatch, capsys):
+    """The incident's end state: the wait began on a fully rendered thread, the older turns have
+    since unmounted, and the answer node exists only after the timeout path's force-render. The
+    wrapper is there, so this is a sentinel-verified answer — completed_verified, await exit 0 —
+    not the CGC_UNWRAPPED salvage the incident recorded."""
+    src = R[4]
+    older = [_turn(i, R[i], _wrapped(R[i], ["answer %d" % i])) for i in range(4)]
+    tab = ForceRenderTab(_page(*older, _turn(4, src)),
+                         _page(*older[2:], _turn(4, src, _wrapped(src))),
+                         renders=31)   # 30 polls in a 600 s wait, then the timeout path's own scroll
+    state, code, env, _ = _wait_then_await(wait, tab, src, tmp_path, monkeypatch, capsys)
+    assert state == "completed_verified"
+    assert code == 0 and env["state"] == "completed_verified" and env["confidence"] == "verified"
+    assert open(env["answer_path"]).read().strip() == BODY[0].strip()
+
+
+def test_a_wrapped_answer_is_verified_even_after_a_stub_dump_left_a_raw_file(
+        wait, tmp_path, monkeypatch, capsys):
+    """A thinking stub settles (stub-stable writes <out>.raw), then the wrapped answer lands. The
+    verified exit must not leave that dump behind for the daemon to read as a salvage."""
+    src = R[4]
+    stub = _turn(4, src, ["Thinking about the review"])
+    tab = NodeTab([(20, _page(stub)), (None, _page(_turn(4, src, _wrapped(src))))])
+    state, code, env, _ = _wait_then_await(wait, tab, src, tmp_path, monkeypatch, capsys,
+                                           timeout=1200)
+    assert state == "completed_verified" and code == 0 and env["confidence"] == "verified"
+
+
+def test_the_timeout_salvage_grades_text_it_finds_wrapped_as_verified(wait, tmp_path, monkeypatch,
+                                                                       capsys):
+    """The timeout's extract and its salvage read are separate evals of the node; if only the salvage
+    read sees the finished wrapper, the canonical parser on that text decides, not the eval order."""
+    src = R[4]
+    tab = NodeTab([(None, _page(_turn(4, src)))])
+    answered = _page(_turn(4, src, _wrapped(src)))
+    orig = tab.eval
+    tab.eval = lambda e, timeout=None: (_node(e, answered) if "return __cgcText(__cgcNode(" in e
+                                        else orig(e, timeout))
+    state, code, env, _ = _wait_then_await(wait, tab, src, tmp_path, monkeypatch, capsys,
+                                           timeout=120)
+    assert state == "completed_verified" and code == 0 and env["confidence"] == "verified"
+    assert open(env["answer_path"]).read().strip() == BODY[0].strip()
+
+
+def test_an_unwrapped_salvage_is_still_graded_unverified(wait, tmp_path, monkeypatch, capsys):
+    """The verified grade is earned by the wrapper, not by reaching the timeout path."""
+    src = R[4]
+    tab = NodeTab([(None, _page(_turn(4, src, BODY)))])
+    state, code, env, _ = _wait_then_await(wait, tab, src, tmp_path, monkeypatch, capsys,
+                                           timeout=120)
+    assert state == "completed_unverified" and code == 3 and env["confidence"] == "unverified"
+
+
+def test_a_later_rounds_wrapper_is_never_salvaged_into_the_source_round(wait, tmp_path, monkeypatch,
+                                                                         capsys):
+    """[S3] at the timeout: R1's own turn has no answer; R2's answer reproduces R1's whole wrapper.
+    Neither the rescue nor the salvage parse may take it."""
+    r2_turn = _turn(2, R[2], _wrapped(R[1], ["echoed, not R1's answer"] * 90))
+    tab = NodeTab([(None, _page(_turn(1, R[1]), r2_turn))])
+    state, code, env, _ = _wait_then_await(wait, tab, R[1], tmp_path, monkeypatch, capsys,
+                                           timeout=120)
+    assert state not in ("completed_verified", "completed_unverified") and code != 0

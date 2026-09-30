@@ -27,9 +27,18 @@ looked the turn up again.
   the later turn, so the first turn's "Thinking failed" no longer applies to the continue.
 - The heartbeat carries `node=found|none|source_unrendered`, so `len=0` because the turn is not
   rendered can be told apart from `len=0` because nothing has been written yet.
+- A wrapped answer is graded `completed_verified` whichever exit of the wait finds it. The daemon
+  grades by the mere presence of `<out>.raw`, and two paths could hand it one beside a wrapped
+  answer. First, the timeout's extract and its salvage read are separate evals, so a wrapper only
+  the salvage read saw was written as `CGC_UNWRAPPED`; salvaged text is now run through the
+  canonical parser first. Second, a stub-stable dump earlier in the same wait stayed on disk
+  through a later verified exit; every verified exit now removes it. An unwrapped salvage is still
+  `completed_unverified`, and a later round's echo of the wrapper is still never taken.
 
 Pinned by `tests/test_wait_virtualized_thread.py`: the waiter's real JS runs in node against a thread
-whose older turns unmount mid-wait, and the page-side rid parser is checked against the Python one.
+whose older turns unmount mid-wait, and whose answer appears only after the timeout's force-render
+scroll. The daemon's own verdict and `await`'s envelope are checked end to end, and the page-side
+rid parser is checked against the Python one.
 
 ### Fixed — a re-opened follow-up could pick its model before the tier switcher existed
 

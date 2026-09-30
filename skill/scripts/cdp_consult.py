@@ -1016,6 +1016,18 @@ def _read_attribution(c, rid, *, scoped=False):
         return None
 
 
+def _write_verified(out, ans):
+    """Write a sentinel-verified answer. The daemon grades a round unverified by the mere presence of
+    the `<out>.raw` sidecar (cgc_backend._wait_phase), and a stub-stable or ambiguous-stable read
+    earlier in this same wait leaves one behind as a diagnostic dump — so a verified exit removes
+    it, or a wrapped answer is recorded as an unwrapped salvage."""
+    _write_private(out, ans)
+    try:
+        os.remove(out + ".raw")
+    except FileNotFoundError:
+        pass
+
+
 def _wait_receipt(rid, out, slug):
     """The ONE stdout line `wait` prints, mirroring what `submit` already does: the daemon parses
     it for attribution. modelSlug is the provider's own producer attribution (SHARED CONTRACT #4);
@@ -3612,7 +3624,7 @@ def cmd_wait(a) -> int:
                 return 4
             if st.get("done"):
                 ans = c.eval(_extract_js(rid, scoped=strict)) or ""
-                _write_private(a.out, ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
+                _write_verified(a.out, ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
                 # Attribution is read from the SAME scoped node that produced `ans`, and BEFORE the
                 # tab is closed below — afterwards the node is gone and the fact is unrecoverable.
                 _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
@@ -3652,20 +3664,24 @@ def cmd_wait(a) -> int:
                     settle_start = time.time()
                 elif time.time() - settle_start >= a.settle_seconds:
                     ans = c.eval(_extract_js(rid, scoped=strict)) or ""
+                    # Unwrapped salvage grabs the largest assistant node in the source turn's
+                    # interval with no rid anchor at all — re-check RIGHT NOW whether rid's turn is
+                    # still the conversation's latest (a later turn may have landed while we
+                    # waited): if not, that later turn now owns its own interval, so salvage must be
+                    # refused.
+                    allowed, observed_rid, _present = _salvage_allowed(c, rid)
+                    raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
+                    # The extract and this read are separate evals of one node, so an answer can
+                    # finish between them: text the canonical parser finds wrapped is never
+                    # salvaged as unwrapped.
+                    ans = ans or _sentinel_parse(raw, rid)[1]
                     if ans:
-                        _write_private(a.out, ans)
+                        _write_verified(a.out, ans)
                         _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
                         sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out} (recovered at settle)\n")
                         if not a.keep_tab:
                             c.close_tab()
                         return 0
-                    # No sentinel wrapper yet. Unwrapped salvage grabs the largest assistant node in
-                    # the source turn's interval with no rid anchor at all — re-check RIGHT NOW
-                    # whether rid's turn is still the conversation's latest (a later turn may have
-                    # landed while we waited): if not, that later turn now owns its own interval, so
-                    # salvage must be refused.
-                    allowed, observed_rid, _present = _salvage_allowed(c, rid)
-                    raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
                     if allowed and len(raw) >= a.min_unwrapped:
                         _write_private(a.out, raw)
                         _write_private(a.out + ".raw", raw)
@@ -3730,18 +3746,19 @@ def cmd_wait(a) -> int:
         # - empty / only short streaming stubs → exit 4, a genuine no-answer timeout, DISTINCT from
         #   the salvage case above (they do not conflict).
         rescue = c.eval(_extract_js(rid, scoped=strict)) or ""
+        # Re-check (see the settle-time comment above) whether rid's turn is still the
+        # conversation's latest before considering unwrapped salvage — a later turn may have landed
+        # anywhere during the whole wait, not just at the settle instant.
+        allowed, observed_rid, present = _salvage_allowed(c, rid)
+        raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
+        rescue = rescue or _sentinel_parse(raw, rid)[1]   # wrapped text is never salvaged as unwrapped
         if rescue:
-            _write_private(a.out, rescue)
+            _write_verified(a.out, rescue)
             _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
             sys.stderr.write(f"CGC_DONE wrote {len(rescue)} chars to {a.out} (rescued at timeout)\n")
             if not a.keep_tab:
                 c.close_tab()
             return 0
-        # No sentinel wrapper. Re-check (see the settle-time comment above) whether rid's turn is
-        # still the conversation's latest before considering unwrapped salvage — a later turn may
-        # have landed anywhere during the whole wait, not just at the settle instant.
-        allowed, observed_rid, present = _salvage_allowed(c, rid)
-        raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
         if not present and strict:
             sys.stderr.write(
                 f"CGC_WAIT interval_unresolved: source_rid={rid}'s own turn could no longer be "
