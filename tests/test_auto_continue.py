@@ -431,3 +431,99 @@ def test_a_preclick_failure_closes_the_reopened_tab_too(env, monkeypatch):
     tab.close_tab = lambda: closed.append(1)
     rc = _run_followup_refusing(monkeypatch, tab, reopened=True, exc=c._PreClickFailure("paste truncated"))
     assert rc == c.EXIT_NOT_SENT_PRECLICK and closed == [1]
+
+
+# ---- hydration is a precondition; tab ownership on EVERY exit ---------------------------------------
+
+def _followup_env(monkeypatch, tab, reopened, hydrated, paste=None, select_raises=None):
+    """cmd_followup with the page's hydration forced, recording whether it pasted or clicked."""
+    import types
+    import cdp_consult as c
+    rec = {"pasted": 0, "clicked": 0, "closed": 0}
+
+    def fake_cdp(port, match=None, create_url=None):
+        if match is not None and reopened:
+            raise SystemExit("CGC_ERROR conversation_not_found: no tab")
+        return tab
+
+    def do_paste(*a, **k):
+        rec["pasted"] += 1
+        if paste is not None:
+            raise paste
+
+    monkeypatch.setattr(c, "CDP", fake_cdp)
+    monkeypatch.setattr(c, "_await_composer", lambda *a, **k: (True, {}))
+    monkeypatch.setattr(c, "_await_thread_rendered", lambda *a, **k: hydrated)
+    monkeypatch.setattr(c, "_egress_gate", lambda p: (True, "ok"))
+    monkeypatch.setattr(c, "_last_user_text_js", lambda: "LAST")
+    monkeypatch.setattr(c, "_write_state", lambda **k: None)
+    monkeypatch.setattr(c, "_paste_prompt", do_paste)
+    if select_raises is not None:
+        def boom(*a, **k):
+            raise select_raises
+        monkeypatch.setattr(c, "_select_model", boom)
+    orig = tab.eval
+
+    def ev(e, timeout=None):
+        if "b.click()" in e:
+            rec["clicked"] += 1
+        return tab.turns[-1] if e == "LAST" else orig(e, timeout)
+    tab.eval = ev
+    tab.close_tab = lambda: rec.__setitem__("closed", rec["closed"] + 1)
+    tab.rec = rec
+    clock = {"now": 0.0}
+    monkeypatch.setattr(c.time, "time", lambda: clock.__setitem__("now", clock["now"] + 1) or clock["now"])
+    monkeypatch.setattr(c.time, "sleep", lambda s: None)
+    pf = os.path.join(os.environ["CGC_STATE_DIR"], "p3.md")
+    open(pf, "w").write("Continuing.\nBEGIN_RESPONSE:%s\nx\nEND_RESPONSE:%s\n" % (RID, RID))
+    ns = types.SimpleNamespace(no_gate=True, conversation=CONV, prompt_file=pf, task=None, rid=RID,
+                               model="Pro" if select_raises else "skip", model_family="skip",
+                               allow_model_mismatch=False, port=9333, mention=["WebCodex Demo"],
+                               watch=False, out=None)
+    return c.cmd_followup(ns), rec
+
+
+def test_a_thread_that_never_renders_is_refused_before_any_paste_or_click(env, monkeypatch, capsys):
+    """The page shows no user turn on a thread that has at least one: not hydrated. A stale same-rid
+    turn appearing after the click would read as a fresh send, so nothing is pasted or clicked."""
+    import cdp_consult as c
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=_turn(RID))
+    rc, rec = _followup_env(monkeypatch, tab, reopened=True, hydrated=False)
+    assert rc == c.EXIT_NOT_SENT_PRECLICK
+    assert rec["pasted"] == 0 and rec["clicked"] == 0, "not one keystroke or click before hydration"
+    assert rec["closed"] == 1, "the tab this command re-opened must not be leaked"
+    assert "never rendered" in capsys.readouterr().err
+
+
+def test_an_unhydrated_live_tab_is_refused_but_never_closed(env, monkeypatch):
+    import cdp_consult as c
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)
+    rc, rec = _followup_env(monkeypatch, tab, reopened=False, hydrated=False)
+    assert rc == c.EXIT_NOT_SENT_PRECLICK and rec["pasted"] == 0 and rec["clicked"] == 0
+    assert rec["closed"] == 0, "a tab we attached to is the user's or another round's, never ours to close"
+
+
+def test_a_reopened_tab_is_closed_when_a_pre_click_step_raises(env, monkeypatch):
+    """The cleanup owner is the finally block, so an exception (not just a return) cannot leak it."""
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)
+    with pytest.raises(RuntimeError):
+        _followup_env(monkeypatch, tab, reopened=True, hydrated=True, select_raises=RuntimeError("boom"))
+    assert tab.rec["closed"] == 1 and tab.rec["clicked"] == 0, \
+        "an exception before the click must still close the tab this command re-opened"
+
+
+def test_a_reopened_tab_stays_open_once_the_click_was_attempted(env, monkeypatch):
+    """After the click nothing is provably unsent: the tab is the evidence, so it is not closed even
+    though the landed check then fails."""
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)   # click lands nothing
+    rc, rec = _followup_env(monkeypatch, tab, reopened=True, hydrated=True)
+    assert rec["clicked"] == 1 and rc != 0, "the click was made and the send never confirmed"
+    assert rec["closed"] == 0, "an uncertain post-click tab is kept, not closed"
+
+
+def test_a_reopened_tab_is_closed_on_a_pre_click_mention_refusal(env, monkeypatch):
+    import cdp_consult as c
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)
+    rc, rec = _followup_env(monkeypatch, tab, reopened=True, hydrated=True,
+                            paste=c._MentionFailure("mention_not_found: not an app"))
+    assert rc == 3 and rec["clicked"] == 0 and rec["closed"] == 1

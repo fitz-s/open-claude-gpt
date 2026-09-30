@@ -3043,6 +3043,7 @@ def cmd_followup(a) -> int:
     # its tab is closed (default), so follow-up must NOT depend on round-1 having kept the
     # tab. Attach to a live tab if one exists; otherwise RE-OPEN the conversation by URL.
     reopened = False
+    click_attempted = False   # flips just before the send click: after it, nothing is provably unsent
     try:
         c = CDP(a.port, match=conv)
     except SystemExit as e:
@@ -3118,7 +3119,16 @@ def cmd_followup(a) -> int:
                 return 2
         # Count user messages BEFORE sending so we can confirm a NEW one landed (the
         # thread already has >=1 user message, so an absolute >0 check would false-pass).
-        _await_thread_rendered(c)
+        if not _await_thread_rendered(c):
+            # A follow-up continues a thread that already holds a user turn, so none rendering means
+            # the page has not hydrated. Every read below (baseline count, last-turn echo, the landed
+            # check) would then start from an empty page: the old turns hydrating after the click
+            # would look like growth, and a same-rid turn like a fresh echo. Nothing is pasted or
+            # clicked; the caller may retry.
+            sys.stderr.write("CGC_ERROR not_sent_preclick: the conversation's turns never rendered "
+                             "(page not hydrated), so a landed send could not be told from the old "
+                             "turns appearing — NOT sent; safe to retry with the same --request-key.\n")
+            return EXIT_NOT_SENT_PRECLICK
         u_before = c.eval("document.querySelectorAll(" + _JS_U + ").length") or 0
         # The last user turn's text before sending. A retry of the SAME rid (the automatic continue
         # after a failed turn) sends into a thread whose last turn already echoes that rid, so the
@@ -3145,17 +3155,14 @@ def cmd_followup(a) -> int:
         try:
             _paste_prompt(c, prompt, a.mention)
         except _MentionFailure as e:
-            if reopened:
-                c.close_tab()  # we opened it and nothing was sent; its draft must not outlive the refusal
             sys.stderr.write(f"CGC_ERROR {e} — NOT sent.\n")
             return 3
         except _PreClickFailure as e:
-            if reopened:
-                c.close_tab()
             sys.stderr.write(f"CGC_ERROR not_sent_preclick: {e} — NOT sent; safe to retry with the "
                              "same --request-key.\n")
             return EXIT_NOT_SENT_PRECLICK
         time.sleep(0.3)
+        click_attempted = True    # from here on a failure is post-click: uncertain, tab kept as evidence
         clicked = c.eval(
             "(function(){var b=document.querySelector('button[data-testid=\"send-button\"],"
             "button[aria-label*=\"Send\" i],button[aria-label*=\"\\u53d1\\u9001\"]');"
@@ -3245,6 +3252,12 @@ def cmd_followup(a) -> int:
                           "followup": True, "modelBadge": model_badge,
                           "wait_out": default_out, "watching": bool(a.watch)}))
     finally:
+        # A tab THIS command re-opened, left by any exit before the send click (a return or an
+        # exception), holds nothing but a possible draft and would leak: close it. A tab we attached
+        # to was already there (the user's, or another round's) and is never ours to close. After a
+        # click attempt the tab is the evidence for an uncertain send and stays.
+        if reopened and not click_attempted:
+            c.close_tab()
         c.close()
     if a.watch:
         # Same process now waits for the answer → the agent runs ONE backgrounded command for
