@@ -31,6 +31,14 @@ looked the turn up again.
 Pinned by `tests/test_wait_virtualized_thread.py`: the waiter's real JS runs in node against a thread
 whose older turns unmount mid-wait, and the page-side rid parser is checked against the Python one.
 
+### Fixed — a re-opened follow-up could pick its model before the tier switcher existed
+
+A re-opened thread renders the composer's mode toggle (`Explore`) first and the tier switcher ~2.5 s
+later. The follow-up released its pre-selection wait on the first label it saw, so `_select_model` could
+act on a composer with no tier picker to open. It now waits (up to 20 s) until at least two switcher
+labels are present and unchanged across two reads 1 s apart; if they never settle, the model gate still
+runs and still refuses to send on a model it could not confirm.
+
 ### Fixed — `fire --mention` found no popup entries, ever
 
 Every `--mention` failed `mention_not_found ... The popup offered: nothing`, for apps that were

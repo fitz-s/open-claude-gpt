@@ -3198,9 +3198,18 @@ def cmd_followup(a) -> int:
                 # NEVER resolves do we fall through to the fail-closed path below. (_select_model
                 # itself then opens the picker and selects — this settle just gives it a live DOM
                 # to act on; the fail-closed guarantee is unchanged.)
-                _settle = time.time() + 8
-                while not (c.eval(_cand_labels_js()) or []) and time.time() < _settle:
-                    time.sleep(0.5)
+                # "Any label" is not hydrated: live 2026-09-30 a reopened thread first renders only
+                # the mode toggle ['Explore'] and the tier switcher ('Pro') ~2.5 s later, so the
+                # old any-label wait handed _select_model a composer with no picker to open. Wait
+                # until the label set is non-empty AND unchanged across two reads 1 s apart.
+                _settle = time.time() + 20
+                _prev = None
+                while time.time() < _settle:
+                    _now = [x for x in (c.eval(_cand_labels_js()) or []) if x]
+                    if _now and _now == _prev and len(_now) >= 2:
+                        break
+                    _prev = _now
+                    time.sleep(1.0)
             pick = _select_model(c, target, a.model_family)
             _fu_ok, model_now, model_badge = pick.confirmed, pick.shown, pick.badge
             if not _fu_ok and not a.allow_model_mismatch:

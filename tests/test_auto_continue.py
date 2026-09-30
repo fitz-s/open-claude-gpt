@@ -441,7 +441,7 @@ def test_a_preclick_failure_closes_the_reopened_tab_too(env, monkeypatch):
 # ---- hydration is a precondition; tab ownership on EVERY exit ---------------------------------------
 
 def _followup_env(monkeypatch, tab, reopened, hydrated, paste=None, select_raises=None,
-                  mention=("WebCodex Demo",)):
+                  mention=("WebCodex Demo",), select=None):
     """cmd_followup with the page's hydration forced, recording whether it pasted or clicked."""
     import types
     import cdp_consult as c
@@ -469,6 +469,8 @@ def _followup_env(monkeypatch, tab, reopened, hydrated, paste=None, select_raise
         def boom(*a, **k):
             raise select_raises
         monkeypatch.setattr(c, "_select_model", boom)
+    if select is not None:
+        monkeypatch.setattr(c, "_select_model", select)
     orig = tab.eval
 
     def ev(e, timeout=None):
@@ -484,7 +486,7 @@ def _followup_env(monkeypatch, tab, reopened, hydrated, paste=None, select_raise
     pf = os.path.join(os.environ["CGC_STATE_DIR"], "p3.md")
     open(pf, "w").write("Continuing.\nBEGIN_RESPONSE:%s\nx\nEND_RESPONSE:%s\n" % (RID, RID))
     ns = types.SimpleNamespace(no_gate=True, conversation=CONV, prompt_file=pf, task=None, rid=RID,
-                               model="Pro" if select_raises else "skip", model_family="skip",
+                               model="Pro" if (select_raises or select) else "skip", model_family="skip",
                                allow_model_mismatch=False, port=9333, mention=list(mention),
                                watch=False, out=None)
     return c.cmd_followup(ns), rec
@@ -517,6 +519,51 @@ def test_a_reopened_tab_is_closed_when_a_pre_click_step_raises(env, monkeypatch)
         _followup_env(monkeypatch, tab, reopened=True, hydrated=True, select_raises=RuntimeError("boom"))
     assert tab.rec["closed"] == 1 and tab.rec["clicked"] == 0, \
         "an exception before the click must still close the tab this command re-opened"
+
+
+def _labelled_tab(reads):
+    """A follow-up tab whose switcher labels (_cand_labels_js) come from `reads`, the last repeating."""
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=_turn(RID))
+    orig, now = tab.eval, {"v": []}
+
+    def ev(e, timeout=None):
+        if ".map(function(b){" in e:
+            now["v"] = next(reads, now["v"])
+            return now["v"]
+        return orig(e, timeout)
+    tab.eval, tab.labels = ev, now
+    return tab
+
+
+def test_a_reopened_followup_picks_the_model_only_once_the_switchers_settle(env, monkeypatch):
+    """Live 2026-09-30: a re-opened thread renders the mode toggle ['Explore'] first and the tier
+    switcher ~2.5 s later. Releasing on any label handed _select_model a composer with no tier picker
+    to open; it must see the full label set, unchanged across two reads."""
+    import cdp_consult as c
+    tab = _labelled_tab(iter([[], ["Explore"], ["Explore"], ["Explore", "Pro"], ["Explore", "Pro"]]))
+    seen = []
+
+    def pick(_c, target, family=None):
+        seen.append(list(tab.labels["v"]))
+        return c._ModelPick(True, "Pro", "Pro", None, False)
+    rc, rec = _followup_env(monkeypatch, tab, reopened=True, hydrated=True, mention=[], select=pick)
+    assert seen == [["Explore", "Pro"]], seen
+    assert rc == 0 and rec["clicked"] == 1
+
+
+def test_a_reopened_followup_whose_switchers_never_settle_still_reaches_the_model_gate(env, monkeypatch):
+    """The settle is bounded: a composer that never shows two stable labels still gets one
+    _select_model verdict, and a refusal there still sends nothing."""
+    import cdp_consult as c
+    tab = _labelled_tab(iter([["Explore"]]))
+    calls = []
+
+    def pick(_c, target, family=None):
+        calls.append(target)
+        return c._ModelPick(False, "Explore", None, "no tier picker", False)
+    rc, rec = _followup_env(monkeypatch, tab, reopened=True, hydrated=True, mention=[], select=pick)
+    assert calls == ["Pro"] and rc == 2
+    assert rec["pasted"] == 0 and rec["clicked"] == 0
 
 
 def test_a_reopened_tab_stays_open_once_the_click_was_attempted(env, monkeypatch):
