@@ -2557,15 +2557,19 @@ def _mention_type_js(name, token):
 
 
 def _mention_pick_js(name, token):
-    # Visible rows the typing produced. A row is a candidate only if it is an app: under the popup's
-    # Plugins header, or in a popup with no header at all (a lone result renders bare) where only an
-    # EXACT label counts, since a bare row could as well be a file. Exact label wins, else a UNIQUE
-    # prefix among Plugins rows. Never guesses. The match is made BEFORE the Connect check, so an
-    # unconnected exact app is refused rather than silently replaced by a connected prefix sibling.
-    # A row with more than label + description carries an extra control (Connect): clicking it starts
-    # an authorization flow, so it is never clicked and is reported as `unconnected`. The test is
-    # structural, so it holds in any UI language. `open` / `loading`: the popup exists / still shows
-    # its "Loading suggestions" skeleton (a query with no match leaves it there).
+    # Visible rows the typing produced. A candidate must be shaped like an APP row, read off the popup's
+    # own markup (probed live 2026-09-29): a content block whose leading icon carries `rounded-2xs`
+    # (connector icons; the Add actions use `icon-leading`/a CompactSource span, files `text-file-document`),
+    # and that sits under the Plugins header or in a popup with no header at all (a single-section result
+    # renders bare, and there only an EXACT label counts). "Headerless" alone proves nothing, since a lone
+    # Files row renders with its own header but a shape change could bare it: the icon and a description
+    # element are what say "app". A candidate is CONNECTED only if its content block is exactly icon + label
+    # (+ description) with no stray text: an unconnected app carries a bare "Connect" text node there, so
+    # the test is structural and holds in any UI language. Exact label wins, else a UNIQUE prefix among
+    # Plugins rows; the name is matched BEFORE the connected check, so an unconnected exact app is refused,
+    # never replaced by a connected app that merely starts with the same text. A row in an allowed section
+    # that is not app-shaped is never clicked and is reported as `unverified`; nothing is clicked on a guess.
+    # `open` / `loading`: the popup exists / still shows its "Loading suggestions" skeleton.
     return ("(function(){var want=" + json.dumps(_norm_label(name)) + ";var os=" + _mention_visible_js()
             + ".filter(function(e){return e.getAttribute('data-cgc-pre')!==" + json.dumps(token) + ";});"
             "function lab(e){return (e.innerText||e.textContent||'').split('\\n')[0].replace(/\\s+/g,' ')"
@@ -2576,20 +2580,32 @@ def _mention_pick_js(name, token):
             "p=p.previousElementSibling;return p?txt(p).toLowerCase():null;}"
             "function headed(e){var k=e.parentElement.children;for(var i=0;i<k.length;i++)"
             "if(!row(k[i])&&txt(k[i]))return true;return false;}"
-            "function unc(e){return (e.innerText||'').split('\\n').filter(function(t){return t.trim();})"
-            ".length>2;}"
+            "function body(e){return e.querySelector('[data-menu-row-content]');}"
+            "function tok(n,c){return ((n&&n.getAttribute&&n.getAttribute('class'))||'').split(/\\s+/)"
+            ".indexOf(c)>=0;}"
+            "function appish(e){var c=body(e);if(!c)return false;var l=c.firstElementChild;"
+            "var i=l&&l.firstElementChild;return !!i&&tok(i,'rounded-2xs');}"
+            "function plain(e){var c=body(e);if(c.children.length!==2)return false;"
+            "for(var i=0;i<c.childNodes.length;i++){var n=c.childNodes[i];"
+            "if(n.nodeType===3&&n.textContent.trim())return false;}"
+            "return !!c.querySelector('.text-codex-description');}"
             "var open=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL) + ");"
             "var loading=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL + ' [role="status"]') + ");"
-            "var pl=os.filter(function(e){var h=hdr(e);return h==='plugins'||(h===null&&!headed(e));});"
+            "var sect=os.filter(function(e){var h=hdr(e);return h==='plugins'||(h===null&&!headed(e));});"
+            "var pl=sect.filter(appish);"
             "var ex=pl.filter(function(e){return lab(e)===want;});"
             "var pf=pl.filter(function(e){return hdr(e)==='plugins'&&lab(e).indexOf(want)===0;});"
             "var hit=ex.length===1?ex[0]:(!ex.length&&pf.length===1?pf[0]:null);"
-            "var un=pl.filter(unc).map(lab).filter(function(l){return l.indexOf(want)===0;});"
-            "if(hit&&unc(hit)){un=[lab(hit)];hit=null;}"
+            "var un=pl.filter(function(e){return !plain(e);}).map(lab).filter(function(l){"
+            "return l.indexOf(want)===0;});"
+            "var uv=sect.filter(function(e){return !appish(e);}).map(function(e){return txt(e)"
+            ".split('\\n')[0].replace(/\\s+/g,' ').trim().toLowerCase();}).filter(function(l){"
+            "return l&&l.indexOf(want)===0;});"
+            "if(hit&&!plain(hit)){un=[lab(hit)];hit=null;}"
             "if(!hit)return {hit:null,open:open,loading:loading,"
-            "seen:pl.filter(function(e){return !unc(e);}).map(lab).filter(Boolean).slice(0,20),"
-            "unconnected:un};"
-            "hit.click();return {hit:lab(hit),open:open,loading:false,seen:[],unconnected:[]};})()")
+            "seen:pl.filter(plain).map(lab).filter(Boolean).slice(0,20),unconnected:un,unverified:uv};"
+            "hit.click();return {hit:lab(hit),open:open,loading:false,seen:[],unconnected:[],"
+            "unverified:[]};})()")
 
 
 def _composer_mentions_js():
@@ -2599,7 +2615,7 @@ def _composer_mentions_js():
             "return d?d.querySelectorAll('[app-mention-name]').length:-1;})()")
 
 
-def _mention_offer(popup_open, seen, unconnected=(), loading=False):
+def _mention_offer(popup_open, seen, unconnected=(), loading=False, unverified=()):
     """What the popup showed, in words that say what to do: never opened (a code/DOM problem),
     listed but not connected (a human connects it), still on its loading skeleton (nothing matched,
     or ChatGPT is slow), opened empty (the app is not enabled here, or the name is wrong), or
@@ -2608,6 +2624,11 @@ def _mention_offer(popup_open, seen, unconnected=(), loading=False):
         return ("The popup lists " + ", ".join(repr(x[:40]) for x in dict.fromkeys(unconnected))
                 + " but it is NOT connected on this account (its row carries a Connect control) — a human "
                   "must connect it in ChatGPT; the daemon never authorizes an app")
+    if unverified:
+        return ("The popup lists " + ", ".join(repr(x[:40]) for x in dict.fromkeys(unverified))
+                + " but its row is not shaped like a connected app (no app icon or description), so the "
+                  "driver will not click it: it may be a file, an action, or an app whose row changed. "
+                  "A human must check it in ChatGPT; if it is an app, this is a driver fix")
     if not popup_open:
         return (f"The @ popup never opened ({_MENTION_POPUP_SEL} absent) — the composer's DOM changed "
                 "or it lost focus; that is a code fix, not an app to enable")
@@ -2638,12 +2659,13 @@ def _insert_mention(c, name):
     if c.eval(_mention_type_js(name, token), timeout=45) is None:
         raise _PreClickFailure("composer not found while typing @mention")
     end = time.time() + _MENTION_WAIT_S
-    seen, unconnected, popup_open, loading = [], [], False, False
+    seen, unconnected, unverified, popup_open, loading = [], [], [], False, False
     while time.time() < end:
         time.sleep(0.4)
         r = c.eval(_mention_pick_js(name, token), timeout=45) or {}
         seen = r.get("seen") or seen
         unconnected = r.get("unconnected") or unconnected
+        unverified = r.get("unverified") or unverified
         popup_open = popup_open or bool(r.get("open"))
         loading = bool(r.get("loading"))
         if r.get("hit"):
@@ -2663,7 +2685,7 @@ def _insert_mention(c, name):
     residue = _clear_after_mention_failure(c)
     raise _MentionFailure(
         f"mention_not_found: the composer offered no app named '{name}' for '@{name}' within "
-        f"{_MENTION_WAIT_S:.0f}s{residue}. {_mention_offer(popup_open, seen, unconnected, loading)}")
+        f"{_MENTION_WAIT_S:.0f}s{residue}. {_mention_offer(popup_open, seen, unconnected, loading, unverified)}")
 
 
 def _paste_prompt(c, prompt: str, mentions=()) -> None:

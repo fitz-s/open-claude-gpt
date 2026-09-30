@@ -26,7 +26,7 @@ the old selector matched zero nodes. The picker now reads those rows, and harden
   the one click, not "the HTML changed", which any stray click satisfies. The same count is re-checked
   after the prompt is pasted, so a paste that eats a mention is not sent.
 - The failure names which thing happened: popup never opened (a DOM/code bug), only its loading
-  skeleton (what ChatGPT leaves for a query that matches nothing), opened empty, app listed but not
+  skeleton (ChatGPT's own state while it searches), opened empty, app listed but not
   connected, other apps offered, or a row was clicked that turned out not to be an app.
 
 - On a conversation re-opened by URL (a follow-up whose tab was gone), the mention never took. The page

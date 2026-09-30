@@ -156,51 +156,81 @@ def test_daemon_passes_mentions_on_the_argv(monkeypatch):
 # whole vocabulary — and throws on anything else, so a selector that grows fails here loudly.
 _NODE_DOM = r"""
 function build(spec, parent){
-  var n={tagName:String(spec.t).toUpperCase(),_a:spec.a||{},innerText:spec.x==null?'':spec.x,
-    parentElement:parent||null,children:[],clicked:0,previousElementSibling:null,
+  if(typeof spec==='string'){return {nodeType:3,textContent:spec,parentElement:parent,innerText:spec};}
+  var n={nodeType:1,tagName:String(spec.t).toUpperCase(),_a:spec.a||{},parentElement:parent||null,
+    children:[],childNodes:[],clicked:0,previousElementSibling:null,
     getAttribute:function(k){return k in this._a?this._a[k]:null},
     hasAttribute:function(k){return k in this._a},
     getBoundingClientRect:function(){return {width:1,height:1}},
     click:function(){this.clicked++}};
-  n.textContent=n.innerText;
-  (spec.c||[]).forEach(function(c,i){var k=build(c,n);
-    k.previousElementSibling=i?n.children[i-1]:null;n.children.push(k);});
+  (spec.c||[]).forEach(function(c){var k=build(c,n);n.childNodes.push(k);
+    if(k.nodeType===1){k.previousElementSibling=n.children.length?n.children[n.children.length-1]:null;n.children.push(k);}});
+  // innerText: block-level children (a row's label and description spans sit on separate lines in the
+  // browser, headers and rows too) are separated by a newline; inline text runs together.
+  Object.defineProperty(n,'innerText',{get:function(){if(spec.x!=null)return spec.x;
+    var parts=n.childNodes.map(function(k){return k.innerText}).filter(function(x){return x!==''});
+    var block=n.children.length>1&&n.children.every(function(k){return k.tagName!=='SVG'});
+    var rowBody=n.hasAttribute&&n.hasAttribute('data-menu-row-content');
+    return parts.join((block&&(rowBody||n._a['data-list-navigation-item']===undefined))?'\n':'')}});
+  Object.defineProperty(n,'textContent',{get:function(){return n.innerText}});
+  Object.defineProperty(n,'firstElementChild',{get:function(){return n.children[0]||null}});
+  n.querySelector=function(sel){return qin(n,sel)[0]||null};
   return n;
 }
-function all(r){var o=[];(function w(n){o.push(n);n.children.forEach(w);})(r);return o;}
-function attrs(sel){return sel.split(' ').map(function(p){var m=/^\[([\w-]+)(?:="([^"]*)")?\]$/.exec(p);
-  if(!m)throw new Error('unsupported selector: '+sel);return [m[1],m[2]];});}
-function has(n,q){return q[1]===undefined?n.hasAttribute(q[0]):n.getAttribute(q[0])===q[1];}
-function qsa(sel){var a=attrs(sel);return all(ROOT).filter(function(n){
-  if(!has(n,a[a.length-1]))return false;
+function all(r){var o=[];(function w(n){o.push(n);(n.children||[]).forEach(w);})(r);return o;}
+function attrs(sel){return sel.split(' ').map(function(p){var m=/^\[([\w-]+)(?:="([^"]*)")?\]$/.exec(p)||/^\.([\w-]+)$/.exec(p);
+  if(!m)throw new Error('unsupported selector: '+sel);return m[0][0]==='.'?['class~',m[1]]:[m[1],m[2]];});}
+function has(n,q){if(q[0]==='class~')return (n.getAttribute('class')||'').split(/\s+/).indexOf(q[1])>=0;
+  return q[1]===undefined?n.hasAttribute(q[0]):n.getAttribute(q[0])===q[1];}
+function qin(root,sel){var a=attrs(sel);return all(root).filter(function(n){
+  if(n===root||!has(n,a[a.length-1]))return false;
   var i=a.length-2,p=n.parentElement;
   while(i>=0&&p){if(has(p,a[i]))i--;p=p.parentElement;}
   return i<0;});}
+function qsa(sel){return qin({children:[ROOT],parentElement:null,hasAttribute:function(){return false},getAttribute:function(){return null}},sel);}
 var document={querySelectorAll:qsa,querySelector:function(s){return qsa(s)[0]||null;}};
 """
 
 
-def _btn(lines, **attrs):
-    return {"t": "button", "a": {"data-list-navigation-item": "true", **attrs}, "x": "\n".join(lines)}
+def _row(label, desc="Does things", icon="rounded-2xs icon-xs", extra=None, **attrs):
+    """One popup row in the shape the live DOM has: button > content block > [icon span > icon, label
+    span (+ description span)] plus, on an unconnected app, a bare text node inside the content block."""
+    body = [{"t": "span", "a": {"class": "leadingIcon-x"}, "c": [{"t": "svg", "a": {"class": icon}}]},
+            {"t": "span", "c": [{"t": "span", "c": [{"t": "span", "c": [label]}] + (
+                [{"t": "span", "a": {"class": "text-codex-description"}, "c": [desc]}] if desc else [])}]}]
+    if extra:
+        body.append(extra)
+    return {"t": "button", "a": {"data-list-navigation-item": "true", **attrs},
+            "c": [{"t": "div", "a": {"data-menu-row-content": "true"}, "c": body}]}
+
+
+def _app(label, **kw):
+    return _row(label, **kw)
+
+
+def _unconnected(label, word="Connect", **kw):
+    return _row(label, extra=word, **kw)
+
+
+def _file(label):
+    return _row(label, desc=None, icon="text-file-document size-5")
+
+
+def _action(label, icon="icon-leading shrink-0"):
+    return _row(label, icon=icon)
 
 
 def _popup_tree(*items):
-    """Real popup shape: scroll area > wrapper > [section header | row ...]. A str is a header, a list
-    is a row's innerText lines, a (list, attrs) pair is a row carrying attributes."""
-    kids = []
-    for it in items:
-        if isinstance(it, str):
-            kids.append({"t": "div", "x": it})
-        elif isinstance(it, tuple):
-            kids.append(_btn(it[0], **it[1]))
-        else:
-            kids.append(_btn(it))
+    """Real popup shape: scroll area > wrapper > [section header | row ...]. A str is a header, a dict
+    is a row built by _app/_unconnected/_file/_action/_row."""
+    kids = [{"t": "div", "c": [it]} if isinstance(it, str) else it for it in items]
     return {"t": "body", "c": [{"t": "div", "a": {"data-mention-list-scroll-area": ""},
                                 "c": [{"t": "div", "c": kids}]}]}
 
 
-def _tree_from_html(html, row_lines):
-    """Parse a captured popup outerHTML into the tree spec. Rows take their captured innerText."""
+def _tree_from_html(html, row_lines=None):
+    """Parse a captured popup outerHTML into the tree spec, keeping every element and text node as
+    captured: the picker's structural tests run on the real markup, not on innerText alone."""
     from html.parser import HTMLParser
 
     class P(HTMLParser):
@@ -208,13 +238,12 @@ def _tree_from_html(html, row_lines):
 
         def __init__(self):
             super().__init__()
-            self.root = {"t": "body", "c": [], "_p": []}
+            self.root = {"t": "body", "c": []}
             self.st = [self.root]
 
         def _open(self, tag, attrs):
-            n = {"t": tag, "a": {k: (v or "") for k, v in attrs}, "c": [], "_p": []}
+            n = {"t": tag, "a": {k: (v or "") for k, v in attrs}, "c": []}
             self.st[-1]["c"].append(n)
-            self.st[-1]["_p"].append(n)
             return n
 
         def handle_starttag(self, tag, attrs):
@@ -232,23 +261,11 @@ def _tree_from_html(html, row_lines):
                     return
 
         def handle_data(self, d):
-            self.st[-1]["_p"].append(d)
+            if d.strip():
+                self.st[-1]["c"].append(d)
 
     p = P()
     p.feed(html)
-    rows = iter(row_lines)
-
-    def fin(n):  # innerText: a row's is the captured one; any other node's is its text content
-        for c in n["c"]:
-            fin(c)
-        if "data-list-navigation-item" in n.get("a", {}):
-            n["x"] = "\n".join(next(rows))
-        else:
-            n["x"] = "".join(x if isinstance(x, str) else x["x"] for x in n["_p"])
-        del n["_p"]
-
-    fin(p.root)
-    assert next(rows, None) is None, "fixture rows and popup HTML disagree on the row count"
     return p.root
 
 
@@ -272,38 +289,38 @@ def _run_pick(tree, name, token="t0"):
 
 
 def test_picker_exact_match_beats_prefix():
-    tree = _popup_tree("Plugins", ["WebCodex Demo Pro"], ["WebCodex Demo", "Runs code"])
+    tree = _popup_tree("Plugins", _app("WebCodex Demo Pro"), _app("WebCodex Demo"))
     assert _run_pick(tree, "WebCodex Demo") == ["webcodex demo", ["WebCodex Demo"]]
 
 
 def test_picker_takes_a_unique_prefix():
-    tree = _popup_tree("Plugins", ["WebCodex Demo — sandbox"], ["Canva"])
-    assert _run_pick(tree, "WebCodex Demo") == ["webcodex demo — sandbox", ["WebCodex Demo — sandbox"]]
+    tree = _popup_tree("Plugins", _app("WebCodex Demo - sandbox"), _app("Canva"))
+    assert _run_pick(tree, "WebCodex Demo") == ["webcodex demo - sandbox", ["WebCodex Demo - sandbox"]]
 
 
 def test_picker_refuses_an_ambiguous_prefix():
-    tree = _popup_tree("Plugins", ["WebCodex Demo Pro"], ["WebCodex Demo Lite"])
+    tree = _popup_tree("Plugins", _app("WebCodex Demo Pro"), _app("WebCodex Demo Lite"))
     assert _run_pick(tree, "WebCodex Demo") == [None, []]
 
 
 def test_picker_ignores_controls_that_were_on_screen_before_the_typing():
     # a same-label control that pre-dates the "@name" keystrokes is not the popup
-    assert _run_pick(_popup_tree("Plugins", (["WebCodex Demo"], {"data-cgc-pre": "t0"})),
+    assert _run_pick(_popup_tree("Plugins", _app("WebCodex Demo", **{"data-cgc-pre": "t0"})),
                      "WebCodex Demo") == [None, []]
-    tree = _popup_tree("Plugins", (["WebCodex Demo"], {"data-cgc-pre": "t0"}), ["WebCodex Demo"])
+    tree = _popup_tree("Plugins", _app("WebCodex Demo", **{"data-cgc-pre": "t0"}), _app("WebCodex Demo"))
     assert _run_pick(tree, "WebCodex Demo") == ["webcodex demo", ["WebCodex Demo"]]
 
 
 def test_picker_only_picks_plugin_rows_never_files():
     # a query also lists Files; a file named like the app must not be clicked in its place
-    tree = _popup_tree("Plugins", ["Canva"], "Files", ["webcodex demo notes.md"])
+    tree = _popup_tree("Plugins", _app("Canva"), "Files", _file("webcodex demo notes.md"))
     r, clicked = _run_pick_tree(tree, "WebCodex Demo")
     assert r["hit"] is None and clicked == [] and r["seen"] == ["canva"]
 
 
 def test_picker_never_clicks_an_unconnected_app():
     # a row with a Connect control starts an authorization flow: reported, never clicked
-    tree = _popup_tree("Plugins", ["Notion", "Notion docs", "Connect"], ["Canva"])
+    tree = _popup_tree("Plugins", _unconnected("Notion"), _app("Canva"))
     r, clicked = _run_pick_tree(tree, "Notion")
     assert r["hit"] is None and clicked == [] and r["unconnected"] == ["notion"]
     assert r["open"] is True and r["seen"] == ["canva"]
@@ -312,7 +329,7 @@ def test_picker_never_clicks_an_unconnected_app():
 def test_picker_never_substitutes_a_connected_prefix_sibling_for_an_unconnected_exact_app():
     # 'Notion' is unconnected; 'Notion Calendar' is connected and starts with the same text. The
     # exact app is refused, and the sibling is NOT clicked in its place (it would be the wrong app).
-    tree = _popup_tree("Plugins", ["Notion", "Notion docs", "Connect"], ["Notion Calendar", "Calendar"])
+    tree = _popup_tree("Plugins", _unconnected("Notion"), _app("Notion Calendar"))
     r, clicked = _run_pick_tree(tree, "Notion")
     assert r["hit"] is None and clicked == [] and r["unconnected"] == ["notion"]
     # asked for by its own name, the connected sibling is still pickable
@@ -320,30 +337,56 @@ def test_picker_never_substitutes_a_connected_prefix_sibling_for_an_unconnected_
 
 
 def test_picker_recognizes_an_unconnected_row_in_any_ui_language():
-    # the extra control's text is localized; the row's SHAPE (a third line) is not
-    tree = _popup_tree(["Notion", "Notion docs", "连接"])
+    # the extra control's text is localized; the row's SHAPE (a stray text node in the content block) is not
+    r, clicked = _run_pick_tree(_popup_tree(_unconnected("Notion", word="\u8fde\u63a5")), "Notion")
+    assert r["hit"] is None and clicked == [] and r["unconnected"] == ["notion"]
+
+
+def test_picker_refuses_a_two_line_authorization_row_with_no_description():
+    # label + Connect and NO description: two innerText lines, so a line count would call it connected.
+    # The content block's stray text node says otherwise.
+    tree = _popup_tree(_row("Notion", desc=None, extra="Connect"))
     r, clicked = _run_pick_tree(tree, "Notion")
     assert r["hit"] is None and clicked == [] and r["unconnected"] == ["notion"]
 
 
-def test_picker_takes_no_bare_row_by_prefix_and_no_row_after_an_empty_spacer():
-    # a headerless popup may hold a lone FILE row: only an exact label counts there
-    r, clicked = _run_pick_tree(_popup_tree(["atlas_notes.md"]), "Atlas")
+def test_picker_never_clicks_a_headerless_exact_file_row():
+    # "headerless" is not evidence of an app: a lone file result can render bare. Its leading icon is a
+    # file icon and it has no description, so it is not app-shaped and is never clicked.
+    for tree in (_popup_tree(_file("atlas_notes.md")), _popup_tree(_file("Atlas"))):
+        r, clicked = _run_pick_tree(tree, "atlas_notes.md" if "notes" in json.dumps(tree) else "Atlas")
+        assert r["hit"] is None and clicked == []
+    r, clicked = _run_pick_tree(_popup_tree(_file("Atlas")), "Atlas")
+    assert r["unverified"] == ["atlas"], "reported as unverified, never guessed"
+
+
+def test_picker_never_clicks_an_add_action_row():
+    r, clicked = _run_pick_tree(_popup_tree(_action("Create image")), "Create image")
     assert r["hit"] is None and clicked == []
-    assert _run_pick(_popup_tree(["Atlas"]), "Atlas") == ["atlas", ["Atlas"]]
+    r, clicked = _run_pick_tree(_popup_tree("Add", _action("Create image")), "Create image")
+    assert r["hit"] is None and clicked == []
+
+
+def test_picker_takes_a_headerless_exact_app_row():
+    assert _run_pick(_popup_tree(_app("Atlas")), "Atlas") == ["atlas", ["Atlas"]]
+    # ...but not by prefix: without a Plugins header only an exact label counts
+    assert _run_pick(_popup_tree(_app("Atlas Pro")), "Atlas") == [None, []]
+
+
+def test_picker_takes_no_row_after_an_empty_spacer_and_no_headerless_row_among_headers():
     # an empty-text spacer between the Files header and its rows must not hide the header
-    tree = _popup_tree("Plugins", ["Canva"], "Files", "", ["atlas_notes.md"])
+    tree = _popup_tree("Plugins", _app("Canva"), "Files", "", _file("atlas_notes.md"))
     r, clicked = _run_pick_tree(tree, "Atlas")
     assert r["hit"] is None and clicked == []
     # a header-less row in a popup that HAS headers belongs to no section: not a plugin
-    r, clicked = _run_pick_tree(_popup_tree(["Atlas"], "Files", ["a.md"]), "Atlas")
+    r, clicked = _run_pick_tree(_popup_tree(_app("Atlas"), "Files", _file("a.md")), "Atlas")
     assert r["hit"] is None and clicked == []
 
 
 def test_popup_offer_is_reported_when_nothing_matches():
-    r, clicked = _run_pick_tree(_popup_tree("Plugins", ["Canva"]), "WebCodex Demo")
+    r, clicked = _run_pick_tree(_popup_tree("Plugins", _app("Canva")), "WebCodex Demo")
     assert r == {"hit": None, "open": True, "loading": False, "seen": ["canva"],
-                 "unconnected": []} and clicked == []
+                 "unconnected": [], "unverified": []} and clicked == []
 
 
 def test_popup_never_opened_is_reported_as_such():
@@ -354,13 +397,17 @@ def test_popup_never_opened_is_reported_as_such():
 # ---- the live DOM, captured 2026-09-29 -----------------------------------------------------------
 # The composer's @ popup carries no ARIA roles at all, which is why the role-based selector matched
 # nothing and every mention failed with "The popup offered: nothing". These pin the picker against
-# the real markup and innerText, not a hand-written imitation of it.
+# the real markup (elements, classes and text nodes), not a hand-written imitation of it.
 FIXTURE = json.load(open(os.path.join(ROOT, "tests", "fixtures", "mention_popup.json")))
 
 
 def _live(case):
-    c = FIXTURE["cases"][case]
-    return _tree_from_html(c["popup_html"], [r["lines"] for r in c["rows"]])
+    return _tree_from_html(FIXTURE["cases"][case]["popup_html"])
+
+
+def _texts(tree):
+    """A row's label the way the picker reads it: the first line of its innerText."""
+    return tree
 
 
 def test_live_popup_rows_carry_no_aria_role_so_the_selector_cannot_be_role_based():
@@ -376,25 +423,54 @@ def test_live_popup_picks_the_named_app_and_nothing_else():
     # 'Atlas' is the exact label of one row, the tail of 'Demo Atlas' and the stem of Files rows
     assert _run_pick(_live("atlas"), "Atlas") == ["atlas", ["Atlas"]]
     assert _run_pick(_live("all_plugins"), "atlas") == ["atlas", ["Atlas"]], "case-insensitive"
+    assert _run_pick(_live("all_plugins"), "Demo Atlas") == ["demo atlas", ["Demo Atlas"]]
+    # connector icons come as an <img> (hosted) or an <svg> (inline); both are app-shaped
+    assert _run_pick(_live("all_plugins"), "GitHub") == ["github", ["GitHub"]]
 
 
 def test_live_popup_never_picks_a_file_row():
-    for c in FIXTURE["cases"]["atlas"]["rows"]:
-        if c["section"] == "Files":
-            r, clicked = _run_pick_tree(_live("atlas"), c["lines"][0])
-            assert r["hit"] is None and clicked == []
+    for name in ("atlas_notes_a.md", "atlas_notes_b.md", "Atlas notes"):
+        r, clicked = _run_pick_tree(_live("atlas"), name)
+        assert r["hit"] is None and clicked == []
+    # a query that returns ONLY a file: the popup carries the Files header, and the row is not app-shaped
+    r, clicked = _run_pick_tree(_live("lone_file"), "atlas_notes_c.md")
+    assert r["hit"] is None and clicked == []
+
+
+def test_live_popup_never_picks_an_add_action():
+    for name in ("Create image", "Sketch", "Add photos & files"):
+        r, clicked = _run_pick_tree(_live("all_plugins"), name)
+        assert r["hit"] is None and clicked == [], name
+    r, clicked = _run_pick_tree(_live("create_image"), "Create image")
+    assert r["hit"] is None and clicked == [], "a bare single-result Add action is not an app"
 
 
 def test_live_popup_refuses_an_unconnected_app():
-    r, clicked = _run_pick_tree(_live("all_plugins"), "Notion")
-    assert r["hit"] is None and clicked == [] and r["unconnected"] == ["notion"]
+    for case in ("all_plugins", "notion"):
+        r, clicked = _run_pick_tree(_live(case), "Notion")
+        assert r["hit"] is None and clicked == [] and r["unconnected"] == ["notion"], case
+    r, clicked = _run_pick_tree(_live("all_plugins"), "Slack")
+    assert r["hit"] is None and clicked == [] and r["unconnected"] == ["slack"]
+    # the headerless two-result query: the unconnected calendar is refused, its connected sibling is not
+    r, clicked = _run_pick_tree(_live("outlook"), "Outlook Calendar")
+    assert r["hit"] is None and clicked == [] and r["unconnected"] == ["outlook calendar"]
+    assert _run_pick(_live("outlook"), "Outlook Email") == ["outlook email", ["Outlook Email"]]
 
 
-def test_live_popup_with_no_match_is_open_empty_and_still_loading():
+def test_live_popup_with_no_match_is_open_and_empty():
+    # settled: ChatGPT renders an explicit "No results" line and no rows
     r, clicked = _run_pick_tree(_live("no_match"), "Qzxvkw")
     assert r["hit"] is None and r["open"] is True and r["seen"] == [] and clicked == []
-    assert r["loading"] is True, "a query nothing matches leaves the Loading suggestions skeleton"
+    assert r["loading"] is False
     assert _run_pick_tree(_live("atlas"), "Atlas")[0]["loading"] is False
+
+
+def test_a_popup_still_on_its_loading_skeleton_reads_as_loading():
+    # not yet settled: a role=status "Loading suggestions" node and no rows (seen on a slow query)
+    tree = {"t": "body", "c": [{"t": "div", "a": {"data-mention-list-scroll-area": ""}, "c": [
+        {"t": "div", "a": {"role": "status"}, "c": ["Loading suggestions"]}]}]}
+    r, clicked = _run_pick_tree(tree, "Qzxvkw")
+    assert r["hit"] is None and r["open"] is True and r["loading"] is True and clicked == []
 
 
 def test_live_picked_app_is_counted_by_the_composer_mention_probe():
