@@ -164,7 +164,8 @@ function build(spec, parent){
     getAttribute:function(k){return k in this._a?this._a[k]:null},
     hasAttribute:function(k){return k in this._a},
     getBoundingClientRect:function(){return {width:1,height:1}},
-    click:function(){this.clicked++}};
+    click:function(){this.clicked++},
+    contains:function(x){while(x){if(x===n)return true;x=x.parentElement;}return false;}};
   (spec.c||[]).forEach(function(c){var k=build(c,n);n.childNodes.push(k);
     if(k.nodeType===1){k.previousElementSibling=n.children.length?n.children[n.children.length-1]:null;n.children.push(k);}});
   // innerText: block-level children (a row's label and description spans sit on separate lines in the
@@ -299,6 +300,28 @@ def test_picker_exact_match_beats_prefix():
     assert _run_pick(tree, "WebCodex Demo") == ["webcodex demo", ["WebCodex Demo"]]
 
 
+def test_picker_refuses_two_rows_with_the_same_exact_label_and_says_so():
+    # two identically named rows may be two different apps: never pick one of them
+    tree = _popup_tree("Plugins", _app("Notion"), _app("Notion"), _app("Canva"))
+    r, clicked = _run_pick_tree(tree, "Notion")
+    assert r["hit"] is None and clicked == [] and r["ambiguous"] == 2
+    msg = CDP._mention_offer(True, r["seen"], r["unconnected"], r["loading"], r["unverified"], r["ambiguous"], "Notion")
+    assert msg.startswith("ambiguous: 2 rows named 'Notion'") and "will not pick one" in msg
+
+
+def test_the_failure_message_for_identical_labels_reaches_the_caller(monkeypatch):
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    monkeypatch.setattr(CDP, "_MENTION_WAIT_S", 0.05)
+    c = _FakeComposer([])
+    real = c.eval
+    c.eval = lambda js, timeout=None: ({"hit": None, "open": True, "loading": False, "seen": ["notion", "notion"],
+                                        "unconnected": [], "unverified": [], "ambiguous": 2}
+                                       if "var want=" in js and "data-cgc-pre" in js else real(js, timeout))
+    with pytest.raises(CDP._MentionFailure) as e:
+        CDP._paste_prompt(c, "body", ["Notion"])
+    assert "ambiguous: 2 rows named 'Notion'" in str(e.value) and c.text == ""
+
+
 def test_picker_never_takes_a_prefix_match_it_would_send_the_wrong_app():
     # 'Atlas' asked for, only 'Atlas Pro' enabled: the ONLY prefix match. Clicking it would attach a
     # different app and every later check would pass, so the prompt would go out with the wrong app.
@@ -374,6 +397,43 @@ def _shaped_row(label, desc="Does things", in_label="", block_extra=None, siblin
     return {"t": "button", "a": {"data-list-navigation-item": "true"}, "c": kids}
 
 
+def _desc_row(label, desc_children):
+    """A real-shaped app row whose DESCRIPTION element holds `desc_children` (text and/or elements)."""
+    lead = {"t": "span", "a": {"class": "leadingIcon-x"}, "c": [{"t": "svg", "a": {"class": "rounded-2xs icon-xs"}}]}
+    text = {"t": "span", "c": [{"t": "span", "c": [{"t": "span", "c": [label]},
+                                                   {"t": "span", "a": {"class": "text-codex-description"},
+                                                    "c": desc_children}]}]}
+    return {"t": "button", "a": {"data-list-navigation-item": "true"},
+            "c": [{"t": "div", "a": {"data-menu-row-content": "true"}, "c": [lead, text]}]}
+
+
+@pytest.mark.parametrize("shape,row", [
+    ("description text plus a Connect <button> nested inside the description",
+     _desc_row("Notion", ["Notion docs", {"t": "button", "c": ["Connect"]}])),
+    ("description text plus a bare ' Connect' text node inside the description",
+     _desc_row("Notion", ["Notion docs", " Connect"])),
+    ("a Connect <span> nested inside the label element",
+     _shaped_row("Notion", in_label="")  # replaced below: label element holds an element child
+     if False else {"t": "button", "a": {"data-list-navigation-item": "true"}, "c": [{"t": "div", "a": {"data-menu-row-content": "true"}, "c": [
+         {"t": "span", "a": {"class": "leadingIcon-x"}, "c": [{"t": "svg", "a": {"class": "rounded-2xs icon-xs"}}]},
+         {"t": "span", "c": [{"t": "span", "c": [{"t": "span", "c": ["Notion", {"t": "span", "c": ["Connect"]}]},
+                                                 {"t": "span", "a": {"class": "text-codex-description"}, "c": ["docs"]}]}]}]}]}),
+])
+def test_picker_refuses_a_connect_control_nested_inside_the_label_or_description(shape, row):
+    for tree in (_popup_tree("Plugins", row), _popup_tree(row)):
+        r, clicked = _run_pick_tree(tree, "Notion")
+        assert r["hit"] is None and clicked == [], shape
+
+
+def test_the_inherent_limit_a_description_that_really_is_or_ends_in_connect_reads_as_connected():
+    """Stated, not hidden: 'Connect' that is PART of the single description text node cannot be told from a
+    description that genuinely says so. The rule is structural (label + description, leaf elements holding one
+    text node, nothing else in the row); it cannot read meaning. This pins the boundary so nobody assumes it
+    is closed. (A SECOND text node or an element carrying it is refused, see the tests above.)"""
+    row = _desc_row("Notion", ["Notion docs and Connect"])          # ONE text node
+    assert _run_pick(_popup_tree("Plugins", row), "Notion") == ["notion", ["Notion"]]
+
+
 @pytest.mark.parametrize("shape,row", [
     ("Connect as text inside the label span", _shaped_row("Notion", in_label=" Connect")),
     ("Connect as a <button> in the content block", _shaped_row("Notion", block_extra={"t": "button", "c": ["Connect"]})),
@@ -434,7 +494,7 @@ def test_picker_takes_no_row_after_an_empty_spacer_and_no_headerless_row_among_h
 def test_popup_offer_is_reported_when_nothing_matches():
     r, clicked = _run_pick_tree(_popup_tree("Plugins", _app("Canva")), "WebCodex Demo")
     assert r == {"hit": None, "open": True, "loading": False, "seen": ["canva"],
-                 "unconnected": [], "unverified": []} and clicked == []
+                 "unconnected": [], "unverified": [], "ambiguous": 0} and clicked == []
 
 
 def test_popup_never_opened_is_reported_as_such():
@@ -587,6 +647,25 @@ def test_two_requested_apps_each_have_to_be_the_one_that_appeared(monkeypatch):
     c.eval = ev
     with pytest.raises(CDP._MentionFailure):
         CDP._paste_prompt(c, "body", ["Alpha", "Beta"])
+
+
+def test_a_paste_that_swaps_the_mention_for_another_app_is_not_sent_even_though_the_count_is_right(monkeypatch):
+    """After the paste the composer holds ONE app mention, as requested, but it is the WRONG app. A count
+    check passes; only the names differ (kept != wanted while the lengths are equal)."""
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    c = _FakeComposer(["WebCodex Demo"])
+    real = c.eval
+
+    def ev(js, timeout=None):
+        if "execCommand('insertText'" in js and "return true" not in js:      # a prompt chunk, not the space
+            c.mentions = ["some other app"]                                    # swapped: same length, other name
+        return real(js, timeout)
+    c.eval = ev
+    with pytest.raises(CDP._MentionFailure) as e:
+        CDP._paste_prompt(c, "review this", ["WebCodex Demo"])
+    assert len(c.mentions) == 1, "the count is exactly what was requested"
+    msg = str(e.value)
+    assert "'some other app'" in msg and "'webcodex demo'" in msg and "wrong apps" in msg
 
 
 def test_a_mention_node_that_never_shows_fails_closed_after_one_click(monkeypatch):

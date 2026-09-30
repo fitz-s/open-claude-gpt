@@ -2467,8 +2467,8 @@ class _PreClickFailure(Exception):
     """Raised only for a failure PROVEN to precede the send click — never after it."""
 
 
-# The composer is resolved ONCE, by stable structure, and everything on the send path is bound to that
-# one resolution: the editor the keystrokes and the picked app go to, the reads that verify them, the
+# The composer is found by stable structure through ONE shared expression, re-evaluated on each call
+# (deterministically, no cached node), and everything on the send path is bound to it: the editor the keystrokes and the picked app go to, the reads that verify them, the
 # clear, and the send button. Probed live 2026-09-29: a conversation re-opened by URL holds TWO forms, a
 # hidden 0x0 one (with its own editor and its own buttons) before the visible one; the project page holds
 # one. The send button lives INSIDE the composer's form and only exists once there is text. So:
@@ -2612,6 +2612,10 @@ def _mention_pick_js(name, token):
     # button reads exactly `label` + `description`, with the description in its own element and nothing else
     # anywhere in the row: an unconnected app carries a "Connect" control or text (inside the label, next to
     # the description, or beside the content block), so the test is structural and holds in any UI language.
+    # Label and description must be LEAVES (one text node, no element inside), so a control or a second text
+    # node appended inside either cannot hide there. The inherent limit that remains: text that is PART of the
+    # single description text node ('Notion docs and Connect') cannot be told from a description that really
+    # says so; the rule is structural and cannot read meaning.
     # An unconnected exact app is refused and reported, never replaced by another; a row in an allowed section
     # that is not app-shaped is never clicked and is reported as `unverified`. `open` / `loading`: the popup
     # exists / still shows its "Loading suggestions" skeleton.
@@ -2632,25 +2636,34 @@ def _mention_pick_js(name, token):
             "function appish(e){var c=body(e);if(!c)return false;var l=c.firstElementChild;"
             "var i=l&&l.firstElementChild;return !!i&&tok(i,'rounded-2xs');}"
             "function nw(s){return (s||'').replace(/\\s+/g,'');}"
+            # a LEAF holds one text node and no element: every captured description and label is exactly that,
+            # so a second text node (a bare ' Connect' appended after the description) fails it as well
+            "function leaf(n){return !!n&&n.children.length===0&&n.childNodes.length<=1;}"
             "function plain(e){var c=body(e);if(!c||e.children.length!==1||c.children.length!==2)return false;"
-            "var d=c.querySelector('.text-codex-description');if(!d)return false;"
-            "var L=e.innerText.split('\\n').map(sp).filter(Boolean);"
-            # adjacent spans concatenate in textContent with NO whitespace between them (live DOM), so the
-            # comparison ignores whitespace entirely: any extra text still adds characters and fails it
-            "return L.length===2&&nw(e.textContent)===nw(L[0]+L[1]);}"
+            "var d=c.querySelector('.text-codex-description');if(!d||!leaf(d))return false;"
+            # the label element is the description's first text sibling: the innermost element holding the
+            # label. Both must be LEAVES (no element inside them), so a Connect control nested inside the
+            # description or the label cannot hide there, and the whole button must read exactly label +
+            # description. textContent concatenates adjacent spans with no whitespace (live DOM), so the
+            # comparison ignores whitespace: any extra text still adds characters and fails it.
+            "var w=d.parentElement,lb=null;for(var i=0;i<w.children.length;i++)"
+            "if(w.children[i]!==d&&!w.children[i].contains(d)){lb=w.children[i];break;}"
+            "if(!leaf(lb))return false;"
+            "return nw(e.textContent)===nw(lb.textContent+d.textContent);}"
             "var open=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL) + ");"
             "var loading=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL + ' [role="status"]') + ");"
             "var sect=os.filter(function(e){var h=hdr(e);return h==='plugins'||(h===null&&!headed(e));});"
             "var pl=sect.filter(appish);"
             "var ex=pl.filter(function(e){return lab(e)===want;});"
-            "var hit=ex.length===1?ex[0]:null;"
+            "var hit=ex.length===1?ex[0]:null;var amb=ex.length>1?ex.length:0;"
             "var un=pl.filter(function(e){return !plain(e);}).map(lab).filter(function(l){return l===want;});"
             "var uv=sect.filter(function(e){return !appish(e);}).map(lab).filter(function(l){return l===want;});"
             "if(hit&&!plain(hit)){un=[lab(hit)];hit=null;}"
             "if(!hit)return {hit:null,open:open,loading:loading,"
-            "seen:pl.filter(plain).map(lab).filter(Boolean).slice(0,20),unconnected:un,unverified:uv};"
+            "seen:pl.filter(plain).map(lab).filter(Boolean).slice(0,20),unconnected:un,unverified:uv,"
+            "ambiguous:amb};"
             "hit.click();return {hit:lab(hit),open:open,loading:false,seen:[],unconnected:[],"
-            "unverified:[]};})()")
+            "unverified:[],ambiguous:0};})()")
 
 
 def _composer_mentions_js():
@@ -2662,11 +2675,16 @@ def _composer_mentions_js():
             ".replace(/\\s+/g,' ').trim().toLowerCase();});})()")
 
 
-def _mention_offer(popup_open, seen, unconnected=(), loading=False, unverified=()):
+def _mention_offer(popup_open, seen, unconnected=(), loading=False, unverified=(), ambiguous=0,
+                   name=""):
     """What the popup showed, in words that say what to do: never opened (a code/DOM problem),
     listed but not connected (a human connects it), still on its loading skeleton (nothing matched,
     or ChatGPT is slow), opened empty (the app is not enabled here, or the name is wrong), or
     offered other entries."""
+    if ambiguous:
+        return (f"ambiguous: {ambiguous} rows named {name!r} — the driver will not pick one of several "
+                "identically named entries (they may be different apps). A human must disambiguate in "
+                "ChatGPT (rename or disconnect the duplicate)")
     if unconnected:
         return ("The popup lists " + ", ".join(repr(x[:40]) for x in dict.fromkeys(unconnected))
                 + " but it is NOT connected on this account (its row carries a Connect control) — a human "
@@ -2707,13 +2725,14 @@ def _insert_mention(c, name):
     if c.eval(_mention_type_js(name, token), timeout=45) is None:
         raise _PreClickFailure("composer not found while typing @mention")
     end = time.time() + _MENTION_WAIT_S
-    seen, unconnected, unverified, popup_open, loading = [], [], [], False, False
+    seen, unconnected, unverified, popup_open, loading, ambiguous = [], [], [], False, False, 0
     while time.time() < end:
         time.sleep(0.4)
         r = c.eval(_mention_pick_js(name, token), timeout=45) or {}
         seen = r.get("seen") or seen
         unconnected = r.get("unconnected") or unconnected
         unverified = r.get("unverified") or unverified
+        ambiguous = r.get("ambiguous") or ambiguous
         popup_open = popup_open or bool(r.get("open"))
         loading = bool(r.get("loading"))
         if r.get("hit"):
@@ -2746,7 +2765,7 @@ def _insert_mention(c, name):
     residue = _clear_after_mention_failure(c)
     raise _MentionFailure(
         f"mention_not_found: the composer offered no app named '{name}' for '@{name}' within "
-        f"{_MENTION_WAIT_S:.0f}s{residue}. {_mention_offer(popup_open, seen, unconnected, loading, unverified)}")
+        f"{_MENTION_WAIT_S:.0f}s{residue}. {_mention_offer(popup_open, seen, unconnected, loading, unverified, ambiguous, name)}")
 
 
 def _paste_prompt(c, prompt: str, mentions=()) -> None:
