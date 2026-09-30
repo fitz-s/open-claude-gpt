@@ -41,6 +41,15 @@ Follow-up route, found live on the same day:
   fails while none is visible), and the send button is the single one inside that composer's own form,
   never a document-wide first match (several is refused as ambiguous, and Enter is not pressed on a
   composer that cannot be named).
+- Every follow-up on a re-opened conversation failed `composer holds 0 normalized chars, prompt needs >= N
+  - paste looks truncated by a DOM stall`, with or without a `--mention`. The whole prompt HAD landed:
+  `execCommand('insertText')` acts on the focused editable, the page focuses the visible editor and a
+  hidden one cannot take focus, so the paste went to the visible editor while the verification read the
+  hidden one. It reproduced with the thread fully rendered (not a hydration race) and with no mention (not
+  the @ popup), and left the full prompt behind as a persisted draft. The form-bound composer above fixes
+  it; a test pins both halves (the paste lands where the focus is, and the old first-match expression
+  reads 0 chars from it).
+- A follow-up with no `--mention` never opens the @ popup or types an `@`.
 - A follow-up waits for the thread's turns to render before reading its baseline (the composer appears
   ~5s before them) and refuses before any paste or click if they never do, since a stale same-rid turn
   appearing after the click would read as a fresh send. A tab this command re-opened is closed on every

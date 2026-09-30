@@ -435,11 +435,12 @@ def test_a_preclick_failure_closes_the_reopened_tab_too(env, monkeypatch):
 
 # ---- hydration is a precondition; tab ownership on EVERY exit ---------------------------------------
 
-def _followup_env(monkeypatch, tab, reopened, hydrated, paste=None, select_raises=None):
+def _followup_env(monkeypatch, tab, reopened, hydrated, paste=None, select_raises=None,
+                  mention=("WebCodex Demo",)):
     """cmd_followup with the page's hydration forced, recording whether it pasted or clicked."""
     import types
     import cdp_consult as c
-    rec = {"pasted": 0, "clicked": 0, "closed": 0}
+    rec = {"pasted": 0, "clicked": 0, "closed": 0, "mentions": []}
 
     def fake_cdp(port, match=None, create_url=None):
         if match is not None and reopened:
@@ -448,6 +449,7 @@ def _followup_env(monkeypatch, tab, reopened, hydrated, paste=None, select_raise
 
     def do_paste(*a, **k):
         rec["pasted"] += 1
+        rec["mentions"].append(list(a[2]) if len(a) > 2 else None)
         if paste is not None:
             raise paste
 
@@ -478,7 +480,7 @@ def _followup_env(monkeypatch, tab, reopened, hydrated, paste=None, select_raise
     open(pf, "w").write("Continuing.\nBEGIN_RESPONSE:%s\nx\nEND_RESPONSE:%s\n" % (RID, RID))
     ns = types.SimpleNamespace(no_gate=True, conversation=CONV, prompt_file=pf, task=None, rid=RID,
                                model="Pro" if select_raises else "skip", model_family="skip",
-                               allow_model_mismatch=False, port=9333, mention=["WebCodex Demo"],
+                               allow_model_mismatch=False, port=9333, mention=list(mention),
                                watch=False, out=None)
     return c.cmd_followup(ns), rec
 
@@ -527,3 +529,12 @@ def test_a_reopened_tab_is_closed_on_a_pre_click_mention_refusal(env, monkeypatc
     rc, rec = _followup_env(monkeypatch, tab, reopened=True, hydrated=True,
                             paste=c._MentionFailure("mention_not_found: not an app"))
     assert rc == 3 and rec["clicked"] == 0 and rec["closed"] == 1
+
+
+def test_a_followup_without_a_mention_is_a_first_class_path(env, monkeypatch):
+    """The first round of a thread carries the app; a follow-up needs no mention and must not touch the
+    popup. cmd_followup hands the paste an EMPTY mention list, so _insert_mention is never reached."""
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=_turn(RID))
+    rc, rec = _followup_env(monkeypatch, tab, reopened=False, hydrated=True, mention=[])
+    assert rec["pasted"] == 1 and rec["mentions"] == [[]], "pasted with no mention to insert"
+    assert rec["clicked"] == 1 and rc == 0, "and it sends normally"

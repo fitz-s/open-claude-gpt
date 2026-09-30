@@ -583,7 +583,9 @@ function el(t,o){o=o||{};var n={tagName:t.toUpperCase(),_a:o.a||{},children:[],p
     while(n){if(ok.indexOf(n.tagName.toLowerCase())>=0||(n._a['data-message-author-role']!==undefined&&ok.indexOf('[data-message-author-role]')>=0))return n;n=n.parent;}return null;},
   contains:function(x){while(x){if(x===this)return true;x=x.parent;}return false;},
   querySelectorAll:function(sel){return ALL.filter(function(x){return x!==n&&n.contains(x)&&match(x,sel)})},
-  click:function(){this.clicked++}};
+  click:function(){this.clicked++},
+  focus:function(){if(!this.hiddenDeep())document.activeElement=this;},   // a hidden editor cannot take focus
+  _text:'',_sel:false};
   (o.c||[]).forEach(function(c){c.parent=n;n.children.push(c);});return n;}
 var ALL=[];function reg(n){ALL.push(n);n.children.forEach(reg);return n;}
 function match(x,sel){return sel.split(',').some(function(p){p=p.trim();
@@ -593,7 +595,8 @@ function match(x,sel){return sel.split(',').some(function(p){p=p.trim();
   if(p==='button[aria-label*="Send" i]')return x.tagName==='BUTTON'&&/send/i.test(x._a['aria-label']||'');
   if(p==='button[aria-label*="\u53d1\u9001"]')return x.tagName==='BUTTON'&&/\u53d1\u9001/.test(x._a['aria-label']||'');
   throw new Error('unsupported selector: '+p);});}
-function ed(o){o=o||{};o.a=Object.assign({role:'textbox',contenteditable:'true'},o.a||{});return el('div',o);}
+function ed(o){o=o||{};o.a=Object.assign({role:'textbox',contenteditable:'true'},o.a||{});var n=el('div',o);
+  Object.defineProperty(n,'innerText',{get:function(){return n._text}});return n;}
 function send(o){o=o||{};o.a=Object.assign({'aria-label':'Send'},o.a||{});return el('button',o);}
 var ACTIVE=null;
 var document={activeElement:null,readyState:'complete',
@@ -602,6 +605,11 @@ var document={activeElement:null,readyState:'complete',
     if(/input\[type="password"\]|iframe\[/.test(sel))return null;   // no login wall, no captcha frame
     return document.querySelectorAll(sel)[0]||null;}};
 var location={hostname:'chatgpt.com',pathname:'/c/x'};
+// execCommand acts on the FOCUSED editable, as in the browser: this is why a paste can land in one editor
+// while a read of another editor sees nothing.
+document.execCommand=function(cmd,ui,arg){var t=document.activeElement;if(!t)return false;
+  if(cmd==='selectAll'){t._sel=true;}else if(cmd==='delete'){if(t._sel){t._text='';t._sel=false;}}
+  else if(cmd==='insertText'){t._text+=arg;}return true;};
 """
 
 
@@ -724,3 +732,55 @@ def test_followup_thread_that_never_renders_is_reported_not_assumed(monkeypatch)
             return 0
 
     assert CDP._await_thread_rendered(C(), seconds=30) is False
+
+
+# ---- the paste on a re-opened page: it LANDED, and the verification read the wrong editor --------------
+# Live 2026-09-29/30: every follow-up on a conversation re-opened by URL failed "composer holds 0 normalized
+# chars, prompt needs >= N - paste looks truncated by a DOM stall", with or without a --mention. The whole
+# prompt HAD landed (the visible editor held it, and it persisted as a draft): execCommand acts on the focused
+# editable, the page autofocuses the visible editor, and a hidden editor cannot take focus, so the paste went
+# to the visible editor while document.querySelector(...) handed the reads the hidden one. Not a hydration
+# race (it reproduced with the thread fully rendered) and not the @ popup (it reproduced with no mention).
+
+_CHUNK = "the whole prompt " * 40
+
+
+def _paste_then_read(tree_js, get_js=None):
+    """The exact JS the driver runs for clear -> paste -> verify, in ONE page, focus on the visible editor."""
+    clear, paste, read = CDP._clear_composer_js(), CDP._paste_chunk_js(_CHUNK), CDP._composer_text_js()
+    if get_js is not None:                     # counterfactual: swap in another way of finding the composer
+        clear, paste, read = (x.replace(CDP._composer_get_js(), get_js) for x in (clear, paste, read))
+    expr = ("(function(){var c=" + clear + ";var p=" + paste + ";var r=" + read + ";"
+            "var v=ALL.filter(function(x){return x._a.id==='V'})[0];"
+            "return {clear:c,pasted:p,read:(r||'').length,landed:v._text.length};})()")
+    return _run_forms(tree_js, expr, active="ALL.filter(function(x){return x._a.id==='V'})[0]")
+
+
+def test_the_paste_verification_reads_the_editor_the_paste_landed_in():
+    r = _paste_then_read(_HIDDEN_FORM_FIRST)
+    assert r["landed"] == len(_CHUNK) and r["read"] == len(_CHUNK), r
+    assert r["clear"] == 0 and r["pasted"] == len(_CHUNK)
+
+
+def test_the_old_first_match_expression_read_zero_chars_after_a_paste_that_landed():
+    old = "document.querySelector(" + json.dumps(CDP._COMPOSER_SEL) + ")"
+    r = _paste_then_read(_HIDDEN_FORM_FIRST, get_js=old)
+    assert r["landed"] == len(_CHUNK), "the paste went to the visible editor, where the focus was"
+    assert r["read"] == 0, "and the verification read the hidden one: 'composer holds 0 normalized chars'"
+
+
+# ---- a follow-up with no --mention never opens the @ popup ---------------------------------------------
+
+def test_a_paste_without_a_mention_never_types_an_at_or_touches_the_popup(monkeypatch):
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    c = _FakeComposer([])
+    seen = []
+    real = c.eval
+    c.eval = lambda js, timeout=None: (seen.append(js), real(js, timeout))[1]
+    for mentions in ([], None, ()):
+        CDP._paste_prompt(c, "plain body", mentions)
+    assert not any("data-cgc-pre" in js or "data-mention-list-scroll-area" in js for js in seen)
+    chunks = [json.loads(js.split("insertText',false,", 1)[1].rsplit(");", 1)[0])
+              for js in seen if "insertText',false," in js]
+    assert chunks and not any(x.startswith("@") for x in chunks), "no '@' is ever typed"
+    assert c.text == "plain body"

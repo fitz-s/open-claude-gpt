@@ -43,8 +43,13 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid>
 - Reviewing `main`/a branch → `--ref <sha>` (commit-pinned; a branch can move mid-consult).
 - No code subject at all (a proof, research, writing) → add `--no-code`.
 - User names a ChatGPT app/plugin (`@WebCodex Demo`) → add `--mention "WebCodex Demo"` (no `@`,
-  repeatable, works with `--followup`). That is the whole job: the daemon picks it from the
-  composer's @ popup before pasting. Never write `@App` into `--task`, never touch the browser.
+  repeatable). That is the whole job: the daemon picks it from the composer's @ popup before pasting.
+  A `--followup` needs NO `--mention`: the first round of the thread already attached the app, and a
+  follow-up without one never opens the popup. `--mention` on a follow-up is optional and, if given,
+  still refuses before the send when it cannot be confirmed. Whether the connector stays active for
+  later messages of the same thread is NOT verified (the thread DOM shows no marker either way); if a
+  follow-up depends on the app's tools and the answer shows it did not use them, re-fire with
+  `--mention` rather than assuming it carried over. Never write `@App` into `--task`, never touch the browser.
   Which apps exist: known today = **`WebCodex Demo`**; the live list is
   `python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py apps` (from `CGC_APPS`). A short or
   lower-case name (`--mention webcodex`) snaps to the listed spelling. Envelope error
