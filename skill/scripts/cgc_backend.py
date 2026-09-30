@@ -613,17 +613,25 @@ def enqueue_round(a, prompt: str, out: str) -> int:
             # parent has no recorded conversation — still refuses, naming the one command that can
             # actually find it.
             prow = s.get_round(parent)
-            if prow is not None and (prow["kind"] == "retrieve" or not prow.get("rendered_prompt")):
-                # The wait verifies END_RESPONSE:<parent rid> on the page. A retrieve sends nothing and
-                # a round with no rendered prompt never put its rid anywhere, so no turn can ever
-                # carry it: whatever conversation is named, the wait could only run out its window.
-                # Not overridable by --conversation, because the missing thing is on the page, not here.
+            if prow is not None and prow["kind"] == "retrieve":
+                # A retrieve sends nothing, so its rid was never on any page: whatever conversation is
+                # named, the wait could only run out its window. The missing thing is on the page, not in
+                # the store, so an explicit --conversation does not help.
                 sys.stderr.write(
-                    f"CGC_ERROR retrieve_parent_sends_nothing: --parent {parent} "
-                    + ("is itself a retrieve, which sends nothing" if prow["kind"] == "retrieve"
-                       else "has no stored prompt, so its rid was never on any page")
-                    + " — there is no turn to recover. Retrieve the round that actually sent "
-                    "(its own --parent chain leads to it).\n")
+                    f"CGC_ERROR retrieve_parent_sends_nothing: --parent {parent} is itself a retrieve, "
+                    "which sends nothing — there is no turn to recover. Retrieve the round that actually "
+                    "sent (its own --parent chain leads to it).\n")
+                return 2
+            if prow is not None and conv in (None, "auto") and not prow.get("rendered_prompt"):
+                # No stored prompt means no rid was ever recorded as sent from here, so with the
+                # conversation coming FROM the store there is nothing to verify against. A round migrated
+                # from the old spool (import_round writes none) is a legitimate retrieve target only when
+                # the caller says where it lives: an explicit --conversation is honoured, as it is for a
+                # never-sent parent below.
+                sys.stderr.write(
+                    f"CGC_ERROR retrieve_parent_sends_nothing: --parent {parent} has no stored prompt, so "
+                    "the store cannot say which conversation its rid lives in. If it was sent (for example "
+                    "migrated from the old spool), pass --conversation <id> explicitly.\n")
                 return 2
             if prow is not None and conv in (None, "auto") and _release_eligible(s, prow):
                 # The store durably proves the parent never sent (a stamped pre-click refusal, a

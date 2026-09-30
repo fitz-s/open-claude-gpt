@@ -2614,13 +2614,26 @@ def test_a_retrieve_of_a_retrieve_is_refused_whatever_conversation_is_named(env,
     assert s.get_round("REQ-20260721-000000-0000c2") is None
 
 
-def test_a_parent_with_no_stored_prompt_is_refused_explicitly(env, capsys):
+def test_a_parent_with_no_stored_prompt_is_refused_only_when_the_conversation_would_come_from_the_store(env, capsys):
+    """import_round (the old-spool migration) writes no rendered_prompt, so such a round is a real retrieve
+    target when the caller says where it lives; without that there is nothing to resolve from."""
     store_mod, backend, s, tmp = env
-    s.create_round("REQ-20260721-000000-0000b0", "submit", thread_id=_CONV_FU)   # no prompt ever stored
+    s.create_round("REQ-20260721-000000-0000b0", "submit", thread_id=_CONV_FU)   # no prompt stored
     capsys.readouterr()
     assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000b1", "REQ-20260721-000000-0000b0") == 2
     err = capsys.readouterr().err
-    assert "retrieve_parent_sends_nothing" in err and "no stored prompt" in err
+    assert "retrieve_parent_sends_nothing" in err and "no stored prompt" in err and "--conversation <id>" in err
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000b2", "REQ-20260721-000000-0000b0",
+                     conversation=_CONV_FU) == 0
+    assert json.loads(s.get_round("REQ-20260721-000000-0000b2")["spec_json"])["conversation"] == _CONV_FU
+
+
+def test_a_migrated_round_is_a_retrieve_target_with_an_explicit_conversation(env):
+    store_mod, backend, s, tmp = env
+    s.import_round("REQ-20260721-000000-0000b9", "submit", store_mod.POSSIBLY_ACCEPTED, thread_id=_CONV_FU)
+    assert s.get_round("REQ-20260721-000000-0000b9").get("rendered_prompt") in (None, "")
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000ba", "REQ-20260721-000000-0000b9",
+                     conversation=_CONV_FU) == 0
 
 
 def test_an_unknown_parent_with_an_explicit_conversation_is_still_allowed(env):
