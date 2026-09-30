@@ -14,54 +14,60 @@ has none. Probed live (2026-09-29), it is a floating panel whose scroll area is
 `[data-mention-list-scroll-area]`, and every row is a plain `<button data-list-navigation-item>`, so
 the old selector matched zero nodes. The picker now reads those rows, and hardens around them:
 
-- A candidate must be shaped like an app row, read off the popup's own markup: a connector icon
+- **The name is matched exactly, never by prefix.** A prefix rule cannot tell a different app from the
+  one asked for: with only "Notion Calendar" enabled, `--mention Notion` would click it, every later
+  check would pass, and the prompt would go out with the wrong app. Short names are still snapped to the
+  known-apps list by the CLI before this; an unlisted short name now fails closed and the error names
+  what the popup did offer.
+- **A candidate must be shaped like an app row**, read off the popup's own markup: a connector icon
   (`rounded-2xs`; Add actions and file rows use other icons) under the **Plugins** header, or in a bare
-  single-section popup where only an exact name counts. Any other row is never clicked and is reported
-  as unverified. It counts as connected only if its content block is exactly icon, label and description:
-  an unconnected app has a bare **Connect** text node there, so the test is structural, holds in any UI
-  language and for a two-line label-plus-Connect row, and is never clicked (it would start an
-  authorization flow). The name is matched first, so an unconnected exact app is refused, never
-  replaced by a connected app that merely starts with the same text.
-- Success is "the composer gained an app mention node" (`[app-mention-name]`), polled for ~2.4s after
-  the one click, not "the HTML changed", which any stray click satisfies. The same count is re-checked
-  after the prompt is pasted, so a paste that eats a mention is not sent.
+  single-section popup. Any other row is never clicked and is reported as unverified. This is an
+  inference from today's markup, not a documented contract.
+- **A row counts as connected only if the whole button reads exactly icon, label, description.** An
+  unconnected app carries a **Connect** control or text inside the label, beside the description, or beside
+  the content block, in any UI language; every such shape is refused and never clicked (it would start an
+  authorization flow). An unconnected exact app is refused, never replaced by another.
+- **Success is the requested app's own mention node.** After the one click the composer's
+  `[app-mention-name]` nodes are polled for (~2.4s) and the one that appeared must carry the requested
+  name; a node for another app, or none, clears the composer and refuses. After the prompt is pasted the
+  composer must still hold exactly the requested apps.
 - The failure names which thing happened: popup never opened (a DOM/code bug), only its loading
   skeleton (ChatGPT's own state while it searches), opened empty, app listed but not connected, a row
-  present but not app-shaped, other apps offered, or a row was clicked that turned out not to be an app.
+  present but not app-shaped, other apps offered, or a click that produced the wrong app or none.
 
 Follow-up route, found live on the same day:
 
-- On a conversation re-opened by URL (a follow-up whose tab was gone), the mention never took. The page
-  holds a hidden 0x0 editor BEFORE the visible one and `document.querySelector` returned it, so the
-  typing and the picked app went to the visible editor while every read of the composer (mention count,
-  text, clear) looked at the hidden one: a mention that had landed read as "the composer took no app
-  mention", and the follow-up was refused. The composer is now resolved once, by structure, and the
-  whole send path is bound to that one resolution: the visible editor inside a `<form>` (an edit-message
-  box in a turn is not in one; focus breaks a tie), with no fallback to a hidden editor (readiness
-  fails while none is visible), and the send button is the single one inside that composer's own form,
-  never a document-wide first match (several is refused as ambiguous, and Enter is not pressed on a
-  composer that cannot be named).
-- Every follow-up on a re-opened conversation failed `composer holds 0 normalized chars, prompt needs >= N
-  - paste looks truncated by a DOM stall`, with or without a `--mention`. The whole prompt HAD landed:
-  `execCommand('insertText')` acts on the focused editable, the page focuses the visible editor and a
-  hidden one cannot take focus, so the paste went to the visible editor while the verification read the
-  hidden one. It reproduced with the thread fully rendered (not a hydration race) and with no mention (not
-  the @ popup), and left the full prompt behind as a persisted draft. The form-bound composer above fixes
-  it; a test pins both halves (the paste lands where the focus is, and the old first-match expression
-  reads 0 chars from it).
+- Every follow-up on a conversation re-opened by URL failed `composer holds 0 normalized chars, prompt
+  needs >= N - paste looks truncated by a DOM stall`, with or without a `--mention`. The whole prompt HAD
+  landed: the page holds a hidden 0x0 editor BEFORE the visible one and `document.querySelector` returned
+  it, while `execCommand('insertText')` acts on the focused editable (the visible one). The paste went to
+  the visible editor, the verification read the hidden one, and the full prompt was left behind as a
+  persisted draft. It reproduced with the thread fully rendered (not a hydration race) and with no
+  mention (not the @ popup). A mention hit the same wrong-editor read ("the composer took no app mention").
+- The composer is now resolved once, by structure, and the whole send path is bound to it: the visible
+  editor inside a `<form>` (an edit-message box in a turn is not in one; focus breaks a tie), no fallback
+  to a hidden editor (readiness fails while none is visible), and the send button is the single visible
+  one inside that composer's own form. Several send buttons, a disabled one, no visible composer, or
+  focus outside the composer refuse before the click and Enter is not pressed; Enter remains only for a
+  composer with no send button yet whose focus is verified inside it.
 - A follow-up with no `--mention` never opens the @ popup or types an `@`.
 - A follow-up waits for the thread's turns to render before reading its baseline (the composer appears
-  ~5s before them) and refuses before any paste or click if they never do, since a stale same-rid turn
-  appearing after the click would read as a fresh send. A tab this command re-opened is closed on every
-  exit before the send click, so a draft never outlives a refusal; a tab it attached to is never closed,
-  and after a click attempt the tab stays as evidence.
+  ~5s before them) and refuses before any paste or click if they never do. A tab a command opened is
+  closed on every exit before the send click; a tab it attached to (including `--reuse-tab`) is never
+  closed, and after a click attempt the tab stays as evidence.
 - `await` no longer calls a pre-click refusal "already sent". A follow-up inherits its parent's
   conversation at enqueue, so the envelope's old test (the round has a conversation) was true for every
-  follow-up, and a mention or login refusal that provably never clicked told the caller to RETRIEVE a
-  reply that did not exist. It now branches on the durable not-sent stamp: stamped means `pre-send`,
-  `retryable:true`, `next_command` = `cgc_spool.py refire --rid <rid>`; an unstamped blocker after a
-  confirmed send stays `post-send` / retrieve. `enqueue --kind retrieve` refuses a parent the store
-  proves never sent (`retrieve_parent_never_sent`) instead of watching ten minutes for a missing turn.
+  follow-up, and a refusal that provably never clicked told the caller to RETRIEVE a reply that did not
+  exist. It now branches on the durable not-sent stamp: stamped means `pre-send`, `retryable:true`,
+  `next_command` = `cgc_spool.py refire --rid <rid>`; an unstamped blocker after a confirmed send stays
+  `post-send` / retrieve.
+- `enqueue --kind retrieve` refuses a parent that is itself a retrieve, and a parent the store proves
+  never sent (`retrieve_parent_never_sent`), instead of watching ten minutes for a turn that never
+  existed. An explicit `--conversation` is honoured (a retrieve is read-only, and the caller may know of a
+  send made out of band), which also keeps a round migrated from the old spool (no stored prompt) usable.
+
+Not verified: whether an app attached by a thread's first message stays active for later messages (the
+thread DOM shows no marker either way), and what clicking a file row leaves attached outside the composer.
 
 Pinned by `tests/fixtures/mention_popup.json`, a scrubbed capture of the live popup (private app names
 replaced), run through the real picker JS in node against a DOM rebuilt from it.

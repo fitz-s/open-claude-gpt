@@ -78,12 +78,12 @@ outcome names the artifact it produced. Act on the fields, never on the code alo
   messages, so it is a decision you make FROM the answer, never a step the envelope proposes.
 - `human_action` set → relay exactly that to the user (login/captcha/rate-limit/safeguard
   refusal), then do `next_command` once it's cleared.
-- `retryable:true` → re-run the SAME fire (use the same `--request-key`). A `blocked` round marked
-  `(pre-send)` (login, captcha, a `--mention` that could not be confirmed) was proven never sent by the
-  driver's own refusal: once the cause in `error` is fixed, run its `next_command`
-  (`cgc_spool.py refire --rid <rid>`, a fresh rid, same prompt and spec) — never a retrieve, there is
-  no answer to find. `retryable:false` with state `possibly_accepted` (or a `(post-send)` blocker) →
-  the send may have landed: NEVER re-fire; follow `next_command` (retrieve by conversation).
+- A `blocked` round marked `(pre-send)` (login, captcha, a `--mention` that could not be confirmed) was
+  proven never sent by the driver's own refusal. Fix the cause in `error`, then run its `next_command`,
+  `cgc_spool.py refire --rid <rid>` (a fresh rid, the same prompt and spec): nothing can duplicate. Never
+  retrieve it, there is no answer to find. Otherwise `retryable:true` → re-run the SAME fire (same
+  `--request-key`). `retryable:false` with state `possibly_accepted` (or a `(post-send)` blocker) → the
+  send may have landed: NEVER re-fire; follow `next_command` (retrieve by conversation).
 - Nothing useful → `log_path` is the full send+wait transcript; read it before guessing.
 - ChatGPT failing a turn ("Thinking failed") is handled for you: the daemon sends ONE "continue" in
   the same thread and the same rid keeps waiting. If that continue also fails, the round ends `failed`
