@@ -613,14 +613,37 @@ def enqueue_round(a, prompt: str, out: str) -> int:
             # parent has no recorded conversation — still refuses, naming the one command that can
             # actually find it.
             prow = s.get_round(parent)
-            if prow is not None and _release_eligible(s, prow) and prow["state"] != store_mod.GATE_REJECTED \
-                    and prow.get("rendered_prompt"):
+            if prow is not None and (prow["kind"] == "retrieve" or not prow.get("rendered_prompt")):
+                # The wait verifies END_RESPONSE:<parent rid> on the page. A retrieve sends nothing and
+                # a round with no rendered prompt never put its rid anywhere, so no turn can ever
+                # carry it: whatever conversation is named, the wait could only run out its window.
+                # Not overridable by --conversation, because the missing thing is on the page, not here.
+                sys.stderr.write(
+                    f"CGC_ERROR retrieve_parent_sends_nothing: --parent {parent} "
+                    + ("is itself a retrieve, which sends nothing" if prow["kind"] == "retrieve"
+                       else "has no stored prompt, so its rid was never on any page")
+                    + " — there is no turn to recover. Retrieve the round that actually sent "
+                    "(its own --parent chain leads to it).\n")
+                return 2
+            if prow is not None and conv in (None, "auto") and _release_eligible(s, prow):
+                # The store durably proves the parent never sent (a stamped pre-click refusal, a
+                # failure with no send attempt, or a gate rejection), so the page holds no answer and
+                # the wait would only watch ten minutes for a turn that never existed. Only when the
+                # conversation is being taken FROM the store: an explicit --conversation is the caller
+                # asserting something the store cannot know (a send made out of band), and a retrieve
+                # is read-only, so it is honoured rather than second-guessed.
                 sys.stderr.write(
                     f"CGC_ERROR retrieve_parent_never_sent: --parent {parent} is durably proven NOT "
-                    f"sent ({prow['state']}, {prow.get('send_disposition') or 'no send attempt'}), so "
-                    "there is no answer on the page to retrieve — a retrieve would only watch for a "
-                    "turn that never existed. Re-fire it instead (nothing can duplicate): python3 "
-                    f"{_spool.__file__} refire --rid {parent}\n")
+                    f"sent ({prow['state']}"
+                    + ("" if prow["state"] == store_mod.GATE_REJECTED else
+                       f", {prow.get('send_disposition') or 'no send attempt'}")
+                    + "), so there is no answer on the page to retrieve — a retrieve would only watch "
+                    "for a turn that never existed. "
+                    + ("The gate refused it before any send: fix what it reported, then re-fire: "
+                       if prow["state"] == store_mod.GATE_REJECTED else
+                       "Re-fire it instead (nothing can duplicate): ")
+                    + f"python3 {_spool.__file__} refire --rid {parent}\n"
+                    "(If you know it was sent outside this store, pass --conversation <id> explicitly.)\n")
                 return 2
             if conv in (None, "auto"):
                 conv = s.conversation_of(parent)

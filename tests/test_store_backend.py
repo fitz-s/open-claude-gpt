@@ -2560,3 +2560,72 @@ def test_a_retrieve_of_an_uncertain_round_is_still_allowed(env):
                                        conversation="auto", parent="REQ-20260721-000000-0000e0"),
                                "", str(tmp / "r2.txt"))
     assert rc == 0 and s.get_round("REQ-20260721-000000-0000e1") is not None
+
+
+# ---- the retrieve guard: what it refuses, and what it must not ------------------------------------
+
+def _retrieve(backend, s, tmp, rid, parent, conversation="auto"):
+    return backend.enqueue_round(_enq_ns(rid, None, kind="retrieve", conversation=conversation, parent=parent),
+                                 "", str(tmp / (rid[-6:] + ".txt")))
+
+
+def test_an_explicit_conversation_overrides_the_never_sent_proof(env, capsys):
+    """A retrieve is read-only, and an explicit --conversation is the caller asserting a send the store
+    cannot know about (made out of band). The guard only speaks when the conversation is taken FROM the
+    store."""
+    store_mod, backend, s, tmp = env
+    rid = _blocked_followup(store_mod, backend, s, tmp)
+    assert backend._release_eligible(s, s.get_round(rid)), "the store proves this parent never sent"
+    capsys.readouterr()
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000e2", rid, conversation=_CONV_FU) == 0
+    spec = json.loads(s.get_round("REQ-20260721-000000-0000e2")["spec_json"])
+    assert spec["conversation"] == _CONV_FU and spec["parent_rid"] == rid
+
+
+def test_a_gate_rejected_parent_is_refused_with_the_gate_named(env, capsys):
+    store_mod, backend, s, tmp = env
+    rid = "REQ-20260721-000000-0000d0"
+    s.create_round(rid, "submit", prompt="p", thread_id=_CONV_FU)
+    s.set_state(rid, store_mod.READY)
+    s.gate_reject(rid, "unverified: gh timed out")
+    capsys.readouterr()
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000d1", rid) == 2
+    err = capsys.readouterr().err
+    assert "retrieve_parent_never_sent" in err and "gate refused it before any send" in err
+    assert f"refire --rid {rid}" in err and "--conversation <id>" in err
+    assert s.get_round("REQ-20260721-000000-0000d1") is None
+
+
+def test_a_retrieve_of_a_retrieve_is_refused_whatever_conversation_is_named(env, capsys):
+    """A retrieve sends nothing, so its rid was never on any page: the wait could only time out. The
+    missing thing is on the page, not in the store, so an explicit --conversation does not help."""
+    store_mod, backend, s, tmp = env
+    s.create_round("REQ-20260721-000000-0000c0", "submit", prompt="p", thread_id=_CONV_FU)
+    s.set_state("REQ-20260721-000000-0000c0", store_mod.READY)
+    aid = s.begin_send("REQ-20260721-000000-0000c0", "p", store_mod.sha256("p"), daemon_instance_id="d1")
+    s.mark_possibly_accepted(aid, "send failed - retrieve, don't resend")
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000c1", "REQ-20260721-000000-0000c0") == 0
+    capsys.readouterr()
+    for conv in ("auto", _CONV_FU):
+        assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000c2", "REQ-20260721-000000-0000c1",
+                         conversation=conv) == 2
+        err = capsys.readouterr().err
+        assert "retrieve_parent_sends_nothing" in err and "itself a retrieve" in err
+    assert s.get_round("REQ-20260721-000000-0000c2") is None
+
+
+def test_a_parent_with_no_stored_prompt_is_refused_explicitly(env, capsys):
+    store_mod, backend, s, tmp = env
+    s.create_round("REQ-20260721-000000-0000b0", "submit", thread_id=_CONV_FU)   # no prompt ever stored
+    capsys.readouterr()
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000b1", "REQ-20260721-000000-0000b0") == 2
+    err = capsys.readouterr().err
+    assert "retrieve_parent_sends_nothing" in err and "no stored prompt" in err
+
+
+def test_an_unknown_parent_with_an_explicit_conversation_is_still_allowed(env):
+    """Recovering a round this store never heard of (sent from another machine, or before the store):
+    nothing to second-guess, and it is read-only."""
+    store_mod, backend, s, tmp = env
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000a1", "REQ-20260721-000000-0000a0",
+                     conversation=_CONV_FU) == 0
