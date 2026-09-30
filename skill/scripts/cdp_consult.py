@@ -583,30 +583,51 @@ _ROLE_FN = ("function __cgcRole(el){return el.getAttribute('data-message-author-
             "el.getAttribute('data-turn')||"
             "((el.getAttribute('data-chatgpt-search-unit-key')||'').split(':').pop())||'';}")
 
+# Layout-independent innerText approximation: a textContent walk that re-inserts newlines at block
+# boundaries, so the extracted answer keeps its line structure WITHOUT needing the tab rendered.
+_TEXT_FN = ("function __cgcText(el){if(!el)return '';"
+            "var BLOCK=/^(P|DIV|LI|UL|OL|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE|TABLE|TR|THEAD|TBODY|SECTION|ARTICLE|HR)$/;"
+            "var out='';(function w(n){for(var i=0;i<n.childNodes.length;i++){var c=n.childNodes[i];"
+            "if(c.nodeType===3){out+=c.nodeValue;}else if(c.nodeType===1){"
+            "if(c.tagName==='BR'){out+='\\n';continue;}var b=BLOCK.test(c.tagName);if(b)out+='\\n';w(c);if(b)out+='\\n';}}})(el);"
+            "return out.replace(/[ \\t]+\\n/g,'\\n').replace(/\\n{3,}/g,'\\n\\n');}")
+
+# The rid regex shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) shared by every rid-reading regex in this file.
+_RID_RE_SRC = r"REQ-\d{8}-\d{6}-[0-9a-f]{6}"
+
+# The page-side mirror of _turn_canonical_rid (SHARED CONTRACT #3): a user turn's OWN rid is the rid
+# of the LAST complete, in-order BEGIN_RESPONSE:<rid>/END_RESPONSE:<rid> pair of bare lines in its
+# block-aware text. tests/test_wait_virtualized_thread.py holds the two to the same answers.
+_RID_FN = ("function __cgcRid(t){var re=/^(BEGIN|END)_RESPONSE:(" + _RID_RE_SRC + ")$/,ob={},rid=null,"
+           "ls=(t||'').replace(/\\r\\n/g,'\\n').split('\\n');"
+           "for(var i=0;i<ls.length;i++){var m=ls[i].trim().match(re);if(!m)continue;"
+           "if(m[1]==='BEGIN')ob[m[2]]=1;else if(ob[m[2]])rid=m[2];}return rid;}")
+
 _NODE_FN = (
-    _ROLE_FN +
-    # __cgcNode(BG, turnIndex): turnIndex is OPTIONAL. Omitted/undefined/negative -> UNSCOPED,
-    # the legacy 'auto' behavior (step 1 searches the whole document; step 2 falls back to only
-    # AFTER the last user node). Given (0-based ordinal of a user turn, DOM order, among
-    # querySelectorAll(_JS_ANY)'s user-role matches) -> SCOPED to the interval strictly between
-    # that turn and the NEXT user turn (or end of conversation): this is the [S3] fix — a
-    # source-pinned retrieve's answer may come ONLY from assistant nodes inside its own turn's
-    # interval, never from a later round's nodes, even when they happen to contain the same BEGIN
-    # token (e.g. the model echoing/quoting it). Returns null when turnIndex is scoped but that
-    # ordinal's user node is not currently in the DOM (virtualized away) — the caller must fail
+    _ROLE_FN + _TEXT_FN + _RID_FN +
+    # __cgcSrc(nx, RID): index in nx of the source turn — the LAST user node whose OWN canonical rid
+    # is RID (the last, so a same-rid resend owns the answer) — or -1 when it is not rendered.
+    "function __cgcSrc(nx,RID){var EN='END_RESPONSE:'+RID,s=-1;"
+    "for(var j=0;j<nx.length;j++){if(__cgcRole(nx[j])==='user'&&(nx[j].textContent||'').indexOf(EN)>=0"
+    "&&__cgcRid(__cgcText(nx[j]))===RID)s=j;}return s;}"
+    # __cgcNode(BG, RID): RID is OPTIONAL. Omitted/null -> UNSCOPED, the legacy 'auto' behavior
+    # (step 1 searches the whole document; step 2 falls back to only AFTER the last user node).
+    # Given -> SCOPED to the interval strictly between the source turn (__cgcSrc) and the NEXT user
+    # node (or end of conversation): this is the [S3] fix — a source-pinned wait's answer may come
+    # ONLY from assistant nodes inside its own turn's interval, never from a later round's nodes,
+    # even when they happen to contain the same BEGIN token (e.g. the model echoing/quoting it).
+    # The source turn is found by WHAT it says, on every call, never by its ordinal: a re-opened
+    # long thread renders every turn and then unmounts the older ones, so "the 5th user turn" named
+    # no turn at all (the waiter read len=0 for 90 minutes beside a finished answer) or, worse, a
+    # LATER round's turn. Returns null when the source turn is not rendered — the caller must fail
     # closed rather than search outside the (unresolvable) interval.
     "function __cgcBody(n,BG){var m=n.querySelectorAll('[data-markdown-text-style=\"assistant-message\"]');"
     "for(var i=m.length-1;i>=0;i--){if((m[i].textContent||'').indexOf(BG)>=0)return m[i];}return n;}"
-    "function __cgcNode(BG,turnIndex){"
+    "function __cgcNode(BG,RID){"
     "var nx=document.querySelectorAll(" + _JS_ANY + ");"
-    "var scoped=(turnIndex!==undefined&&turnIndex!==null&&turnIndex>=0);"
-    "var lo=-1,hi=nx.length;"
-    "if(scoped){"
-    "var seen=-1;lo=-1;hi=nx.length;"
-    "for(var j=0;j<nx.length;j++){if(__cgcRole(nx[j])==='user'){seen++;"
-    "if(seen===turnIndex){lo=j;}else if(seen===turnIndex+1){hi=j;break;}}}"
-    "if(lo<0)return null;"
-    "}"
+    "var scoped=!!RID,lo=-1,hi=nx.length;"
+    "if(scoped){lo=__cgcSrc(nx,RID);if(lo<0)return null;"
+    "for(var j=lo+1;j<nx.length;j++){if(__cgcRole(nx[j])==='user'){hi=j;break;}}}"
     # 1) exact: any assistant node containing our (unique) BEGIN sentinel, newest-first. Scoped ->
     #    within [lo,hi) only. Unscoped -> the whole document (lo=-1,hi=nx.length), matching the
     #    original global search.
@@ -625,14 +646,11 @@ _NODE_FN = (
     "return best?__cgcBody(best,''):best;}"
 )
 
-# Layout-independent innerText approximation: a textContent walk that re-inserts newlines at block
-# boundaries, so the extracted answer keeps its line structure WITHOUT needing the tab rendered.
-_TEXT_FN = ("function __cgcText(el){if(!el)return '';"
-            "var BLOCK=/^(P|DIV|LI|UL|OL|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE|TABLE|TR|THEAD|TBODY|SECTION|ARTICLE|HR)$/;"
-            "var out='';(function w(n){for(var i=0;i<n.childNodes.length;i++){var c=n.childNodes[i];"
-            "if(c.nodeType===3){out+=c.nodeValue;}else if(c.nodeType===1){"
-            "if(c.tagName==='BR'){out+='\\n';continue;}var b=BLOCK.test(c.tagName);if(b)out+='\\n';w(c);if(b)out+='\\n';}}})(el);"
-            "return out.replace(/[ \\t]+\\n/g,'\\n').replace(/\\n{3,}/g,'\\n\\n');}")
+
+def _node_call(rid, scoped):
+    """The __cgcNode call for rid's answer — scoped to rid's own turn, or the legacy unscoped read."""
+    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
+    return f"__cgcNode({begin},{json.dumps(rid)})" if scoped else f"__cgcNode({begin})"
 
 
 # ---- SHARED CONTRACT #1: fence-aware line-anchored sentinel parser (v3) -----
@@ -743,37 +761,38 @@ def _sentinel_js(rid: str, text_expr: str) -> str:
     )
 
 
-def _detect_js(rid: str, turn_index=None) -> str:
-    """Returns JSON {generating,done,blocker,len,begin,end,ac} for the answer node.
+def _detect_js(rid: str, *, scoped=False) -> str:
+    """Returns JSON {generating,done,blocker,failed,node,len,begin,end,ac} for the answer node.
     done comes from the canonical bare-line _sentinel_js parser (SHARED CONTRACT #1) — a line
     merely CONTAINING BEGIN/END_RESPONSE:<rid> (quoted in prose or a code block) never counts,
     only a bare standalone sentinel line does. This is NOT stop-button driven: the model writes
     END_RESPONSE only as its final line, so its presence == complete + extractable. Depending on
     the stop-button was fragile — if that UI selector ever persists, done would never fire and
-    wait would only return on timeout. begin/end/ac are diagnostics for the heartbeat.
+    wait would only return on timeout. node/begin/end/ac are diagnostics for the heartbeat: node
+    is 'found', 'none' (no assistant node in the interval yet) or 'source_unrendered' (the scoped
+    source turn is not in the DOM, so there is no interval to read) — len=0 alone cannot tell
+    "not answered yet" from "looking in the wrong place".
 
-    turn_index: when given (a source-pinned wait — see cmd_wait/_locate_source_turn), the answer
-    node is looked up SCOPED to that turn's interval via __cgcNode's turnIndex ([S3] fix: an
-    answer may only come from its own source turn's interval, never a later round's). Omitted
-    (None) keeps the legacy unscoped 'auto' lookup."""
+    scoped: a source-pinned wait (cmd_wait with a concrete rid) reads the answer ONLY from rid's
+    own turn's interval ([S3] fix: never a later round's), re-finding that turn by its canonical
+    rid on every call. False keeps the legacy unscoped 'auto' lookup."""
     begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
     end = json.dumps(f"END_RESPONSE:{rid}")
     sentinel = _sentinel_js(rid, "__cgcText(node)")
-    node_call = f"__cgcNode({begin})" if turn_index is None else f"__cgcNode({begin},{int(turn_index)})"
-    ti_js = "-1" if turn_index is None else str(int(turn_index))
     return (
-        "(function(){" + _NODE_FN + _TEXT_FN +
+        "(function(){" + _NODE_FN +
         "var a=document.querySelectorAll(" + _JS_A + ");"
-        "var BG=" + begin + ",EN=" + end + ";"
-        "var node=" + node_call + ";"
+        "var BG=" + begin + ",EN=" + end + ",RID=" + (json.dumps(rid) if scoped else "null") + ";"
+        "var node=" + _node_call(rid, scoped) + ";"
+        "var nx=document.querySelectorAll(" + _JS_ANY + "),src=RID?__cgcSrc(nx,RID):-1;"
+        "var where=node?'found':(RID&&src<0)?'source_unrendered':'none';"
         # ChatGPT's own "this turn will never answer" marker, read from the SOURCE turn's container:
-        # the user node at turn_index when the caller resolved one (a later prompt can quote the BEGIN
-        # token, so a substring match could read another turn's marker); the last user node carrying
-        # BG only for an unscoped 'auto' wait, which by definition watches the latest turn.
-        "var failed=null;(function(){var us=[].slice.call(document.querySelectorAll(" + _JS_ANY + "))"
-        ".filter(function(e){return __cgcRole(e)==='user';}),u=null,TI=" + ti_js + ";"
-        "if(TI>=0){u=us[TI]||null;}else{for(var i=us.length-1;i>=0;i--)"
-        "if((us[i].textContent||'').indexOf(BG)>=0){u=us[i];break;}}"
+        # rid's own turn for a scoped wait (a later prompt can quote the BEGIN token, so a substring
+        # match could read another turn's marker); the last user node carrying BG only for an
+        # unscoped 'auto' wait, which by definition watches the latest turn.
+        "var failed=null;(function(){var u=src>=0?nx[src]:null;"
+        "if(!RID){for(var i=nx.length-1;i>=0;i--)"
+        "if(__cgcRole(nx[i])==='user'&&(nx[i].textContent||'').indexOf(BG)>=0){u=nx[i];break;}}"
         "var t=u&&u.closest('[data-turn-key]');if(!t)return;"
         # The marker is a status element whose WHOLE text is the phrase (live 2026-09-25: a lone
         # "Thinking failed" span in the turn's activity header). Matching an exact element text,
@@ -794,13 +813,13 @@ def _detect_js(rid: str, turn_index=None) -> str:
         "else if(document.querySelector('iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]'))blocker='captcha';"
         "else{var al=document.querySelector('[role=\"alert\"]');if(al&&/rate limit|too many requests|usage limit/i.test(al.textContent||''))blocker='rate_limit';}"
         "var done=(res.done&&a.length>0);"
-        "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,len:rawT.length,begin:hasB,end:hasE,ac:a.length});})()"
+        "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,node:where,"
+        "len:rawT.length,begin:hasB,end:hasE,ac:a.length});})()"
     )
 
 
 # ---- SHARED CONTRACT #3: canonical per-turn request-rid parser ([S3] fix) --------------------
-# The rid regex shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) shared by every rid-reading regex in this file.
-_RID_RE_SRC = r"REQ-\d{8}-\d{6}-[0-9a-f]{6}"
+# Mirrored page-side by _RID_FN, which the scoped answer reads anchor on.
 _TURN_BEGIN_LINE_RE = re.compile(rf"^BEGIN_RESPONSE:({_RID_RE_SRC})$")
 _TURN_END_LINE_RE = re.compile(rf"^END_RESPONSE:({_RID_RE_SRC})$")
 
@@ -903,10 +922,8 @@ def _locate_source_turn(user_texts, source_rid):
       _detect_js/_extract_js) can still be safely attributed to the source turn; unwrapped salvage
       must be refused (rid_superseded/ambiguous) since a later turn's own interval now exists.
 
-    turn_index: the 0-based ordinal (DOM order) of the located turn among ALL user turns, or None
-    when absent. The caller threads this into __cgcNode's turnIndex so assistant-answer selection
-    is scoped to the exact interval between this turn and the next user turn — an answer may never
-    come from outside it (see _detect_js/_extract_js/_last_assistant_js).
+    No ordinal is returned: the answer reads re-find the source turn by its canonical rid on every
+    call (__cgcSrc), because a turn's ordinal shifts as a long thread mounts and unmounts turns.
 
     observed_rid is the CANONICAL rid of the LAST user turn, if any — 'what the conversation is
     actually on now', surfaced in error text and the outcome envelope so a refusal is legible, not
@@ -917,43 +934,34 @@ def _locate_source_turn(user_texts, source_rid):
         if _turn_canonical_rid(t) == source_rid:
             idx = i  # keep the LAST turn whose OWN canonical rid is source_rid (a legitimate resend)
     observed = _turn_canonical_rid(user_texts[-1]) if user_texts else None
-    if idx is None:
-        return {"present": False, "is_last": False, "observed_rid": observed, "turn_index": None}
-    return {"present": True, "is_last": idx == len(user_texts) - 1,
-            "observed_rid": observed, "turn_index": idx}
+    return {"present": idx is not None, "is_last": idx is not None and idx == len(user_texts) - 1,
+            "observed_rid": observed}
 
 
 def _salvage_allowed(c, rid):
     """Re-check, AT THE MOMENT unwrapped salvage is considered (not just once at wait-start),
     whether rid's own turn is still the conversation's LAST — a later turn can land WHILE the wait
     is in progress, which is exactly the race a retrieve recovery must close. Returns
-    (allowed: bool, observed_rid, turn_index, present). Cheap (one DOM query), so re-checking on
-    every salvage attempt costs nothing against a poll loop measured in seconds. turn_index/present
-    are the fresh (this-instant) values from _locate_source_turn — the caller should use THIS
-    turn_index (not a cached one) for the salvage extraction that immediately follows, since the
-    DOM composition may have shifted since the wait started."""
+    (allowed: bool, observed_rid, present). Cheap (one DOM query), so re-checking on every salvage
+    attempt costs nothing against a poll loop measured in seconds."""
     loc = _locate_source_turn(c.eval(_all_user_texts_js()) or [], rid)
-    return loc["is_last"] and loc["present"], loc["observed_rid"], loc["turn_index"], loc["present"]
+    return loc["is_last"], loc["observed_rid"], loc["present"]
 
 
-def _last_assistant_js(rid: str, turn_index=None) -> str:
+def _last_assistant_js(rid: str, *, scoped=False) -> str:
     """Reconstructed text of the answer node (no sentinel slicing) — for the stall raw dump.
-    turn_index: see _detect_js — scopes the lookup to the source turn's interval when given."""
-    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
-    node_call = f"__cgcNode({begin})" if turn_index is None else f"__cgcNode({begin},{int(turn_index)})"
-    return ("(function(){" + _NODE_FN + _TEXT_FN +
-            "return __cgcText(" + node_call + ");})()")
+    scoped: see _detect_js — reads only rid's own turn's interval."""
+    return ("(function(){" + _NODE_FN +
+            "return __cgcText(" + _node_call(rid, scoped) + ");})()")
 
 
-def _extract_js(rid: str, turn_index=None) -> str:
+def _extract_js(rid: str, *, scoped=False) -> str:
     """Returns the answer text BETWEEN the bare-line sentinels of the answer node (SHARED
     CONTRACT #1, via the canonical _sentinel_js parser), or '' if no valid wrapper is present.
-    turn_index: see _detect_js — scopes the lookup to the source turn's interval when given."""
-    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
-    node_call = f"__cgcNode({begin})" if turn_index is None else f"__cgcNode({begin},{int(turn_index)})"
-    sentinel = _sentinel_js(rid, f"__cgcText({node_call})")
+    scoped: see _detect_js — reads only rid's own turn's interval."""
+    sentinel = _sentinel_js(rid, f"__cgcText({_node_call(rid, scoped)})")
     return (
-        "(function(){" + _NODE_FN + _TEXT_FN +
+        "(function(){" + _NODE_FN +
         "var res=" + sentinel + ";"
         "return res.done?res.body:'';})()"
     )
@@ -987,25 +995,23 @@ def _extract_js(rid: str, turn_index=None) -> str:
 # The attribute lives on the MESSAGE node while __cgcNode may legitimately resolve the TURN
 # wrapper (_SEL_A matches either shape) — hence self -> descendant -> ancestor, all three confined
 # to that one resolved node.
-def _model_slug_js(rid: str, turn_index=None) -> str:
+def _model_slug_js(rid: str, *, scoped=False) -> str:
     """JS returning the producing model's slug for the rid's OWN answer node, or '' when the
     provider has not written one (a legitimate outcome — see SHARED CONTRACT #4)."""
-    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
-    node_call = f"__cgcNode({begin})" if turn_index is None else f"__cgcNode({begin},{int(turn_index)})"
     return ("(function(){" + _NODE_FN + "var A='data-message-model-slug';"
-            "var n=" + node_call + ";if(!n)return '';"
+            "var n=" + _node_call(rid, scoped) + ";if(!n)return '';"
             "var v=n.getAttribute(A);if(v)return v;"
             "var d=n.querySelector('['+A+']');if(d){v=d.getAttribute(A);if(v)return v;}"
             "var p=n.closest?n.closest('['+A+']'):null;"
             "return (p&&p.getAttribute(A))||'';})()")
 
 
-def _read_attribution(c, rid, turn_index=None):
+def _read_attribution(c, rid, *, scoped=False):
     """The producing model's slug for this rid's answer, or None when absent/unreadable. Never
     raises: attribution is evidence ABOUT an answer, so failing to read it must not fail a consult
     that otherwise succeeded — it degrades to 'unknown', reported honestly as null."""
     try:
-        return (c.eval(_model_slug_js(rid, turn_index)) or "").strip() or None
+        return (c.eval(_model_slug_js(rid, scoped=scoped)) or "").strip() or None
     except Exception:
         return None
 
@@ -1037,20 +1043,6 @@ def _reload_stale_tab(c, reason):
         sys.stderr.write(f"CGC_WAIT stale-tab: reload failed ({e}); continuing on the current DOM\n")
         return
     time.sleep(STALE_RELOAD_SETTLE_S)
-
-
-def _scoped_raw(c, rid, strict, turn_index):
-    """Fetch unwrapped-salvage raw text via _last_assistant_js, honoring the [S3] interval
-    guarantee. STRICT (source-pinned) mode: the answer may come ONLY from the source turn's own
-    interval — if turn_index is None (that turn is no longer resolvable in the current DOM, e.g.
-    virtualized away), refuse outright rather than falling back to an unscoped 'current turn'
-    search that could read a LATER round's answer. Non-strict ('auto') mode keeps the legacy
-    unscoped lookup, since there is no pinned source turn to violate."""
-    if strict:
-        if turn_index is None:
-            return ""
-        return c.eval(_last_assistant_js(rid, turn_index)) or ""
-    return c.eval(_last_assistant_js(rid)) or ""
 
 
 # ChatGPT VIRTUALIZES message nodes on a backgrounded/inactive tab: the completed answer node
@@ -3482,14 +3474,11 @@ def cmd_wait(a) -> int:
         # possibly several — most notably a retrieve's --parent source_rid, which must be located
         # and verified, never assumed to be the latest (that is the causal-substitution bug this
         # closes: a later same-thread send must never be mistaken for an earlier round's answer).
+        # strict also scopes every answer read below to rid's own turn's interval ([S3] fix), each
+        # read re-finding that turn by its canonical rid; 'auto' keeps the legacy unscoped lookup.
         strict = a.rid != "auto"
         rid = None
         observed_rid = None
-        # Set only in the strict branch, from _locate_source_turn's turn_index: the ordinal (DOM
-        # order) of the source turn among user turns, threaded into every _detect_js/_extract_js/
-        # _last_assistant_js call below so the answer can only come from THAT turn's interval
-        # ([S3] fix). Stays None for 'auto' — the legacy unscoped lookup.
-        turn_index = None
         rdl = time.time() + min(600, a.timeout)
         # At most ONE stale-tab reload per WAIT (see _reload_stale_tab) — one budget shared by
         # both triggers, the missing-source-turn one below and the frozen-stub one in the watch
@@ -3511,7 +3500,6 @@ def cmd_wait(a) -> int:
                 observed_rid = loc["observed_rid"]
                 if loc["present"]:
                     rid = a.rid
-                    turn_index = loc["turn_index"]
                     break
                 if not reloaded and time.time() >= stale_deadline:
                     reloaded = True
@@ -3559,7 +3547,7 @@ def cmd_wait(a) -> int:
             except Exception:
                 pass
             try:
-                st = json.loads(c.eval(_detect_js(rid, turn_index)) or "{}")
+                st = json.loads(c.eval(_detect_js(rid, scoped=strict)) or "{}")
             except Exception as e:
                 # transient CDP/eval hiccup — log and keep waiting, don't die
                 sys.stderr.write(f"CGC_WAIT eval-retry: {e}\n")
@@ -3567,9 +3555,10 @@ def cmd_wait(a) -> int:
                 continue
             ticks += 1
             if ticks == 1 or ticks % 5 == 0:  # heartbeat so the .output shows it's alive + diagnosable
-                sys.stderr.write(f"CGC_WAIT alive: gen={st.get('generating')} len={st.get('len')} "
-                                 f"done={st.get('done')} begin={st.get('begin')} end={st.get('end')} "
-                                 f"ac={st.get('ac')} t+{int(time.time()-(deadline-a.timeout))}s\n")
+                sys.stderr.write(f"CGC_WAIT alive: gen={st.get('generating')} node={st.get('node')} "
+                                 f"len={st.get('len')} done={st.get('done')} begin={st.get('begin')} "
+                                 f"end={st.get('end')} ac={st.get('ac')} "
+                                 f"t+{int(time.time()-(deadline-a.timeout))}s\n")
             card = _answer_approval(c)
             if card:
                 app, text = card
@@ -3603,7 +3592,7 @@ def cmd_wait(a) -> int:
                 # A RECOVERY wait (retrieve) looks at a turn sent long ago: if it is not generating
                 # and holds no answer now, none is coming. Watching it for the full budget held a
                 # worker slot for 90 minutes each and starved new sends queued behind it.
-                raw = _scoped_raw(c, rid, strict, turn_index)
+                raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
                 _write_private(a.out + ".raw", raw)
                 sys.stderr.write(
                     f"CGC_ERROR timeout_no_answer: {rid}'s turn has no answer and has not moved for "
@@ -3613,11 +3602,11 @@ def cmd_wait(a) -> int:
                     c.close_tab()
                 return 4
             if st.get("done"):
-                ans = c.eval(_extract_js(rid, turn_index)) or ""
+                ans = c.eval(_extract_js(rid, scoped=strict)) or ""
                 _write_private(a.out, ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
-                # Attribution is read from the SAME turn_index that produced `ans`, and BEFORE the
+                # Attribution is read from the SAME scoped node that produced `ans`, and BEFORE the
                 # tab is closed below — afterwards the node is gone and the fact is unrecoverable.
-                _wait_receipt(rid, a.out, _read_attribution(c, rid, turn_index))
+                _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
                 sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out}\n")
                 conv = conv or c.conversation_id()
                 _write_state(conversation=conv, status="answered")  # mark this job answered
@@ -3653,10 +3642,10 @@ def cmd_wait(a) -> int:
                 if settle_start is None:
                     settle_start = time.time()
                 elif time.time() - settle_start >= a.settle_seconds:
-                    ans = c.eval(_extract_js(rid, turn_index)) or ""
+                    ans = c.eval(_extract_js(rid, scoped=strict)) or ""
                     if ans:
                         _write_private(a.out, ans)
-                        _wait_receipt(rid, a.out, _read_attribution(c, rid, turn_index))
+                        _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
                         sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out} (recovered at settle)\n")
                         if not a.keep_tab:
                             c.close_tab()
@@ -3665,14 +3654,13 @@ def cmd_wait(a) -> int:
                     # the source turn's interval with no rid anchor at all — re-check RIGHT NOW
                     # whether rid's turn is still the conversation's latest (a later turn may have
                     # landed while we waited): if not, that later turn now owns its own interval, so
-                    # salvage must be refused. Use the FRESH turn_index from this check (DOM
-                    # composition may have shifted since the wait started), not the cached one.
-                    allowed, observed_rid, fresh_turn_index, _present = _salvage_allowed(c, rid)
-                    raw = _scoped_raw(c, rid, strict, fresh_turn_index)
+                    # salvage must be refused.
+                    allowed, observed_rid, _present = _salvage_allowed(c, rid)
+                    raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
                     if allowed and len(raw) >= a.min_unwrapped:
                         _write_private(a.out, raw)
                         _write_private(a.out + ".raw", raw)
-                        _wait_receipt(rid, a.out, _read_attribution(c, rid, fresh_turn_index))
+                        _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
                         sys.stderr.write(
                             f"CGC_UNWRAPPED wrote {len(raw)} chars to {a.out} (also saved to {a.out}.raw): "
                             f"the model did NOT emit BEGIN/END_RESPONSE:{rid}, so the whole last message "
@@ -3708,13 +3696,6 @@ def cmd_wait(a) -> int:
                                 c, f"{stub_cycles} consecutive stub-stable reads for {rid}, all "
                                    f"frozen at {stub_len} chars with no generation "
                                    f"(~{int(stub_cycles * a.settle_seconds)}s of a motionless DOM)")
-                            # The turn ordinal was read off the DOM we just declared untrustworthy;
-                            # re-locate the source turn on the rebuilt page rather than keep scoping
-                            # the answer by an ordinal that may have shifted.
-                            if strict:
-                                _ok, _obs, fresh_idx, fresh_present = _salvage_allowed(c, rid)
-                                if fresh_present:
-                                    turn_index = fresh_idx
             else:
                 # Generating, or the byte count moved: the round is alive. This is the reset that
                 # keeps the frozen-stub trigger off every legitimate thinking/streaming pause.
@@ -3739,10 +3720,10 @@ def cmd_wait(a) -> int:
         #   present answer).
         # - empty / only short streaming stubs → exit 4, a genuine no-answer timeout, DISTINCT from
         #   the salvage case above (they do not conflict).
-        rescue = c.eval(_extract_js(rid, turn_index)) or ""
+        rescue = c.eval(_extract_js(rid, scoped=strict)) or ""
         if rescue:
             _write_private(a.out, rescue)
-            _wait_receipt(rid, a.out, _read_attribution(c, rid, turn_index))
+            _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
             sys.stderr.write(f"CGC_DONE wrote {len(rescue)} chars to {a.out} (rescued at timeout)\n")
             if not a.keep_tab:
                 c.close_tab()
@@ -3750,8 +3731,8 @@ def cmd_wait(a) -> int:
         # No sentinel wrapper. Re-check (see the settle-time comment above) whether rid's turn is
         # still the conversation's latest before considering unwrapped salvage — a later turn may
         # have landed anywhere during the whole wait, not just at the settle instant.
-        allowed, observed_rid, fresh_turn_index, present = _salvage_allowed(c, rid)
-        raw = _scoped_raw(c, rid, strict, fresh_turn_index)
+        allowed, observed_rid, present = _salvage_allowed(c, rid)
+        raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
         if not present and strict:
             sys.stderr.write(
                 f"CGC_WAIT interval_unresolved: source_rid={rid}'s own turn could no longer be "
@@ -3760,7 +3741,7 @@ def cmd_wait(a) -> int:
         if allowed and len(raw) >= a.min_unwrapped:
             _write_private(a.out, raw)
             _write_private(a.out + ".raw", raw)
-            _wait_receipt(rid, a.out, _read_attribution(c, rid, fresh_turn_index))
+            _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
             sys.stderr.write(
                 f"CGC_UNWRAPPED wrote {len(raw)} chars to {a.out} (also saved to {a.out}.raw): the "
                 f"model did NOT emit BEGIN/END_RESPONSE:{rid} — best-effort salvage at timeout; "

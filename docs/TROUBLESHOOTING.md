@@ -68,8 +68,12 @@ Every job the daemon runs writes a full transcript of its send + wait to
 `await` names that path on any failure. It streams **live**, so you can watch a
 consult while it runs — the waiter's per-poll heartbeat is the line to read:
 
-    CGC_WAIT alive: gen=… len=… done=… begin=… end=… ac=…
+    CGC_WAIT alive: gen=… node=… len=… done=… begin=… end=… ac=…
 
+- `node=source_unrendered` — the round's own user turn is not in the tab's DOM right now, so
+  there is no interval to read (`len=0` here means "not looking", never "no answer"). The waiter
+  re-finds the turn by its rid on every poll, so this clears when the turn renders again.
+- `node=none` — the turn is there but has no assistant reply yet.
 - `ac=0` for the whole run — ChatGPT never produced an assistant turn at all. The
   prompt was inserted but the send didn't take, or the session was rejected. Look
   at the debug Chrome window.

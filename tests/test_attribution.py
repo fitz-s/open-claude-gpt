@@ -240,14 +240,15 @@ class TestSlugRead:
         return _load("cdp_consult", tmp_path / "control.db")
 
     def test_the_js_reads_the_named_attribute_off_the_rid_scoped_node(self, cdp):
-        js = cdp._model_slug_js("REQ-20260906-000000-00000c", turn_index=3)
+        js = cdp._model_slug_js("REQ-20260906-000000-00000c", scoped=True)
         assert "data-message-model-slug" in js
         # scoped to THIS rid's own turn interval, never "the last assistant message" — a stale tab
         # under-reports how many assistant turns exist.
-        assert "BEGIN_RESPONSE:REQ-20260906-000000-00000c" in js and "__cgcNode(" in js and ",3)" in js
+        assert '__cgcNode("BEGIN_RESPONSE:REQ-20260906-000000-00000c","REQ-20260906-000000-00000c")' in js
 
-    def test_unscoped_read_omits_the_turn_index(self, cdp):
-        assert ",3)" not in cdp._model_slug_js("REQ-20260906-000000-00000c")
+    def test_unscoped_read_names_no_source_turn(self, cdp):
+        assert '__cgcNode("BEGIN_RESPONSE:REQ-20260906-000000-00000c")' in \
+            cdp._model_slug_js("REQ-20260906-000000-00000c")
 
     def test_read_degrades_to_none_never_raises(self, cdp):
         class Boom:

@@ -1200,7 +1200,7 @@ class TestSourceTurnMatching:
                  "BEGIN_RESPONSE:REQ-20260707-120000-0aaa01\nthe answer\nEND_RESPONSE:REQ-20260707-120000-0aaa01\n"]
         loc = cdp._locate_source_turn(turns, "REQ-20260707-120000-0aaa01")
         assert loc == {"present": True, "is_last": True,
-                       "observed_rid": "REQ-20260707-120000-0aaa01", "turn_index": 0}
+                       "observed_rid": "REQ-20260707-120000-0aaa01"}
 
     def test_source_turn_not_last_when_a_later_turn_was_sent(self, tmp_path):
         """The exact shape of the audit's race: R1's turn exists, but R2 was sent afterward —
@@ -1216,7 +1216,6 @@ class TestSourceTurnMatching:
         assert loc["present"] is True
         assert loc["is_last"] is False
         assert loc["observed_rid"] == "REQ-20260707-120500-0bbb01"
-        assert loc["turn_index"] == 0
 
     def test_source_turn_absent_reports_observed_latest(self, tmp_path):
         cdp = self._cdp(tmp_path)
@@ -1224,12 +1223,12 @@ class TestSourceTurnMatching:
                  "BEGIN_RESPONSE:REQ-20260707-120500-0bbb01\nthe ask\nEND_RESPONSE:REQ-20260707-120500-0bbb01\n"]
         loc = cdp._locate_source_turn(turns, "REQ-20260707-120000-0aaa01")
         assert loc == {"present": False, "is_last": False,
-                       "observed_rid": "REQ-20260707-120500-0bbb01", "turn_index": None}
+                       "observed_rid": "REQ-20260707-120500-0bbb01"}
 
     def test_no_turns_at_all(self, tmp_path):
         cdp = self._cdp(tmp_path)
         assert cdp._locate_source_turn([], "REQ-20260707-120000-0aaa01") == \
-            {"present": False, "is_last": False, "observed_rid": None, "turn_index": None}
+            {"present": False, "is_last": False, "observed_rid": None}
 
     def test_substring_quote_of_an_old_rid_never_steals_its_identity(self, tmp_path):
         """[S3] audit fixture: R1 is being recovered because no valid sentinel-wrapped R1 answer is
@@ -1250,7 +1249,7 @@ class TestSourceTurnMatching:
             f"BEGIN_RESPONSE:{r2}\nmy real ask\nEND_RESPONSE:{r2}\n"
         )
         loc = cdp._locate_source_turn([r1_turn, r2_prose], r1)
-        assert loc["present"] is True and loc["is_last"] is False and loc["turn_index"] == 0
+        assert loc["present"] is True and loc["is_last"] is False
         assert loc["observed_rid"] == r2
 
         # (b) quoted inside a code fence (DOM textContent flattens the fence markers to plain lines)
@@ -1262,7 +1261,7 @@ class TestSourceTurnMatching:
             f"BEGIN_RESPONSE:{r2}\nmy real ask\nEND_RESPONSE:{r2}\n"
         )
         loc = cdp._locate_source_turn([r1_turn, r2_fence], r1)
-        assert loc["present"] is True and loc["is_last"] is False and loc["turn_index"] == 0
+        assert loc["present"] is True and loc["is_last"] is False
         assert loc["observed_rid"] == r2
 
         # (c) a FULLY quoted BEGIN+END R1 pair, followed by R2's own canonical footer
@@ -1272,7 +1271,7 @@ class TestSourceTurnMatching:
             f"BEGIN_RESPONSE:{r2}\nmy real ask\nEND_RESPONSE:{r2}\n"
         )
         loc = cdp._locate_source_turn([r1_turn, r2_full_pair], r1)
-        assert loc["present"] is True and loc["is_last"] is False and loc["turn_index"] == 0
+        assert loc["present"] is True and loc["is_last"] is False
         assert loc["observed_rid"] == r2
 
 

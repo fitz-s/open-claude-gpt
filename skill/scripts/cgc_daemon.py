@@ -746,7 +746,7 @@ def _run(cmd, timeout, rid=None, stdin_text=None, env_extra=None, pass_fds=()):
     stderr streams LIVE into the job's log instead of being captured and discarded. Both halves of
     that matter. It used to be captured and thrown away except for a 240-char tail folded into the
     status message — so when a consult burned its whole 25-minute budget and produced nothing, the
-    waiter's per-poll heartbeat (`CGC_WAIT alive: gen/len/done/begin/end/ac`), which says exactly
+    waiter's per-poll heartbeat (`CGC_WAIT alive: gen/node/len/done/begin/end/ac`), which says exactly
     which failure happened, was gone. And buffering it to write at exit would still leave the log
     empty for the 25 minutes you actually want to watch it. stdout is still captured, because the
     daemon parses submit's conversation id out of it."""

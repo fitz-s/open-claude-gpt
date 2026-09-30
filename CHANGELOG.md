@@ -6,6 +6,31 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — a follow-up into a long, re-opened thread never saw its own finished answer
+
+A follow-up that had to re-open its thread's tab watched for the full 90 minutes printing
+`CGC_WAIT alive: ... len=0 ... begin=False end=False` while ChatGPT wrote a complete, correctly wrapped
+answer in that same tab. At the timeout the salvage path took it anyway, but as an *unwrapped* answer,
+so the round ended `completed_unverified` and `await` reported it stuck.
+
+The waiter found its round's user turn once, at the start, and remembered it by ordinal ("the 5th user
+turn"). A re-opened thread first renders every turn and then unmounts the older ones (the heartbeat's
+`ac` fell 4 → 2 and 6 → 3), so the ordinal soon named no turn at all: the scoped answer read returned
+nothing, and the heartbeat printed that as an empty answer. The timeout salvage worked only because it
+looked the turn up again.
+
+- Every scoped read now finds the round's turn by its own rid on every poll: the last user turn whose
+  own sentinel pair (the same rule `_turn_canonical_rid` applies, now mirrored in the page JS) names the
+  rid. The answer is still read only between that turn and the next user turn, so a later round's reply
+  that quotes the wrapper is never taken, however the turns above it mount and unmount.
+- The ChatGPT failure marker is read from that same turn. A re-sent rid (auto-continue) resolves to
+  the later turn, so the first turn's "Thinking failed" no longer applies to the continue.
+- The heartbeat carries `node=found|none|source_unrendered`, so `len=0` because the turn is not
+  rendered can be told apart from `len=0` because nothing has been written yet.
+
+Pinned by `tests/test_wait_virtualized_thread.py`: the waiter's real JS runs in node against a thread
+whose older turns unmount mid-wait, and the page-side rid parser is checked against the Python one.
+
 ### Fixed — `fire --mention` found no popup entries, ever
 
 Every `--mention` failed `mention_not_found ... The popup offered: nothing`, for apps that were

@@ -69,24 +69,24 @@ def test_the_sent_turn_is_visible_to_the_send_contract():
 
 
 def test_a_finished_answer_is_done_despite_attachment_cards_after_it():
-    got = json.loads(_eval(CDP._detect_js(R1, 0), _page()))
+    got = json.loads(_eval(CDP._detect_js(R1, scoped=True), _page()))
     assert got["done"] is True and got["ac"] == 1
 
 
 def test_an_unanswered_turn_is_not_done():
-    got = json.loads(_eval(CDP._detect_js(R2, 1), _page()))
+    got = json.loads(_eval(CDP._detect_js(R2, scoped=True), _page()))
     assert got["done"] is False
 
 
 def test_extract_returns_the_body_without_the_cards():
-    body = _eval(CDP._extract_js(R1, 0), _page())
+    body = _eval(CDP._extract_js(R1, scoped=True), _page())
     assert body.strip() == "the verdict"
 
 
 def test_the_no_sentinel_salvage_read_skips_the_attachment_cards():
     setup = _page().replace("md(['BEGIN_RESPONSE:%s','the verdict','END_RESPONSE:%s'])" % (R1, R1),
                             "md(['an unwrapped answer'])")
-    raw = _eval(CDP._last_assistant_js(R1, 0), setup)
+    raw = _eval(CDP._last_assistant_js(R1, scoped=True), setup)
     assert raw.strip() == "an unwrapped answer" and "Open file" not in raw
 
 
@@ -132,19 +132,19 @@ def _turned(extra_r2=""):
 
 
 def test_chatgpts_failure_marker_on_the_source_turn_is_read():
-    got = json.loads(_eval(CDP._detect_js(R2, 1), _turned(",E('SPAN',{},[],'Thinking failed')")))
+    got = json.loads(_eval(CDP._detect_js(R2, scoped=True), _turned(",E('SPAN',{},[],'Thinking failed')")))
     assert got["failed"] == "Thinking failed" and got["done"] is False
 
 
 def test_a_failure_on_a_later_turn_is_not_attributed_to_an_earlier_one():
-    """R2's prompt quotes R1's BEGIN token and R2 failed. Pinned by turn_index, R1 is unaffected."""
+    """R2's prompt quotes R1's BEGIN token and R2 failed. Scoped to its own turn, R1 is unaffected."""
     setup = _turned(",E('SPAN',{},[],'Thinking failed')")
-    assert json.loads(_eval(CDP._detect_js(R1, 0), setup))["failed"] is None
-    assert json.loads(_eval(CDP._detect_js(R2, 1), setup))["failed"] == "Thinking failed"
+    assert json.loads(_eval(CDP._detect_js(R1, scoped=True), setup))["failed"] is None
+    assert json.loads(_eval(CDP._detect_js(R2, scoped=True), setup))["failed"] == "Thinking failed"
 
 
 def test_no_marker_means_no_failure():
-    assert json.loads(_eval(CDP._detect_js(R2, 1), _turned()))["failed"] is None
+    assert json.loads(_eval(CDP._detect_js(R2, scoped=True), _turned()))["failed"] is None
 
 
 
@@ -152,4 +152,4 @@ def test_an_answer_line_that_starts_like_a_failure_is_not_a_failure():
     """Review S1: the marker is a lone status element outside any message body. An unwrapped answer
     whose last line is "Network error handling is untested" must not read as a failed turn."""
     setup = _turned(",unit('t2:2:assistant',[md(['Network error handling is untested in cgc_spool.'])])")
-    assert json.loads(_eval(CDP._detect_js(R2, 1), setup))["failed"] is None
+    assert json.loads(_eval(CDP._detect_js(R2, scoped=True), setup))["failed"] is None
