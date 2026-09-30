@@ -25,47 +25,49 @@ CDP = _load("cdp_consult")
 
 
 class _FakeComposer:
-    """Answers the JS the paste path evaluates. `offers` = app labels the @ popup shows."""
+    """Answers the JS the paste path evaluates. `offers` = app labels the @ popup shows. Mention nodes carry
+    display NAMES (as the live composer does); `yields` overrides which name a click actually produces."""
 
     def __init__(self, offers, popup_open=True, unconnected=(), non_app=False, loading=False,
-                 late_by=0, drop_on_paste=False):
+                 late_by=0, drop_on_paste=False, yields=None, unverified=()):
         self.offers = [o.lower() for o in offers]
         self.popup_open, self.unconnected, self.non_app = popup_open, list(unconnected), non_app
-        self.loading = loading
+        self.loading, self.unverified = loading, list(unverified)
         self.late_by, self.drop_on_paste = late_by, drop_on_paste  # polls before the node shows
-        self._pending = 0
+        self.yields = yields
+        self._pending = []
         self.html = ""
         self.text = ""
-        self.mentions = 0
+        self.mentions = []
 
     def eval(self, js, timeout=None):
         if "readyState" in js:
             return True
         if "selectAll" in js:
             self.html = self.text = ""
-            self.mentions = 0
+            self.mentions = []
             return 0
         if "app-mention-name" in js:
             if self._pending:                       # a click landed: the node shows after late_by reads
                 if self.late_by <= 0:
-                    self.mentions, self._pending = self.mentions + self._pending, 0
+                    self.mentions, self._pending = self.mentions + self._pending, []
                 else:
                     self.late_by -= 1
-            return self.mentions
+            return list(self.mentions)
         if "var want=" in js and "data-cgc-pre" in js:
             want = json.loads(js.split("var want=", 1)[1].split(";", 1)[0])
             if want in self.offers:
                 if not self.non_app:  # a row that is not an app leaves the composer without a mention
                     self.html = self.html.replace("@" + want, "") + f'<span data-mention>{want}</span>'
                     self.text = self.text.lower().replace("@" + want, want)
-                    self._pending += 1
-                return {"hit": want, "open": True, "seen": [], "unconnected": []}
-            return {"hit": None, "open": self.popup_open, "loading": self.loading,
-                    "seen": self.offers, "unconnected": self.unconnected}
+                    self._pending.append(self.yields or want)
+                return {"hit": want, "open": True, "seen": [], "unconnected": [], "unverified": []}
+            return {"hit": None, "open": self.popup_open, "loading": self.loading, "seen": self.offers,
+                    "unconnected": self.unconnected, "unverified": self.unverified}
         if "execCommand('insertText'" in js:
             chunk = json.loads(js.split("execCommand('insertText',false,", 1)[1].rsplit(");", 1)[0])
             if self.drop_on_paste and len(chunk) > 1:
-                self.mentions = 0          # a select-and-replace accident eats the mention node
+                self.mentions = []          # a select-and-replace accident eats the mention node
             self.text += chunk
             self.html += chunk.lower()
             return True if "return true" in js else len(self.text)
@@ -172,7 +174,11 @@ function build(spec, parent){
     var block=n.children.length>1&&n.children.every(function(k){return k.tagName!=='SVG'});
     var rowBody=n.hasAttribute&&n.hasAttribute('data-menu-row-content');
     return parts.join((block&&(rowBody||n._a['data-list-navigation-item']===undefined))?'\n':'')}});
-  Object.defineProperty(n,'textContent',{get:function(){return n.innerText}});
+  // textContent concatenates text nodes with NO separator (the browser does; innerText adds the block
+  // newlines). A mock that returned innerText here hid a live regression: adjacent label/description
+  // spans read 'WebCodex DemoLocal...' in a real page, and a strict equality on it refused every app.
+  Object.defineProperty(n,'textContent',{get:function(){if(spec.x!=null)return spec.x;
+    return n.childNodes.map(function(k){return k.textContent}).join('')}});
   Object.defineProperty(n,'firstElementChild',{get:function(){return n.children[0]||null}});
   n.querySelector=function(sel){return qin(n,sel)[0]||null};
   return n;
@@ -293,9 +299,17 @@ def test_picker_exact_match_beats_prefix():
     assert _run_pick(tree, "WebCodex Demo") == ["webcodex demo", ["WebCodex Demo"]]
 
 
-def test_picker_takes_a_unique_prefix():
-    tree = _popup_tree("Plugins", _app("WebCodex Demo - sandbox"), _app("Canva"))
-    assert _run_pick(tree, "WebCodex Demo") == ["webcodex demo - sandbox", ["WebCodex Demo - sandbox"]]
+def test_picker_never_takes_a_prefix_match_it_would_send_the_wrong_app():
+    # 'Atlas' asked for, only 'Atlas Pro' enabled: the ONLY prefix match. Clicking it would attach a
+    # different app and every later check would pass, so the prompt would go out with the wrong app.
+    tree = _popup_tree("Plugins", _app("Atlas Pro"), _app("Canva"))
+    r, clicked = _run_pick_tree(tree, "Atlas")
+    assert r["hit"] is None and clicked == [] and r["seen"] == ["atlas pro", "canva"]
+    # the same with a single result and no header (a lone enabled app that merely starts with the name)
+    r, clicked = _run_pick_tree(_popup_tree(_app("Notion Calendar")), "Notion")
+    assert r["hit"] is None and clicked == []
+    # asked for by its own full name it is picked
+    assert _run_pick(tree, "Atlas Pro") == ["atlas pro", ["Atlas Pro"]]
 
 
 def test_picker_refuses_an_ambiguous_prefix():
@@ -348,6 +362,40 @@ def test_picker_refuses_a_two_line_authorization_row_with_no_description():
     tree = _popup_tree(_row("Notion", desc=None, extra="Connect"))
     r, clicked = _run_pick_tree(tree, "Notion")
     assert r["hit"] is None and clicked == [] and r["unconnected"] == ["notion"]
+
+
+def _shaped_row(label, desc="Does things", in_label="", block_extra=None, sibling=None):
+    """A real-shaped app row with an extra control planted where an unconnected app carries it."""
+    lead = {"t": "span", "a": {"class": "leadingIcon-x"}, "c": [{"t": "svg", "a": {"class": "rounded-2xs icon-xs"}}]}
+    text = {"t": "span", "c": [{"t": "span", "c": [{"t": "span", "c": [label + in_label]}] + (
+        [{"t": "span", "a": {"class": "text-codex-description"}, "c": [desc]}] if desc else [])}]}
+    content = [lead, text] + ([block_extra] if block_extra else [])
+    kids = [{"t": "div", "a": {"data-menu-row-content": "true"}, "c": content}] + ([sibling] if sibling else [])
+    return {"t": "button", "a": {"data-list-navigation-item": "true"}, "c": kids}
+
+
+@pytest.mark.parametrize("shape,row", [
+    ("Connect as text inside the label span", _shaped_row("Notion", in_label=" Connect")),
+    ("Connect as a <button> in the content block", _shaped_row("Notion", block_extra={"t": "button", "c": ["Connect"]})),
+    ("Connect as a bare text node in the content block", _shaped_row("Notion", block_extra="Connect")),
+    ("Connect as a sibling of the content block", _shaped_row("Notion", sibling={"t": "span", "c": ["Connect"]})),
+    ("localized Connect beside the content block", _shaped_row("Notion", sibling={"t": "span", "c": ["\u8fde\u63a5"]})),
+    ("label plus Connect, no description", _shaped_row("Notion", desc=None, block_extra="Connect")),
+])
+def test_picker_refuses_every_shape_an_unconnected_app_can_take(shape, row):
+    # the extra control is legally placed in several spots; none of them may read as "connected".
+    # (the label used for the match ignores the stray text, so this is what stops the click)
+    for tree in (_popup_tree("Plugins", row), _popup_tree(row)):
+        r, clicked = _run_pick_tree(tree, "Notion")
+        assert clicked == [], shape
+        assert r["hit"] is None, shape
+
+
+def test_picker_still_clicks_a_plain_headerless_app_with_a_description():
+    # the real shape of a connected app that is the ONLY result: rounded-2xs icon, label, description, nothing
+    # else. This must stay clickable, or every single-result mention would fail closed.
+    assert _run_pick(_popup_tree(_shaped_row("WebCodex Demo", desc="Local demo")), "WebCodex Demo") == \
+        ["webcodex demo", ["WebCodex Demo"]]
 
 
 def test_picker_never_clicks_a_headerless_exact_file_row():
@@ -506,7 +554,39 @@ def test_a_mention_node_that_shows_late_is_still_a_success(monkeypatch):
     monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
     c = _FakeComposer(["WebCodex Demo"], late_by=CDP._MENTION_SETTLE_POLLS - 1)
     CDP._paste_prompt(c, "review this", ["WebCodex Demo"])
-    assert c.mentions == 1 and c.text.endswith("review this")
+    assert c.mentions == ["webcodex demo"] and c.text.endswith("review this")
+
+
+def test_a_click_that_yields_a_different_app_is_refused_and_the_composer_cleared(monkeypatch):
+    # every earlier check would pass: the row is app-shaped, exact, and a node appears. The node's NAME is
+    # what proves it is the requested app, so a click that attached another one must not be sent.
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    c = _FakeComposer(["Notion"], yields="notion calendar")
+    with pytest.raises(CDP._MentionFailure) as e:
+        CDP._paste_prompt(c, "review this", ["Notion"])
+    msg = str(e.value)
+    assert "'notion calendar'" in msg and "wrong app" in msg and "'notion'" in msg
+    assert isinstance(e.value, CDP._PreClickFailure) and c.text == "" and c.mentions == []
+
+
+def test_two_requested_apps_each_have_to_be_the_one_that_appeared(monkeypatch):
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    c = _FakeComposer(["Alpha", "Beta"])
+    CDP._paste_prompt(c, "body", ["Alpha", "Beta"])
+    assert sorted(c.mentions) == ["alpha", "beta"]
+    # the SECOND click producing the first app's node again is not "Beta"
+    c = _FakeComposer(["Alpha", "Beta"])
+    real = c.eval
+    n = {"clicks": 0}
+
+    def ev(js, timeout=None):
+        if "var want=" in js and "data-cgc-pre" in js:
+            n["clicks"] += 1
+            c.yields = "alpha"           # every click attaches Alpha
+        return real(js, timeout)
+    c.eval = ev
+    with pytest.raises(CDP._MentionFailure):
+        CDP._paste_prompt(c, "body", ["Alpha", "Beta"])
 
 
 def test_a_mention_node_that_never_shows_fails_closed_after_one_click(monkeypatch):
@@ -525,7 +605,7 @@ def test_a_prompt_paste_that_eats_the_mention_is_not_sent(monkeypatch):
     c = _FakeComposer(["WebCodex Demo"], drop_on_paste=True)
     with pytest.raises(CDP._MentionFailure) as e:
         CDP._paste_prompt(c, "review this", ["WebCodex Demo"])
-    assert "0 of the 1 requested app mentions" in str(e.value)
+    assert "holds the app mentions [] after the paste" in str(e.value) and "'webcodex demo'" in str(e.value)
     assert isinstance(e.value, CDP._PreClickFailure)
 
 
@@ -685,21 +765,45 @@ def test_send_clicks_the_button_in_the_composers_own_form():
     assert r == ["clicked", ["S"]], "the hidden form's send button is never touched"
 
 
+def _send_with_focus(tree_js, focused_id=None):
+    """Run the send eval with focus on the element whose id is `focused_id` (None: nothing focused)."""
+    active = ("ALL.filter(function(x){return x._a.id===%s})[0]" % json.dumps(focused_id)) if focused_id else None
+    return _run_forms(tree_js, CDP._send_click_js(), active=active)
+
+
 def test_send_refuses_ambiguous_buttons_and_absent_ones():
     two = "el('body',{c:[el('form',{c:[ed(),send({a:{id:'1'}}),send({a:{id:'2'}})]})]})"
     r = _run_forms(two, "(function(){var v=" + CDP._send_click_js() +
                    ";return [v,ALL.filter(function(x){return x.clicked}).length];})()")
     assert r == ["ambiguous", 0], "several send buttons in the form is a guess: nothing is clicked"
-    assert _send("el('body',{c:[el('form',{c:[ed()]})]})") == "no-send"          # no text yet
     assert _send("el('body',{c:[]})") == "no-composer"
     assert _send("el('body',{c:[el('form',{c:[ed(),send({disabled:true})]})]})") == "disabled"
 
 
+def test_send_with_no_button_yet_needs_focus_inside_the_composer_before_enter_is_allowed():
+    # no send button rendered yet (empty draft): Enter is the pre-existing fallback, but Enter submits
+    # whatever is FOCUSED, so it is only allowed when focus is verified inside the resolved editor.
+    tree = "el('body',{c:[el('form',{c:[ed({a:{id:'E'}})]}),el('div',{a:{id:'OTHER'}})]})"
+    assert _send_with_focus(tree, "E") == "no-send"
+    assert _send_with_focus(tree, "OTHER") == "no-focus", "focus is elsewhere: Enter would act on it"
+    assert _send_with_focus(tree, None) == "no-focus", "nothing focused"
+    assert _send(tree) == "no-focus"
+
+
+def test_send_verdict_lets_only_clicked_and_no_send_go_on_and_enter_only_for_no_send():
+    assert CDP._send_verdict("clicked") == (True, False, "")
+    assert CDP._send_verdict("no-send") == (True, True, "")
+    for bad in ("no-composer", "ambiguous", "disabled", "no-focus", None, "", "weird", 0, False):
+        may, enter, why = CDP._send_verdict(bad)
+        assert may is False and enter is False and "send target" in why, bad
+
+
 def test_send_never_reaches_a_send_button_outside_the_composers_form():
     # a Send-labelled button elsewhere on the page (another form) must not be clicked for this composer
-    tree = ("el('body',{c:[el('form',{c:[ed()]}),el('form',{c:[el('div',{c:[send({a:{id:'X'}})]})]})]})")
+    tree = ("el('body',{c:[el('form',{c:[ed({a:{id:'E'}})]}),el('form',{c:[el('div',{c:[send({a:{id:'X'}})]})]})]})")
     r = _run_forms(tree, "(function(){var v=" + CDP._send_click_js() +
-                   ";return [v,ALL.filter(function(x){return x.clicked}).length];})()")
+                   ";return [v,ALL.filter(function(x){return x.clicked}).length];})()",
+                   active="ALL.filter(function(x){return x._a.id==='E'})[0]")
     assert r == ["no-send", 0]
 
 
@@ -784,3 +888,25 @@ def test_a_paste_without_a_mention_never_types_an_at_or_touches_the_popup(monkey
               for js in seen if "insertText',false," in js]
     assert chunks and not any(x.startswith("@") for x in chunks), "no '@' is ever typed"
     assert c.text == "plain body"
+
+
+def test_the_mock_dom_reads_textcontent_like_a_browser_not_like_innertext():
+    """Adjacent spans concatenate in textContent with no whitespace; innerText separates blocks with a
+    newline. The connected-row test depends on both, and a mock that conflated them let a live regression
+    through (the exact, connected app was refused as 'not connected')."""
+    import shutil, subprocess
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    tree = _popup_tree("Plugins", _app("WebCodex Demo", desc="Local demo"))
+    src = (_NODE_DOM + "var ROOT=build(" + json.dumps(tree) + ",null);"
+           "var e=document.querySelectorAll('[data-list-navigation-item]')[0];"
+           "console.log(JSON.stringify([e.textContent,e.innerText]));")
+    tc, it = json.loads(subprocess.run(["node", "-e", src], capture_output=True, text=True, check=True).stdout)
+    assert tc == "WebCodex DemoLocal demo" and it == "WebCodex Demo\nLocal demo"
+
+
+def test_the_real_captured_connected_app_is_picked_by_the_real_markup():
+    # the exact regression: WebCodex Demo, connected, exactly as the live page renders it
+    assert _run_pick(_live("webcodex_demo"), "WebCodex Demo") == ["webcodex demo", ["WebCodex Demo"]]
+    assert _run_pick(_live("all_plugins"), "WebCodex Demo") == ["webcodex demo", ["WebCodex Demo"]]
+    assert _run_pick(_live("outlook"), "Outlook Email") == ["outlook email", ["Outlook Email"]]

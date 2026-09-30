@@ -2489,16 +2489,36 @@ def _composer_get_js():
 
 
 def _send_click_js():
-    """Click the send button of the resolved composer's own form. Returns 'clicked', 'no-composer',
-    'no-send' (no button in that form, e.g. no text) or 'disabled'. Exactly one candidate must exist in
-    the form; several is ambiguous and is refused rather than guessed."""
+    """Click the send button of the resolved composer's own form. Returns one of:
+      'clicked'      the form's single visible send button was clicked;
+      'no-composer'  no visible composer form (nothing to send from);
+      'ambiguous'    several visible send buttons in that form (picking one would be a guess);
+      'disabled'     exactly one, but it is disabled;
+      'no-send'      no send button yet AND focus is inside the resolved editor (Enter would act on it);
+      'no-focus'     no send button and focus is NOT inside the resolved editor (Enter would act elsewhere).
+    Only 'clicked' and 'no-send' may go on to send; see _send_verdict."""
     return ("(function(){" + _COMPOSER_RESOLVE_JS + "var d=__cg();if(!d)return 'no-composer';"
             "var f=d.closest('form');var b=Array.prototype.slice.call(f.querySelectorAll("
             "'button[data-testid=\"send-button\"],button[aria-label*=\"Send\" i],"
             "button[aria-label*=\"\\u53d1\\u9001\"]')).filter(function(x){var r=x.getBoundingClientRect();"
             "return r.width>0&&r.height>0;});"
-            "if(b.length!==1)return b.length?'ambiguous':'no-send';if(b[0].disabled)return 'disabled';"
-            "b[0].click();return 'clicked';})()")
+            "if(b.length>1)return 'ambiguous';if(b.length===1){if(b[0].disabled)return 'disabled';"
+            "b[0].click();return 'clicked';}"
+            "var a=document.activeElement;return (a===d||d.contains(a))?'no-send':'no-focus';})()")
+
+
+def _send_verdict(sent_via):
+    """(may_proceed, press_enter, note). The send eval must return one of the values above. Anything else,
+    including None (the eval timed out or returned nothing), 'disabled', 'ambiguous', 'no-composer' and
+    'no-focus', means NOTHING was clicked and Enter must not be pressed: Enter submits whatever is
+    focused, and on a composer we could not name or focus that may be nothing or the wrong thing. The
+    only Enter fallback is 'no-send' (a composer whose send button has not rendered) with focus verified
+    inside that composer, the pre-existing behaviour."""
+    if sent_via == "clicked":
+        return True, False, ""
+    if sent_via == "no-send":
+        return True, True, ""
+    return False, False, f"send target {sent_via!r}"
 
 
 def _settle_composer(c, seconds=5):
@@ -2578,23 +2598,28 @@ def _mention_type_js(name, token):
 
 
 def _mention_pick_js(name, token):
-    # Visible rows the typing produced. A candidate must be shaped like an APP row, read off the popup's
-    # own markup (probed live 2026-09-29): a content block whose leading icon carries `rounded-2xs`
-    # (connector icons; the Add actions use `icon-leading`/a CompactSource span, files `text-file-document`),
-    # and that sits under the Plugins header or in a popup with no header at all (a single-section result
-    # renders bare, and there only an EXACT label counts). "Headerless" alone proves nothing, since a lone
-    # Files row renders with its own header but a shape change could bare it: the icon and a description
-    # element are what say "app". A candidate is CONNECTED only if its content block is exactly icon + label
-    # (+ description) with no stray text: an unconnected app carries a bare "Connect" text node there, so
-    # the test is structural and holds in any UI language. Exact label wins, else a UNIQUE prefix among
-    # Plugins rows; the name is matched BEFORE the connected check, so an unconnected exact app is refused,
-    # never replaced by a connected app that merely starts with the same text. A row in an allowed section
-    # that is not app-shaped is never clicked and is reported as `unverified`; nothing is clicked on a guess.
-    # `open` / `loading`: the popup exists / still shows its "Loading suggestions" skeleton.
+    # Visible rows the typing produced. The requested name is matched EXACTLY (case- and whitespace-
+    # insensitive) against a row's label, and only among app rows: never by prefix. A prefix rule cannot be
+    # told apart from a different app that merely starts with the same text ('Notion' vs 'Notion Calendar',
+    # 'Atlas' vs 'Atlas Pro'): with only that other app enabled it is the ONLY prefix match, so it would be
+    # clicked and the prompt sent with the wrong app attached. The short-name snapping the CLI does
+    # (`--mention webcodex` -> 'WebCodex Demo') happens BEFORE this, against the known-apps list, so an
+    # unlisted short name fails closed here and the error names what the popup DID offer.
+    # A candidate must be shaped like an APP row, read off the popup's own markup (probed live 2026-09-29): a
+    # content block whose leading icon carries `rounded-2xs` (connector icons; Add actions use
+    # `icon-leading`/CompactSource, files `text-file-document`), under the Plugins header or in a bare
+    # single-section popup. "Headerless" alone proves nothing. A candidate is CONNECTED only if the whole
+    # button reads exactly `label` + `description`, with the description in its own element and nothing else
+    # anywhere in the row: an unconnected app carries a "Connect" control or text (inside the label, next to
+    # the description, or beside the content block), so the test is structural and holds in any UI language.
+    # An unconnected exact app is refused and reported, never replaced by another; a row in an allowed section
+    # that is not app-shaped is never clicked and is reported as `unverified`. `open` / `loading`: the popup
+    # exists / still shows its "Loading suggestions" skeleton.
     return ("(function(){var want=" + json.dumps(_norm_label(name)) + ";var os=" + _mention_visible_js()
             + ".filter(function(e){return e.getAttribute('data-cgc-pre')!==" + json.dumps(token) + ";});"
-            "function lab(e){return (e.innerText||e.textContent||'').split('\\n')[0].replace(/\\s+/g,' ')"
-            ".trim().replace(/^@/,'').toLowerCase();}"
+            "function sp(s){return (s||'').replace(/\\s+/g,' ').trim();}"
+            "function lab(e){return sp((e.innerText||e.textContent||'').split('\\n')[0]).replace(/^@/,'')"
+            ".toLowerCase();}"
             "function row(n){return n.hasAttribute('data-list-navigation-item');}"
             "function txt(n){return (n.innerText||'').trim();}"
             "function hdr(e){var p=e.previousElementSibling;while(p&&(row(p)||!txt(p)))"
@@ -2606,22 +2631,21 @@ def _mention_pick_js(name, token):
             ".indexOf(c)>=0;}"
             "function appish(e){var c=body(e);if(!c)return false;var l=c.firstElementChild;"
             "var i=l&&l.firstElementChild;return !!i&&tok(i,'rounded-2xs');}"
-            "function plain(e){var c=body(e);if(c.children.length!==2)return false;"
-            "for(var i=0;i<c.childNodes.length;i++){var n=c.childNodes[i];"
-            "if(n.nodeType===3&&n.textContent.trim())return false;}"
-            "return !!c.querySelector('.text-codex-description');}"
+            "function nw(s){return (s||'').replace(/\\s+/g,'');}"
+            "function plain(e){var c=body(e);if(!c||e.children.length!==1||c.children.length!==2)return false;"
+            "var d=c.querySelector('.text-codex-description');if(!d)return false;"
+            "var L=e.innerText.split('\\n').map(sp).filter(Boolean);"
+            # adjacent spans concatenate in textContent with NO whitespace between them (live DOM), so the
+            # comparison ignores whitespace entirely: any extra text still adds characters and fails it
+            "return L.length===2&&nw(e.textContent)===nw(L[0]+L[1]);}"
             "var open=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL) + ");"
             "var loading=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL + ' [role="status"]') + ");"
             "var sect=os.filter(function(e){var h=hdr(e);return h==='plugins'||(h===null&&!headed(e));});"
             "var pl=sect.filter(appish);"
             "var ex=pl.filter(function(e){return lab(e)===want;});"
-            "var pf=pl.filter(function(e){return hdr(e)==='plugins'&&lab(e).indexOf(want)===0;});"
-            "var hit=ex.length===1?ex[0]:(!ex.length&&pf.length===1?pf[0]:null);"
-            "var un=pl.filter(function(e){return !plain(e);}).map(lab).filter(function(l){"
-            "return l.indexOf(want)===0;});"
-            "var uv=sect.filter(function(e){return !appish(e);}).map(function(e){return txt(e)"
-            ".split('\\n')[0].replace(/\\s+/g,' ').trim().toLowerCase();}).filter(function(l){"
-            "return l&&l.indexOf(want)===0;});"
+            "var hit=ex.length===1?ex[0]:null;"
+            "var un=pl.filter(function(e){return !plain(e);}).map(lab).filter(function(l){return l===want;});"
+            "var uv=sect.filter(function(e){return !appish(e);}).map(lab).filter(function(l){return l===want;});"
             "if(hit&&!plain(hit)){un=[lab(hit)];hit=null;}"
             "if(!hit)return {hit:null,open:open,loading:loading,"
             "seen:pl.filter(plain).map(lab).filter(Boolean).slice(0,20),unconnected:un,unverified:uv};"
@@ -2630,10 +2654,12 @@ def _mention_pick_js(name, token):
 
 
 def _composer_mentions_js():
-    # How many APP mentions the composer holds (a picked app becomes <span app-mention-name=...>; a
-    # picked file or any other row does not). -1: no composer.
-    return ("(function(){var d=" + _composer_get_js() + ";"
-            "return d?d.querySelectorAll('[app-mention-name]').length:-1;})()")
+    # The composer's APP mention nodes: a picked app becomes <span app-mention-name=... app-mention-display-name=...>;
+    # a picked file or any other row does not. Returns the normalized display names ([] when there is no composer).
+    return ("(function(){var d=" + _composer_get_js() + ";if(!d)return [];"
+            "return Array.prototype.map.call(d.querySelectorAll('[app-mention-name]'),function(e){"
+            "return (e.getAttribute('app-mention-display-name')||e.getAttribute('app-mention-name')||'')"
+            ".replace(/\\s+/g,' ').trim().toLowerCase();});})()")
 
 
 def _mention_offer(popup_open, seen, unconnected=(), loading=False, unverified=()):
@@ -2676,7 +2702,8 @@ def _clear_after_mention_failure(c):
 
 def _insert_mention(c, name):
     token = os.urandom(4).hex()
-    have = c.eval(_composer_mentions_js(), timeout=45)
+    want = _norm_label(name)
+    have = list(c.eval(_composer_mentions_js(), timeout=45) or [])
     if c.eval(_mention_type_js(name, token), timeout=45) is None:
         raise _PreClickFailure("composer not found while typing @mention")
     end = time.time() + _MENTION_WAIT_S
@@ -2692,13 +2719,26 @@ def _insert_mention(c, name):
         if r.get("hit"):
             # One click, ever. The composer inserts the mention node a beat later, so give it
             # _MENTION_SETTLE_POLLS looks before concluding the row was not an app.
+            got = []
             for _ in range(_MENTION_SETTLE_POLLS):
                 time.sleep(0.4)
-                if (c.eval(_composer_mentions_js(), timeout=45) or 0) > have:
-                    c.eval(_paste_chunk_js(" "), timeout=45)
-                    return
-            # The composer holds no new app mention, so sending would drop the app.
+                got = list(c.eval(_composer_mentions_js(), timeout=45) or [])
+                if len(got) > len(have):
+                    break
+            appeared = list(got)
+            for h in have:                       # what was ALREADY there is not what this click added
+                if h in appeared:
+                    appeared.remove(h)
+            if appeared == [want]:
+                c.eval(_paste_chunk_js(" "), timeout=45)
+                return
+            # Not the requested app: nothing appeared (the row was not an app), or something else did.
+            # Either way the prompt would go out without the app that was asked for.
             residue = _clear_after_mention_failure(c)
+            if appeared:
+                raise _MentionFailure(
+                    f"mention_not_found: '@{name}' produced the app mention {appeared!r}, not {want!r} — "
+                    f"refusing to send with the wrong app attached{residue}")
             raise _MentionFailure(
                 f"mention_not_found: the popup row {r['hit'][:40]!r} for '@{name}' is not an app — the "
                 f"composer took no app mention from it{residue}. Enable the app '{name}' in ChatGPT "
@@ -2751,11 +2791,12 @@ def _paste_prompt(c, prompt: str, mentions=()) -> None:
             f"composer holds {got_len} normalized chars, prompt needs >= {want_len} — paste "
             "looks truncated by a DOM stall")
     if mentions:
-        kept = c.eval(_composer_mentions_js(), timeout=45)
-        if kept is None or kept < len(mentions):
+        kept = sorted(c.eval(_composer_mentions_js(), timeout=45) or [])
+        wanted = sorted(_norm_label(m) for m in mentions)
+        if kept != wanted:
             raise _MentionFailure(
-                f"mention_not_found: the composer holds {kept} of the {len(mentions)} requested app "
-                "mentions after the paste — refusing to send the prompt without them")
+                f"mention_not_found: the composer holds the app mentions {kept!r} after the paste, not "
+                f"the requested {wanted!r} — refusing to send the prompt with the wrong apps")
 
 
 def cmd_submit(a) -> int:
@@ -2798,6 +2839,8 @@ def cmd_submit(a) -> int:
         c.call("Page.navigate", {"url": a.project_url})
     else:
         c = CDP(a.port, create_url=a.project_url)
+    owns_tab = not a.reuse_tab   # a --reuse-tab tab was already there: never ours to close
+    pre_click = True             # False from just before the send eval: after it the tab is evidence, not garbage
     try:
         # (The old reuse-tab user-message COUNT guard lived here. It became dead when the post-send
         # check moved to _await_contract, which matches THIS request's rid inside a user turn — an
@@ -2807,7 +2850,6 @@ def cmd_submit(a) -> int:
         ready, _cstate = _await_composer(c)
         if not ready:
             _code, _msg = _composer_failure(_cstate)
-            c.close_tab()   # nothing was sent and this page never loaded — do not leak it
             sys.stderr.write(_msg + "\n")
             return _code
         # Model selection — fully automated (must run AFTER navigate, which resets the
@@ -2821,9 +2863,6 @@ def cmd_submit(a) -> int:
             pick = _select_model(c, target, a.model_family)
             model_confirmed, model_now, model_badge = pick.confirmed, pick.shown, pick.badge
             if not model_confirmed and not a.allow_model_mismatch:
-                if not a.reuse_tab:
-                    c.close_tab()  # don't orphan the dedicated tab we opened for this submit
-                c.close()
                 print(json.dumps({"ok": False, "submitted": False,
                                   "modelConfirmed": False, "model": model_now,
                                   "modelBadge": model_badge, "wanted": target,
@@ -2857,11 +2896,9 @@ def cmd_submit(a) -> int:
         try:
             _paste_prompt(c, prompt, a.mention)
         except _MentionFailure as e:
-            c.close_tab()
             sys.stderr.write(f"CGC_ERROR {e} — NOT submitted.\n")
             return 3
         except _PreClickFailure as e:
-            c.close_tab()   # nothing was sent; don't leak the tab
             sys.stderr.write(f"CGC_ERROR not_sent_preclick: {e} — NOT submitted; safe to retry with "
                              "the same --request-key.\n")
             return EXIT_NOT_SENT_PRECLICK
@@ -2882,16 +2919,16 @@ def cmd_submit(a) -> int:
             before_conv = "?unknown"
         # Submit. Prefer the send button; fall back to Enter. (POST-click from here: a failure past
         # this point is uncertain, never provably-not-sent.)
-        sent_via = c.eval(_send_click_js())
-        if sent_via in ("no-composer", "ambiguous"):
-            # Returned WITHOUT clicking (no visible composer form, or several send buttons in it): still
-            # provably unsent, and Enter is not pressed on a composer we cannot name.
-            c.close_tab()
-            sys.stderr.write(f"CGC_ERROR not_sent_preclick: send target {sent_via} — NOT submitted; safe "
-                             "to retry with the same --request-key.\n")
+        pre_click = False        # the eval below may click: from here a failure is uncertain
+        may_send, press_enter, why = _send_verdict(c.eval(_send_click_js()))
+        if not may_send:
+            # Nothing was clicked and Enter is not pressed, so this is still provably unsent.
+            pre_click = True
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: {why} — NOT submitted; safe to retry with the "
+                             "same --request-key.\n")
             return EXIT_NOT_SENT_PRECLICK
-        if sent_via != "clicked":
-            c.key("Enter", "Enter", 13)   # 'no-send'/'disabled': the pre-existing Enter path, unchanged
+        if press_enter:
+            c.key("Enter", "Enter", 13)   # no send button rendered yet, focus verified inside the composer
         # Confirm a user message actually landed (poll — render lags the click). On a reused
         # tab, requiring merely "count > 0" would false-positive on OLD messages already in
         # the thread if THIS send's composer insert/click silently failed — so require the
@@ -2936,7 +2973,8 @@ def cmd_submit(a) -> int:
                 + f"observed: {json.dumps(contract)}\n")
             return 3
         if verdict == "selector_drift":
-            c.close_tab()   # the send is confirmed and the conversation persists server-side
+            if owns_tab:
+                c.close_tab()   # the send is confirmed and the conversation persists server-side
             print(json.dumps({"ok": False, "submitted": True, "rid": a.rid,
                               "reason": "selector_drift", "adapter": adapter, "contract": contract,
                               "conversation_id": conv}))
@@ -2980,6 +3018,12 @@ def cmd_submit(a) -> int:
             "answer lands silently and you wait forever.\n")
         return 0
     finally:
+        # ONE owner of tab cleanup. A tab this command opened is closed on every exit BEFORE the send
+        # click, a return or an exception, since it holds nothing but a possible draft. After the click
+        # it is the evidence for an uncertain send and each outcome above decides for itself (and only
+        # ever for a tab it owns). A --reuse-tab tab was already there and is never closed here.
+        if owns_tab and pre_click:
+            c.close_tab()
         c.close()
 
 
@@ -3210,17 +3254,15 @@ def cmd_followup(a) -> int:
             return EXIT_NOT_SENT_PRECLICK
         time.sleep(0.3)
         click_attempted = True    # from here on a failure is post-click: uncertain, tab kept as evidence
-        sent_via = c.eval(_send_click_js())
-        if sent_via in ("no-composer", "ambiguous"):
-            # The eval returned WITHOUT clicking: there is no visible composer form, or its form holds
-            # several send buttons and picking one would be a guess. Nothing was clicked or pressed, so
-            # this is still provably unsent, and Enter is not pressed on a composer we cannot name.
+        may_send, press_enter, why = _send_verdict(c.eval(_send_click_js()))
+        if not may_send:
+            # Nothing was clicked and Enter is not pressed, so this is still provably unsent.
             click_attempted = False
-            sys.stderr.write(f"CGC_ERROR not_sent_preclick: send target {sent_via} — NOT sent; safe to "
-                             "retry with the same --request-key.\n")
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: {why} — NOT sent; safe to retry with the "
+                             "same --request-key.\n")
             return EXIT_NOT_SENT_PRECLICK
-        if sent_via != "clicked":
-            c.key("Enter", "Enter", 13)   # 'no-send'/'disabled': the pre-existing Enter path, unchanged
+        if press_enter:
+            c.key("Enter", "Enter", 13)   # no send button rendered yet, focus verified inside the composer
         # Landed-confirmation: on a long thread the DOM virtualizes older turns, so the rendered
         # user-turn COUNT can stay flat forever after a real send (observed live: a landed follow-up
         # returned ok:false because the render window kept its size). Count-increase is only the
