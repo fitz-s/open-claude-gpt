@@ -23,10 +23,16 @@ the old selector matched zero nodes. The picker now reads those rows, and harden
   (`rounded-2xs`; Add actions and file rows use other icons) under the **Plugins** header, or in a bare
   single-section popup. Any other row is never clicked and is reported as unverified. This is an
   inference from today's markup, not a documented contract.
-- **A row counts as connected only if the whole button reads exactly icon, label, description.** An
-  unconnected app carries a **Connect** control or text inside the label, beside the description, or beside
-  the content block, in any UI language; every such shape is refused and never clicked (it would start an
-  authorization flow). An unconnected exact app is refused, never replaced by another.
+- **A row counts as connected only if the whole button reads exactly icon, label, description**, with the
+  label and the description each a leaf element holding a single text node. An unconnected app carries a
+  **Connect** control or text; the shapes this refuses (each is a test) are: text inside the label, a button
+  or a second text node inside the description, a bare text node or a button in the content block, and an
+  element or text beside the content block, in any UI language. None of those is clicked (it would start an
+  authorization flow), and an unconnected exact app is refused, never replaced by another. The rule is
+  structural and cannot read meaning: text that is PART of the description's single text node ("Notion docs
+  and Connect") cannot be told from a description that really says so, and reads as connected.
+- **Two rows with the same exact name are refused as ambiguous** ("ambiguous: 2 rows named ..."), since
+  they may be different apps.
 - **Success is the requested app's own mention node.** After the one click the composer's
   `[app-mention-name]` nodes are polled for (~2.4s) and the one that appeared must carry the requested
   name; a node for another app, or none, clears the composer and refuses. After the prompt is pasted the
@@ -44,12 +50,14 @@ Follow-up route, found live on the same day:
   the visible editor, the verification read the hidden one, and the full prompt was left behind as a
   persisted draft. It reproduced with the thread fully rendered (not a hydration race) and with no
   mention (not the @ popup). A mention hit the same wrong-editor read ("the composer took no app mention").
-- The composer is now resolved once, by structure, and the whole send path is bound to it: the visible
-  editor inside a `<form>` (an edit-message box in a turn is not in one; focus breaks a tie), no fallback
-  to a hidden editor (readiness fails while none is visible), and the send button is the single visible
-  one inside that composer's own form. Several send buttons, a disabled one, no visible composer, or
-  focus outside the composer refuse before the click and Enter is not pressed; Enter remains only for a
-  composer with no send button yet whose focus is verified inside it.
+- The composer is now found by structure, and every step of the send path uses the same expression: the
+  visible editor inside a `<form>` (an edit-message box in a turn is not in one; focus breaks a tie), no
+  fallback to a hidden editor (readiness fails while none is visible), and the send button is the single
+  visible one inside that composer's own form. The expression is re-evaluated on each call, and
+  deterministically: it does not cache a node, so it follows the page if the editor is replaced. Several
+  send buttons, a disabled one, no visible composer, or focus outside the composer refuse before the click
+  and Enter is not pressed; Enter remains only for a composer with no send button yet whose focus is
+  verified inside it.
 - A follow-up with no `--mention` never opens the @ popup or types an `@`.
 - A follow-up waits for the thread's turns to render before reading its baseline (the composer appears
   ~5s before them) and refuses before any paste or click if they never do. A tab a command opened is
