@@ -2468,7 +2468,16 @@ class _PreClickFailure(Exception):
 
 
 def _composer_get_js():
-    return "document.querySelector(" + json.dumps(_COMPOSER_SEL) + ")"
+    # More than one editor can match the selector. A conversation re-opened by URL carries a hidden
+    # 0x0 one BEFORE the visible one (probed 2026-09-29), and document.querySelector returned it: every
+    # read (mention count, text, clear) looked at an editor the user cannot type into, while the
+    # keystrokes and the picked app went to the visible one. The composer is the visible editor; the
+    # one holding focus wins if several are.
+    return ("(function(){var l=Array.prototype.slice.call(document.querySelectorAll("
+            + json.dumps(_COMPOSER_SEL) + "));"
+            "var v=l.filter(function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;});"
+            "var f=v.filter(function(e){return e===document.activeElement||e.contains(document.activeElement);});"
+            "return f[0]||v[0]||l[0]||null;})()")
 
 
 def _settle_composer(c, seconds=5):
@@ -2510,12 +2519,17 @@ def _composer_text_js():
 # ---- @mention (ChatGPT apps/plugins) ------------------------------------------------------------
 # A plugin is not text: typing "@WebCodex Demo" as prose sends a literal string and the app is never
 # invoked. The composer turns "@<query>" into a popup of apps; picking one inserts a mention node.
-# So a mention is a composer ACTION done before the paste: type "@<name>", click the popup option
-# whose label matches, verify the composer changed. Unresolvable -> CGC_ERROR mention_not_found,
-# strictly pre-click (nothing sent), and a human fixes the name or enables the app.
+# So a mention is a composer ACTION done before the paste: type "@<name>", click the popup Plugins
+# row whose label matches, verify the composer gained an APP mention. Unresolvable -> CGC_ERROR
+# mention_not_found, strictly pre-click (nothing sent); the error says whether the popup never
+# opened, opened empty, listed the app unconnected, or offered other entries.
 _MENTION_WAIT_S = 8.0
-_MENTION_OPT_SEL = ('[role="option"],[role="menuitem"],[role="menuitemradio"],'
-                    '[role="listbox"] li,[data-radix-popper-content-wrapper] button')
+_MENTION_SETTLE_POLLS = 6  # x0.4s for the composer to show the picked app's mention node
+# Probed live 2026-09-29: the popup carries NO ARIA roles. It is a floating panel whose scroll area
+# is [data-mention-list-scroll-area]; every row (plugin, file, ...) is a plain
+# <button data-list-navigation-item> inside it. The roles this once guessed matched nothing.
+_MENTION_POPUP_SEL = '[data-mention-list-scroll-area]'
+_MENTION_OPT_SEL = _MENTION_POPUP_SEL + ' [data-list-navigation-item]'
 
 
 class _MentionFailure(_PreClickFailure):
@@ -2539,53 +2553,117 @@ def _mention_type_js(name, token):
             + _mention_visible_js() + ".forEach(function(e){e.setAttribute('data-cgc-pre',"
             + json.dumps(token) + ");});d.focus();"
             "document.execCommand('insertText',false," + json.dumps("@" + name) + ");"
-            "return d.innerHTML;})()")
+            "return true;})()")
 
 
 def _mention_pick_js(name, token):
-    # Visible options the typing produced; exact label wins, else a UNIQUE prefix match (the popup
-    # may append a description line). Returns the picked label, or null. Never guesses.
+    # Visible rows the typing produced. A row is a candidate only if it is an app: under the popup's
+    # Plugins header, or in a popup with no header at all (a lone result renders bare) where only an
+    # EXACT label counts, since a bare row could as well be a file. Exact label wins, else a UNIQUE
+    # prefix among Plugins rows. Never guesses. The match is made BEFORE the Connect check, so an
+    # unconnected exact app is refused rather than silently replaced by a connected prefix sibling.
+    # A row with more than label + description carries an extra control (Connect): clicking it starts
+    # an authorization flow, so it is never clicked and is reported as `unconnected`. The test is
+    # structural, so it holds in any UI language. `open` / `loading`: the popup exists / still shows
+    # its "Loading suggestions" skeleton (a query with no match leaves it there).
     return ("(function(){var want=" + json.dumps(_norm_label(name)) + ";var os=" + _mention_visible_js()
             + ".filter(function(e){return e.getAttribute('data-cgc-pre')!==" + json.dumps(token) + ";});"
             "function lab(e){return (e.innerText||e.textContent||'').split('\\n')[0].replace(/\\s+/g,' ')"
             ".trim().replace(/^@/,'').toLowerCase();}"
-            "var ex=os.filter(function(e){return lab(e)===want;});"
-            "var pf=os.filter(function(e){return lab(e).indexOf(want)===0;});"
+            "function row(n){return n.hasAttribute('data-list-navigation-item');}"
+            "function txt(n){return (n.innerText||'').trim();}"
+            "function hdr(e){var p=e.previousElementSibling;while(p&&(row(p)||!txt(p)))"
+            "p=p.previousElementSibling;return p?txt(p).toLowerCase():null;}"
+            "function headed(e){var k=e.parentElement.children;for(var i=0;i<k.length;i++)"
+            "if(!row(k[i])&&txt(k[i]))return true;return false;}"
+            "function unc(e){return (e.innerText||'').split('\\n').filter(function(t){return t.trim();})"
+            ".length>2;}"
+            "var open=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL) + ");"
+            "var loading=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL + ' [role="status"]') + ");"
+            "var pl=os.filter(function(e){var h=hdr(e);return h==='plugins'||(h===null&&!headed(e));});"
+            "var ex=pl.filter(function(e){return lab(e)===want;});"
+            "var pf=pl.filter(function(e){return hdr(e)==='plugins'&&lab(e).indexOf(want)===0;});"
             "var hit=ex.length===1?ex[0]:(!ex.length&&pf.length===1?pf[0]:null);"
-            "if(!hit)return {hit:null,seen:os.map(lab).filter(Boolean).slice(0,20)};"
-            "hit.click();return {hit:lab(hit),seen:[]};})()")
+            "var un=pl.filter(unc).map(lab).filter(function(l){return l.indexOf(want)===0;});"
+            "if(hit&&unc(hit)){un=[lab(hit)];hit=null;}"
+            "if(!hit)return {hit:null,open:open,loading:loading,"
+            "seen:pl.filter(function(e){return !unc(e);}).map(lab).filter(Boolean).slice(0,20),"
+            "unconnected:un};"
+            "hit.click();return {hit:lab(hit),open:open,loading:false,seen:[],unconnected:[]};})()")
 
 
-def _composer_html_js():
-    return "(function(){var d=" + _composer_get_js() + ";return d?d.innerHTML:null;})()"
+def _composer_mentions_js():
+    # How many APP mentions the composer holds (a picked app becomes <span app-mention-name=...>; a
+    # picked file or any other row does not). -1: no composer.
+    return ("(function(){var d=" + _composer_get_js() + ";"
+            "return d?d.querySelectorAll('[app-mention-name]').length:-1;})()")
+
+
+def _mention_offer(popup_open, seen, unconnected=(), loading=False):
+    """What the popup showed, in words that say what to do: never opened (a code/DOM problem),
+    listed but not connected (a human connects it), still on its loading skeleton (nothing matched,
+    or ChatGPT is slow), opened empty (the app is not enabled here, or the name is wrong), or
+    offered other entries."""
+    if unconnected:
+        return ("The popup lists " + ", ".join(repr(x[:40]) for x in dict.fromkeys(unconnected))
+                + " but it is NOT connected on this account (its row carries a Connect control) — a human "
+                  "must connect it in ChatGPT; the daemon never authorizes an app")
+    if not popup_open:
+        return (f"The @ popup never opened ({_MENTION_POPUP_SEL} absent) — the composer's DOM changed "
+                "or it lost focus; that is a code fix, not an app to enable")
+    if not seen and loading:
+        return (f"The popup opened but only ever showed its loading skeleton — no app of that name "
+                f"came back in {_MENTION_WAIT_S:.0f}s: not enabled for this account/project, the name "
+                "is wrong, or ChatGPT is slow; a human must check in ChatGPT")
+    if not seen:
+        return ("The popup opened but nothing matched — no app of that name is enabled for this "
+                "account/project (or the name is wrong); a human must enable it in ChatGPT")
+    return ("The popup offered: " + ", ".join(repr(x[:40]) for x in dict.fromkeys(seen))
+            + " — re-fire with one of those as --mention (and add it to CGC_APPS via cgc_config.py "
+              "set), or enable the app")
+
+
+def _clear_after_mention_failure(c):
+    """Leave no half-typed "@name" behind; either way the round is not sent. Returns the residue note."""
+    try:
+        left = c.eval(_clear_composer_js(), timeout=45)
+    except Exception:
+        left = None
+    return "" if left == 0 else " (and the composer could not be proven cleared)"
 
 
 def _insert_mention(c, name):
     token = os.urandom(4).hex()
-    typed = c.eval(_mention_type_js(name, token), timeout=45)
-    if typed is None:
+    have = c.eval(_composer_mentions_js(), timeout=45)
+    if c.eval(_mention_type_js(name, token), timeout=45) is None:
         raise _PreClickFailure("composer not found while typing @mention")
     end = time.time() + _MENTION_WAIT_S
-    seen = []
+    seen, unconnected, popup_open, loading = [], [], False, False
     while time.time() < end:
         time.sleep(0.4)
         r = c.eval(_mention_pick_js(name, token), timeout=45) or {}
         seen = r.get("seen") or seen
+        unconnected = r.get("unconnected") or unconnected
+        popup_open = popup_open or bool(r.get("open"))
+        loading = bool(r.get("loading"))
         if r.get("hit"):
-            time.sleep(0.4)
-            if c.eval(_composer_html_js(), timeout=45) != typed:
-                c.eval(_paste_chunk_js(" "), timeout=45)
-                return
-    try:  # leave no half-typed "@name" behind; either way the round is not sent
-        left = c.eval(_clear_composer_js(), timeout=45)
-    except Exception:
-        left = None
-    residue = "" if left == 0 else " (and the composer could not be proven cleared)"
+            # One click, ever. The composer inserts the mention node a beat later, so give it
+            # _MENTION_SETTLE_POLLS looks before concluding the row was not an app.
+            for _ in range(_MENTION_SETTLE_POLLS):
+                time.sleep(0.4)
+                if (c.eval(_composer_mentions_js(), timeout=45) or 0) > have:
+                    c.eval(_paste_chunk_js(" "), timeout=45)
+                    return
+            # The composer holds no new app mention, so sending would drop the app.
+            residue = _clear_after_mention_failure(c)
+            raise _MentionFailure(
+                f"mention_not_found: the popup row {r['hit'][:40]!r} for '@{name}' is not an app — the "
+                f"composer took no app mention from it{residue}. Enable the app '{name}' in ChatGPT "
+                "or fix the name")
+    residue = _clear_after_mention_failure(c)
     raise _MentionFailure(
         f"mention_not_found: the composer offered no app named '{name}' for '@{name}' within "
-        f"{_MENTION_WAIT_S:.0f}s{residue}. The popup offered: "
-        + (", ".join(repr(x) for x in dict.fromkeys(seen)) or "nothing")
-        + " — re-fire with one of those as --mention (and add it to CGC_APPS via cgc_config.py set), or enable the app")
+        f"{_MENTION_WAIT_S:.0f}s{residue}. {_mention_offer(popup_open, seen, unconnected, loading)}")
 
 
 def _paste_prompt(c, prompt: str, mentions=()) -> None:
@@ -2629,6 +2707,12 @@ def _paste_prompt(c, prompt: str, mentions=()) -> None:
         raise _PreClickFailure(
             f"composer holds {got_len} normalized chars, prompt needs >= {want_len} — paste "
             "looks truncated by a DOM stall")
+    if mentions:
+        kept = c.eval(_composer_mentions_js(), timeout=45)
+        if kept is None or kept < len(mentions):
+            raise _MentionFailure(
+                f"mention_not_found: the composer holds {kept} of the {len(mentions)} requested app "
+                "mentions after the paste — refusing to send the prompt without them")
 
 
 def cmd_submit(a) -> int:
@@ -2901,6 +2985,19 @@ def _extract_rid_from_prompt_file(prompt_file: str) -> str:
     return rids[0]
 
 
+def _await_thread_rendered(c, seconds=30):
+    """A follow-up continues a thread that already holds at least one user turn, so a page that shows
+    none has not hydrated yet: the composer appears seconds before the turns do (2.8s vs 7.1s on a
+    re-opened conversation). The baseline count below, the same-rid guard and the landed check all
+    read the turns, and an early read of 0 made the first new turn look like a confirmation."""
+    end = time.time() + seconds
+    while time.time() < end:
+        if (c.eval("document.querySelectorAll(" + _JS_U + ").length") or 0) > 0:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def cmd_followup(a) -> int:
     """Continue a consult THREAD (ChatGPT keeps the conversation's full context + model).
     Two ways to call it, both zero-bookkeeping:
@@ -3021,6 +3118,7 @@ def cmd_followup(a) -> int:
                 return 2
         # Count user messages BEFORE sending so we can confirm a NEW one landed (the
         # thread already has >=1 user message, so an absolute >0 check would false-pass).
+        _await_thread_rendered(c)
         u_before = c.eval("document.querySelectorAll(" + _JS_U + ").length") or 0
         # The last user turn's text before sending. A retry of the SAME rid (the automatic continue
         # after a failed turn) sends into a thread whose last turn already echoes that rid, so the
@@ -3047,9 +3145,13 @@ def cmd_followup(a) -> int:
         try:
             _paste_prompt(c, prompt, a.mention)
         except _MentionFailure as e:
+            if reopened:
+                c.close_tab()  # we opened it and nothing was sent; its draft must not outlive the refusal
             sys.stderr.write(f"CGC_ERROR {e} — NOT sent.\n")
             return 3
         except _PreClickFailure as e:
+            if reopened:
+                c.close_tab()
             sys.stderr.write(f"CGC_ERROR not_sent_preclick: {e} — NOT sent; safe to retry with the "
                              "same --request-key.\n")
             return EXIT_NOT_SENT_PRECLICK

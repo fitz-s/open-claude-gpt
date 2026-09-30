@@ -2448,3 +2448,115 @@ class TestRefire:
         capsys.readouterr()
         assert backend.refire_round("REQ-20260707-120000-0nope01") == 2
         assert "no_such_round" in capsys.readouterr().err
+
+
+# ---- a follow-up's pre-click refusal is not "already sent" ---------------------------------------
+# Live incident 2026-09-29: a follow-up whose @mention could not be confirmed exited 3 before the click
+# and was stamped not_sent_proven, yet `await` printed "(post-send) ... already sent to conversation
+# ... RETRIEVE it", retryable:false. It keyed on conversation_of(), which is truthy for EVERY follow-up
+# (it inherits its parent's thread at enqueue). An honest agent followed it and waited for an answer
+# that never existed.
+
+_MENTION_REFUSAL = ("CGC_ERROR mention_not_found: the popup row 'atlas' for '@Atlas' is not an app — the "
+                    "composer took no app mention from it. Enable the app 'Atlas' in ChatGPT or fix the "
+                    "name — NOT sent.")
+_CONV_FU = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+
+
+def _blocked_followup(store_mod, backend, s, tmp, rid="REQ-20260721-000000-0000f1"):
+    """A follow-up that inherited its parent's thread, then hit the driver's exit-3 mention refusal."""
+    s.create_round("REQ-20260721-000000-0000f0", "submit", prompt="p", thread_id=_CONV_FU)
+    s.create_round(rid, "followup", out_path=str(tmp / "f.txt"),
+                   prompt=f"next question\nBEGIN_RESPONSE:{rid}\n...\nEND_RESPONSE:{rid}",
+                   thread_id=_CONV_FU, parent_rid="REQ-20260721-000000-0000f0",
+                   spec_json=json.dumps({"conversation": _CONV_FU, "mentions": ["Atlas"],
+                                         "parent_rid": "REQ-20260721-000000-0000f0"}))
+    s.set_state(rid, store_mod.READY)
+    calls = []
+
+    def cdp(kind, **kw):
+        calls.append(kind)
+        return {"code": 3, "stderr": _MENTION_REFUSAL}
+
+    final = backend.process_round(s, s.get_round(rid), cdp, daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.BLOCKED and calls == ["followup"], "one send attempt, no wait"
+    return rid
+
+
+def test_followup_mention_refusal_is_stamped_not_sent_and_release_eligible(env):
+    store_mod, backend, s, tmp = env
+    rid = _blocked_followup(store_mod, backend, s, tmp)
+    r = s.get_round(rid)
+    assert r["send_disposition"] == store_mod.NOT_SENT_PROVEN
+    assert s.conversation_of(rid) == _CONV_FU, "the inherited thread is why conversation_of is no proof"
+    assert backend._release_eligible(s, r)
+
+
+def test_await_reports_a_stamped_followup_refusal_as_pre_send_with_the_supported_refire(env, capsys):
+    store_mod, backend, s, tmp = env
+    rid = _blocked_followup(store_mod, backend, s, tmp)
+    capsys.readouterr()
+    code = backend.await_round(types.SimpleNamespace(rid=rid, timeout=2, poll=1))
+    cap = capsys.readouterr()
+    env_json = json.loads(cap.out.strip().splitlines()[-1])
+    assert code == 3 and env_json["state"] == "blocked"
+    assert env_json["retryable"] is True, "nothing was sent, so a re-fire cannot duplicate"
+    assert f"refire --rid {rid}" in env_json["next_command"] and "retrieve" not in env_json["next_command"]
+    assert "(pre-send)" in cap.err and "(post-send)" not in cap.err
+    assert "already sent" not in cap.err and "Do NOT retrieve" in cap.err
+
+
+def test_await_still_calls_an_unstamped_blocker_after_a_confirmed_send_post_send(env, capsys):
+    """The other half of the split: a blocker hit DURING the wait carries no stamp and keeps its
+    retrieve-don't-resend advice. Only the durable stamp may downgrade it to pre-send."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    rid = r["rid"]
+    aid = s.begin_send(rid, "p", store_mod.sha256("p"), daemon_instance_id="d1")
+    s.mark_accepted(aid, _CONV_FU)
+    s.mark_waiting(rid)
+    backend._wait_phase(s, rid, _CONV_FU, {},
+                        lambda kind, **kw: {"code": 3, "stderr": "CGC_ERROR rate_limit: try again later"})
+    capsys.readouterr()
+    backend.await_round(types.SimpleNamespace(rid=rid, timeout=2, poll=1))
+    cap = capsys.readouterr()
+    env_json = json.loads(cap.out.strip().splitlines()[-1])
+    assert env_json["retryable"] is False and "kind retrieve" in env_json["next_command"]
+    assert "(post-send)" in cap.err
+
+
+def test_refire_replays_a_stamped_followup_refusal_under_a_fresh_rid(env, capsys):
+    store_mod, backend, s, tmp = env
+    rid = _blocked_followup(store_mod, backend, s, tmp)
+    assert backend.refire_round(rid) == 0
+    new = [x for x in s.db.execute("SELECT rid FROM rounds WHERE rid != ? AND kind='followup'", (rid,))]
+    assert len(new) == 1, "exactly one fresh follow-up is enqueued"
+    row = s.get_round(new[0]["rid"])
+    assert json.loads(row["spec_json"])["mentions"] == ["Atlas"] and row["parent_rid"] == "REQ-20260721-000000-0000f0"
+
+
+def test_a_retrieve_of_a_round_the_store_proves_never_sent_is_refused(env, capsys):
+    """The lead's retrieve sat 'waiting' ten minutes hunting a turn that never existed. The store
+    already knows the parent was proven not-sent, so enqueue says so and names the refire."""
+    store_mod, backend, s, tmp = env
+    rid = _blocked_followup(store_mod, backend, s, tmp)
+    capsys.readouterr()
+    rc = backend.enqueue_round(_enq_ns("REQ-20260721-000000-0000f9", None, kind="retrieve",
+                                       conversation="auto", parent=rid), "", str(tmp / "r.txt"))
+    err = capsys.readouterr().err
+    assert rc == 2 and "retrieve_parent_never_sent" in err and f"refire --rid {rid}" in err
+    assert s.get_round("REQ-20260721-000000-0000f9") is None, "nothing may be enqueued"
+
+
+def test_a_retrieve_of_an_uncertain_round_is_still_allowed(env):
+    """The guard is only for durable not-sent proof. A possibly_accepted parent is exactly what a
+    retrieve exists for."""
+    store_mod, backend, s, tmp = env
+    s.create_round("REQ-20260721-000000-0000e0", "submit", prompt="p", thread_id=_CONV_FU)
+    s.set_state("REQ-20260721-000000-0000e0", store_mod.READY)
+    aid = s.begin_send("REQ-20260721-000000-0000e0", "p", store_mod.sha256("p"), daemon_instance_id="d1")
+    s.mark_possibly_accepted(aid, "send failed (exit 1) - retrieve, don't resend")
+    rc = backend.enqueue_round(_enq_ns("REQ-20260721-000000-0000e1", None, kind="retrieve",
+                                       conversation="auto", parent="REQ-20260721-000000-0000e0"),
+                               "", str(tmp / "r2.txt"))
+    assert rc == 0 and s.get_round("REQ-20260721-000000-0000e1") is not None

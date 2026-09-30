@@ -612,6 +612,16 @@ def enqueue_round(a, prompt: str, out: str) -> int:
             # only when none was given. The one case that genuinely cannot be resolved this way — the
             # parent has no recorded conversation — still refuses, naming the one command that can
             # actually find it.
+            prow = s.get_round(parent)
+            if prow is not None and _release_eligible(s, prow) and prow["state"] != store_mod.GATE_REJECTED \
+                    and prow.get("rendered_prompt"):
+                sys.stderr.write(
+                    f"CGC_ERROR retrieve_parent_never_sent: --parent {parent} is durably proven NOT "
+                    f"sent ({prow['state']}, {prow.get('send_disposition') or 'no send attempt'}), so "
+                    "there is no answer on the page to retrieve — a retrieve would only watch for a "
+                    "turn that never existed. Re-fire it instead (nothing can duplicate): python3 "
+                    f"{_spool.__file__} refire --rid {parent}\n")
+                return 2
             if conv in (None, "auto"):
                 conv = s.conversation_of(parent)
                 if not conv:
@@ -986,13 +996,29 @@ def _await_round(a) -> int:
                   human_action="verify the salvaged answer is complete and belongs to this round")
             return 3
         if state == store_mod.BLOCKED:
-            # A blocker BEFORE the send (login/model/composer at submit) is safely re-enqueued; a
-            # blocker AFTER the send (login/captcha/rate-limit hit during the wait) is NOT — the
-            # consult may still be generating or already complete, so re-enqueue would duplicate it.
-            # A recorded conversation means the send crossed the fence → retrieve, don't resend.
+            # Pre- or post-send is decided by the durable not-sent stamp, NEVER by whether the round
+            # has a conversation. A follow-up inherits its parent's thread at enqueue, so
+            # conversation_of() is truthy for every follow-up: keying on it reported a mention or login
+            # refusal that provably never clicked as "already sent" and pointed at a retrieve for an
+            # answer that does not exist. The stamp is what _release_eligible (and refire) trust.
             with store_mod.Store() as _s:
                 conv = _s.conversation_of(a.rid)
-            if conv:
+                proven_unsent = _release_eligible(_s, r)
+            if proven_unsent:
+                sys.stderr.write(
+                    f"CGC_BLOCKER {a.rid} (pre-send): {r['error_code'] or 'login/captcha/rate-limit'}\n"
+                    "Nothing was sent: the driver refused before the send click, and the store holds "
+                    "that proof. Fix the cause (a human clears it in the ChatGPT window, or the "
+                    "--mention/name is corrected), then re-fire it under a fresh rid:\n"
+                    f"  python3 {_spool.__file__} refire --rid {a.rid}\n"
+                    "Do NOT retrieve: there is no answer to find.\n")
+                _emit(a.rid, state, retryable=True, parent_rid=parent,
+                      human_action="fix the cause named in `error`, then re-fire (nothing was sent)",
+                      next_command=f"python3 {_spool.__file__} refire --rid {a.rid}",
+                      error=r["error_code"])
+            elif conv:
+                # A blocker AFTER a confirmed send (login/captcha/rate-limit hit during the wait) is
+                # NOT safely re-enqueued: the consult may still be generating or already complete.
                 # --parent pins the SOURCE rid the retrieve must verify on the page — never let it
                 # auto-adopt whatever the conversation's latest turn happens to be by the time a
                 # human clears the blocker and runs this.

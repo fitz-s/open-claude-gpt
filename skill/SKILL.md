@@ -48,8 +48,10 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid>
   Which apps exist: known today = **`WebCodex Demo`**; the live list is
   `python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py apps` (from `CGC_APPS`). A short or
   lower-case name (`--mention webcodex`) snaps to the listed spelling. Envelope error
-  `mention_not_found` names what the popup DID offer → re-fire with that name, else relay
-  "enable the app" and stop.
+  `mention_not_found` says what the popup showed: other apps → re-fire with one of those names;
+  opened but empty, only its loading skeleton, or listed with a Connect control → relay
+  "enable/connect the app in ChatGPT" and stop; a row that "is not an app" or a popup that "never
+  opened" → a driver/DOM problem, relay it verbatim, do not retry.
 - Do NOT preflight: never run `doctor`/`queue`/`status` before firing. The daemon is installed
   once (`cgc install-daemon`, launchd keeps it alive); if it is genuinely down, fire/await say so
   in one line — relay `cgc install-daemon` to the user and stop.
@@ -71,9 +73,12 @@ outcome names the artifact it produced. Act on the fields, never on the code alo
   messages, so it is a decision you make FROM the answer, never a step the envelope proposes.
 - `human_action` set → relay exactly that to the user (login/captcha/rate-limit/safeguard
   refusal), then do `next_command` once it's cleared.
-- `retryable:true` → re-run the SAME fire (use the same `--request-key`). `retryable:false` with
-  state `possibly_accepted` → the send may have landed: NEVER re-fire; follow `next_command`
-  (retrieve by conversation).
+- `retryable:true` → re-run the SAME fire (use the same `--request-key`). A `blocked` round marked
+  `(pre-send)` (login, captcha, a `--mention` that could not be confirmed) was proven never sent by the
+  driver's own refusal: once the cause in `error` is fixed, run its `next_command`
+  (`cgc_spool.py refire --rid <rid>`, a fresh rid, same prompt and spec) — never a retrieve, there is
+  no answer to find. `retryable:false` with state `possibly_accepted` (or a `(post-send)` blocker) →
+  the send may have landed: NEVER re-fire; follow `next_command` (retrieve by conversation).
 - Nothing useful → `log_path` is the full send+wait transcript; read it before guessing.
 - ChatGPT failing a turn ("Thinking failed") is handled for you: the daemon sends ONE "continue" in
   the same thread and the same rid keeps waiting. If that continue also fails, the round ends `failed`

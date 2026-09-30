@@ -6,6 +6,48 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — `fire --mention` found no popup entries, ever
+
+Every `--mention` failed `mention_not_found ... The popup offered: nothing`, for apps that were
+enabled. The picker looked for ARIA roles (`option`, `menuitem`, `listbox li`); the composer's @ popup
+has none. Probed live (2026-09-29), it is a floating panel whose scroll area is
+`[data-mention-list-scroll-area]`, and every row is a plain `<button data-list-navigation-item>`, so
+the old selector matched zero nodes. The picker now reads those rows, and hardens around them:
+
+- Only apps are candidates: rows under the **Plugins** header, or in a popup with no header at all
+  (a lone result renders bare, and there only an exact name counts, since a bare row may be a file).
+  A query also lists **Files**, and clicking one attaches a file instead of the app.
+- A row with more than a label and a description carries an extra control (**Connect**): an app this
+  account has not connected, whose click would start an authorization flow. It is never clicked and is
+  reported as not connected. The test is the row's shape, so it holds in any UI language. The name is
+  matched first, so an unconnected exact app is refused, never replaced by a connected app that
+  merely starts with the same text.
+- Success is "the composer gained an app mention node" (`[app-mention-name]`), polled for ~2.4s after
+  the one click, not "the HTML changed", which any stray click satisfies. The same count is re-checked
+  after the prompt is pasted, so a paste that eats a mention is not sent.
+- The failure names which thing happened: popup never opened (a DOM/code bug), only its loading
+  skeleton (what ChatGPT leaves for a query that matches nothing), opened empty, app listed but not
+  connected, other apps offered, or a row was clicked that turned out not to be an app.
+
+- On a conversation re-opened by URL (a follow-up whose tab was gone), the mention never took. The page
+  holds a hidden 0x0 editor BEFORE the visible one and `document.querySelector` returned it, so the
+  typing and the picked app went to the visible editor while every read of the composer (mention count,
+  text, clear) looked at the hidden one: a mention that had landed read as "the composer took no app
+  mention", and the follow-up was refused. The composer is now the visible editor (the focused one if
+  several). A follow-up also waits for the thread's turns to render before reading its baseline (the
+  composer appears ~5s before them), and closes a tab it re-opened when it refuses before the send,
+  so a draft never outlives the refusal.
+- `await` no longer calls a pre-click refusal "already sent". A follow-up inherits its parent's
+  conversation at enqueue, so the envelope's old test (the round has a conversation) was true for every
+  follow-up, and a mention or login refusal that provably never clicked told the caller to RETRIEVE a
+  reply that did not exist. It now branches on the durable not-sent stamp: stamped means `pre-send`,
+  `retryable:true`, `next_command` = `cgc_spool.py refire --rid <rid>`; an unstamped blocker after a
+  confirmed send stays `post-send` / retrieve. `enqueue --kind retrieve` refuses a parent the store
+  proves never sent (`retrieve_parent_never_sent`) instead of watching ten minutes for a missing turn.
+
+Pinned by `tests/fixtures/mention_popup.json`, a scrubbed capture of the live popup (private app names
+replaced), run through the real picker JS in node against a DOM rebuilt from it.
+
 ## [0.4.0] — 2026-09-25
 
 ### Added — a failed ChatGPT turn gets one automatic "continue"

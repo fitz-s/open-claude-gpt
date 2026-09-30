@@ -368,3 +368,66 @@ def test_a_same_rid_resend_without_a_baseline_refuses_before_clicking(env, monke
     tab = _FollowupTab([_turn(RID)], lands=_turn(RID) + "\n")
     assert _run_followup(monkeypatch, tab, RID, blank_last=True) == c.EXIT_NOT_SENT_PRECLICK
     assert not tab.clicked
+
+
+# ---- a follow-up's mention refusal must not leave its own tab behind, and must wait for the thread ----
+
+def _run_followup_refusing(monkeypatch, tab, reopened, exc):
+    """cmd_followup with _paste_prompt raising `exc`; `reopened` decides whether CDP() first says the
+    tab is gone (so the command opens it itself)."""
+    import types
+    import cdp_consult as c
+
+    def fake_cdp(port, match=None, create_url=None):
+        if match is not None and reopened:
+            raise SystemExit("CGC_ERROR conversation_not_found: no tab")
+        return tab
+
+    monkeypatch.setattr(c, "CDP", fake_cdp)
+    monkeypatch.setattr(c, "_await_composer", lambda *a, **k: (True, {}))
+    monkeypatch.setattr(c, "_await_thread_rendered", lambda *a, **k: True)
+    monkeypatch.setattr(c, "_egress_gate", lambda p: (True, "ok"))
+    monkeypatch.setattr(c, "_last_user_text_js", lambda: "LAST")
+    monkeypatch.setattr(c, "_write_state", lambda **k: None)
+
+    def refuse(*a, **k):
+        raise exc
+    monkeypatch.setattr(c, "_paste_prompt", refuse)
+    orig = tab.eval
+    tab.eval = lambda e, timeout=None: tab.turns[-1] if e == "LAST" else orig(e, timeout)
+    monkeypatch.setattr(c.time, "sleep", lambda s: None)
+    pf = os.path.join(os.environ["CGC_STATE_DIR"], "p2.md")
+    open(pf, "w").write("Continuing.\nBEGIN_RESPONSE:%s\nx\nEND_RESPONSE:%s\n" % (RID, RID))
+    ns = types.SimpleNamespace(no_gate=True, conversation=CONV, prompt_file=pf, task=None, rid=RID,
+                               model="skip", model_family="skip", allow_model_mismatch=False,
+                               port=9333, mention=["WebCodex Demo"], watch=False, out=None)
+    return c.cmd_followup(ns)
+
+
+def test_a_mention_refusal_closes_the_tab_the_followup_reopened(env, monkeypatch):
+    import cdp_consult as c
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)
+    closed = []
+    tab.close_tab = lambda: closed.append(1)
+    rc = _run_followup_refusing(monkeypatch, tab, reopened=True,
+                                exc=c._MentionFailure("mention_not_found: not an app"))
+    assert rc == 3 and closed == [1], "a tab this command opened must not outlive a refusal"
+
+
+def test_a_mention_refusal_leaves_a_live_tab_it_did_not_open_alone(env, monkeypatch):
+    import cdp_consult as c
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)
+    closed = []
+    tab.close_tab = lambda: closed.append(1)
+    rc = _run_followup_refusing(monkeypatch, tab, reopened=False,
+                                exc=c._MentionFailure("mention_not_found: not an app"))
+    assert rc == 3 and closed == [], "a tab the user or another round holds is not ours to close"
+
+
+def test_a_preclick_failure_closes_the_reopened_tab_too(env, monkeypatch):
+    import cdp_consult as c
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)
+    closed = []
+    tab.close_tab = lambda: closed.append(1)
+    rc = _run_followup_refusing(monkeypatch, tab, reopened=True, exc=c._PreClickFailure("paste truncated"))
+    assert rc == c.EXIT_NOT_SENT_PRECLICK and closed == [1]
