@@ -212,11 +212,11 @@ class _FollowupTab:
     def eval(self, expr, timeout=None):
         if ".length" in expr and "querySelectorAll" in expr and "function" not in expr:
             return len(self.turns)
-        if "b.click()" in expr:
+        if "return 'clicked'" in expr:
             self.clicked = True
             if self.lands:
                 self.turns.append(self.lands)
-            return True
+            return "clicked"
         if "location.pathname" in expr:
             return "/c/" + CONV
         return None
@@ -465,7 +465,7 @@ def _followup_env(monkeypatch, tab, reopened, hydrated, paste=None, select_raise
     orig = tab.eval
 
     def ev(e, timeout=None):
-        if "b.click()" in e:
+        if "return 'clicked'" in e:
             rec["clicked"] += 1
         return tab.turns[-1] if e == "LAST" else orig(e, timeout)
     tab.eval = ev

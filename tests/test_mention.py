@@ -565,49 +565,134 @@ def test_blocked_round_keeps_the_offered_app_names():
     assert backend._block_code("CGC_ERROR login_needed: log in") == "login_needed"
 
 
-# ---- a re-opened conversation carries two editors ----------------------------------------------
-# Probed live 2026-09-29: a conversation opened by URL holds a HIDDEN 0x0 editor BEFORE the visible one,
-# and document.querySelector took it. The typing and the picked app went to the visible editor while
-# every read (mention count, text, clear) looked at the hidden one, so a mention that had landed read as
-# "the composer took no app mention from it", and the follow-up that carried it was reported "already
-# sent" although nothing was sent. The composer is the visible editor; focus breaks a tie.
+# ---- the composer is resolved once, from the form, and the send button belongs to that form -------
+# Probed live 2026-09-29: a conversation re-opened by URL holds TWO forms, a hidden 0x0 one (with its own
+# editor and buttons) before the visible one. document.querySelector took the hidden editor: typing and
+# the picked app went to the visible one while every read (mention count, text, clear) saw the hidden one,
+# so a mention that had landed read as "the composer took no app mention". The composer is the VISIBLE
+# editor INSIDE a <form> (an edit-message box in a turn is not in one); focus breaks a tie; a hidden
+# editor is never a fallback; the send button is the one INSIDE that composer's own form.
 
-_NODE_COMPOSER = r"""
-function ed(o){o=o||{};return {tagName:'DIV',_a:{role:'textbox',contenteditable:'true'},
-  getBoundingClientRect:function(){return o.hidden?{width:0,height:0}:{width:547,height:36}},
-  contains:function(n){return n===this||(o.hasFocus&&n===ACTIVE)},id:o.id||''};}
+_NODE_FORMS = r"""
+function el(t,o){o=o||{};var n={tagName:t.toUpperCase(),_a:o.a||{},children:[],parent:null,hidden:!!o.hidden,
+  disabled:!!o.disabled,clicked:0,
+  getAttribute:function(k){return k in this._a?this._a[k]:null},
+  getBoundingClientRect:function(){return this.hidden||(this.parent&&this.parent.hiddenDeep())?{width:0,height:0}:{width:500,height:40}},
+  hiddenDeep:function(){return this.hidden||(this.parent&&this.parent.hiddenDeep())},
+  closest:function(sel){var ok=sel.split(',').map(function(x){return x.trim()});var n=this;
+    while(n){if(ok.indexOf(n.tagName.toLowerCase())>=0||(n._a['data-message-author-role']!==undefined&&ok.indexOf('[data-message-author-role]')>=0))return n;n=n.parent;}return null;},
+  contains:function(x){while(x){if(x===this)return true;x=x.parent;}return false;},
+  querySelectorAll:function(sel){return ALL.filter(function(x){return x!==n&&n.contains(x)&&match(x,sel)})},
+  click:function(){this.clicked++}};
+  (o.c||[]).forEach(function(c){c.parent=n;n.children.push(c);});return n;}
+var ALL=[];function reg(n){ALL.push(n);n.children.forEach(reg);return n;}
+function match(x,sel){return sel.split(',').some(function(p){p=p.trim();
+  if(p==='#prompt-textarea')return x._a.id==='prompt-textarea';
+  if(p==='div[role="textbox"][contenteditable="true"]')return x.tagName==='DIV'&&x._a.role==='textbox'&&x._a.contenteditable==='true';
+  if(p==='button[data-testid="send-button"]')return x.tagName==='BUTTON'&&x._a['data-testid']==='send-button';
+  if(p==='button[aria-label*="Send" i]')return x.tagName==='BUTTON'&&/send/i.test(x._a['aria-label']||'');
+  if(p==='button[aria-label*="\u53d1\u9001"]')return x.tagName==='BUTTON'&&/\u53d1\u9001/.test(x._a['aria-label']||'');
+  throw new Error('unsupported selector: '+p);});}
+function ed(o){o=o||{};o.a=Object.assign({role:'textbox',contenteditable:'true'},o.a||{});return el('div',o);}
+function send(o){o=o||{};o.a=Object.assign({'aria-label':'Send'},o.a||{});return el('button',o);}
 var ACTIVE=null;
-var document={querySelectorAll:function(sel){return EDS},activeElement:null};
+var document={activeElement:null,readyState:'complete',
+  querySelectorAll:function(sel){return ALL.filter(function(x){return match(x,sel)})},
+  querySelector:function(sel){
+    if(/input\[type="password"\]|iframe\[/.test(sel))return null;   // no login wall, no captcha frame
+    return document.querySelectorAll(sel)[0]||null;}};
+var location={hostname:'chatgpt.com',pathname:'/c/x'};
 """
 
 
-def _pick_composer(eds_js, active_idx=None):
+def _run_forms(tree_js, expr, active=None):
+    """Run a driver JS expression in node over a tree of forms/editors/buttons; returns its JSON result."""
     import shutil, subprocess
     if not shutil.which("node"):
         pytest.skip("node not installed")
-    src = (_NODE_COMPOSER + "var EDS=" + eds_js + ";"
-           + ("ACTIVE=EDS[%d];document.activeElement=ACTIVE;" % active_idx if active_idx is not None else "")
-           + "var d=" + CDP._composer_get_js() + ";"
-           "console.log(JSON.stringify(d?EDS.indexOf(d):null));")
+    src = (_NODE_FORMS + "var ROOT=reg(" + tree_js + ");"
+           + ("document.activeElement=%s;" % active if active else "")
+           + "var R=" + expr + ";console.log(JSON.stringify(R));")
     return json.loads(subprocess.run(["node", "-e", src], capture_output=True, text=True,
                                      check=True).stdout)
 
 
+_HIDDEN_FORM_FIRST = ("el('body',{c:[el('form',{hidden:true,c:[ed({a:{id:'H'}}),send()]}),"
+                      "el('form',{c:[ed({a:{id:'V'}}),send({a:{id:'S'}})]})]})")
+
+
+def _composer_id(tree_js, active=None):
+    r = _run_forms(tree_js, "(function(){var d=" + CDP._composer_get_js() + ";return d?d._a.id||'?':null;})()",
+                   active)
+    return r
+
+
 def test_composer_is_the_visible_editor_not_the_first_match():
-    # the live shape: a hidden editor first, the visible one second
-    assert _pick_composer("[ed({hidden:true,id:'a'}),ed({id:'b'})]") == 1
-    # a single visible editor (the project page) is unchanged
-    assert _pick_composer("[ed({id:'a'})]") == 0
+    assert _composer_id(_HIDDEN_FORM_FIRST) == "V"      # the live shape: hidden form first
+    assert _composer_id("el('body',{c:[el('form',{c:[ed({a:{id:'A'}})]})]})") == "A"   # project page
 
 
-def test_composer_prefers_the_focused_editor_when_several_are_visible():
-    assert _pick_composer("[ed({id:'a'}),ed({id:'b',hasFocus:true})]", active_idx=1) == 1
+def test_composer_has_no_hidden_fallback():
+    # hydrating: nothing visible yet means NO composer, not the first match. A read or paste that landed
+    # in a hidden editor is silent, and readiness must not pass on it.
+    assert _composer_id("el('body',{c:[el('form',{hidden:true,c:[ed({a:{id:'H'}})]})]})") is None
+    assert _composer_id("el('body',{c:[]})") is None
 
 
-def test_composer_falls_back_to_the_first_match_while_nothing_is_visible():
-    # still hydrating: the old behaviour, so the wait loops that poll for a composer keep working
-    assert _pick_composer("[ed({hidden:true,id:'a'}),ed({hidden:true,id:'b'})]") == 0
-    assert _pick_composer("[]") is None
+def test_composer_ignores_an_edit_message_box_that_is_not_in_the_composer_form():
+    # a visible editor inside a conversation turn (editing a sent message) is not the composer
+    tree = ("el('body',{c:[el('article',{c:[el('div',{c:[ed({a:{id:'EDIT'}})]})]}),"
+            "el('form',{c:[ed({a:{id:'MAIN'}})]})]})")
+    assert _composer_id(tree) == "MAIN"
+    # even an edit box wrapped in a form inside a turn is excluded
+    tree = ("el('body',{c:[el('article',{c:[el('form',{c:[ed({a:{id:'EDIT'}})]})]}),"
+            "el('form',{c:[ed({a:{id:'MAIN'}})]})]})")
+    assert _composer_id(tree) == "MAIN"
+
+
+def test_composer_prefers_the_focused_editor_when_several_qualify():
+    tree = "el('body',{c:[el('form',{c:[ed({a:{id:'A'}})]}),el('form',{c:[ed({a:{id:'B'}})]})]})"
+    assert _composer_id(tree, active="ALL.filter(function(x){return x._a.id==='B'})[0]") == "B"
+    assert _composer_id(tree) == "A"
+
+
+def test_readiness_uses_the_same_resolution_as_the_paste():
+    # a page whose only editor is hidden is NOT ready, so _await_composer keeps waiting instead of
+    # letting the paste run against nothing
+    js = CDP._composer_state_js()
+    hidden = _run_forms("el('body',{c:[el('form',{hidden:true,c:[ed()]})]})", "JSON.parse((" + js + "))")
+    ready = _run_forms(_HIDDEN_FORM_FIRST, "JSON.parse((" + js + "))")
+    assert hidden["composer"] is False and ready["composer"] is True
+
+
+def _send(tree_js):
+    return _run_forms(tree_js, CDP._send_click_js())
+
+
+def test_send_clicks_the_button_in_the_composers_own_form():
+    # two forms each with a send button: only the visible composer's form is clicked
+    tree = _HIDDEN_FORM_FIRST
+    r = _run_forms(tree, "(function(){var v=" + CDP._send_click_js() +
+                   ";return [v,ALL.filter(function(x){return x.clicked}).map(function(x){return x._a.id||'?'})];})()")
+    assert r == ["clicked", ["S"]], "the hidden form's send button is never touched"
+
+
+def test_send_refuses_ambiguous_buttons_and_absent_ones():
+    two = "el('body',{c:[el('form',{c:[ed(),send({a:{id:'1'}}),send({a:{id:'2'}})]})]})"
+    r = _run_forms(two, "(function(){var v=" + CDP._send_click_js() +
+                   ";return [v,ALL.filter(function(x){return x.clicked}).length];})()")
+    assert r == ["ambiguous", 0], "several send buttons in the form is a guess: nothing is clicked"
+    assert _send("el('body',{c:[el('form',{c:[ed()]})]})") == "no-send"          # no text yet
+    assert _send("el('body',{c:[]})") == "no-composer"
+    assert _send("el('body',{c:[el('form',{c:[ed(),send({disabled:true})]})]})") == "disabled"
+
+
+def test_send_never_reaches_a_send_button_outside_the_composers_form():
+    # a Send-labelled button elsewhere on the page (another form) must not be clicked for this composer
+    tree = ("el('body',{c:[el('form',{c:[ed()]}),el('form',{c:[el('div',{c:[send({a:{id:'X'}})]})]})]})")
+    r = _run_forms(tree, "(function(){var v=" + CDP._send_click_js() +
+                   ";return [v,ALL.filter(function(x){return x.clicked}).length];})()")
+    assert r == ["no-send", 0]
 
 
 def test_every_composer_probe_reads_the_one_visible_editor():

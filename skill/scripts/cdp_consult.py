@@ -2386,8 +2386,8 @@ _COMPOSER_SEL = 'div[role="textbox"][contenteditable="true"],#prompt-textarea'
 
 
 def _composer_state_js():
-    js = """(function(){return JSON.stringify({
-      composer: !!document.querySelector(__SEL__),
+    js = """(function(){__RESOLVE__return JSON.stringify({
+      composer: !!__cg(),
       onChatGPT: /(^|\\.)chatgpt\\.com$/.test(location.hostname),
       loginWall: !!document.querySelector('input[type="password"]')
                  || /^\\/(auth|login)(\\/|$)/i.test(location.pathname),
@@ -2395,7 +2395,7 @@ def _composer_state_js():
       readyState: document.readyState,
       path: location.pathname.slice(0,60)
     });})()"""
-    return js.replace("__SEL__", json.dumps(_COMPOSER_SEL))
+    return js.replace("__RESOLVE__", _COMPOSER_RESOLVE_JS)
 
 
 def _await_composer(c, seconds=60):
@@ -2467,17 +2467,38 @@ class _PreClickFailure(Exception):
     """Raised only for a failure PROVEN to precede the send click — never after it."""
 
 
+# The composer is resolved ONCE, by stable structure, and everything on the send path is bound to that
+# one resolution: the editor the keystrokes and the picked app go to, the reads that verify them, the
+# clear, and the send button. Probed live 2026-09-29: a conversation re-opened by URL holds TWO forms, a
+# hidden 0x0 one (with its own editor and its own buttons) before the visible one; the project page holds
+# one. The send button lives INSIDE the composer's form and only exists once there is text. So:
+#   composer = the VISIBLE editor inside a <form> (an edit-message box in a turn is not in one);
+#              the one holding focus wins if several qualify. Nothing visible means no composer: there is
+#              no fallback to a hidden editor, because a read or a paste that lands there is silent.
+#   send     = the send button INSIDE that composer's own form, never a document-wide first match.
+_COMPOSER_RESOLVE_JS = (
+    "function __cg(){var l=Array.prototype.slice.call(document.querySelectorAll("
+    + json.dumps(_COMPOSER_SEL) + ")).filter(function(e){var r=e.getBoundingClientRect();"
+    "return r.width>0&&r.height>0&&!!e.closest('form')&&!e.closest('article,[data-message-author-role]');});"
+    "var f=l.filter(function(e){return e===document.activeElement||e.contains(document.activeElement);});"
+    "return f[0]||l[0]||null;}")
+
+
 def _composer_get_js():
-    # More than one editor can match the selector. A conversation re-opened by URL carries a hidden
-    # 0x0 one BEFORE the visible one (probed 2026-09-29), and document.querySelector returned it: every
-    # read (mention count, text, clear) looked at an editor the user cannot type into, while the
-    # keystrokes and the picked app went to the visible one. The composer is the visible editor; the
-    # one holding focus wins if several are.
-    return ("(function(){var l=Array.prototype.slice.call(document.querySelectorAll("
-            + json.dumps(_COMPOSER_SEL) + "));"
-            "var v=l.filter(function(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;});"
-            "var f=v.filter(function(e){return e===document.activeElement||e.contains(document.activeElement);});"
-            "return f[0]||v[0]||l[0]||null;})()")
+    return "(function(){" + _COMPOSER_RESOLVE_JS + "return __cg();})()"
+
+
+def _send_click_js():
+    """Click the send button of the resolved composer's own form. Returns 'clicked', 'no-composer',
+    'no-send' (no button in that form, e.g. no text) or 'disabled'. Exactly one candidate must exist in
+    the form; several is ambiguous and is refused rather than guessed."""
+    return ("(function(){" + _COMPOSER_RESOLVE_JS + "var d=__cg();if(!d)return 'no-composer';"
+            "var f=d.closest('form');var b=Array.prototype.slice.call(f.querySelectorAll("
+            "'button[data-testid=\"send-button\"],button[aria-label*=\"Send\" i],"
+            "button[aria-label*=\"\\u53d1\\u9001\"]')).filter(function(x){var r=x.getBoundingClientRect();"
+            "return r.width>0&&r.height>0;});"
+            "if(b.length!==1)return b.length?'ambiguous':'no-send';if(b[0].disabled)return 'disabled';"
+            "b[0].click();return 'clicked';})()")
 
 
 def _settle_composer(c, seconds=5):
@@ -2861,12 +2882,16 @@ def cmd_submit(a) -> int:
             before_conv = "?unknown"
         # Submit. Prefer the send button; fall back to Enter. (POST-click from here: a failure past
         # this point is uncertain, never provably-not-sent.)
-        clicked = c.eval(
-            "(function(){var b=document.querySelector('button[data-testid=\"send-button\"],"
-            "button[aria-label*=\"Send\" i],button[aria-label*=\"\\u53d1\\u9001\"]');"
-            "if(b&&!b.disabled){b.click();return true;}return false;})()")
-        if not clicked:
-            c.key("Enter", "Enter", 13)
+        sent_via = c.eval(_send_click_js())
+        if sent_via in ("no-composer", "ambiguous"):
+            # Returned WITHOUT clicking (no visible composer form, or several send buttons in it): still
+            # provably unsent, and Enter is not pressed on a composer we cannot name.
+            c.close_tab()
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: send target {sent_via} — NOT submitted; safe "
+                             "to retry with the same --request-key.\n")
+            return EXIT_NOT_SENT_PRECLICK
+        if sent_via != "clicked":
+            c.key("Enter", "Enter", 13)   # 'no-send'/'disabled': the pre-existing Enter path, unchanged
         # Confirm a user message actually landed (poll — render lags the click). On a reused
         # tab, requiring merely "count > 0" would false-positive on OLD messages already in
         # the thread if THIS send's composer insert/click silently failed — so require the
@@ -3185,12 +3210,17 @@ def cmd_followup(a) -> int:
             return EXIT_NOT_SENT_PRECLICK
         time.sleep(0.3)
         click_attempted = True    # from here on a failure is post-click: uncertain, tab kept as evidence
-        clicked = c.eval(
-            "(function(){var b=document.querySelector('button[data-testid=\"send-button\"],"
-            "button[aria-label*=\"Send\" i],button[aria-label*=\"\\u53d1\\u9001\"]');"
-            "if(b&&!b.disabled){b.click();return true;}return false;})()")
-        if not clicked:
-            c.key("Enter", "Enter", 13)
+        sent_via = c.eval(_send_click_js())
+        if sent_via in ("no-composer", "ambiguous"):
+            # The eval returned WITHOUT clicking: there is no visible composer form, or its form holds
+            # several send buttons and picking one would be a guess. Nothing was clicked or pressed, so
+            # this is still provably unsent, and Enter is not pressed on a composer we cannot name.
+            click_attempted = False
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: send target {sent_via} — NOT sent; safe to "
+                             "retry with the same --request-key.\n")
+            return EXIT_NOT_SENT_PRECLICK
+        if sent_via != "clicked":
+            c.key("Enter", "Enter", 13)   # 'no-send'/'disabled': the pre-existing Enter path, unchanged
         # Landed-confirmation: on a long thread the DOM virtualizes older turns, so the rendered
         # user-turn COUNT can stay flat forever after a real send (observed live: a landed follow-up
         # returned ok:false because the render window kept its size). Count-increase is only the

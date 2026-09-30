@@ -14,29 +14,38 @@ has none. Probed live (2026-09-29), it is a floating panel whose scroll area is
 `[data-mention-list-scroll-area]`, and every row is a plain `<button data-list-navigation-item>`, so
 the old selector matched zero nodes. The picker now reads those rows, and hardens around them:
 
-- Only apps are candidates: rows under the **Plugins** header, or in a popup with no header at all
-  (a lone result renders bare, and there only an exact name counts, since a bare row may be a file).
-  A query also lists **Files**, and clicking one attaches a file instead of the app.
-- A row with more than a label and a description carries an extra control (**Connect**): an app this
-  account has not connected, whose click would start an authorization flow. It is never clicked and is
-  reported as not connected. The test is the row's shape, so it holds in any UI language. The name is
-  matched first, so an unconnected exact app is refused, never replaced by a connected app that
-  merely starts with the same text.
+- A candidate must be shaped like an app row, read off the popup's own markup: a connector icon
+  (`rounded-2xs`; Add actions and file rows use other icons) under the **Plugins** header, or in a bare
+  single-section popup where only an exact name counts. Any other row is never clicked and is reported
+  as unverified. It counts as connected only if its content block is exactly icon, label and description:
+  an unconnected app has a bare **Connect** text node there, so the test is structural, holds in any UI
+  language and for a two-line label-plus-Connect row, and is never clicked (it would start an
+  authorization flow). The name is matched first, so an unconnected exact app is refused, never
+  replaced by a connected app that merely starts with the same text.
 - Success is "the composer gained an app mention node" (`[app-mention-name]`), polled for ~2.4s after
   the one click, not "the HTML changed", which any stray click satisfies. The same count is re-checked
   after the prompt is pasted, so a paste that eats a mention is not sent.
 - The failure names which thing happened: popup never opened (a DOM/code bug), only its loading
-  skeleton (ChatGPT's own state while it searches), opened empty, app listed but not
-  connected, other apps offered, or a row was clicked that turned out not to be an app.
+  skeleton (ChatGPT's own state while it searches), opened empty, app listed but not connected, a row
+  present but not app-shaped, other apps offered, or a row was clicked that turned out not to be an app.
+
+Follow-up route, found live on the same day:
 
 - On a conversation re-opened by URL (a follow-up whose tab was gone), the mention never took. The page
   holds a hidden 0x0 editor BEFORE the visible one and `document.querySelector` returned it, so the
   typing and the picked app went to the visible editor while every read of the composer (mention count,
   text, clear) looked at the hidden one: a mention that had landed read as "the composer took no app
-  mention", and the follow-up was refused. The composer is now the visible editor (the focused one if
-  several). A follow-up also waits for the thread's turns to render before reading its baseline (the
-  composer appears ~5s before them), and closes a tab it re-opened when it refuses before the send,
-  so a draft never outlives the refusal.
+  mention", and the follow-up was refused. The composer is now resolved once, by structure, and the
+  whole send path is bound to that one resolution: the visible editor inside a `<form>` (an edit-message
+  box in a turn is not in one; focus breaks a tie), with no fallback to a hidden editor (readiness
+  fails while none is visible), and the send button is the single one inside that composer's own form,
+  never a document-wide first match (several is refused as ambiguous, and Enter is not pressed on a
+  composer that cannot be named).
+- A follow-up waits for the thread's turns to render before reading its baseline (the composer appears
+  ~5s before them) and refuses before any paste or click if they never do, since a stale same-rid turn
+  appearing after the click would read as a fresh send. A tab this command re-opened is closed on every
+  exit before the send click, so a draft never outlives a refusal; a tab it attached to is never closed,
+  and after a click attempt the tab stays as evidence.
 - `await` no longer calls a pre-click refusal "already sent". A follow-up inherits its parent's
   conversation at enqueue, so the envelope's old test (the round has a conversation) was true for every
   follow-up, and a mention or login refusal that provably never clicked told the caller to RETRIEVE a
