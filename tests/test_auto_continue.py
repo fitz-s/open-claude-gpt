@@ -566,6 +566,56 @@ def test_a_reopened_followup_whose_switchers_never_settle_still_reaches_the_mode
     assert rec["pasted"] == 0 and rec["clicked"] == 0
 
 
+class _SleepClock:
+    """Only sleep moves time, so a settle window is measured in the seconds it really waits."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def time(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def _settle_on(monkeypatch, timeline):
+    """Run _settled_labels against labels that change at given virtual seconds:
+    timeline = [(from_second, labels), ...]. Returns (labels returned, seconds spent)."""
+    import types
+    import cdp_consult as c
+    clock = _SleepClock()
+    monkeypatch.setattr(c, "time", clock)
+
+    def ev(_e):
+        return [lab for t0, lab in timeline if clock.t >= t0][-1]
+    got = c._settled_labels(types.SimpleNamespace(eval=ev))
+    return got, clock.t
+
+
+def test_a_single_stable_switcher_settles_at_the_hold_not_the_bound(env, monkeypatch):
+    """A build with one switcher (the ['6'] badge) must not pay the full 20 s on every re-open."""
+    got, spent = _settle_on(monkeypatch, [(0, ["6"])])
+    assert got == ["6"] and 4 <= spent < 5
+
+
+def test_a_tier_switcher_that_hydrates_late_is_waited_for(env, monkeypatch):
+    """The live shape: ['Explore'] alone, then 'Pro' ~2.5 s later. Two equal reads 1 s apart would
+    release on ['Explore']; the hold outlasts the gap."""
+    got, spent = _settle_on(monkeypatch, [(0, []), (0.5, ["Explore"]), (3.0, ["Explore", "Pro"])])
+    assert got == ["Explore", "Pro"] and spent < 8
+
+
+def test_labels_that_never_settle_stop_at_the_bound(env, monkeypatch):
+    got, spent = _settle_on(monkeypatch, [(t, ["Pro"] if int(t) % 2 else ["6"]) for t in range(40)])
+    assert 20 <= spent < 21
+
+
+def test_a_composer_that_never_shows_a_switcher_stops_at_the_bound(env, monkeypatch):
+    got, spent = _settle_on(monkeypatch, [(0, [])])
+    assert got == [] and 20 <= spent < 21
+
+
 def test_a_reopened_tab_stays_open_once_the_click_was_attempted(env, monkeypatch):
     """After the click nothing is provably unsent: the tab is the evidence, so it is not closed even
     though the landed check then fails."""

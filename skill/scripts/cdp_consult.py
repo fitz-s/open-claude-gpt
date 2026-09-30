@@ -597,7 +597,10 @@ _RID_RE_SRC = r"REQ-\d{8}-\d{6}-[0-9a-f]{6}"
 
 # The page-side mirror of _turn_canonical_rid (SHARED CONTRACT #3): a user turn's OWN rid is the rid
 # of the LAST complete, in-order BEGIN_RESPONSE:<rid>/END_RESPONSE:<rid> pair of bare lines in its
-# block-aware text. tests/test_wait_virtualized_thread.py holds the two to the same answers.
+# block-aware text. tests/test_wait_virtualized_thread.py holds the two to the same answers on every
+# ASCII rendering. They part only outside it: Python's str.strip() and \d also take \x1c-\x1f, \x85
+# and non-ASCII digits, and JS's trim() and \d take the BOM instead; each difference makes one side
+# see no pair, so a disagreement reads as "turn not found" (fail closed), never as another rid's turn.
 _RID_FN = ("function __cgcRid(t){var re=/^(BEGIN|END)_RESPONSE:(" + _RID_RE_SRC + ")$/,ob={},rid=null,"
            "ls=(t||'').replace(/\\r\\n/g,'\\n').split('\\n');"
            "for(var i=0;i<ls.length;i++){var m=ls[i].trim().match(re);if(!m)continue;"
@@ -1851,6 +1854,25 @@ def _cand_labels_js():
     entries are other switchers (ChatGPT splits model and reasoning effort) or modes."""
     return ("(function(){return %s.map(function(b){"
             "return (b.innerText||'').trim().split('\\n')[0];});})()" % _ALL_CAND_JS)
+
+
+def _settled_labels(c, hold=4.0, bound=20.0):
+    """Wait until the composer's switcher labels are non-empty and have not changed for `hold`
+    seconds, or `bound` seconds pass; return the last read. Live 2026-09-30 a re-opened thread
+    rendered the mode toggle ['Explore'] and the tier switcher 'Pro' ~2.5 s later, so a label set
+    stable across only two reads 1 s apart can still be half-built — `hold` must outlast that gap.
+    No label count is assumed: a build with one switcher (['6']) settles at `hold`, not `bound`."""
+    end = time.time() + bound
+    prev, since = None, time.time()
+    while True:
+        now = [x for x in (c.eval(_cand_labels_js()) or []) if x]
+        if now != prev:
+            prev, since = now, time.time()
+        elif now and time.time() - since >= hold:
+            return now
+        if time.time() >= end:
+            return now
+        time.sleep(0.5)
 
 
 def _matches(label, target):
@@ -3203,25 +3225,11 @@ def cmd_followup(a) -> int:
         if a.model and a.model.lower() != "skip":
             target = a.model
             if reopened:
-                # ROBUSTNESS: a freshly re-opened composer reports the model-tier switcher as
-                # None on the first probes (the switcher button hasn't hydrated yet) — reading
-                # that as "unselectable" is the recurring false refusal on reopen. Wait up to
-                # ~8s for the switcher to hydrate before letting _select_model act; only if it
-                # NEVER resolves do we fall through to the fail-closed path below. (_select_model
-                # itself then opens the picker and selects — this settle just gives it a live DOM
-                # to act on; the fail-closed guarantee is unchanged.)
-                # "Any label" is not hydrated: live 2026-09-30 a reopened thread first renders only
-                # the mode toggle ['Explore'] and the tier switcher ('Pro') ~2.5 s later, so the
-                # old any-label wait handed _select_model a composer with no picker to open. Wait
-                # until the label set is non-empty AND unchanged across two reads 1 s apart.
-                _settle = time.time() + 20
-                _prev = None
-                while time.time() < _settle:
-                    _now = [x for x in (c.eval(_cand_labels_js()) or []) if x]
-                    if _now and _now == _prev and len(_now) >= 2:
-                        break
-                    _prev = _now
-                    time.sleep(1.0)
+                # ROBUSTNESS: a freshly re-opened composer hydrates its switchers late — reading
+                # a half-built composer as "unselectable" is the recurring false refusal on reopen.
+                # Let them settle first (_settled_labels); if they never do, _select_model still
+                # runs and the fail-closed path below is unchanged.
+                _settled_labels(c)
             pick = _select_model(c, target, a.model_family)
             _fu_ok, model_now, model_badge = pick.confirmed, pick.shown, pick.badge
             if not _fu_ok and not a.allow_model_mismatch:

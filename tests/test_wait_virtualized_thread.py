@@ -128,6 +128,32 @@ def test_the_js_turn_rid_parser_matches_the_python_one():
     assert got == [CDP._turn_canonical_rid(t) for t in corpus]
 
 
+def test_every_rendered_prompt_template_parses_to_its_rid_in_both_parsers():
+    """The waiter anchors on __cgcRid, so the prompts this tool actually sends — the first-round and
+    follow-up templates and the automatic continue, rendered through the page's block-aware text —
+    must parse to their own rid in JS exactly as in Python. ASCII only: the Unicode edges named at
+    _RID_FN fail closed and are not pinned."""
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(ROOT, "skill", "scripts"))
+    import consult
+    rid = R[1]
+    fill = dict(title="t", role="r", task="review\nBEGIN_RESPONSE:%s quoted" % R[2], refs_block="",
+                context_block="", output_body="o", rid=rid)
+    prompts = [consult.PROMPT_TEMPLATE.format(**fill), consult.FOLLOWUP_TEMPLATE.format(**fill),
+               "Continuing this consult.\n\n" + consult.RESPONSE_WRAP.format(rid=rid)]
+    # One <p> per line, as the composer pastes it, read back through the page's own __cgcText.
+    turns = ["unit('t%d:0:user',[%s])" % (i, ",".join("P(%s)" % json.dumps(ln) for ln in p.split("\n")))
+             for i, p in enumerate(prompts)]
+    js = (CDP._TEXT_FN + CDP._RID_FN + "var ts=[" + ",".join(turns) + "].map(__cgcText);"
+          "console.log(JSON.stringify({js:ts.map(__cgcRid),text:ts}));")
+    got = json.loads(subprocess.run(["node", "-e", _DOM + js], capture_output=True, text=True,
+                                    check=True).stdout)
+    assert got["js"] == [rid] * 3
+    assert [CDP._turn_canonical_rid(t) for t in got["text"]] == [rid] * 3
+
+
 # ---- the waiter, end to end, on a DOM that changes under it -----------------------------------
 
 class _Clock:

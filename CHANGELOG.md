@@ -44,9 +44,10 @@ rid parser is checked against the Python one.
 
 A re-opened thread renders the composer's mode toggle (`Explore`) first and the tier switcher ~2.5 s
 later. The follow-up released its pre-selection wait on the first label it saw, so `_select_model` could
-act on a composer with no tier picker to open. It now waits (up to 20 s) until at least two switcher
-labels are present and unchanged across two reads 1 s apart; if they never settle, the model gate still
-runs and still refuses to send on a model it could not confirm.
+act on a composer with no tier picker to open. It now waits until the switcher labels are non-empty and
+unchanged for 4 s — longer than that gap, so two equal reads of `['Explore']` do not release it — with
+no assumed label count, so a one-switcher build (`['6']`) settles at 4 s rather than the 20 s bound. If
+they never settle, the model gate still runs and still refuses to send on a model it could not confirm.
 
 ### Fixed — `fire --mention` found no popup entries, ever
 
