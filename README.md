@@ -146,7 +146,7 @@ That proves what was **requested**. What **answered** is a separate fact, read s
 ```bash
 CGC_AUTO_MODEL=1        # ON (default): select CGC_MODEL + CGC_MODEL_FAMILY, fail closed if unavailable
 CGC_MODEL="Pro"         # which reasoning tier to target (set the strongest your plan has)
-CGC_MODEL_FAMILY="Latest"   # which model to pin; "skip" to leave the model alone
+CGC_MODEL_FAMILY="GPT-6"   # which model to pin; "skip" to leave the model alone
 CGC_MODEL_SLUG=""       # producers you accept, e.g. "gpt-6-*,gpt-5-6-pro"; empty = record, don't judge
 CGC_AUTO_MODEL=0        # OFF: don't touch the picker, send on whatever is shown
 ```
@@ -169,7 +169,7 @@ It persists in the tool's own config (`~/.config/cgc/config`); a `CGC_PROJECT_UR
 | `CGC_PROJECT_URL` | new chat | ChatGPT URL a fresh consult opens — set to *your* project to group consults |
 | `CGC_AUTO_MODEL` | `1` | auto-pick the model and its tier before sending (fail closed) — on/off |
 | `CGC_MODEL` | `Pro` | which reasoning tier auto-select targets |
-| `CGC_MODEL_FAMILY` | `Latest` | which model to pin (GPT-6 picker); `skip` to leave the model alone |
+| `CGC_MODEL_FAMILY` | `GPT-6` | which model to pin (GPT-6 picker); `skip` to leave the model alone |
 | `CGC_PORT` | `9333` | remote-debugging port for the dedicated Chrome |
 | `CGC_PROFILE` | `~/.cgc-chrome` | dedicated Chrome profile dir |
 | `CGC_CHROME` | auto-detect | explicit browser binary |

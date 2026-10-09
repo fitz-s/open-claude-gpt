@@ -128,7 +128,7 @@ def test_mention_flag_strips_the_at_sign():
 
 def test_mentions_route_the_request_but_leave_old_fingerprints_alone():
     backend = _load("cgc_backend")
-    base = dict(kind="submit", logical_sha="x", project_url="u", model="Pro", model_family="Latest",
+    base = dict(kind="submit", logical_sha="x", project_url="u", model="Pro", model_family="GPT-6",
                 parent=None, conversation=None)
     plain = backend._request_fingerprint(argparse.Namespace(**base), "p")
     empty = backend._request_fingerprint(argparse.Namespace(**base, mentions=[]), "p")
@@ -147,7 +147,7 @@ def test_daemon_passes_mentions_on_the_argv(monkeypatch):
 
     monkeypatch.setattr(daemon.subprocess, "run", lambda cmd, **kw: got.setdefault("cmd", cmd) and _R())
     daemon._make_run_cdp()("submit", rid="REQ-20260924-000000-abcdef", prompt="p",
-                           project_url="https://chatgpt.com/", model="Pro", model_family="Latest",
+                           project_url="https://chatgpt.com/", model="Pro", model_family="GPT-6",
                            mentions=["WebCodex Demo"])
     i = got["cmd"].index("--mention")
     assert got["cmd"][i + 1] == "WebCodex Demo"

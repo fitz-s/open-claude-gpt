@@ -298,7 +298,7 @@ def _spec_model_family(a) -> str:
 
     `a` may legitimately not carry the attribute (consult.py's `fire` builds its enqueue namespace
     without one); the env default then applies, which is the same value that CLI flag defaults to."""
-    return getattr(a, "model_family", None) or os.environ.get("CGC_MODEL_FAMILY", "Latest")
+    return getattr(a, "model_family", None) or os.environ.get("CGC_MODEL_FAMILY", "GPT-6")
 
 
 def _spec_mentions(a) -> list:
@@ -1234,7 +1234,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             # time. The followup path passed NEITHER before, so both are named here.
             send = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
                            model=spec.get("model") or "Pro",
-                           model_family=spec.get("model_family") or "Latest",
+                           model_family=spec.get("model_family") or "GPT-6",
                            mentions=spec.get("mentions") or [])
         finally:
             if hasattr(conv_lease, "close"):
@@ -1282,7 +1282,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
     sub = run_cdp("submit", rid=rid, prompt=prompt,
                   project_url=spec.get("project_url") or "https://chatgpt.com/",
                   model=spec.get("model") or "Pro",
-                  model_family=spec.get("model_family") or "Latest",
+                  model_family=spec.get("model_family") or "GPT-6",
                   mentions=spec.get("mentions") or [])
     conv = sub.get("conversation")
 
@@ -1393,7 +1393,7 @@ def _no_live_worker(rid: str) -> bool:
 # and reported but nothing judges it — `unchecked`.
 #
 # It is deliberately NOT derived from CGC_MODEL / CGC_MODEL_FAMILY. Those are the composer's UI
-# labels ("Pro", "Latest", "GPT-5.6 Sol"); a slug is the provider's own identifier ("gpt-6-pro",
+# labels ("Pro", "GPT-6", "GPT-5.6 Sol"); a slug is the provider's own identifier ("gpt-6-pro",
 # "gpt-5-6-thinking"). Nothing local knows the mapping between them, OpenAI changes both sides
 # without notice, and a label->slug table would be a rot machine that fabricates a verdict from a
 # guess — which is the exact failure this whole change exists to remove. So the installation
@@ -1507,7 +1507,7 @@ def _send_continue(store, rid, conv, spec, run_cdp, prompt) -> str:
         try:
             sent = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
                            model=spec.get("model") or "Pro",
-                           model_family=spec.get("model_family") or "Latest",
+                           model_family=spec.get("model_family") or "GPT-6",
                            mentions=spec.get("mentions") or [])
         except Exception as e:                        # noqa: BLE001 — a crash may follow the click
             sys.stderr.write(f"CGC_WARN {rid}: auto-continue crashed ({type(e).__name__}: {e}).\n")

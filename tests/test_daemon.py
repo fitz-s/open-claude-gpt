@@ -506,7 +506,7 @@ def test_mutating_cdp_subprocess_inherits_exactly_the_live_lease_fds(daemon, mon
     daemon._make_run_cdp()("followup", rid=rid,
                            conversation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
                            prompt="continuing this consult",
-                           model="Pro", model_family="Latest")
+                           model="Pro", model_family="GPT-6")
     assert set(captured["pass_fds"]) == expected, \
         "the followup subprocess must inherit exactly the held rid+browser+conversation lease fds"
     for lease in (conv_l, brow_l, rid_l):

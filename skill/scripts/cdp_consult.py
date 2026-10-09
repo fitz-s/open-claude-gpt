@@ -103,7 +103,7 @@ except ImportError:
 #   CGC_STATE_DIR    scratch dir for state + answer files           (default /tmp/cgc)
 #   CGC_AUTO_MODEL   auto-pick the model tier before sending? 1/0    (default 1 = on)
 #   CGC_MODEL        which tier to pick when auto-model is on        (default "Pro")
-#   CGC_MODEL_FAMILY which MODEL to pin in the same picker menu      (default "Latest")
+#   CGC_MODEL_FAMILY which MODEL to pin in the same picker menu      (default "GPT-6")
 #                    — new on the GPT-6 composer (2026-09-03); "skip" disables the check
 #   CGC_PROJECT_URL  ChatGPT URL a fresh consult opens; set this to YOUR project
 #                    (…/g/g-p-<id>-<slug>/project) to keep consults in one project,
@@ -129,7 +129,7 @@ CGC_MODEL = os.environ.get("CGC_MODEL", "Pro") if CGC_AUTO_MODEL else "skip"
 # The MODEL, as distinct from the tier — a second dimension the composer only started exposing
 # with GPT-6 (2026-09-03). Same toggle, same "skip" escape hatch as CGC_MODEL: auto-model OFF
 # means the picker is not touched at all, so neither dimension is enforced.
-CGC_MODEL_FAMILY = os.environ.get("CGC_MODEL_FAMILY", "Latest") if CGC_AUTO_MODEL else "skip"
+CGC_MODEL_FAMILY = os.environ.get("CGC_MODEL_FAMILY", "GPT-6") if CGC_AUTO_MODEL else "skip"
 # App approval cards ("<App> — Allow file materialization? [Deny] [Allow once]") pause generation until
 # answered, and ChatGPT offers no standing grant for them (the plugin's "Allow all tools" does not cover
 # them). The waiter already polls the consult's own tab, so it answers them there: only for apps named
@@ -1110,7 +1110,7 @@ def cmd_status(a) -> int:
 # family would sit unguarded: "Pro tier on GPT-5.5" satisfies every tier check this file makes
 # while being a DIFFERENT MODEL than the receipt claims answered. A consult that silently runs
 # weaker than it says is precisely the failure this whole guard exists to prevent, so the family
-# is pinned too now — CGC_MODEL_FAMILY, default "Latest" — with the tier's own discipline: fail
+# is pinned too now — CGC_MODEL_FAMILY, default "GPT-6" — with the tier's own discipline: fail
 # closed, never send on an unconfirmed model.
 #
 # Live readings from a logged-in Pro tab, 2026-09-06 (verbatim, this is the build being fixed):
@@ -1120,6 +1120,8 @@ def cmd_status(a) -> int:
 #   [data-testid="composer-intelligence-picker-content"] innerText lines:
 #     0 "6"  1 "Pro"  2 "Pro, 5 of 5."  3 "Use Left and Right arrow keys to adjust power."
 #     4 "Latest" (menuitemradio, aria-checked=true)  5 "GPT-5.6 Sol"  6 "GPT-5.5"
+#   (2026-10: the "Latest" radio was relabelled "GPT-6" — same model, same slot. Every "Latest" in
+#   a dated reading in this file is today's "GPT-6".)
 #   span[role=slider]: aria-valuemin=0 aria-valuemax=4 aria-valuenow=4, textContent "", NO
 #     aria-valuetext. Its [role=menuitem] ancestor is aria-label="Power" with EMPTY innerText
 #     AND textContent, carrying aria-describedby="_r_cn_ _r_co_" whose first id reads
@@ -1616,7 +1618,8 @@ def _submenu_try(c, target):
 
 # ---- model FAMILY path (new dimension; see the law at the top of this section) ----
 # Live 2026-09-06: the open picker carries the MODEL itself as [role="menuitemradio"] items —
-# "Latest" (aria-checked=true), "GPT-5.6 Sol", "GPT-5.5" — in the SAME menu as the power slider.
+# "Latest" (aria-checked=true; relabelled "GPT-6" in 2026-10), "GPT-5.6 Sol", "GPT-5.5" — in the
+# SAME menu as the power slider.
 # Read as {label, checked} pairs so the "already correct" case can be distinguished from the
 # "must click" case without a click: this is the one control in the picker where a redundant
 # gesture is not free (a Radix radio click also closes the menu, which would drop the slider out
@@ -1651,7 +1654,7 @@ _FamilyObs = collections.namedtuple("_FamilyObs", "status entries detail")
 The old signal was a fail-open: the list-shaped family read turned a null read, a non-list read
 and a malformed read all into [], and [] meant "this build has no family control — exempt".
 The reachable counterexample: a composer sitting on GPT-5.5 whose family probe returns null during
-a React render transition while the Pro slider reads fine. Nothing established `Latest`, and the
+a React render transition while the Pro slider reads fine. Nothing established `GPT-6`, and the
 guard reported the model confirmed. An unreadable control is not evidence that the control is
 right; it is the absence of evidence, which is the one thing a fail-closed guard must never treat
 as a pass.
@@ -3918,7 +3921,7 @@ def main() -> int:
                          "Medium/Instant/etc. Pass 'skip' to leave as-is.")
     su.add_argument("--model-family", default=CGC_MODEL_FAMILY,
                     help="MODEL to pin in the same picker menu, a separate dimension from the tier "
-                         "(default $CGC_MODEL_FAMILY or 'Latest'). GPT-6's composer lists the model "
+                         "(default $CGC_MODEL_FAMILY or 'GPT-6'). GPT-6's composer lists the model "
                          "as radios beside the power slider, so 'Pro on GPT-5.5' is reachable and "
                          "would otherwise pass the tier check silently. 'skip' = don't check. A "
                          "build with no such radios ignores this.")
@@ -3956,7 +3959,7 @@ def main() -> int:
                          "leave as-is (old behavior).")
     fu.add_argument("--model-family", default=CGC_MODEL_FAMILY,
                     help="MODEL to re-assert on the thread alongside the tier (default "
-                         "$CGC_MODEL_FAMILY or 'Latest'). 'skip' = don't check; a build without the "
+                         "$CGC_MODEL_FAMILY or 'GPT-6'). 'skip' = don't check; a build without the "
                          "model radios ignores it.")
     fu.add_argument("--allow-model-mismatch", action="store_true",
                     help="send the follow-up even if the target tier can't be selected (default: "

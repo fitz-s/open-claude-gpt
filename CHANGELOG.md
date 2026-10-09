@@ -6,6 +6,19 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — the model picker renamed `Latest` to `GPT-6`, so every consult refused to send
+
+The composer's model radios now read `GPT-6` / `GPT-5.6 Sol` / `GPT-5.5`; the first is the same model
+the old `Latest` entry named. The default `CGC_MODEL_FAMILY` was still `Latest`, so the family guard
+failed closed before the click (`model_not_selectable: model family 'Latest' is not offered`) — nothing
+was sent, but nothing could be.
+
+- The default family is `GPT-6` in the driver, the enqueue path, the daemon's send fallbacks, the CLI
+  flag defaults, `doctor`, and the docs. `Latest` is not accepted as an alias: it is refused with the
+  list of what the picker offers, like any other label the picker does not carry.
+- A round enqueued earlier froze `model_family` into its spec. Such a round, and a `refire` of it, keeps
+  `Latest` and is refused again; resend it as a fresh `fire` under a new `--request-key`.
+
 ### Fixed — a follow-up into a long, re-opened thread never saw its own finished answer
 
 A follow-up that had to re-open its thread's tab watched for the full 90 minutes printing
