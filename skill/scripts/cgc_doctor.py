@@ -46,7 +46,7 @@ MODEL = os.environ.get("CGC_MODEL", "Pro")
 # The MODEL, as distinct from the reasoning tier. GPT-6's composer (2026-09-03) exposes both in
 # one picker, so the tier alone no longer says which model answered — the doctor reports both or
 # it reports a half-truth. See the model-selection law in cdp_consult.py.
-MODEL_FAMILY = os.environ.get("CGC_MODEL_FAMILY", "Latest")
+MODEL_FAMILY = os.environ.get("CGC_MODEL_FAMILY", "GPT-6")
 PROJECT_URL = os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/ (new chat)")
 HERE = os.path.dirname(os.path.abspath(__file__))
 

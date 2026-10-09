@@ -77,10 +77,10 @@ class _Composer:
     """
 
     TIERS = ["Instant", "Medium", "High", "Extra High", "Pro"]
-    FAMILIES = ["Latest", "GPT-5.6 Sol", "GPT-5.5"]
-    BADGE = {"Latest": "6", "GPT-5.6 Sol": "5.6", "GPT-5.5": "5.5"}
+    FAMILIES = ["GPT-6", "GPT-5.6 Sol", "GPT-5.5"]
+    BADGE = {"GPT-6": "6", "GPT-5.6 Sol": "5.6", "GPT-5.5": "5.5"}
 
-    def __init__(self, tier=4, family="Latest", schema="gpt6", probe="ok",
+    def __init__(self, tier=4, family="GPT-6", schema="gpt6", probe="ok",
                  badge_mode="family", commit_closes_menu=False, rebuild_tier_on_family=None,
                  flip_family_on_walk=None, revert_tier_on_close=None, oscillate=False,
                  unreadable_after=None, mode_toggle=False, picker_unopenable=False,
@@ -247,7 +247,7 @@ def test_legacy_picker_without_a_family_control_is_exempt():
     """A picker that positively renders no radio group at all is the pre-GPT-6 composer. Refusing
     an old account over a control its ChatGPT does not render would be the opposite outage."""
     c = _Composer(tier=2, schema="legacy", badge_mode="tier")
-    pick = _CDP._select_model(c, "Pro", "Latest")
+    pick = _CDP._select_model(c, "Pro", "GPT-6")
     assert (pick.confirmed, pick.shown) == (True, "Pro")
     assert pick.error is None and pick.dirty is False
     assert c.tier == 4 and c.menu is None
@@ -259,7 +259,7 @@ def test_unreadable_family_radios_refuse_instead_of_taking_the_exemption():
     reported the model confirmed — a fail-open in the middle of a fail-closed guard. Nothing may be
     pinned behind a model control that did not read."""
     c = _Composer(tier=4, family="GPT-5.5", probe="fam_null")
-    pick = _CDP._select_model(c, "Pro", "Latest")
+    pick = _CDP._select_model(c, "Pro", "GPT-6")
     assert pick.confirmed is False
     assert pick.error and "did not read back" in pick.error
     assert (c.family, c.tier) == ("GPT-5.5", 4), "a refusal must not have driven anything"
@@ -269,7 +269,7 @@ def test_unreadable_family_radios_refuse_instead_of_taking_the_exemption():
 def test_malformed_family_radios_refuse():
     """A radio with no label is a half-rendered group, not a build without one."""
     c = _Composer(tier=4, family="GPT-5.5", probe="malformed")
-    pick = _CDP._select_model(c, "Pro", "Latest")
+    pick = _CDP._select_model(c, "Pro", "GPT-6")
     assert pick.confirmed is False
     assert pick.error and "malformed" in pick.error
     assert (c.family, c.tier) == ("GPT-5.5", 4) and c.menu is None
@@ -280,7 +280,7 @@ def test_two_open_pickers_refuse_rather_than_scan_both():
     owning picker there is no coherent group to read, and 'some radio somewhere is checked' is not
     a statement about this composer."""
     c = _Composer(tier=4, family="GPT-5.5", probe="ambiguous")
-    pick = _CDP._select_model(c, "Pro", "Latest")
+    pick = _CDP._select_model(c, "Pro", "GPT-6")
     assert pick.confirmed is False
     assert pick.error and "uniquely owns" in pick.error
     assert (c.family, c.tier) == ("GPT-5.5", 4) and c.menu is None
@@ -293,9 +293,9 @@ def test_unrelated_menu_without_radios_does_not_satisfy_family_inspection():
     the model never established — on a tab actually sitting on GPT-5.5."""
     c = _Composer(tier=4, family="GPT-5.5", badge_mode="tier",
                   mode_toggle=True, picker_unopenable=True)
-    pick = _CDP._select_model(c, "Pro", "Latest")
+    pick = _CDP._select_model(c, "Pro", "GPT-6")
     assert pick.confirmed is False, "an unrelated menu is not the picker, inspected"
-    assert pick.error and "Latest" in pick.error
+    assert pick.error and "GPT-6" in pick.error
     assert (c.family, c.tier) == ("GPT-5.5", 4) and c.menu is None
 
 
@@ -305,7 +305,7 @@ def test_flat_menu_build_still_exempts_the_family_it_cannot_express():
     must stay a silent no-op — the exemption is earned by the tier arriving through the flat path,
     never by a menu merely having no radios in it."""
     c = _Composer(tier=1, schema="flat", badge_mode="tier")
-    pick = _CDP._select_model(c, "Pro", "Latest")
+    pick = _CDP._select_model(c, "Pro", "GPT-6")
     assert (pick.confirmed, pick.shown) == (True, "Pro")
     assert pick.error is None and c.tier == 4 and c.menu is None
 
@@ -320,7 +320,7 @@ def test_a_tier_that_reverts_when_the_menu_closes_is_vetoed():
     tool down when the badge replaced the tier on it — but to re-read the CONTROLS after they
     settle. An explicit contradiction is a veto."""
     c = _Composer(tier=2, revert_tier_on_close=2)
-    pick = _CDP._select_model(c, "Pro", "Latest")
+    pick = _CDP._select_model(c, "Pro", "GPT-6")
     assert pick.confirmed is False
     assert pick.error and "'High'" in pick.error and "not 'Pro'" in pick.error
     assert c.tier == 2, "and the composer is left on the tier it was actually found on"
@@ -330,23 +330,23 @@ def test_a_tier_that_reverts_when_the_menu_closes_is_vetoed():
 def test_a_family_that_drifts_during_the_tier_walk_is_caught_by_the_joint_confirmation():
     """The family was pinned first and then never revalidated, so a tier walk that reset the model
     passed on two observations that were never simultaneously true. The confirming read takes the
-    tuple TOGETHER, after the commit — and here it reads (GPT-5.5, Pro) where (Latest, Pro) was
+    tuple TOGETHER, after the commit — and here it reads (GPT-5.5, Pro) where (GPT-6, Pro) was
     promised."""
-    c = _Composer(tier=2, family="Latest", flip_family_on_walk="GPT-5.5")
-    pick = _CDP._select_model(c, "Pro", "Latest")
+    c = _Composer(tier=2, family="GPT-6", flip_family_on_walk="GPT-5.5")
+    pick = _CDP._select_model(c, "Pro", "GPT-6")
     assert pick.confirmed is False
-    assert pick.error and "GPT-5.5" in pick.error and "Latest" in pick.error
-    assert (c.family, c.tier) == ("Latest", 2), "the vetoed attempt is rolled back, both halves"
+    assert pick.error and "GPT-5.5" in pick.error and "GPT-6" in pick.error
+    assert (c.family, c.tier) == ("GPT-6", 2), "the vetoed attempt is rolled back, both halves"
     assert c.menu is None and pick.dirty is False
 
 
 def test_a_correct_pin_still_confirms_through_the_joint_read():
     """The veto must not become the new outage: the ordinary GPT-6 walk still confirms, and the
     receipt still records the badge that answered."""
-    c = _Composer(tier=2, family="Latest")
-    pick = _CDP._select_model(c, "Pro", "Latest")
+    c = _Composer(tier=2, family="GPT-6")
+    pick = _CDP._select_model(c, "Pro", "GPT-6")
     assert (pick.confirmed, pick.shown, pick.badge) == (True, "Pro", "6")
-    assert (c.family, c.tier) == ("Latest", 4) and c.menu is None and pick.dirty is False
+    assert (c.family, c.tier) == ("GPT-6", 4) and c.menu is None and pick.dirty is False
 
 
 # ---- defect 3: failure was not transactional ----------------------------------------------
@@ -358,21 +358,21 @@ def test_family_selection_that_closes_and_rebuilds_the_menu_is_still_verified():
     has to survive the switcher being RENAMED by that very commit: the GPT-6 badge is the model, so
     it read '5.5' before the click and '6' after."""
     c = _Composer(tier=4, family="GPT-5.5", commit_closes_menu=True, rebuild_tier_on_family=0)
-    pick = _CDP._select_model(c, "Pro", "Latest")
+    pick = _CDP._select_model(c, "Pro", "GPT-6")
     assert (pick.confirmed, pick.shown) == (True, "Pro")
     assert c.rebuilds >= 1, "the fixture must actually have rebuilt the menu"
-    assert (c.family, c.tier) == ("Latest", 4) and c.menu is None
+    assert (c.family, c.tier) == ("GPT-6", 4) and c.menu is None
     assert pick.badge == "6" and pick.dirty is False
 
 
 def test_family_success_then_tier_failure_restores_the_original_family_and_tier():
     """The reviewer's trace: the composer starts on GPT-5.5 and a non-target tier, the caller asks
-    for Latest and a tier this account does not have. The family switch succeeds; the tier walk
+    for GPT-6 and a tier this account does not have. The family switch succeeds; the tier walk
     fails and restores only ITS OWN entry position — captured AFTER the family change, so on a
     build where that change rebuilt the slider it restores a position the composer was never on.
-    The call returned False with the composer left on Latest. Both halves go back, family first."""
+    The call returned False with the composer left on GPT-6. Both halves go back, family first."""
     c = _Composer(tier=2, family="GPT-5.5", commit_closes_menu=True, rebuild_tier_on_family=0)
-    pick = _CDP._select_model(c, "Ultra", "Latest")
+    pick = _CDP._select_model(c, "Ultra", "GPT-6")
     assert pick.confirmed is False
     assert c.family == "GPT-5.5", "a failed run must not leave the composer on the target family"
     assert c.tier == 2, "nor on the position the family change rebuilt the slider at"
@@ -397,7 +397,7 @@ def test_oscillating_restoration_terminates_and_reports_dirty():
     algorithm terminating. Monotonic-progress-in-range now ends it on the first non-approaching
     observation, and an unproven restore is reported as dirty rather than as a restore."""
     c = _Composer(tier=1, oscillate=True)
-    pick = _CDP._select_model(c, "Ultra", "Latest")
+    pick = _CDP._select_model(c, "Ultra", "GPT-6")
     assert pick.confirmed is False
     assert pick.dirty is True, "an unproven restoration is a dirty composer, not a clean one"
     assert c.presses < 40, "the walk must be bounded by construction: %d presses" % c.presses
@@ -411,7 +411,7 @@ def test_unreadable_final_restoration_state_reports_unknown_not_history():
     as an observation of what is currently selected. The composer is genuinely somewhere unknown
     here, and the verdict must say so."""
     c = _Composer(tier=2, unreadable_after=3)
-    pick = _CDP._select_model(c, "Ultra", "Latest")
+    pick = _CDP._select_model(c, "Ultra", "GPT-6")
     assert pick.confirmed is False
     assert pick.dirty is True
     assert pick.shown != "High", "the entry label must not be quoted as the current state"
@@ -420,8 +420,8 @@ def test_unreadable_final_restoration_state_reports_unknown_not_history():
 
 def test_a_reachable_tier_still_walks_and_is_not_reported_dirty():
     """The bounds must not make an ordinary walk look like a failure."""
-    c = _Composer(tier=0, family="Latest")
-    pick = _CDP._select_model(c, "Extra High", "Latest")
+    c = _Composer(tier=0, family="GPT-6")
+    pick = _CDP._select_model(c, "Extra High", "GPT-6")
     assert (pick.confirmed, pick.shown) == (True, "Extra High")
     assert c.tier == 3 and pick.dirty is False and c.menu is None
 
@@ -439,8 +439,8 @@ def test_a_menu_that_ignores_the_cdp_escape_is_still_closed_before_the_verdict()
     behaviour. The verdict is taken from the RESTING composer, whose switcher reads "Thinking
     effort" while the menu is open — so a guard that cannot actually close the menu judges the
     composer by a string that is neither a model nor a tier."""
-    c = _Composer(tier=2, family="Latest", escape_dismisses=False)
-    pick = _CDP._select_model(c, "Pro", "Latest")
+    c = _Composer(tier=2, family="GPT-6", escape_dismisses=False)
+    pick = _CDP._select_model(c, "Pro", "GPT-6")
     assert (pick.confirmed, pick.shown, pick.badge) == (True, "Pro", "6")
     assert c.menu is None, "the composer must actually be resting when the verdict is taken"
 
@@ -471,6 +471,6 @@ def test_a_picker_left_mounted_after_dismissal_is_read_where_it_stands():
     them is not a stronger observation, only a more disruptive one — and reopening is where the
     flake lives."""
     c = _Composer(tier=2, family="GPT-5.5", mounted_when_closed=True)
-    pick = _CDP._select_model(c, "Pro", "Latest")
+    pick = _CDP._select_model(c, "Pro", "GPT-6")
     assert (pick.confirmed, pick.shown) == (True, "Pro")
-    assert (c.family, c.tier) == ("Latest", 4) and c.menu is None
+    assert (c.family, c.tier) == ("GPT-6", 4) and c.menu is None

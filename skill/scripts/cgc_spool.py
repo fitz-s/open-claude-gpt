@@ -839,7 +839,7 @@ def main() -> int:
                                     "ITS conversation (causal, unambiguous under concurrency). "
                                     "Preferred over --conversation auto.")
     e.add_argument("--model", default=os.environ.get("CGC_MODEL", "Pro"))
-    e.add_argument("--model-family", default=os.environ.get("CGC_MODEL_FAMILY", "Latest"),
+    e.add_argument("--model-family", default=os.environ.get("CGC_MODEL_FAMILY", "GPT-6"),
                    help="model family to pin, FROZEN into the round's spec here rather than read "
                         "from the daemon's environment at send time — so a queued round keeps the "
                         "family it was fired with. Part of the request-key fingerprint: the same "

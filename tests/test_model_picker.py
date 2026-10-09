@@ -692,7 +692,7 @@ def test_group_text_missing_falls_back_to_button_label(monkeypatch):
 #     1 "Pro"                                               to be. This one line is the entire
 #     2 "Pro, 5 of 5."                                      regression.
 #     3 "Use Left and Right arrow keys to adjust power."
-#     4 "Latest"      role=menuitemradio aria-checked=true
+#     4 "Latest"      role=menuitemradio aria-checked=true   (relabelled "GPT-6" in 2026-10)
 #     5 "GPT-5.6 Sol" role=menuitemradio aria-checked=false
 #     6 "GPT-5.5"     role=menuitemradio aria-checked=false
 #   span[role=slider] aria-valuemin=0 aria-valuemax=4 aria-valuenow=4, textContent "", no
@@ -710,9 +710,9 @@ class _FakeGpt6PickerClient:
     which is also the pre-GPT-6 shape, where that announcement WAS line 0."""
 
     LABELS = ["Instant", "Medium", "High", "Extra High", "Pro"]
-    FAMILIES = ["Latest", "GPT-5.6 Sol", "GPT-5.5"]
+    FAMILIES = ["GPT-6", "GPT-5.6 Sol", "GPT-5.5"]
 
-    def __init__(self, start=4, checked="Latest", describedby=True, radios=True):
+    def __init__(self, start=4, checked="GPT-6", describedby=True, radios=True):
         self.now = start
         self.checked = checked
         self.describedby = describedby
@@ -802,11 +802,11 @@ class _FakeGpt6PickerClient:
 
 
 def test_gpt6_picker_confirms_pro_where_it_already_sits(monkeypatch):
-    """The live tab verbatim: slider at 4, family Latest. Pre-fix this returned (False, '6') and
+    """The live tab verbatim: slider at 4, family GPT-6. Pre-fix this returned (False, '6') and
     refused to send; it must confirm without touching anything."""
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
-    client = _FakeGpt6PickerClient(start=4, checked="Latest")
-    pick = _CDP._select_model(client, "Pro", "Latest")
+    client = _FakeGpt6PickerClient(start=4, checked="GPT-6")
+    pick = _CDP._select_model(client, "Pro", "GPT-6")
     assert (pick.confirmed, pick.shown) == (True, "Pro")
     assert client.now == 4
     assert pick.badge == "6", "the receipt must record WHICH MODEL answered, not just the tier"
@@ -814,8 +814,8 @@ def test_gpt6_picker_confirms_pro_where_it_already_sits(monkeypatch):
 
 def test_gpt6_picker_walks_the_slider_to_pro(monkeypatch):
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
-    client = _FakeGpt6PickerClient(start=2, checked="Latest")   # High
-    pick = _CDP._select_model(client, "Pro", "Latest")
+    client = _FakeGpt6PickerClient(start=2, checked="GPT-6")   # High
+    pick = _CDP._select_model(client, "Pro", "GPT-6")
     assert (pick.confirmed, pick.shown) == (True, "Pro")
     assert client.now == 4
 
@@ -824,8 +824,8 @@ def test_gpt6_tier_survives_a_missing_describedby(monkeypatch):
     """Source 1 of the chain gone: the tier is then only in the group's ', N of M.' line — which
     on this build is line 2, not line 0, so it has to be FOUND by shape, not read by index."""
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
-    client = _FakeGpt6PickerClient(start=2, checked="Latest", describedby=False)
-    pick = _CDP._select_model(client, "Pro", "Latest")
+    client = _FakeGpt6PickerClient(start=2, checked="GPT-6", describedby=False)
+    pick = _CDP._select_model(client, "Pro", "GPT-6")
     assert (pick.confirmed, pick.shown) == (True, "Pro")
 
 
@@ -833,8 +833,8 @@ def test_gpt6_family_already_checked_is_not_clicked(monkeypatch):
     """A checked Radix radio must be left alone: clicking one is not a guaranteed no-op (it
     commits the menu closed), and there is nothing to change."""
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
-    client = _FakeGpt6PickerClient(start=4, checked="Latest")
-    pick = _CDP._select_model(client, "Pro", "Latest")
+    client = _FakeGpt6PickerClient(start=4, checked="GPT-6")
+    pick = _CDP._select_model(client, "Pro", "GPT-6")
     assert pick.confirmed is True
     assert client.family_clicks == 0, "no gesture may be dispatched at an already-correct family"
 
@@ -844,15 +844,15 @@ def test_gpt6_family_is_switched_off_gpt55_and_confirmed(monkeypatch):
     different model than the receipt names."""
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
     client = _FakeGpt6PickerClient(start=4, checked="GPT-5.5")
-    pick = _CDP._select_model(client, "Pro", "Latest")
+    pick = _CDP._select_model(client, "Pro", "GPT-6")
     assert (pick.confirmed, pick.shown) == (True, "Pro")
     assert client.family_clicks == 1
-    assert client.checked == "Latest", "the click must be confirmed by re-reading aria-checked"
+    assert client.checked == "GPT-6", "the click must be confirmed by re-reading aria-checked"
 
 
 def test_gpt6_missing_family_fails_closed_and_names_what_is_offered(monkeypatch):
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
-    client = _FakeGpt6PickerClient(start=4, checked="Latest")
+    client = _FakeGpt6PickerClient(start=4, checked="GPT-6")
     pick = _CDP._select_model(client, "Pro", "GPT-7")
     assert pick.confirmed is False, "an unavailable family must refuse, exactly like a tier miss"
     assert pick.error and "GPT-7" in pick.error
@@ -866,8 +866,8 @@ def test_gpt6_unreachable_tier_restores_the_slider(monkeypatch):
     """The side-effect-free property, on the new DOM: a target this account does not have must
     leave the slider exactly where the walk found it, never at whatever tier it gave up on."""
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
-    client = _FakeGpt6PickerClient(start=3, checked="Latest")   # Extra High
-    pick = _CDP._select_model(client, "Ultra", "Latest")
+    client = _FakeGpt6PickerClient(start=3, checked="GPT-6")   # Extra High
+    pick = _CDP._select_model(client, "Ultra", "GPT-6")
     assert pick.confirmed is False
     assert client.now == 3, "a doomed walk must restore the entry position"
     assert pick.shown == "Extra High", "and report the tier the composer is actually left on"
@@ -878,7 +878,7 @@ def test_old_build_without_model_radios_ignores_the_family(monkeypatch):
     no-op — never a refusal over a control that build does not render."""
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
     client = _FakeSliderClient(start=2, keys_work=True)          # the 2026-08-18 build
-    pick = _CDP._select_model(client, "Pro", "Latest")
+    pick = _CDP._select_model(client, "Pro", "GPT-6")
     assert (pick.confirmed, pick.shown) == (True, "Pro")
     assert pick.error is None
 
@@ -891,9 +891,9 @@ def test_family_unverifiable_does_not_confirm(monkeypatch):
     monkeypatch.setattr(_CDP.time, "sleep", lambda n: None)
     client = _FakeAlwaysMismatchedOpenClient()          # every open lands on the wrong label
     client.eval = _never_opens(client)
-    pick = _CDP._select_model(client, "Extra High", "Latest")
+    pick = _CDP._select_model(client, "Extra High", "GPT-6")
     assert pick.confirmed is False
-    assert pick.error and "Latest" in pick.error
+    assert pick.error and "GPT-6" in pick.error
     assert client.slider_reads == 0
 
 
