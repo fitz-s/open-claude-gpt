@@ -6,6 +6,21 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — a long prompt's send was reported `unknown_send` and its answer `rid_absent`, though both existed
+
+ChatGPT collapses a long user message in the DOM to its head plus "…Show more" (a 20.7 KB prompt kept
+10098 characters). The template's `BEGIN_RESPONSE`/`END_RESPONSE` pair is the last thing in the render, so a
+collapsed turn never carried the rid: the send contract saw `search-unit-v1 users:1, ridLanded:false` and
+refused to confirm a send that had landed, and the waiter and retrieve found no source turn beside a
+finished, correctly wrapped answer.
+
+- A user turn that shows a "Show more" button now reads its text from the turn's React item
+  (`props.item.message`, the exact text the composer sent). Every other turn, and a collapsed turn whose
+  item cannot be found, reads from the DOM as before, so an unprovable send still ends `unknown_send` and is
+  never auto-resent.
+- The same read serves the send contract, the waiter's source-turn lookup, the failure marker, the
+  `rid_echo` check of a follow-up, and `status --rid auto`.
+
 ### Fixed — the model picker renamed `Latest` to `GPT-6`, so every consult refused to send
 
 The composer's model radios now read `GPT-6` / `GPT-5.6 Sol` / `GPT-5.5`; the first is the same model

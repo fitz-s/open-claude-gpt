@@ -592,6 +592,19 @@ _TEXT_FN = ("function __cgcText(el){if(!el)return '';"
             "if(c.tagName==='BR'){out+='\\n';continue;}var b=BLOCK.test(c.tagName);if(b)out+='\\n';w(c);if(b)out+='\\n';}}})(el);"
             "return out.replace(/[ \\t]+\\n/g,'\\n').replace(/\\n{3,}/g,'\\n\\n');}")
 
+# ChatGPT collapses a long user message to its head plus "…Show more" (live 2026-10-08: the DOM held
+# 10098 of a 20707-char prompt), and the template's own sentinel pair is the LAST thing in the render —
+# so a collapsed turn's DOM can never carry the rid, and every read of "which turn is mine" went blind
+# beside a send that had landed. The turn's React item still holds the whole message the composer sent
+# (props.item.message, two fibers above the unit). A collapsed turn reads from it; any other turn, or a
+# collapsed one whose item cannot be found, reads from the DOM exactly as before.
+_USER_TEXT_FN = (
+    "function __cgcUserText(el){var t=__cgcText(el);"
+    "if(!el.querySelector('button[aria-expanded=\"false\"]'))return t;"
+    "var k=Object.keys(el).filter(function(x){return x.indexOf('__reactFiber$')===0})[0];"
+    "for(var f=k&&el[k],i=0;f&&i<8;f=f.return,i++){var m=f.memoizedProps&&f.memoizedProps.item;"
+    "if(m&&typeof m.message==='string')return m.message;}return t;}")
+
 # The rid regex shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) shared by every rid-reading regex in this file.
 _RID_RE_SRC = r"REQ-\d{8}-\d{6}-[0-9a-f]{6}"
 
@@ -607,12 +620,12 @@ _RID_FN = ("function __cgcRid(t){var re=/^(BEGIN|END)_RESPONSE:(" + _RID_RE_SRC 
            "if(m[1]==='BEGIN')ob[m[2]]=1;else if(ob[m[2]])rid=m[2];}return rid;}")
 
 _NODE_FN = (
-    _ROLE_FN + _TEXT_FN + _RID_FN +
+    _ROLE_FN + _TEXT_FN + _USER_TEXT_FN + _RID_FN +
     # __cgcSrc(nx, RID): index in nx of the source turn — the LAST user node whose OWN canonical rid
     # is RID (the last, so a same-rid resend owns the answer) — or -1 when it is not rendered.
     "function __cgcSrc(nx,RID){var EN='END_RESPONSE:'+RID,s=-1;"
-    "for(var j=0;j<nx.length;j++){if(__cgcRole(nx[j])==='user'&&(nx[j].textContent||'').indexOf(EN)>=0"
-    "&&__cgcRid(__cgcText(nx[j]))===RID)s=j;}return s;}"
+    "for(var j=0;j<nx.length;j++){if(__cgcRole(nx[j])==='user'&&__cgcRid(__cgcUserText(nx[j]))===RID)s=j;}"
+    "return s;}"
     # __cgcNode(BG, RID): RID is OPTIONAL. Omitted/null -> UNSCOPED, the legacy 'auto' behavior
     # (step 1 searches the whole document; step 2 falls back to only AFTER the last user node).
     # Given -> SCOPED to the interval strictly between the source turn (__cgcSrc) and the NEXT user
@@ -795,7 +808,7 @@ def _detect_js(rid: str, *, scoped=False) -> str:
         # unscoped 'auto' wait, which by definition watches the latest turn.
         "var failed=null;(function(){var u=src>=0?nx[src]:null;"
         "if(!RID){for(var i=nx.length-1;i>=0;i--)"
-        "if(__cgcRole(nx[i])==='user'&&(nx[i].textContent||'').indexOf(BG)>=0){u=nx[i];break;}}"
+        "if(__cgcRole(nx[i])==='user'&&__cgcUserText(nx[i]).indexOf(BG)>=0){u=nx[i];break;}}"
         "var t=u&&u.closest('[data-turn-key]');if(!t)return;"
         # The marker is a status element whose WHOLE text is the phrase (live 2026-09-25: a lone
         # "Thinking failed" span in the turn's activity header). Matching an exact element text,
@@ -870,8 +883,8 @@ def _last_user_text_js() -> str:
     observed live: a landed send classified possibly_accepted because its own echo was unparseable).
     DOM extraction stays JS's only job here — parsing the rid out of it is Python's (via
     _turn_canonical_rid, pure and unit-tested)."""
-    return ("(function(){" + _TEXT_FN + "var u=document.querySelectorAll(" + _JS_U + ");"
-            "var n=u[u.length-1];return n?__cgcText(n):'';})()")
+    return ("(function(){" + _TEXT_FN + _USER_TEXT_FN + "var u=document.querySelectorAll(" + _JS_U + ");"
+            "var n=u[u.length-1];return n?__cgcUserText(n):'';})()")
 
 
 def _resolve_rid(c, rid):
@@ -899,8 +912,8 @@ def _all_user_texts_js() -> str:
     line-anchored parser) of EVERY user turn, DOM order — unlike _last_user_text_js (last turn
     only), this lets a retrieve locate a SOURCE rid's own turn anywhere in the conversation, even
     when later turns were sent after it."""
-    return ("(function(){" + _TEXT_FN + "var u=document.querySelectorAll(" + _JS_U + ");"
-            "return Array.prototype.map.call(u, function(n){return __cgcText(n);});})()")
+    return ("(function(){" + _TEXT_FN + _USER_TEXT_FN + "var u=document.querySelectorAll(" + _JS_U + ");"
+            "return Array.prototype.map.call(u, function(n){return __cgcUserText(n);});})()")
 
 
 def _locate_source_turn(user_texts, source_rid):
@@ -2300,10 +2313,10 @@ def _contract_js(rid):
     still READ the reply — the failure that burned two 25-minute rounds."""
     tag = json.dumps(f"BEGIN_RESPONSE:{rid}")
     fams = json.dumps([{"name": n, "u": u, "a": a} for n, u, a in _ADAPTERS])
-    return ("(function(){var TAG=%s,F=%s,out=[];"
+    return ("(function(){" + _TEXT_FN + _USER_TEXT_FN + "var TAG=%s,F=%s,out=[];"
             "for(var i=0;i<F.length;i++){"
             "var us=document.querySelectorAll(F[i].u),as=document.querySelectorAll(F[i].a),hit=false;"
-            "for(var j=0;j<us.length;j++){if((us[j].textContent||'').indexOf(TAG)>=0){hit=true;break;}}"
+            "for(var j=0;j<us.length;j++){if(__cgcUserText(us[j]).indexOf(TAG)>=0){hit=true;break;}}"
             "out.push({adapter:F[i].name,ridLanded:hit,users:us.length,assistants:as.length});}"
             "var gen=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"]');"
             "return JSON.stringify({families:out,generating:gen});})()" % (tag, fams))
