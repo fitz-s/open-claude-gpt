@@ -468,25 +468,29 @@ def _store_env(tmp_path):
             "CGC_STATE_DIR": str(tmp_path / "s")}
 
 
-def test_snapshot_prints_the_note_then_one_state_line(tmp_path, paths):
-    _s, activation = paths
-    env = {**_store_env(tmp_path), "CGC_WEEKLY_BUDGET": "50"}
+def _seed_env(monkeypatch, tmp_path, **extra):
+    """Point THIS process at the test's own store (monkeypatch undoes it, and conftest's isolation
+    stays in force afterwards) and return the same settings for a subprocess."""
+    env = {**_store_env(tmp_path), **extra}
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
     sys.path.insert(0, SCRIPTS)
+    return env
+
+
+def test_snapshot_prints_the_note_then_one_state_line(tmp_path, paths, monkeypatch):
+    _s, activation = paths
+    env = _seed_env(monkeypatch, tmp_path, CGC_WEEKLY_BUDGET="50")
     import cgc_store
-    os.environ.update(env)
-    try:
-        with cgc_store.Store() as st:
-            st.create_round("REQ-20260707-120000-0d0001", "submit", prompt="# T\n\nb")
-            st.set_state("REQ-20260707-120000-0d0001", cgc_store.READY)
-            aid = st.begin_send("REQ-20260707-120000-0d0001", "p", "h" * 64, daemon_instance_id="d")
-            st.mark_accepted(aid, "conv-1")
-            st.mark_waiting("REQ-20260707-120000-0d0001")
-            st.finish("REQ-20260707-120000-0d0001", cgc_store.COMPLETED_VERIFIED, result_text="a")
-            st.create_round("REQ-20260707-120000-0d0002", "submit", prompt="# Later\n\nb",
-                            not_before="2999-01-01T00:00:00+00:00")
-    finally:
-        for k in env:
-            os.environ.pop(k, None)
+    with cgc_store.Store() as st:
+        st.create_round("REQ-20260707-120000-0d0001", "submit", prompt="# T\n\nb")
+        st.set_state("REQ-20260707-120000-0d0001", cgc_store.READY)
+        aid = st.begin_send("REQ-20260707-120000-0d0001", "p", "h" * 64, daemon_instance_id="d")
+        st.mark_accepted(aid, "conv-1")
+        st.mark_waiting("REQ-20260707-120000-0d0001")
+        st.finish("REQ-20260707-120000-0d0001", cgc_store.COMPLETED_VERIFIED, result_text="a")
+        st.create_round("REQ-20260707-120000-0d0002", "submit", prompt="# Later\n\nb",
+                        not_before="2999-01-01T00:00:00+00:00")
     r = _run_snapshot(activation, env)
     assert r.returncode == 0, r.stderr
     lines = r.stdout.splitlines()
@@ -504,17 +508,11 @@ def test_snapshot_is_read_only_and_never_creates_a_store(tmp_path, paths):
     assert not os.path.exists(env["CGC_STORE_DB"]) and not os.path.exists(env["CGC_DATA_DIR"])
 
 
-def test_snapshot_does_not_write_to_the_store(tmp_path, paths):
+def test_snapshot_does_not_write_to_the_store(tmp_path, paths, monkeypatch):
     _s, activation = paths
-    env = _store_env(tmp_path)
-    sys.path.insert(0, SCRIPTS)
+    env = _seed_env(monkeypatch, tmp_path)
     import cgc_store
-    os.environ.update(env)
-    try:
-        cgc_store.Store().close()
-    finally:
-        for k in env:
-            os.environ.pop(k, None)
+    cgc_store.Store().close()
     db = env["CGC_STORE_DB"]
     before = open(db, "rb").read()
     os.chmod(db, 0o400)
@@ -555,19 +553,13 @@ def test_snapshot_with_a_missing_note_prints_the_visible_warning_and_exits_zero(
     assert "WARNING: chatgpt-consult ACTIVATION.md missing at " + missing in r.stdout
 
 
-def test_snapshot_is_bounded_when_the_store_is_locked(tmp_path, paths):
+def test_snapshot_is_bounded_when_the_store_is_locked(tmp_path, paths, monkeypatch):
     """An exclusive writer lock must cost the hook its status line, not the session its start."""
     import time
     _s, activation = paths
-    env = _store_env(tmp_path)
-    sys.path.insert(0, SCRIPTS)
+    env = _seed_env(monkeypatch, tmp_path)
     import cgc_store
-    os.environ.update(env)
-    try:
-        cgc_store.Store().close()
-    finally:
-        for k in env:
-            os.environ.pop(k, None)
+    cgc_store.Store().close()
     c = sqlite3.connect(env["CGC_STORE_DB"], isolation_level=None, timeout=0)
     c.execute("PRAGMA locking_mode=EXCLUSIVE")
     c.execute("BEGIN EXCLUSIVE")
