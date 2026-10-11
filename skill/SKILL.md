@@ -1,12 +1,16 @@
 ---
 name: chatgpt-consult
 description: >-
-  Offload a deep, self-contained job — code review, architecture/planning, hard reasoning,
-  research, a second opinion, an audit — to the user's ChatGPT Pro subscription in the background,
-  keep working locally, and get woken with the full result. Use when the job is worth ~25 min of
-  frontier reasoning AND you have other work meanwhile. Do NOT use for anything answerable locally
-  in minutes, for routine checks, or when the answer is needed immediately. Inputs must be PUBLIC
-  GitHub links or content safe to send externally — never secrets/`.env`/keys/private code.
+  Use proactively, not only when asked, whenever a consequential decision is still open: a
+  design or architecture fork before building, a diagnosis stuck between competing causes, a
+  result that contradicts a load-bearing assumption, maths/statistics/probability to derive or
+  check, a disagreement with gpt-sol or a reviewer, an audit before merge or deploy, research on
+  an external contract, or substantive writing. Sends the question to the user's ChatGPT Pro in
+  the background and wakes you with the answer while you keep working. With --mention "WebCodex
+  Demo" the remote model also reads private code, local DBs and logs, and runs checks inside the
+  user's registered workspaces. The user wants the weekly Pro allowance spent on questions like
+  these; the SessionStart line shows what is left. gpt-sol stays the synchronous reviewer for
+  answers needed now; Pro takes the distinct, deeper question. Never paste secrets or .env.
 allowed-tools: Read, Write, Grep, Glob, Bash(python3:*), Bash(bash:*), Bash(mkdir:*), Bash(git status:*), Bash(git diff:*), Bash(git ls-files:*), Bash(git rev-parse:*), Bash(git remote:*), Bash(git branch:*)
 ---
 
@@ -15,11 +19,40 @@ allowed-tools: Read, Write, Grep, Glob, Bash(python3:*), Bash(bash:*), Bash(mkdi
 ChatGPT advises; Claude Code executes and verifies. A consult is a deep reasoning round on your
 configured model and tier — GPT-6 Astra Pro by default, ~25 minutes — or whichever family/tier
 `CGC_MODEL`/`CGC_MODEL_FAMILY` target instead, including an older family you've deliberately
-pinned or a legacy picker that only offers a tier: only send work worth that, steer it precisely,
-fire it, and keep working — the detached waiter wakes you with the answer.
+pinned or a legacy picker that only offers a tier. Steer it precisely, fire it, and keep working;
+the detached waiter wakes you with the answer.
 
-**Safety gate.** Every consult ships PUBLIC GitHub links (or content you'd comfortably send to
-ChatGPT outright). NEVER secrets, `.env`, tokens, private-repo content, customer data, or
+## When to fire
+
+Fire when an independent deep argument or investigation can change a decision that is still open
+when the answer lands (p50 ~28 min, p90 ~90 min). Ask for the smallest decisive deliverable: a
+counterexample, derivation, discriminating experiment, implementation rule, source-backed
+conclusion, or revised passage. Ranked by value per message:
+
+1. A measured result contradicts a load-bearing assumption (fit looks good, replay loses).
+2. The deciding evidence sits in a local workspace — DB, logs, private or unpushed code — that an
+   independent analyst should query and re-run (WebCodex route below).
+3. A reversible but expensive design fork, before the code exists.
+4. A maths/statistics property governs correctness: derive it, or find the counterexample.
+5. Debugging has stalled between competing causes; ask for the discriminating experiment.
+6. You and gpt-sol (or a reviewer) disagree on a consequential claim.
+7. An obscure external contract (settlement, protocol, API rules) must be researched before it is coded.
+8. Substantive writing with competing framings, judged against evidence.
+
+gpt-sol is the synchronous standing reviewer and answers bounded questions needed now; Pro takes
+the distinct, deeper uncertainty, and either may start first. A complete question that can wait
+goes to the backlog (`--not-before` / `--use-by`). Keep routine fixes, lookups, and anything that
+cannot change an action local. The SessionStart line shows the week's budget, backlog, and
+ungraded answers. Unspent allowance at week's end is lost, so use it on these triggers rather
+than on invented questions.
+
+Record the decision before you see the answer: `--origin agent --trigger <kind> --decision "<the
+action this can change>" --baseline "<your current answer>" --check "<how the result will be
+judged>"`.
+
+**Safety gate.** Every consult's prompt ships PUBLIC GitHub links (or content you'd comfortably
+send to ChatGPT outright). Private code and local data reach the model only through a WebCodex
+workspace the user registered (`--workspace` + `--mention`), never pasted into the prompt. NEVER secrets, `.env`, tokens, private-repo content, customer data, or
 unreviewed logs. A private repo is sendable ONLY if the user named it in
 `CGC_GATE_PRIVATE_REPOS` — you never decide that or add to it. The user's daemon independently
 re-validates every prompt (public repos, existing refs, no secret shapes) and refuses fail-closed.
@@ -42,16 +75,18 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid>
 
 - Reviewing `main`/a branch → `--ref <sha>` (commit-pinned; a branch can move mid-consult).
 - No code subject at all (a proof, research, writing) → add `--no-code`.
-- User names a ChatGPT app/plugin (`@WebCodex Demo`) → add `--mention "WebCodex Demo"` (no `@`,
-  repeatable). That is the whole job: the daemon picks it from the composer's @ popup before pasting.
-  A `--followup` needs NO `--mention`: the first round of the thread already attached the app, and a
-  follow-up without one never opens the popup. `--mention` on a follow-up is optional and, if given,
-  still refuses before the send when it cannot be confirmed. Whether the connector stays active for
-  later messages of the same thread is NOT verified (the thread DOM shows no marker either way); if a
-  follow-up depends on the app's tools and the answer shows it did not use them, re-fire with
-  `--mention` rather than assuming it carried over. Never write `@App` into `--task`, never touch the browser.
-  Which apps exist: known today = **`WebCodex Demo`**; the live list is
-  `python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py apps` (from `CGC_APPS`). A short or
+- **WebCodex route.** The deciding evidence is local (private or unpushed code, a DB, logs, data,
+  a check to run) and lives in a workspace the user registered with WebCodex → add
+  `--workspace <name> --mention "WebCodex Demo"` (no `@`). The remote model then reads files, lists
+  directories, runs processes, and observes jobs inside that workspace. In `--task`, name the
+  revision or data window and the read/run scope; checks that write go to a temp dir or an isolated
+  worktree, never the active one. The daemon picks the app from the composer's @ popup before
+  pasting. A user naming an app (`@WebCodex Demo`) means the same flag.
+  Whether the app stays attached for later messages of a thread is NOT verified, so a follow-up
+  that needs its tools repeats `--mention`. `--mention` refuses before the send when it cannot be
+  confirmed. Never write `@App` into `--task`, never touch the browser.
+  `python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py apps` lists the known apps
+  (`CGC_APPS`) and registered workspaces (`CGC_WORKSPACES`). A short or
   lower-case name (`--mention webcodex`) snaps to the listed spelling. Envelope error
   `mention_not_found` says what the popup showed: other apps → re-fire with one of those names;
   opened but empty, only its loading skeleton, or listed with a Connect control → relay
@@ -74,8 +109,8 @@ outcome names the artifact it produced. Act on the fields, never on the code alo
 
 - `answer_path` set → Read it. `confidence:"unverified"` → a human verifies the answer is complete
   and belongs to this round before you act on it; never auto-chain a follow-up on it.
-- Success carries `next_command:null` by design — a follow-up costs one of the week's few Pro
-  messages, so it is a decision you make FROM the answer, never a step the envelope proposes.
+- Success carries `next_command:null` by design: a follow-up is a decision you make FROM the
+  answer, never a step the envelope proposes.
 - `human_action` set → relay exactly that to the user (login/captcha/rate-limit/safeguard
   refusal), then do `next_command` once it's cleared.
 - A `blocked` round marked `(pre-send)` (login, captcha, a `--mention` that could not be confirmed) was
@@ -90,8 +125,7 @@ outcome names the artifact it produced. Act on the fields, never on the code alo
   with `turn_failed` — re-fire with a NEW `--request-key` only if you still need the answer. If the
   continue could not be confirmed it ends `possibly_accepted` like any unconfirmed send: follow
   `next_command` (retrieve), never re-fire.
-- "Still running" is not an outcome — a round takes ~25 min and await just keeps waiting. It gives
-  up only after 60+ min, which means broken, not slow.
+- "Still running" is not an outcome: await keeps waiting through the round's 90-minute deadline.
 
 **A stopped/killed `await` is a NON-EVENT.** The round lives in the store and the daemon finishes
 it regardless; the waiter is only the notifier. Re-arm the same one-liner (`await --rid <rid>`,
@@ -127,7 +161,7 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py fire --followup --pa
 concurrency. A bare `--followup` (no parent) resolves "the last thread" and REFUSES when that is
 ambiguous (another consult in flight, or two threads finished close together) — so always pass
 `--parent`. Add `--refs-file` for a fresh diff link. Loop (fire-followup → await → verify →
-again) until clean when asked; cap 3 rounds without user approval unless told otherwise.
+again) until clean; every follow-up carries new local evidence or a new question.
 
 ## Steer the round — `--title`, `--role`, `--task` decide the answer's depth
 
@@ -161,6 +195,21 @@ because you know a fact it didn't (it reviewed from outside, blind to your runti
 write that reasoning into the design rationale so the next reader doesn't re-raise it. Verify the
 load-bearing claims and anything tagged `verify locally` — a sanity check, not a re-audit. Only
 genuinely product-changing forks go to the user, with your analysis attached.
+
+**Grade it once you have acted** — this is what tunes the triggers and templates:
+
+```bash
+python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py feedback --rid <rid> --grade <g> \
+  --reason <r> --action "<what you did with it>" --evidence "<commit SHA / test / file>"
+```
+
+`2` changed a material decision or caught a defect, verified; `1` validated improvement or new
+discriminating evidence absent from your baseline; `0` duplicate, late, refuted, or unused; `-1`
+acting on it caused rework. A grade of 1 or more requires evidence, and reassurance alone earns 0.
+Grade transport failures `0 --reason transport` so the topic is not blamed. When the SessionStart
+line says the weekly review is due, read `cgc_spool.py stats --week` and change ONE trigger rule,
+template clause, or test that the graded outcomes support. Then record it with
+`feedback --policy "<what changed and why>"`.
 
 ## References (read only when needed)
 
