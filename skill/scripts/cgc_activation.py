@@ -350,10 +350,14 @@ def cmd_snapshot(a) -> int:
     activation = a.activation or DEFAULT_ACTIVATION
     try:
         with open(activation, encoding="utf-8") as f:
-            sys.stdout.write(f.read())
-    except OSError:
-        sys.stdout.write(_missing_warning(activation) + "\n")
-    sys.stdout.flush()
+            note = f.read()
+    except (OSError, ValueError):   # missing, unreadable, or not UTF-8: all the same to the session
+        note = _missing_warning(activation) + "\n"
+    try:
+        sys.stdout.write(note)
+        sys.stdout.flush()
+    except BaseException:  # noqa: BLE001 — a closed pipe must not turn into a failed session start
+        return 0
     armed = False
     try:
         import signal

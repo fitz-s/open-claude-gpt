@@ -553,6 +553,14 @@ def test_snapshot_with_a_missing_note_prints_the_visible_warning_and_exits_zero(
     assert "WARNING: chatgpt-consult ACTIVATION.md missing at " + missing in r.stdout
 
 
+def test_snapshot_with_an_undecodable_note_still_exits_zero_with_the_warning(tmp_path):
+    bad = tmp_path / "ACTIVATION.md"
+    bad.write_bytes(b"\xff\xfe not utf-8 \x80")
+    r = _run_snapshot(str(bad), _store_env(tmp_path))
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: chatgpt-consult ACTIVATION.md missing at " + str(bad) in r.stdout
+
+
 def test_snapshot_is_bounded_when_the_store_is_locked(tmp_path, paths, monkeypatch):
     """An exclusive writer lock must cost the hook its status line, not the session its start."""
     import time
