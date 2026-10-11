@@ -414,3 +414,183 @@ def test_install_new_file_defaults_to_0600(m, paths):
     import stat
     mode = stat.S_IMODE(os.stat(settings).st_mode)
     assert mode == 0o600
+
+
+# ---- the snapshot hook: upgrade path, output, and the error fallback ---------------------------
+# The hook runs `cgc_activation.py snapshot` (ACTIVATION.md + one state line) instead of `cat`. It
+# must upgrade the previous `cat || echo` form in place, never fail a session start, and never write
+# to the store it reads.
+
+import sqlite3  # noqa: E402
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+
+def test_install_upgrades_the_previous_cat_form_to_the_snapshot_form(m, paths):
+    settings, activation = paths
+    prev = (f"cat '{activation}' 2>/dev/null || echo 'WARNING: chatgpt-consult ACTIVATION.md "
+            f"missing at {activation} — run: cgc doctor'")
+    with open(settings, "w", encoding="utf-8") as f:
+        json.dump({"hooks": {"SessionStart": [
+            {"matcher": "", "hooks": [{"type": "command", "command": prev, "timeout": 10}]}]}}, f)
+    assert m.status(settings, activation)["stale"] is True
+    assert m.install(settings, activation) == ("upgraded", 1)
+    data = json.loads(open(settings, encoding="utf-8").read())
+    hooks = data["hooks"]["SessionStart"]
+    assert len(hooks) == 1 and len(hooks[0]["hooks"]) == 1, "upgraded in place, not appended"
+    cmd = hooks[0]["hooks"][0]["command"]
+    assert cmd == m.build_command(activation) and "snapshot" in cmd
+    assert m.install(settings, activation) == ("unchanged", 0)
+    assert m.status(settings, activation)["stale"] is False
+
+
+def test_snapshot_command_is_recognized_as_ours_even_without_the_warning_text(m, tmp_path):
+    hook = {"command": f"python3 '{m.SELF}' snapshot --activation '{tmp_path / 'A.md'}'"}
+    assert m.is_ours(hook)
+
+
+def test_the_snapshot_command_keeps_a_visible_fallback_chain(m, paths):
+    _s, activation = paths
+    cmd = m.build_command(activation)
+    assert "|| true" not in cmd
+    assert cmd.index("snapshot") < cmd.index("cat '") < cmd.index("echo '")
+
+
+def _run_snapshot(activation, env_over):
+    env = {**os.environ, "PATH": "/usr/bin:/bin", **env_over}
+    return subprocess.run([sys.executable, os.path.join(SCRIPTS, "cgc_activation.py"), "snapshot",
+                           "--activation", activation], capture_output=True, text=True, env=env,
+                          timeout=10)
+
+
+def _store_env(tmp_path):
+    return {"CGC_STORE_DB": str(tmp_path / "d" / "control.db"), "CGC_DATA_DIR": str(tmp_path / "d"),
+            "CGC_STATE_DIR": str(tmp_path / "s")}
+
+
+def test_snapshot_prints_the_note_then_one_state_line(tmp_path, paths):
+    _s, activation = paths
+    env = {**_store_env(tmp_path), "CGC_WEEKLY_BUDGET": "50"}
+    sys.path.insert(0, SCRIPTS)
+    import cgc_store
+    os.environ.update(env)
+    try:
+        with cgc_store.Store() as st:
+            st.create_round("REQ-20260707-120000-0d0001", "submit", prompt="# T\n\nb")
+            st.set_state("REQ-20260707-120000-0d0001", cgc_store.READY)
+            aid = st.begin_send("REQ-20260707-120000-0d0001", "p", "h" * 64, daemon_instance_id="d")
+            st.mark_accepted(aid, "conv-1")
+            st.mark_waiting("REQ-20260707-120000-0d0001")
+            st.finish("REQ-20260707-120000-0d0001", cgc_store.COMPLETED_VERIFIED, result_text="a")
+            st.create_round("REQ-20260707-120000-0d0002", "submit", prompt="# Later\n\nb",
+                            not_before="2999-01-01T00:00:00+00:00")
+    finally:
+        for k in env:
+            os.environ.pop(k, None)
+    r = _run_snapshot(activation, env)
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.splitlines()
+    assert lines[0] == "activation note"
+    assert len(lines) == 2, "the note, then exactly ONE state line"
+    assert lines[1] == ("Consult budget: 1 of 50 used (rolling 7d) · 49 available · 1 ready in backlog"
+                        " · 1 answers awaiting grade (cgc feedback) · p50 0s · weekly review due")
+
+
+def test_snapshot_is_read_only_and_never_creates_a_store(tmp_path, paths):
+    _s, activation = paths
+    env = _store_env(tmp_path)
+    r = _run_snapshot(activation, env)
+    assert r.returncode == 0 and r.stdout == "activation note\n", "no store -> just the note"
+    assert not os.path.exists(env["CGC_STORE_DB"]) and not os.path.exists(env["CGC_DATA_DIR"])
+
+
+def test_snapshot_does_not_write_to_the_store(tmp_path, paths):
+    _s, activation = paths
+    env = _store_env(tmp_path)
+    sys.path.insert(0, SCRIPTS)
+    import cgc_store
+    os.environ.update(env)
+    try:
+        cgc_store.Store().close()
+    finally:
+        for k in env:
+            os.environ.pop(k, None)
+    db = env["CGC_STORE_DB"]
+    before = open(db, "rb").read()
+    os.chmod(db, 0o400)
+    try:
+        r = _run_snapshot(activation, env)
+    finally:
+        os.chmod(db, 0o600)
+    assert r.returncode == 0 and r.stdout.startswith("activation note\n")
+    assert open(db, "rb").read() == before, "snapshot must not modify the database file"
+
+
+@pytest.mark.parametrize("breakage", ["garbage", "newer_schema", "wrong_tables"])
+def test_snapshot_survives_any_store_error_and_still_prints_the_note(tmp_path, paths, breakage):
+    _s, activation = paths
+    env = _store_env(tmp_path)
+    os.makedirs(env["CGC_DATA_DIR"])
+    db = env["CGC_STORE_DB"]
+    if breakage == "garbage":
+        open(db, "wb").write(b"this is not a sqlite database" * 50)
+    else:
+        c = sqlite3.connect(db)
+        if breakage == "newer_schema":
+            c.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            c.execute("INSERT INTO meta VALUES('schema_version','99')")
+        else:
+            c.execute("CREATE TABLE unrelated (x)")
+        c.commit()
+        c.close()
+    r = _run_snapshot(activation, env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "activation note\n", "the note survives; the state line is simply omitted"
+
+
+def test_snapshot_with_a_missing_note_prints_the_visible_warning_and_exits_zero(tmp_path):
+    missing = str(tmp_path / "nope" / "ACTIVATION.md")
+    r = _run_snapshot(missing, _store_env(tmp_path))
+    assert r.returncode == 0
+    assert "WARNING: chatgpt-consult ACTIVATION.md missing at " + missing in r.stdout
+
+
+def test_snapshot_is_bounded_when_the_store_is_locked(tmp_path, paths):
+    """An exclusive writer lock must cost the hook its status line, not the session its start."""
+    import time
+    _s, activation = paths
+    env = _store_env(tmp_path)
+    sys.path.insert(0, SCRIPTS)
+    import cgc_store
+    os.environ.update(env)
+    try:
+        cgc_store.Store().close()
+    finally:
+        for k in env:
+            os.environ.pop(k, None)
+    c = sqlite3.connect(env["CGC_STORE_DB"], isolation_level=None, timeout=0)
+    c.execute("PRAGMA locking_mode=EXCLUSIVE")
+    c.execute("BEGIN EXCLUSIVE")
+    try:
+        t0 = time.monotonic()
+        r = _run_snapshot(activation, env)
+        took = time.monotonic() - t0
+    finally:
+        c.execute("ROLLBACK")
+        c.close()
+    assert r.returncode == 0 and r.stdout.startswith("activation note\n")
+    assert took < 1.5, f"snapshot took {took:.2f}s against a locked store"
+
+
+def test_the_installed_hook_command_runs_and_never_fails_the_session(m, paths, tmp_path):
+    """End to end through /bin/sh, exactly as Claude Code runs it — including with python3 unusable."""
+    _s, activation = paths
+    cmd = m.build_command(activation)
+    env = {**os.environ, **_store_env(tmp_path)}
+    ok = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env, timeout=10)
+    assert ok.returncode == 0 and ok.stdout.startswith("activation note")
+    # No python3 and no cat on PATH: every external command fails, the `echo` builtin still runs, and
+    # the visible WARNING reaches the session instead of a silent empty hook or a non-zero exit.
+    dead = subprocess.run(cmd, shell=True, executable="/bin/sh", capture_output=True, text=True,
+                          env=dict(env, PATH="/nonexistent"), timeout=10)
+    assert dead.returncode == 0 and "WARNING: chatgpt-consult ACTIVATION.md missing at" in dead.stdout

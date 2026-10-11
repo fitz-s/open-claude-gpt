@@ -484,7 +484,6 @@ def week_view(db, now=None) -> dict:
         "policy_update": ({"happened": True, "at": pol[0][1], **_spec(pol[0][0])} if pol
                           else {"happened": False}),
         "latency_p50_s": durs[len(durs) // 2] if durs else None,
-        "has_rounds": bool(q("SELECT 1 FROM rounds LIMIT 1")),
     }
 
 

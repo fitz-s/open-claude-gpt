@@ -17,6 +17,8 @@ nothing else should duplicate the snippet text.
     cgc_activation.py status  [--json]         report configured / broken / absent / unreadable
     cgc_activation.py install [--json]         idempotently add or upgrade the hook
     cgc_activation.py remove  [--json]         remove our entry again
+    cgc_activation.py snapshot                 what the installed hook runs: ACTIVATION.md, then ONE
+                                                line of weekly budget/backlog/grading state
 
     --settings PATH     default: ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json
     --activation PATH   default: ACTIVATION.md next to this script's skill root
@@ -52,8 +54,13 @@ import tempfile
 # used the installed skill's own ACTIVATION.md path.
 MARKER_CURRENT = "WARNING: chatgpt-consult ACTIVATION.md missing at"
 MARKER_LEGACY = "chatgpt-consult/ACTIVATION.md"
+# The snapshot form names this script's subcommand. It repeats MARKER_CURRENT in its echo fallback
+# today, but identity must not hang on the wording of a warning: edit that text and every installed
+# hook would be orphaned (install would append a second entry beside it).
+MARKER_SNAPSHOT = "cgc_activation.py' snapshot"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+SELF = os.path.join(HERE, "cgc_activation.py")
 DEFAULT_ACTIVATION = os.path.join(os.path.dirname(HERE), "ACTIVATION.md")
 
 
@@ -70,23 +77,30 @@ class QuoteError(Exception):
     """The activation path can't be safely single-quoted for the shell."""
 
 
+def _missing_warning(p: str) -> str:
+    return f"{MARKER_CURRENT} {p} — run: cgc doctor"
+
+
 def build_command(activation_path: str) -> str:
-    """The one hook command string — `cat` the note, or a visible WARNING if it's missing.
+    """The one hook command string: `snapshot` prints the note plus one state line; if python3 or
+    the script is unavailable, fall back to `cat` of the note, and failing that a visible WARNING.
     Deliberately `|| echo ...` and not `|| true`: a missing/unreadable ACTIVATION.md must show up
     in the injected context, not vanish silently. Never exits non-zero, so it can't fail the
-    user's session start."""
-    if "'" in activation_path:
-        raise QuoteError(f"activation path contains a single quote, cannot shell-quote it safely: {activation_path!r}")
+    user's session start. The WARNING literal (MARKER_CURRENT) is still in the command, so a hook
+    installed in the previous `cat ... || echo` form is recognized and upgraded in place."""
+    for q in (activation_path, SELF):
+        if "'" in q:
+            raise QuoteError(f"path contains a single quote, cannot shell-quote it safely: {q!r}")
     p = activation_path
-    return (f"cat '{p}' 2>/dev/null || echo 'WARNING: chatgpt-consult ACTIVATION.md missing at "
-            f"{p} — run: cgc doctor'")
+    return (f"python3 '{SELF}' snapshot --activation '{p}' 2>/dev/null || cat '{p}' 2>/dev/null "
+            f"|| echo '{_missing_warning(p)}'")
 
 
 def is_ours(hook) -> bool:
     if not isinstance(hook, dict):
         return False
     cmd = hook.get("command") or ""
-    return MARKER_CURRENT in cmd or MARKER_LEGACY in cmd
+    return MARKER_CURRENT in cmd or MARKER_LEGACY in cmd or MARKER_SNAPSHOT in cmd
 
 
 def _validate_shape(data) -> None:
@@ -283,6 +297,92 @@ def status(settings_path: str, activation_path: str) -> dict:
     return result
 
 
+# ---- the SessionStart snapshot ------------------------------------------------
+
+SNAPSHOT_BUDGET_S = 0.8   # wall-clock cap on the whole line; the hook must never slow a session start
+
+
+def _dur(secs) -> str:
+    secs = int(secs)
+    return (f"{secs}s" if secs < 60 else f"{secs // 60}m" if secs < 3600
+            else f"{secs // 3600}h{secs % 3600 // 60:02d}m")
+
+
+def snapshot_line():
+    """The one line, or None when there is nothing to say (no store yet). Reads the store through a
+    `mode=ro` URI connection: it cannot create the DB, migrate it, or write a byte, and it touches no
+    network and no browser. The figures come from cgc_store.week_view, the same function behind
+    `stats --week`, so the two surfaces cannot disagree."""
+    import sqlite3
+    import urllib.parse
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import cgc_store as st
+    path = st.db_path()
+    if path == ":memory:" or not os.path.exists(path):
+        return None
+    db = sqlite3.connect("file:" + urllib.parse.quote(os.path.abspath(path)) + "?mode=ro",
+                         uri=True, timeout=0.3)
+    try:
+        w = st.week_view(db)
+    finally:
+        db.close()
+    b = w["budget"]
+    parts = [f"Consult budget: {b['spent']} of {b['weekly']} used (rolling 7d)" if b["weekly"] is not None
+             else f"Consult budget: {b['spent']} used (rolling 7d; CGC_WEEKLY_BUDGET unset)"]
+    if b["available"] is not None:
+        parts.append(f"{b['available']} available")
+    if w["backlog"]:
+        parts.append(f"{len(w['backlog'])} ready in backlog")
+    if w["ungraded"]:
+        parts.append(f"{len(w['ungraded'])} answers awaiting grade (cgc feedback)")
+    if w["latency_p50_s"] is not None:
+        parts.append(f"p50 {_dur(w['latency_p50_s'])}")
+    if b["spent"] and not w["policy_update"]["happened"]:
+        parts.append("weekly review due")
+    return " · ".join(parts)
+
+
+def cmd_snapshot(a) -> int:
+    """What the installed SessionStart hook runs. Prints ACTIVATION.md, then ONE state line. Whatever
+    goes wrong — unreadable store, locked DB, a schema this code doesn't know, a timeout — the note
+    has already been printed and the line is simply omitted. Exits 0 always."""
+    activation = a.activation or DEFAULT_ACTIVATION
+    try:
+        with open(activation, encoding="utf-8") as f:
+            sys.stdout.write(f.read())
+    except OSError:
+        sys.stdout.write(_missing_warning(activation) + "\n")
+    sys.stdout.flush()
+    armed = False
+    try:
+        import signal
+
+        def _expire(*_):
+            raise TimeoutError("snapshot budget exceeded")
+        signal.signal(signal.SIGALRM, _expire)
+        signal.setitimer(signal.ITIMER_REAL, SNAPSHOT_BUDGET_S)
+        armed = True
+    except (ImportError, AttributeError, ValueError):
+        pass  # no SIGALRM here (Windows): the sqlite timeout is the only bound
+    try:
+        line = snapshot_line()
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)   # disarm before anything else can be interrupted
+        if line:
+            sys.stdout.write(line + "\n")
+    except BaseException:  # noqa: BLE001 — a status line must never be able to fail the session
+        pass
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+    try:
+        sys.stdout.flush()
+    except BaseException:  # noqa: BLE001 — e.g. a closed pipe
+        pass
+    return 0
+
+
 # ---- CLI ---------------------------------------------------------------------
 
 def _paths(a) -> "tuple[str, str]":
@@ -303,7 +403,8 @@ change any settings unless you pass --install.
 
 On demand, the skill already activates on its own (Claude reads its SKILL.md description).
 Add the hook below ONLY if you also want Claude to consider offloading a consult at the
-start of every session. It injects: {activation}
+start of every session. It injects: {activation}, then one line of this week's consult budget,
+backlog and grading state (read-only, local, never fails the session)
 
 Merge this into the "hooks" object of your Claude settings.json
 ({settings}) — keep any existing SessionStart entries:
@@ -392,6 +493,9 @@ def main() -> int:
     sub.add_parser("status", parents=[parent], help="report configured / broken / absent / unreadable").set_defaults(fn=cmd_status)
     sub.add_parser("install", parents=[parent], help="idempotently add or upgrade the hook").set_defaults(fn=cmd_install)
     sub.add_parser("remove", parents=[parent], help="remove our entry again").set_defaults(fn=cmd_remove)
+    sub.add_parser("snapshot", parents=[parent],
+                   help="print ACTIVATION.md and one line of weekly consult state (what the hook runs)"
+                   ).set_defaults(fn=cmd_snapshot)
 
     a = p.parse_args()
     return a.fn(a)
