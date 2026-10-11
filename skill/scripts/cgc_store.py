@@ -513,12 +513,13 @@ class Store:
                      source_mode: str | None = None, out_path: str | None = None,
                      spec_json: str | None = None, prompt: str | None = None,
                      request_key: str | None = None, parent_rid: str | None = None,
-                     state: str = QUEUED) -> None:
+                     state: str = QUEUED, not_before: str | None = None) -> None:
         """Insert a new round. `prompt` (the exact rendered bytes to send) is stored on the round at
         enqueue, so the CLI receipt is just the rid and there is no prompt PATHNAME whose contents
         could drift before the gate reads them — the store row is the one copy. `request_key` is the
         caller's logical-request identity (unique where set — the idempotency anchor); `parent_rid`
-        records which consult a follow-up causally continues."""
+        records which consult a follow-up causally continues. `not_before` (UTC ISO-8601) schedules the
+        round: claim_ready will not pick it before that instant."""
         if state not in _LEGAL:
             raise ValueError(f"unknown initial state {state!r}")
         now = _now()
@@ -536,9 +537,9 @@ class Store:
             self.db.execute(
                 "INSERT INTO rounds(rid,thread_id,kind,source_mode,spec_json,rendered_prompt,"
                 "prompt_sha256,out_path,request_key,parent_rid,state,created_at,updated_at,"
-                "schema_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "schema_version,not_before) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rid, thread_id, kind, source_mode, spec_json, prompt, psha, out_path,
-                 request_key, parent_rid, state, now, now, SCHEMA_VERSION))
+                 request_key, parent_rid, state, now, now, SCHEMA_VERSION, not_before))
             self._event("created", rid=rid, detail=f"kind={kind} state={state}")
 
     def round_by_request_key(self, key: str) -> dict | None:
@@ -590,7 +591,7 @@ class Store:
                              thread_id: str | None = None, out_path: str | None = None,
                              spec_json: str | None = None, prompt: str | None = None,
                              request_key: str, parent_rid: str | None = None,
-                             state: str = QUEUED) -> None:
+                             state: str = QUEUED, not_before: str | None = None) -> None:
         """Atomically MOVE a request-key from a terminally-failed `old_rid` to a fresh successor
         round, in ONE transaction: clear the old row's key and INSERT the new row already holding it,
         so the UNIQUE key is never momentarily free for a concurrent retry to seize (the separate
@@ -621,9 +622,9 @@ class Store:
             self.db.execute(
                 "INSERT INTO rounds(rid,thread_id,kind,source_mode,spec_json,rendered_prompt,"
                 "prompt_sha256,out_path,request_key,parent_rid,state,created_at,updated_at,"
-                "schema_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "schema_version,not_before) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rid, thread_id, kind, None, spec_json, prompt, psha, out_path,
-                 request_key, parent_rid, state, now, now, SCHEMA_VERSION))
+                 request_key, parent_rid, state, now, now, SCHEMA_VERSION, not_before))
             self._event("created", rid=rid,
                         detail=f"kind={kind} state={state} (request-key transfer from {old_rid})")
 

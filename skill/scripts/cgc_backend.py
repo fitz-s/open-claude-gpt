@@ -299,6 +299,20 @@ def _spec_mentions(a) -> list:
     return [m for m in (getattr(a, "mentions", None) or []) if m]
 
 
+# The caller's declared intent for a consult (fire --origin/--trigger/--decision/--baseline/--check).
+# Local bookkeeping for the feedback loop, never rendered into the prompt. These five, and only when
+# set, are part of a request's identity. policy_rev (derived from install state, not caller intent)
+# and the schedule (use_by, not_before) deliberately are not: an idempotent retry must not conflict
+# because SKILL.md was edited since, or because a relative `+2h` resolved a minute later.
+_INTENT_KEYS = ("origin", "trigger", "decision", "baseline", "check")
+
+
+def _spec_consult_meta(a) -> dict:
+    """The round's consult_meta as frozen into spec_json; {} when the caller supplied none (a
+    low-level enqueue), so such rounds' specs stay byte-identical to before."""
+    return dict(getattr(a, "consult_meta", None) or {})
+
+
 def _request_fingerprint(a, prompt: str) -> str:
     """The identity of one LOGICAL request — canonical JSON over every CALLER-side field that
     routes or shapes it: kind, the rid-independent prompt identity, project, model, and the
@@ -332,6 +346,9 @@ def _request_fingerprint(a, prompt: str) -> str:
     }
     if _spec_mentions(a):  # only when set, so every existing request-key keeps its fingerprint
         fp["mentions"] = _spec_mentions(a)
+    intent = {k: v for k, v in _spec_consult_meta(a).items() if k in _INTENT_KEYS and v}
+    if intent:  # likewise only when set
+        fp["consult_meta"] = intent
     return store_mod.sha256(json.dumps(fp, sort_keys=True))
 
 
@@ -452,11 +469,14 @@ def _enqueue_transfer(s, a, prompt: str, out: str, prior: dict, fingerprint: str
             "model_family": _spec_model_family(a), "mentions": _spec_mentions(a),
             "conversation": inh_conv, "parent_rid": inh_parent, "poll": getattr(a, "poll", None),
             "timeout": getattr(a, "timeout", None), "request_fingerprint": fingerprint}
+    if _spec_consult_meta(a):
+        spec["consult_meta"] = _spec_consult_meta(a)
     thread = inh_conv if inh_conv not in (None, "auto", "last") else None
     try:
         s.transfer_request_key(prior["rid"], rid=a.rid, kind=a.kind, thread_id=thread,
                                out_path=out, spec_json=json.dumps(spec), prompt=prompt,
-                               request_key=rkey, parent_rid=inh_parent)
+                               request_key=rkey, parent_rid=inh_parent,
+                               not_before=getattr(a, "not_before", None))
     except store_mod.RequestKeyRaced:
         # A concurrent retry moved the key first — re-resolve to the current owner (the winner) and
         # take its receipt, so exactly one successor ever owns the key.
@@ -658,10 +678,13 @@ def enqueue_round(a, prompt: str, out: str) -> int:
                 "model_family": _spec_model_family(a), "mentions": _spec_mentions(a),
                 "conversation": conv, "parent_rid": parent, "poll": getattr(a, "poll", None),
                 "timeout": getattr(a, "timeout", None), "request_fingerprint": fingerprint}
+        if _spec_consult_meta(a):
+            spec["consult_meta"] = _spec_consult_meta(a)
         thread = conv if conv not in (None, "auto", "last") else None
         try:
             s.create_round(a.rid, a.kind, thread_id=thread, out_path=out, prompt=prompt,
-                           spec_json=json.dumps(spec), request_key=rkey, parent_rid=parent)
+                           spec_json=json.dumps(spec), request_key=rkey, parent_rid=parent,
+                           not_before=getattr(a, "not_before", None))
         except sqlite3.IntegrityError:
             # Two concurrent enqueues with the same key both saw "no prior row"; the unique index
             # on request_key made exactly one insert win. The loser resolves DETERMINISTICALLY to
@@ -794,7 +817,10 @@ def refire_round(old_rid: str) -> int:
         conversation=pspec.get("conversation"),
         parent=pspec.get("parent_rid") or prior.get("parent_rid"),
         poll=pspec.get("poll"), timeout=pspec.get("timeout"),
-        request_key=None, logical_sha=None, out=None, quiet=False)
+        request_key=None, logical_sha=None, out=None, quiet=False,
+        # The intent and policy_rev replay with the request. use_by does not: an expired round is
+        # exactly what an operator refires, and the same deadline would expire it again.
+        consult_meta={k: v for k, v in (pspec.get("consult_meta") or {}).items() if k != "use_by"})
     out = os.path.abspath(_spool.default_out(new_rid))
     sys.stderr.write(f"CGC_REFIRE {old_rid} -> {new_rid}: replaying its stored prompt as a fresh "
                      f"{prior['kind']} round.\n")
@@ -1150,6 +1176,18 @@ def _publish_answer(store, rid: str, text: str) -> None:
 
 
 # ---- the worker --------------------------------------------------------------
+def _expired(use_by: str) -> bool:
+    """True iff the ISO-8601 instant `use_by` has passed. An unparseable value is not expiry: the
+    deadline was validated at fire time, and a malformed one must never silently eat a paid round."""
+    try:
+        t = datetime.datetime.fromisoformat(use_by)
+    except (TypeError, ValueError):
+        return False
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return t <= datetime.datetime.now(datetime.timezone.utc)
+
+
 def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate) -> str:
     """Drive one claimed (`ready`) round to a terminal or uncertain state. `run_cdp` is injected (the
     daemon wraps cdp_consult subprocesses; tests stub it); `validate(prompt) -> (ok, reason)` is the
@@ -1157,6 +1195,18 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
     rid = r["rid"]
     prompt = r["rendered_prompt"] or ""
     spec = json.loads(r["spec_json"]) if r.get("spec_json") else {}
+
+    # `fire --use-by T`: a round whose answer is useless after T never sends after it. This is the
+    # one dispatch point every send passes through (a fresh claim, a gate-backoff requeue, a
+    # ready-orphan), and it runs before the gate and begin_send, so the failure is pre-send by
+    # construction: stamped not_sent_proven, which also keeps it out of the message ledger (no
+    # attempts row) and releases its request-key.
+    use_by = (spec.get("consult_meta") or {}).get("use_by")
+    if use_by and _expired(use_by):
+        store.set_state(rid, store_mod.FAILED, expect=store_mod.READY,
+                        send_disposition=store_mod.NOT_SENT_PROVEN,
+                        error_code=f"expired: use-by {use_by} passed before send")
+        return store_mod.FAILED
 
     # retrieve: attach to an existing conversation and wait — no gate, no send (nothing leaves).
     # It pins the SOURCE round's rid (spec["parent_rid"], from --parent at enqueue) and hands it to
