@@ -6,6 +6,46 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Added — a usage feedback loop: intent, backlog, grading, a weekly view, and a budget line at session start
+
+Agents almost never fired on their own (1 of 13 consult sessions in 30 days), nothing measured whether
+an answer was useful, and nothing said how much allowance was left. Prompts and usage rules can now be
+tuned from graded results. Everything here is local: no network, no browser, no schema change.
+
+- **Intent on `fire`.** `--origin`, `--trigger`, `--decision`, `--baseline`, `--check` are stored in
+  `spec_json.consult_meta` with an automatic `policy_rev` (sha256[:12] of `SKILL.md`, `ACTIVATION.md`
+  and the prompt templates). Nothing new is rendered into the prompt. The five intent flags join the
+  request fingerprint only when set, so existing request-keys keep theirs.
+- **Backlog.** `fire --not-before` (written to `rounds.not_before`, which `claim_ready` already
+  honoured) holds a complete question until later; `--use-by` makes a round that missed its window end
+  `failed` (`expired: use-by <t> passed before send`) before the gate and `begin_send`, stamped
+  not-sent-proven so it is never charged and its request-key is released. There is no `reschedule`:
+  cancel and re-fire.
+- **`cgc feedback`.** Grades an answer (`consult_outcome` event, latest per rid wins; grade 1 or 2
+  requires `--evidence`; unknown rids refused; a retrieve resolves to its source round) and records the
+  weekly review (`feedback --policy`). It never touches `rounds.updated_at`.
+- **`stats --week`.** A rolling 7-day view: potentially spent messages vs `CGC_WEEKLY_BUDGET`, ungraded
+  answers, backlog and expired rounds, grades by trigger and by mention, useful outcomes per message,
+  and whether the policy review happened.
+- **A budget line at session start.** `cgc_activation.py snapshot` prints `ACTIVATION.md` plus one
+  line of that state, read-only and bounded under a second, and never fails a session start.
+  `cgc activation-hook --install` upgrades an installed hook in place.
+- **`fire --workspace NAME`** (with a required `--mention`) declares a local WebCodex workspace as the
+  question's source, so a code question whose evidence is local no longer has to claim `--no-code`.
+  The source rule accepts it in the same three places that accept the no-code and follow-up
+  declarations (`validate_prompt`, the enqueue pre-check, the driver's send-time backstop); every
+  secret and URL gate is unchanged. `CGC_WORKSPACES` lists your registered workspaces, and
+  `consult.py apps` prints them.
+
+### Fixed — the message ledger under-counted: an automatic continue is a second message
+
+`stats` charged at most one message per rid, but the "continue" sent after a ChatGPT turn failure is a
+second outgoing message under the same rid. The metric is now `potentially_spent`: base sends plus
+continuations whose recorded result is `landed`, `unsure`, or absent (the worker died between claim and
+result, possibly after the click). A `not_sent` continuation and a `retrieve` count zero. `free` is now
+the number of rounds that spent nothing; it was `total - charged`, which cannot hold once messages can
+exceed rounds. The JSON key `messages.charged` is renamed `messages.potentially_spent`.
+
 ### Fixed — a long prompt's send was reported `unknown_send` and its answer `rid_absent`, though both existed
 
 ChatGPT collapses a long user message in the DOM to its head plus "…Show more" (a 20.7 KB prompt kept
