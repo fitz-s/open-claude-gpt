@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import hashlib
+import json
 import os
 import sqlite3
 import sys
@@ -391,6 +392,100 @@ def spent_messages(db) -> list:
         "AND x.kind='auto_continue_result' ORDER BY x.id DESC LIMIT 1), 'claimed')<>'not_sent'"
     ).fetchall()
     return [tuple(r) for r in (*base, *cont)]
+
+
+WEEK_S = 7 * 86400   # the rolling window every weekly figure uses; no reset day to configure
+_DONE = (COMPLETED_VERIFIED, COMPLETED_UNVERIFIED)
+
+
+def _title(prompt) -> str:
+    """The round's headline: the first line of the rendered prompt is always `# <title>`."""
+    for ln in (prompt or "").splitlines():
+        if ln.strip():
+            return ln.strip()[2:].strip()[:80] if ln.startswith("# ") else ""
+    return ""
+
+
+def _spec(raw) -> dict:
+    try:
+        v = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def week_view(db, now=None) -> dict:
+    """The rolling-7-day picture the weekly review and the SessionStart line both read. ONE
+    definition, over any sqlite3 connection onto the store (a read-only one is fine), so the two
+    surfaces cannot disagree. Pure reads: nothing here writes, migrates, or touches updated_at.
+
+    Windowed by instant, never by calendar: a message counts for 7 days after it was sent, so the
+    budget frees up continuously and there is no reset day to configure. Timestamps are all written
+    by _now() (UTC isoformat), so string comparison orders them."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    t0 = (now - datetime.timedelta(seconds=WEEK_S)).isoformat()
+    t1 = now.isoformat()
+    q = lambda sql, *args: db.execute(sql, args).fetchall()  # noqa: E731
+
+    spent = [m for m in spent_messages(db) if m[2] and m[2] >= t0]
+    ungraded = [{"rid": r[0], "title": _title(r[1]), "completed_at": r[2]} for r in q(
+        "SELECT r.rid, r.rendered_prompt, r.updated_at FROM rounds r "
+        "WHERE r.state IN (?,?) AND r.kind<>'retrieve' AND r.updated_at>=? "
+        "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.rid=r.rid AND e.kind='consult_outcome') "
+        "ORDER BY r.updated_at", *_DONE, t0)]
+    # A scheduled round waits with a future not_before and no gate retries; a gate-backoff requeue
+    # (gate_retry_count>0) also has a future not_before but is a transient retry, not backlog.
+    backlog = [{"rid": r[0], "title": _title(r[1]), "not_before": r[2],
+                "use_by": _spec(r[3]).get("consult_meta", {}).get("use_by")} for r in q(
+        "SELECT rid, rendered_prompt, not_before, spec_json FROM rounds "
+        "WHERE state=? AND not_before>? AND gate_retry_count=0 ORDER BY not_before", QUEUED, t1)]
+    expired = [{"rid": r[0], "title": _title(r[1]), "error": r[2]} for r in q(
+        "SELECT rid, rendered_prompt, error_code FROM rounds "
+        "WHERE state=? AND error_code LIKE 'expired: use-by%' AND updated_at>=? ORDER BY updated_at",
+        FAILED, t0)]
+
+    by_trigger, by_mention, useful = {}, {}, 0
+    for rid, detail, spec in q(
+            "SELECT e.rid, e.detail, r.spec_json FROM events e JOIN rounds r ON r.rid=e.rid "
+            "WHERE e.kind='consult_outcome' AND e.at>=? AND e.id=(SELECT max(x.id) FROM events x "
+            "WHERE x.rid=e.rid AND x.kind='consult_outcome')", t0):
+        sp = _spec(spec)
+        g = str(_spec(detail).get("grade"))
+        trig = (sp.get("consult_meta") or {}).get("trigger") or "none"
+        ment = "with_mention" if sp.get("mentions") else "without_mention"
+        for tally, k in ((by_trigger, trig), (by_mention, ment)):
+            tally.setdefault(k, {})[g] = tally.setdefault(k, {}).get(g, 0) + 1
+        useful += g in ("1", "2")
+
+    pol = q("SELECT detail, at FROM events WHERE kind='policy_update' AND at>=? "
+            "ORDER BY id DESC LIMIT 1", t0)
+    durs = []
+    for c, u in q("SELECT created_at, updated_at FROM rounds WHERE state IN (?,?)", *_DONE):
+        try:
+            d = (datetime.datetime.fromisoformat(u) - datetime.datetime.fromisoformat(c)).total_seconds()
+        except (TypeError, ValueError):
+            continue
+        if d > 0:
+            durs.append(d)
+    durs.sort()
+    try:
+        budget = int(os.environ.get("CGC_WEEKLY_BUDGET", "").strip())
+    except ValueError:
+        budget = None
+    return {
+        "window": {"from": t0, "to": t1, "days": 7},
+        "budget": {"weekly": budget, "spent": len(spent),
+                   "available": max(0, budget - len(spent)) if budget is not None else None,
+                   **({} if budget is not None else {"note": "budget unset (set CGC_WEEKLY_BUDGET)"})},
+        "ungraded": ungraded, "backlog": backlog, "expired": expired,
+        "grades": {"by_trigger": by_trigger, "by_mention": by_mention},
+        "useful": {"outcomes": useful,
+                   "per_spent_message": round(useful / len(spent), 3) if spent else None},
+        "policy_update": ({"happened": True, "at": pol[0][1], **_spec(pol[0][0])} if pol
+                          else {"happened": False}),
+        "latency_p50_s": durs[len(durs) // 2] if durs else None,
+        "has_rounds": bool(q("SELECT 1 FROM rounds LIMIT 1")),
+    }
 
 
 def new_daemon_instance_id() -> str:
@@ -1120,6 +1215,19 @@ class Store:
                detail: str | None = None) -> None:
         self.db.execute("INSERT INTO events(rid,attempt_id,kind,detail,at) VALUES(?,?,?,?,?)",
                         (rid, attempt_id, kind, detail, _now()))
+
+    def record_outcome(self, rid: str, outcome: dict) -> None:
+        """A local grade of one round's answer. An event, never a column: grading must not move
+        rounds.updated_at (completion-latency stats read it), needs no migration, and the LATEST
+        consult_outcome event per rid is the grade that stands."""
+        with self._tx():
+            self._event("consult_outcome", rid=rid, detail=json.dumps(outcome, sort_keys=True))
+
+    def record_policy_update(self, policy_rev: str, text: str) -> None:
+        """The record that the weekly review happened and what it changed."""
+        with self._tx():
+            self._event("policy_update",
+                        detail=json.dumps({"policy_rev": policy_rev, "text": text}, sort_keys=True))
 
     def events(self, rid: str) -> list[dict]:
         return [dict(r) for r in self.db.execute(

@@ -883,7 +883,30 @@ def main() -> int:
 
     st = sub.add_parser("stats", help="reliability metrics: outcome rates + completion latency "
                                       "percentiles + sentinel-drift alarm")
-    st.set_defaults(fn=lambda a: __import__("cgc_backend").stats_report())
+    st.add_argument("--week", action="store_true",
+                    help="instead: the rolling-7-day view — potentially spent messages vs "
+                         "CGC_WEEKLY_BUDGET, answers awaiting a grade, backlog, expired rounds, "
+                         "grades by trigger and by mention, useful outcomes per message, and whether "
+                         "the weekly policy review was recorded")
+    st.set_defaults(fn=lambda a: __import__("cgc_backend").week_report() if a.week
+                    else __import__("cgc_backend").stats_report())
+
+    fb = sub.add_parser("feedback", help="grade a consult's answer (LOCAL only), or record the "
+                                         "weekly policy review with --policy")
+    fb.add_argument("--rid", help="the round whose answer you are grading (a retrieve round "
+                                  "resolves to the round it recovered)")
+    fb.add_argument("--grade", type=int, choices=(-1, 0, 1, 2),
+                    help="2 changed a decision or caught a defect, verified; 1 validated improvement "
+                         "or new evidence; 0 duplicate/late/refuted/unused/transport; -1 acting on it "
+                         "caused rework. 1 and 2 require --evidence.")
+    fb.add_argument("--reason", choices=("useful", "decision-changed", "defect-caught", "duplicate",
+                                         "late", "refuted", "unused", "transport", "missing-source",
+                                         "wrong"))
+    fb.add_argument("--action", help="what you did with the answer")
+    fb.add_argument("--evidence", help="a commit SHA, test, file, or concrete acceptance judgment")
+    fb.add_argument("--policy", help="record the weekly review: what rule/template/test changed and "
+                                     "why (stamped with the current policy_rev; takes no other flag)")
+    fb.set_defaults(fn=lambda a: __import__("cgc_backend").record_feedback(a))
 
     rc = sub.add_parser("reconcile", help="operator-driven durable reconcile of a stuck round "
                                           "(today: recording a verified not-sent proof)")

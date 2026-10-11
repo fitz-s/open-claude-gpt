@@ -229,3 +229,205 @@ def test_fire_cli_accepts_the_new_flags(tmp_path):
     bad = subprocess.run(cli + ["--trigger", "nonsense"], capture_output=True, text=True, env=env,
                          cwd=ROOT, timeout=60)
     assert bad.returncode == 2 and "invalid choice" in bad.stderr
+
+
+# ---- item 4: feedback ----------------------------------------------------------------------------
+
+def _fb(**kw):
+    d = dict(rid=None, grade=None, reason=None, action=None, evidence=None, policy=None)
+    d.update(kw)
+    return argparse.Namespace(**d)
+
+
+def _completed(rid="REQ-20260707-120000-0a0001", kind="submit", spec=None, parent=None,
+               prompt="# Title of it\n\nbody", conv="conv-1"):
+    with store_mod.Store() as s:
+        s.create_round(rid, kind, thread_id=conv, prompt=prompt, parent_rid=parent,
+                       spec_json=json.dumps(spec or {}))
+        s.set_state(rid, store_mod.READY)
+        aid = s.begin_send(rid, prompt, "h" * 64, daemon_instance_id="d")
+        s.mark_accepted(aid, conv)
+        s.mark_waiting(rid)
+        s.finish(rid, store_mod.COMPLETED_VERIFIED, result_text="a")
+    return rid
+
+
+def _outcomes(rid):
+    with store_mod.Store() as s:
+        return [e for e in s.events(rid) if e["kind"] == "consult_outcome"]
+
+
+def test_feedback_records_a_consult_outcome_and_the_latest_wins():
+    rid = _completed()
+    assert backend.record_feedback(_fb(rid=rid, grade=0, reason="unused", action="skipped it")) == 0
+    assert backend.record_feedback(_fb(rid=rid, grade=2, reason="defect-caught", action="fixed",
+                                       evidence="commit abc1234")) == 0
+    evs = _outcomes(rid)
+    assert len(evs) == 2, "history is kept; the latest event is the grade that stands"
+    assert json.loads(evs[-1]["detail"]) == {"grade": 2, "reason": "defect-caught", "action": "fixed",
+                                             "evidence": "commit abc1234"}
+    w = _week()
+    assert w["grades"]["by_trigger"]["none"] == {"2": 1}, "only the latest grade is counted"
+    assert w["useful"]["outcomes"] == 1
+
+
+@pytest.mark.parametrize("grade", [1, 2])
+def test_a_positive_grade_requires_evidence(grade, capsys):
+    rid = _completed()
+    for ev in (None, "", "   "):
+        assert backend.record_feedback(_fb(rid=rid, grade=grade, reason="useful", action="a",
+                                           evidence=ev)) == 2
+    assert "evidence_required" in capsys.readouterr().err and _outcomes(rid) == []
+
+
+@pytest.mark.parametrize("grade", [-1, 0])
+def test_a_non_positive_grade_needs_no_evidence(grade):
+    rid = _completed()
+    assert backend.record_feedback(_fb(rid=rid, grade=grade, reason="unused", action="a")) == 0
+
+
+def test_feedback_refuses_unknown_and_incomplete(capsys):
+    assert backend.record_feedback(_fb(rid="REQ-20260707-120000-ffffff", grade=0, reason="late",
+                                       action="a")) == 2
+    assert "no_such_round" in capsys.readouterr().err
+    assert backend.record_feedback(_fb(rid="x", grade=0)) == 2
+    assert "feedback_incomplete" in capsys.readouterr().err
+
+
+def test_feedback_never_touches_updated_at():
+    """Latency stats read rounds.updated_at; grading a day later must not change a round's latency."""
+    rid = _completed()
+    with store_mod.Store() as s:
+        before = s.get_round(rid)["updated_at"]
+    backend.record_feedback(_fb(rid=rid, grade=0, reason="late", action="a"))
+    with store_mod.Store() as s:
+        assert s.get_round(rid)["updated_at"] == before
+
+
+def test_retrieve_feedback_resolves_to_the_source_round():
+    src = _completed("REQ-20260707-120000-0a0002")
+    ret = "REQ-20260707-120000-0a0003"
+    with store_mod.Store() as s:
+        s.create_round(ret, "retrieve", thread_id="conv-1", prompt=None, parent_rid=src)
+    assert backend.record_feedback(_fb(rid=ret, grade=1, reason="useful", action="a",
+                                       evidence="test_x")) == 0
+    assert len(_outcomes(src)) == 1 and _outcomes(ret) == []
+    assert json.loads(_outcomes(src)[0]["detail"])["via_retrieve"] == ret
+
+
+def test_policy_update_is_recorded_with_the_current_policy_rev():
+    assert backend.record_feedback(_fb(policy="  tightened the math trigger  ")) == 0
+    with store_mod.Store() as s:
+        ev = s.db.execute("SELECT detail FROM events WHERE kind='policy_update'").fetchone()
+    d = json.loads(ev["detail"])
+    assert d == {"policy_rev": consult.policy_rev(), "text": "tightened the math trigger"}
+    assert backend.record_feedback(_fb(policy="x", rid="r")) == 2, "--policy takes no other flag"
+    assert backend.record_feedback(_fb(policy="  ")) == 2
+
+
+def test_feedback_cli_is_wired_in_cgc_spool_and_bin_cgc(tmp_path):
+    import subprocess
+    env = {**os.environ, "CGC_STATE_DIR": str(tmp_path / "s"), "CGC_DATA_DIR": str(tmp_path / "d"),
+           "CGC_STORE_DB": str(tmp_path / "d" / "control.db"), "PATH": "/usr/bin:/bin"}
+    spool = [sys.executable, os.path.join(SCRIPTS, "cgc_spool.py"), "feedback"]
+    r = subprocess.run(spool + ["--rid", "REQ-20260707-120000-ffffff", "--grade", "3",
+                                "--reason", "late", "--action", "a"],
+                       capture_output=True, text=True, env=env, timeout=30)
+    assert r.returncode == 2 and "invalid choice" in r.stderr
+    r = subprocess.run(spool + ["--policy", "p"], capture_output=True, text=True, env=env, timeout=30)
+    assert r.returncode == 0 and json.loads(r.stdout)["recorded"] == "policy_update"
+    bin_cgc = open(os.path.join(ROOT, "bin", "cgc"), encoding="utf-8").read()
+    assert "enqueue|await|cancel|stats|feedback)" in bin_cgc, "cgc must dispatch feedback"
+
+
+# ---- item 5: the week view -----------------------------------------------------------------------
+
+def _week():
+    with store_mod.Store() as s:
+        return store_mod.week_view(s.db)
+
+
+def _age(rid, days):
+    """Backdate a round's events and timestamps so it falls outside the rolling window."""
+    ts = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).isoformat()
+    with store_mod.Store() as s:
+        s.db.execute("UPDATE events SET at=? WHERE rid=?", (ts, rid))
+        s.db.execute("UPDATE attempts SET started_at=? WHERE rid=?", (ts, rid))
+        s.db.execute("UPDATE rounds SET updated_at=?, created_at=? WHERE rid=?", (ts, ts, rid))
+
+
+def test_week_budget_counts_only_the_rolling_window(monkeypatch):
+    monkeypatch.setenv("CGC_WEEKLY_BUDGET", "10")
+    _completed("REQ-20260707-120000-0b0001")
+    old = _completed("REQ-20260707-120000-0b0002")
+    _age(old, 8)
+    assert _week()["budget"] == {"weekly": 10, "spent": 1, "available": 9}
+
+
+def test_week_budget_unset_says_so(monkeypatch):
+    monkeypatch.delenv("CGC_WEEKLY_BUDGET", raising=False)
+    b = _week()["budget"]
+    assert b["weekly"] is None and b["available"] is None and "budget unset" in b["note"]
+
+
+def test_week_lists_ungraded_completed_rounds_with_titles():
+    a = _completed("REQ-20260707-120000-0b0003", prompt="# The queue question\n\nx")
+    g = _completed("REQ-20260707-120000-0b0004")
+    backend.record_feedback(_fb(rid=g, grade=0, reason="unused", action="a"))
+    assert [(u["rid"], u["title"]) for u in _week()["ungraded"]] == [(a, "The queue question")]
+
+
+def test_week_backlog_and_expired(fire):
+    waiting = fire(not_before="+2h", use_by="+1d", trigger="math")
+    due = fire()
+    with store_mod.Store() as s:
+        s.db.execute("UPDATE rounds SET not_before=NULL WHERE rid=?", (due["rid"],))
+    w = _week()
+    assert [b["rid"] for b in w["backlog"]] == [waiting["rid"]], "only a FUTURE not_before is backlog"
+    assert w["backlog"][0]["use_by"]
+    with store_mod.Store() as s:
+        s.db.execute("UPDATE rounds SET not_before=NULL WHERE rid=?", (waiting["rid"],))
+        s.db.execute("UPDATE rounds SET state='failed' WHERE rid=?", (due["rid"],))
+        row = s.claim_ready("d")
+        spec = json.loads(row["spec_json"])
+        spec["consult_meta"]["use_by"] = "2001-01-01T00:00:00+00:00"
+        s.db.execute("UPDATE rounds SET spec_json=? WHERE rid=?", (json.dumps(spec), row["rid"]))
+        backend.process_round(s, s.get_round(row["rid"]), lambda *a, **k: {"code": 0},
+                              daemon_instance_id="d", validate=lambda p: (True, "ok"))
+    w = _week()
+    assert [e["rid"] for e in w["expired"]] == [waiting["rid"]] and w["backlog"] == []
+
+
+def test_week_grades_by_trigger_and_mention_and_useful_rate(monkeypatch):
+    monkeypatch.setenv("CGC_WEEKLY_BUDGET", "50")
+    spec_m = {"mentions": ["WebCodex Demo"], "consult_meta": {"trigger": "workspace-evidence"}}
+    spec_p = {"mentions": [], "consult_meta": {"trigger": "math"}}
+    a = _completed("REQ-20260707-120000-0c1001", spec=spec_m)
+    b = _completed("REQ-20260707-120000-0c1002", spec=spec_p)
+    c = _completed("REQ-20260707-120000-0c1003", spec=spec_p)
+    backend.record_feedback(_fb(rid=a, grade=2, reason="defect-caught", action="x", evidence="e"))
+    backend.record_feedback(_fb(rid=b, grade=0, reason="unused", action="x"))
+    backend.record_feedback(_fb(rid=c, grade=1, reason="useful", action="x", evidence="e"))
+    w = _week()
+    assert w["grades"]["by_trigger"] == {"workspace-evidence": {"2": 1}, "math": {"0": 1, "1": 1}}
+    assert w["grades"]["by_mention"] == {"with_mention": {"2": 1}, "without_mention": {"0": 1, "1": 1}}
+    assert w["useful"] == {"outcomes": 2, "per_spent_message": round(2 / 3, 3)}
+    assert w["ungraded"] == []
+
+
+def test_week_policy_update_flag():
+    assert _week()["policy_update"] == {"happened": False}
+    backend.record_feedback(_fb(policy="changed the math trigger"))
+    pu = _week()["policy_update"]
+    assert pu["happened"] and pu["text"] == "changed the math trigger"
+
+
+def test_stats_week_prints_json_and_plain_stats_is_unchanged(capsys):
+    _completed()
+    assert backend.week_report() == 0
+    cap = capsys.readouterr()
+    assert json.loads(cap.out)["budget"]["spent"] == 1 and "CGC_WEEK" in cap.err
+    assert backend.stats_report() == 0
+    rep = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert set(rep) == {"rounds", "by_state", "completed", "failed", "unverified_rate", "latency_s",
+                        "messages"}

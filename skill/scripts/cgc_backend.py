@@ -276,6 +276,94 @@ def stats_report() -> int:
     return 0
 
 
+def week_report() -> int:
+    """`stats --week`: the rolling-7-day budget, backlog, grading and policy picture. JSON on
+    stdout, a short human digest on stderr — same shape as `stats`. See store_mod.week_view."""
+    with store_mod.Store() as s:
+        w = store_mod.week_view(s.db)
+    print(json.dumps(w))
+    b = w["budget"]
+    sys.stderr.write(
+        f"CGC_WEEK {b['spent']} potentially spent messages in the last 7 days — "
+        + (f"{b['available']} of {b['weekly']} available" if b["weekly"] is not None
+           else b["note"]) + f"; {w['useful']['outcomes']} useful outcome(s)"
+        + (f" ({w['useful']['per_spent_message']}/message)" if w["useful"]["per_spent_message"]
+           is not None else "") + ".\n")
+    for r in w["ungraded"]:
+        sys.stderr.write(f"CGC_WEEK ungraded {r['rid']}  {r['title']}\n")
+    for r in w["backlog"]:
+        sys.stderr.write(f"CGC_WEEK backlog {r['rid']}  not before {r['not_before']}  {r['title']}\n")
+    for r in w["expired"]:
+        sys.stderr.write(f"CGC_WEEK expired {r['rid']}  {r['title']}\n")
+    sys.stderr.write("CGC_WEEK policy review " + ("done this week." if w["policy_update"]["happened"]
+                                                  else "NOT done this week: feedback --policy \"...\"") + "\n")
+    return 0
+
+
+FEEDBACK_REASONS = ("useful", "decision-changed", "defect-caught", "duplicate", "late", "refuted",
+                    "unused", "transport", "missing-source", "wrong")
+
+
+def record_feedback(a) -> int:
+    """`feedback`: grade one round's answer, or record the weekly policy review. LOCAL only — an
+    event in the store, no network, no browser. Refuses what would corrupt the signal: an unknown
+    rid, and a positive grade with no evidence (reassurance alone earns 0)."""
+    def refuse(code, msg):
+        sys.stderr.write(f"CGC_ERROR {code}: {msg}\n")
+        return 2
+
+    if a.policy is not None:
+        if any(v is not None for v in (a.rid, a.grade, a.reason, a.action, a.evidence)):
+            return refuse("feedback_mixed", "--policy records the weekly review and takes no other "
+                                            "flag; grade a round in a separate call.")
+        text = a.policy.strip()
+        if not text:
+            return refuse("policy_empty", "--policy needs the text of what changed and why.")
+        import consult as _consult
+        rev = _consult.policy_rev()
+        with store_mod.Store() as s:
+            s.record_policy_update(rev, text)
+        print(json.dumps({"recorded": "policy_update", "policy_rev": rev}))
+        return 0
+
+    missing = [f"--{n}" for n in ("rid", "grade", "reason", "action")
+               if getattr(a, n) in (None, "")]
+    if missing:
+        return refuse("feedback_incomplete", f"{', '.join(missing)} required (or --policy \"...\").")
+    evidence = (a.evidence or "").strip()
+    if a.grade >= 1 and not evidence:
+        return refuse("evidence_required", "a grade of 1 or 2 needs --evidence: a commit SHA, a test, "
+                                           "a file, or a concrete acceptance judgment. If you cannot "
+                                           "name one, the answer earned 0.")
+    with store_mod.Store() as s:
+        row = s.get_round(a.rid)
+        if row is None:
+            return refuse("no_such_round", f"{a.rid} is not in the store.")
+        target = a.rid
+        if row["kind"] == "retrieve":
+            # A retrieve recovers ANOTHER round's answer, and the store links them through
+            # parent_rid; the answer being judged is the source's.
+            target = row.get("parent_rid") or _spec_of(row).get("parent_rid")
+            if not target or s.get_round(target) is None:
+                return refuse("retrieve_source_unknown",
+                              f"{a.rid} is a retrieve whose source round is not in the store.")
+        detail = {"grade": a.grade, "reason": a.reason, "action": a.action.strip()}
+        if evidence:
+            detail["evidence"] = evidence
+        if target != a.rid:
+            detail["via_retrieve"] = a.rid
+        s.record_outcome(target, detail)
+    print(json.dumps({"recorded": "consult_outcome", "rid": target, **detail}))
+    return 0
+
+
+def _spec_of(row) -> dict:
+    try:
+        return json.loads(row.get("spec_json") or "{}")
+    except ValueError:
+        return {}
+
+
 # ---- enqueue -----------------------------------------------------------------
 def _spec_model_family(a) -> str:
     """The model family this round is PINNED to, resolved ONCE at enqueue and frozen into its spec.
