@@ -1276,6 +1276,31 @@ def _expired(use_by: str) -> bool:
     return t <= datetime.datetime.now(datetime.timezone.utc)
 
 
+def _use_by(spec: dict):
+    return (spec.get("consult_meta") or {}).get("use_by")
+
+
+def _use_by_passed(spec: dict) -> bool:
+    use_by = _use_by(spec)
+    return bool(use_by) and _expired(use_by)
+
+
+def _expire_if_due(store, rid: str, spec: dict) -> bool:
+    """`fire --use-by T`: a round whose answer is useless after T never sends after it. Fails a READY
+    round past its deadline and returns True. Called at entry AND again immediately before each
+    begin_send, because the gate's gh calls and the conversation-lease wait both sit in between and
+    can run past T. Every call site is strictly pre-send (no attempts row yet), so the failure is
+    pre-send by construction: stamped not_sent_proven, which keeps it out of the message ledger and
+    releases its request-key."""
+    use_by = _use_by(spec)
+    if not (use_by and _expired(use_by)):
+        return False
+    store.set_state(rid, store_mod.FAILED, expect=store_mod.READY,
+                    send_disposition=store_mod.NOT_SENT_PROVEN,
+                    error_code=f"expired: use-by {use_by} passed before send")
+    return True
+
+
 def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate) -> str:
     """Drive one claimed (`ready`) round to a terminal or uncertain state. `run_cdp` is injected (the
     daemon wraps cdp_consult subprocesses; tests stub it); `validate(prompt) -> (ok, reason)` is the
@@ -1284,16 +1309,9 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
     prompt = r["rendered_prompt"] or ""
     spec = json.loads(r["spec_json"]) if r.get("spec_json") else {}
 
-    # `fire --use-by T`: a round whose answer is useless after T never sends after it. This is the
-    # one dispatch point every send passes through (a fresh claim, a gate-backoff requeue, a
-    # ready-orphan), and it runs before the gate and begin_send, so the failure is pre-send by
-    # construction: stamped not_sent_proven, which also keeps it out of the message ledger (no
-    # attempts row) and releases its request-key.
-    use_by = (spec.get("consult_meta") or {}).get("use_by")
-    if use_by and _expired(use_by):
-        store.set_state(rid, store_mod.FAILED, expect=store_mod.READY,
-                        send_disposition=store_mod.NOT_SENT_PROVEN,
-                        error_code=f"expired: use-by {use_by} passed before send")
+    # The one dispatch point every send passes through (a fresh claim, a gate-backoff requeue, a
+    # ready-orphan); re-checked right before each begin_send below.
+    if _expire_if_due(store, rid, spec):
         return store_mod.FAILED
 
     # retrieve: attach to an existing conversation and wait — no gate, no send (nothing leaves).
@@ -1354,6 +1372,8 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         if conv_lease is None:
             raise ConversationLeaseRefused(conv)
         try:
+            if _expire_if_due(store, rid, spec):   # the lease may have been contended for a while
+                return store_mod.FAILED
             attempt = store.begin_send(rid, prompt, store_mod.sha256(prompt),
                                        daemon_instance_id=daemon_instance_id)
             # SEND only (not send+wait): so the round reaches `waiting` promptly and is reattach-able on
@@ -1407,6 +1427,8 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
     if gated is not None:
         return gated
 
+    if _expire_if_due(store, rid, spec):           # the gate's gh calls may have run past use-by
+        return store_mod.FAILED
     attempt = store.begin_send(rid, prompt, store_mod.sha256(prompt),
                                daemon_instance_id=daemon_instance_id)
     sub = run_cdp("submit", rid=rid, prompt=prompt,
@@ -1596,6 +1618,12 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
       "unsure"   the click may have happened (timeout, crash, unconfirmed echo)."""
     import cgc_spool as _spool
     prompt = _continue_prompt(rid)
+    if _use_by_passed(spec):
+        # The answer is worthless past use-by, and a continue is a second paid message for it.
+        # Declined BEFORE the claim, so no auto_continue event exists and nothing is charged; the
+        # round then ends turn_failed exactly as any declined continue does (see _wait_phase).
+        sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — use-by {_use_by(spec)} passed.\n")
+        return "not_sent"
     if not _spool.is_canonical_conversation(conv):
         return "not_sent"
     ok, why = _spool.validate_prompt(prompt)   # the same egress gate every send passes
@@ -1629,6 +1657,10 @@ def _send_continue(store, rid, conv, spec, run_cdp, prompt) -> str:
                          f"{conv} for {CONTINUE_LEASE_WAIT_S}s.\n")
         return "not_sent"
     try:
+        if _use_by_passed(spec):                 # the lease wait (up to 60 s) may have crossed it
+            sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — use-by {_use_by(spec)} "
+                             "passed while waiting for the conversation.\n")
+            return "not_sent"
         newer = _newer_send(store, rid, conv)    # again: a sibling may have sent while we waited
         if newer:
             sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — {newer['rid']} was sent into "
@@ -1753,7 +1785,9 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
         store.finish(rid, store_mod.FAILED,
                      error_code=(_stderr_error_line(res.get("stderr") or "") or "turn_failed")
                      + (" — the one automatic continue also failed" if went_out else
-                        " — no automatic continue went out")
+                        " — no automatic continue went out"
+                        + (f" (expired: use-by {_use_by(spec)} passed)" if _use_by_passed(spec)
+                           else ""))
                      + "; re-fire with a NEW --request-key only if the answer is still needed.")
         return store_mod.FAILED
     if is_retrieve:

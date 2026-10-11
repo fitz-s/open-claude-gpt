@@ -182,6 +182,76 @@ def test_a_round_past_use_by_never_sends_and_is_not_charged(fire):
         assert backend._release_eligible(s, row), "its request-key is released"
 
 
+@pytest.mark.parametrize("kind", ["submit", "followup"])
+def test_use_by_is_rechecked_immediately_before_the_send(fire, monkeypatch, kind):
+    """Entry passes, then the gate (gh calls) or the conversation-lease wait runs past use-by: the
+    re-check right before begin_send must still stop the round — no attempt row, no driver call."""
+    import cgc_spool
+    monkeypatch.setattr(cgc_spool, "acquire_conversation_lease", lambda conv: object())
+    r = _ready(fire, use_by="+1h")
+    conv = "3f6d2c1a-7b8e-4a9d-9c0b-1d2e3f4a5b6c"
+    with store_mod.Store() as s:
+        spec = json.loads(r["spec_json"])
+        spec["conversation"] = conv
+        s.db.execute("UPDATE rounds SET kind=?, spec_json=? WHERE rid=?",
+                     (kind, json.dumps(spec), r["rid"]))
+        r = s.get_round(r["rid"])
+        sent = []
+        # The deadline is still ahead at entry and passes before the send: the first call (entry)
+        # sees time before use-by, every later call sees time after it.
+        state = {"calls": 0}
+
+        def expired_after_entry(use_by):
+            state["calls"] += 1
+            return state["calls"] > 1
+        monkeypatch.setattr(backend, "_expired", expired_after_entry)
+        final = backend.process_round(s, r, lambda *a, **k: sent.append(a) or {"code": 0},
+                                      daemon_instance_id="d", validate=lambda p: (True, "ok"))
+        row = s.get_round(r["rid"])
+        assert final == store_mod.FAILED and sent == [], "nothing may reach the driver"
+        assert state["calls"] >= 2, "the check ran at entry and again before the send"
+        assert row["error_code"].startswith("expired: use-by ")
+        assert row["send_disposition"] == store_mod.NOT_SENT_PROVEN
+        assert not s.has_send_attempt(r["rid"]) and store_mod.spent_messages(s.db) == []
+
+
+def test_no_automatic_continue_past_use_by(env_continue):
+    """A failed turn normally earns one continue (a second paid message). Past use-by the answer is
+    worthless, so none is sent or claimed, and the round ends turn_failed naming the expiry."""
+    store_mod_, backend_, s, rid, conv = env_continue
+    spec = {"model": "Pro", "consult_meta": {"use_by": "2001-01-01T00:00:00+00:00"}}
+    calls = []
+
+    def cdp(kind, **kw):
+        calls.append(kind)
+        return {"code": 4, "stderr": "CGC_ERROR turn_failed: ChatGPT marked it 'Thinking failed'\n"}
+    final = backend_._wait_phase(s, rid, conv, spec, cdp)
+    row = s.get_round(rid)
+    assert final == store_mod_.FAILED and calls == ["wait"], "no followup was sent"
+    assert "turn_failed" in row["error_code"]
+    assert "no automatic continue went out" in row["error_code"]
+    assert "expired: use-by 2001-01-01T00:00:00+00:00 passed" in row["error_code"]
+    assert s.auto_continue_state(rid) is None, "declined before the claim: nothing recorded"
+    assert store_mod_.spent_messages(s.db) == [(rid, "submit", s.db.execute(
+        "SELECT max(started_at) FROM attempts WHERE rid=?", (rid,)).fetchone()[0])], \
+        "only the original send is charged"
+
+
+@pytest.fixture
+def env_continue(tmp_path, monkeypatch):
+    """A WAITING round with a landed send, for the continue path (mirrors tests/test_auto_continue.py)."""
+    import cgc_spool
+    monkeypatch.setattr(cgc_spool, "acquire_conversation_lease", lambda conv: object())
+    conv, rid = "6ab58360-59cc-83e8-bcbe-3df6cba4a4fc", "REQ-20260925-120000-00000a"
+    with store_mod.Store() as s:
+        s.create_round(rid, "submit", prompt="p", spec_json=json.dumps({"model": "Pro"}))
+        s.set_state(rid, store_mod.READY)
+        aid = s.begin_send(rid, "p", store_mod.sha256("p"), daemon_instance_id="d1")
+        s.mark_accepted(aid, conv)
+        s.mark_waiting(rid)
+        yield store_mod, backend, s, rid, conv
+
+
 def test_a_round_before_use_by_sends_normally(fire):
     r = _ready(fire, use_by="+1h")
     with store_mod.Store() as s:
