@@ -32,6 +32,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import pathlib
@@ -597,6 +598,46 @@ def cmd_deliver(a: argparse.Namespace) -> int:
     return out
 
 
+def policy_rev() -> str:
+    """Which version of the consult policy a round was fired under: sha256[:12] over SKILL.md,
+    ACTIVATION.md and the prompt text (both templates and the output arms), read NOW. The feedback
+    loop attributes graded outcomes to the policy that produced them, so an edit to any of these
+    must change the revision; a missing file contributes nothing rather than failing a fire."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    h = hashlib.sha256()
+    for name in ("SKILL.md", "ACTIVATION.md"):
+        try:
+            h.update(pathlib.Path(root, name).read_bytes())
+        except OSError:
+            pass
+        h.update(b"\0")
+    for t in (PROMPT_TEMPLATE, FOLLOWUP_TEMPLATE, DEFAULT_OUTPUT_BODY, REPLACE_OUTPUT_OPEN,
+              OUTPUT_CLOSE):
+        h.update(t.encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()[:12]
+
+
+_DUR_UNIT_S = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+_DUR_RE = re.compile(r"^\+(?:\d+[smhd])+$")
+
+
+def _when(v: str) -> datetime.datetime:
+    """`ISO8601 | +DURATION` (+90m, +2h, +1d, +1h30m) -> an aware UTC datetime. A naive ISO time is
+    the caller's local time. Raises ValueError naming the accepted forms on anything else."""
+    v = (v or "").strip()
+    if _DUR_RE.match(v):
+        secs = sum(int(n) * _DUR_UNIT_S[u] for n, u in re.findall(r"(\d+)([smhd])", v))
+        return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=secs)
+    try:
+        t = datetime.datetime.fromisoformat(v[:-1] + "+00:00" if v.endswith("Z") else v)
+    except ValueError:
+        raise ValueError(f"{v!r} is neither an ISO-8601 time nor a +DURATION like +90m / +2h / +1d")
+    if t.tzinfo is None:
+        t = t.astimezone()
+    return t.astimezone(datetime.timezone.utc)
+
+
 def cmd_prep(a: argparse.Namespace) -> int:
     if a.target_chars < 2000 or a.hard_chars < a.target_chars:
         raise SystemExit("CGC_ERROR bad_chunk_sizes: need target-chars>=2000 and hard-chars>=target-chars")
@@ -885,6 +926,24 @@ def cmd_fire(a: argparse.Namespace) -> int:
     debugging and for anyone who wants to edit the refs or the prompt in between."""
     import cgc_spool as spool
 
+    # Schedule and intent, validated BEFORE deliver/prep so a bad flag costs nothing.
+    try:
+        not_before = _when(a.not_before) if getattr(a, "not_before", None) else None
+        use_by = _when(a.use_by) if getattr(a, "use_by", None) else None
+    except ValueError as e:
+        sys.stderr.write(f"CGC_ERROR bad_schedule: {e}. Nothing was queued.\n")
+        return 2
+    if use_by and (use_by <= datetime.datetime.now(datetime.timezone.utc)
+                   or (not_before and use_by <= not_before)):
+        sys.stderr.write("CGC_ERROR bad_schedule: --use-by must be later than now and than "
+                         "--not-before, or the round could never send. Nothing was queued.\n")
+        return 2
+    meta = {k: getattr(a, k, None) for k in ("origin", "trigger", "decision", "baseline", "check")}
+    meta = {k: v for k, v in meta.items() if v}
+    if use_by:
+        meta["use_by"] = use_by.isoformat()
+    meta["policy_rev"] = policy_rev()
+
     # A follow-up continues a thread — but it no longer needs a hand-tracked conversation id. A bare
     # `--followup` (or `--conversation auto`/`last`) defaults to the LAST completed consult's thread,
     # which enqueue resolves from the store while the intent is fresh. This is the whole point of
@@ -941,7 +1000,8 @@ def cmd_fire(a: argparse.Namespace) -> int:
         project_url=a.project_url, conversation=(a.conversation or "auto"),
         parent=getattr(a, "parent", None), model=a.model, mentions=getattr(a, "mention", None) or [],
         request_key=getattr(a, "request_key", None),
-        logical_sha=st.get("logical_sha"),
+        logical_sha=st.get("logical_sha"), consult_meta=meta,
+        not_before=not_before.isoformat() if not_before else None,
         out=a.out, poll=spool.POLL_S, timeout=spool.STUCK_AFTER_S, quiet=True)
     if spool.cmd_enqueue(eq) != 0:
         return 2
@@ -1096,6 +1156,21 @@ def main() -> int:
                     help="ChatGPT app/plugin to @mention (repeatable), name WITHOUT the '@', e.g. "
                          "--mention \"WebCodex Demo\". The daemon picks it from the composer's @ popup "
                          "before pasting the prompt; never write '@App' into --task.")
+    pf.add_argument("--origin", choices=("agent", "user"),
+                    help="who decided to fire this: the agent on its own initiative, or the user asked")
+    pf.add_argument("--trigger", choices=("premise-conflict", "workspace-evidence", "design-fork",
+                                          "math", "competing-causes", "reviewer-disagreement",
+                                          "external-contract", "writing", "research", "review",
+                                          "other"),
+                    help="which activation trigger applied (graded per trigger in `stats --week`)")
+    pf.add_argument("--decision", help="the action this answer can change")
+    pf.add_argument("--baseline", help="your current answer (or gpt-sol's), frozen BEFORE the answer")
+    pf.add_argument("--check", help="how the result will be judged")
+    pf.add_argument("--not-before", help="ISO-8601 time or +DURATION (+90m, +2h, +1d): the daemon will "
+                                         "not send before it, so a complete question can wait in the "
+                                         "backlog")
+    pf.add_argument("--use-by", help="ISO-8601 time or +DURATION: past it the round never sends — it "
+                                     "ends `failed` (expired), not charged")
     pf.set_defaults(fn=cmd_fire)
 
     sub.add_parser("apps", help="list the ChatGPT apps --mention knows (CGC_APPS); local, no network"
