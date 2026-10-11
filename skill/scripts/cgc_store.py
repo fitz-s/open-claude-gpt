@@ -368,6 +368,31 @@ def _new_id() -> str:
     return uuid.uuid4().hex
 
 
+def spent_messages(db) -> list:
+    """Every outgoing paid message that may have been spent, as (rid, kind, at). `db` is any sqlite3
+    connection onto the store, including a read-only one — the SessionStart snapshot has no Store.
+
+    One round can send more than once: its base send, and the single automatic "continue" a
+    ChatGPT-failed turn gets under the SAME rid. So the unit is the message, not the round.
+      - base: the round crossed the send fence (an `attempts` row, begin_send being its only writer)
+        and carries no durable not-sent proof. An UNCERTAIN send is charged: the click may have
+        landed. `at` is the last attempt's start — the one that actually sent.
+      - continuation: a claimed `auto_continue` whose recorded result is landed, unsure, or absent
+        (the worker died between claim and result, possibly after the click). `not_sent` is free.
+    A `retrieve` never calls begin_send and never claims a continue, so it contributes nothing."""
+    base = db.execute(
+        "SELECT r.rid, r.kind, (SELECT max(a.started_at) FROM attempts a WHERE a.rid=r.rid) "
+        "FROM rounds r WHERE EXISTS(SELECT 1 FROM attempts a WHERE a.rid=r.rid) "
+        "AND (r.send_disposition IS NULL OR r.send_disposition<>?)", (NOT_SENT_PROVEN,)).fetchall()
+    cont = db.execute(
+        "SELECT r.rid, r.kind, e.at FROM rounds r JOIN events e "
+        "ON e.rid=r.rid AND e.kind='auto_continue' "
+        "WHERE COALESCE((SELECT x.detail FROM events x WHERE x.rid=r.rid "
+        "AND x.kind='auto_continue_result' ORDER BY x.id DESC LIMIT 1), 'claimed')<>'not_sent'"
+    ).fetchall()
+    return [tuple(r) for r in (*base, *cont)]
+
+
 def new_daemon_instance_id() -> str:
     """A fresh identity per daemon process — recorded on attempts so ownership is the daemon
     INSTANCE, not a reusable OS pid."""

@@ -876,10 +876,62 @@ class TestStats:
 
         assert backend.stats_report() == 0
         rep = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-        assert rep["messages"]["charged"] == 2, rep["messages"]
+        assert rep["messages"]["potentially_spent"] == 2, rep["messages"]
         assert rep["messages"]["free"] == 3, rep["messages"]
         assert rep["messages"]["by_kind"] == {"submit": 2}, \
             "a retrieve must never appear in the ledger — it sends nothing"
+
+    def _waiting_round(self, store_mod, s, rid, kind="submit"):
+        s.create_round(rid, kind, prompt="p")
+        s.set_state(rid, store_mod.READY)
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d")
+        s.mark_accepted(aid, "conv-" + rid[-3:])
+        s.mark_waiting(rid)
+        return rid
+
+    def _spent(self, backend, capsys):
+        assert backend.stats_report() == 0
+        return json.loads(capsys.readouterr().out.strip().splitlines()[-1])["messages"]
+
+    def test_a_landed_continuation_is_a_second_message_under_the_same_rid(self, env, capsys):
+        """ChatGPT failing a turn makes the worker send ONE automatic continue under the same rid —
+        a second outgoing message. Counting one per rid under-reported spend against a weekly
+        allowance."""
+        store_mod, backend, s, _ = env
+        rid = self._waiting_round(store_mod, s, "REQ-20260707-120000-0c0001")
+        assert s.claim_auto_continue(rid, "x")
+        s.record_auto_continue(rid, "landed")
+        m = self._spent(backend, capsys)
+        assert m["potentially_spent"] == 2 and m["by_kind"] == {"submit": 2}
+        assert m["free"] == 0, "free counts rounds that spent nothing, not total - spent"
+
+    def test_a_not_sent_continuation_counts_zero(self, env, capsys):
+        store_mod, backend, s, _ = env
+        rid = self._waiting_round(store_mod, s, "REQ-20260707-120000-0c0002")
+        assert s.claim_auto_continue(rid, "x")
+        s.record_auto_continue(rid, "not_sent")
+        assert self._spent(backend, capsys)["potentially_spent"] == 1
+
+    @pytest.mark.parametrize("result", ["unsure", None])
+    def test_an_unsure_or_unresolved_continuation_is_charged(self, env, capsys, result):
+        """A claim with no recorded result means the worker died between claim and result — possibly
+        after the click — so the honest ledger charges it, like an uncertain base send."""
+        store_mod, backend, s, _ = env
+        rid = self._waiting_round(store_mod, s, "REQ-20260707-120000-0c0003")
+        assert s.claim_auto_continue(rid, "x")
+        if result:
+            s.record_auto_continue(rid, result)
+        assert self._spent(backend, capsys)["potentially_spent"] == 2
+
+    def test_a_retrieve_counts_zero_even_beside_a_continued_round(self, env, capsys):
+        store_mod, backend, s, _ = env
+        rid = self._waiting_round(store_mod, s, "REQ-20260707-120000-0c0004")
+        assert s.claim_auto_continue(rid, "x")
+        s.record_auto_continue(rid, "landed")
+        r = "REQ-20260707-120000-0c0005"
+        s.create_round(r, "retrieve", prompt="p", parent_rid=rid)
+        m = self._spent(backend, capsys)
+        assert m["potentially_spent"] == 2 and m["free"] == 1 and "retrieve" not in m["by_kind"]
 
 
 class TestRequestFingerprint:
