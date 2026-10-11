@@ -26,6 +26,15 @@ Ship a **public GitHub PR/tree link**; get a grounded, file-cited review — cor
 
 > *Also: investigation, research-backed decisions, RFC/design docs, long-context consistency audits, a devil's-advocate before an irreversible action, a draft-while-you-build second pair of eyes — any deep, self-contained job qualifies.*
 
+### 🔌 Reach your machine — with [WebCodex](https://github.com/yyjeqhc/webcodex)
+A GitHub link only shows the Pro model the code you have pushed. **WebCodex** gives the model a live connection to a workspace you chose to share, so it can see much more:
+
+- private code and unpushed work;
+- databases, logs and data files;
+- the results of tests and checks it runs itself.
+
+WebCodex is a local MCP server exposed to ChatGPT as an app through OpenAI's Secure MCP Tunnel. Add `--mention "WebCodex Demo"`, using your app's name, and the round can read files, list directories, run processes, and observe jobs inside the workspaces you registered with WebCodex. This turns "review from the outside" into "investigate on the box". For example: root-cause a loss from the live DB, re-run a backtest before giving a verdict, or audit a private repo end to end. See [WebCodex below](#webcodex-give-the-pro-model-your-workspace).
+
 ## Why it's different
 
 - **Spend the subscription, not an API budget.** It automates your real ChatGPT session — the same Pro plan you use in the browser. Nothing is billed per token; your normal web-plan limits and availability apply.
@@ -136,6 +145,25 @@ Runnable walkthroughs in [examples/](examples/):
 | 💬 Toggle the model / group in a project | [config-recipes.md](examples/config-recipes.md) |
 
 Copyable `--output-file` / `--output-replace` contracts live in [examples/_specs/](examples/_specs/).
+
+## WebCodex: give the Pro model your workspace
+
+[WebCodex](https://github.com/yyjeqhc/webcodex) runs on your machine as an MCP server and reaches ChatGPT over OpenAI's Secure MCP Tunnel. You register workspaces in it, and ChatGPT sees it as an app. Its tools act only inside those workspaces:
+
+- read, list and edit files;
+- run a process, for up to an hour;
+- observe a running job.
+
+```bash
+python3 skill/scripts/cgc_config.py set CGC_APPS "WebCodex Demo"   # the app's name in ChatGPT's @ menu
+cgc fire --repo owner/repo --ref <sha> --mention "WebCodex Demo" \
+  --title "Root-cause: fills lose at 30% vs modeled 70%" \
+  --task "Use the zeus workspace: query the settlement DB, rerun the calibration check, then decide."
+```
+
+The daemon picks the app from the composer's @ popup before it pastes the prompt. If the popup does not confirm the app, the round is refused before the send, so no message is spent. When ChatGPT asks for approval of a write, such as "Allow file materialization?", the waiter answers it for the apps listed in `CGC_AUTO_APPROVE` (default: `CGC_APPS`).
+
+**What changes, and what doesn't.** This is how private code and local data reach the model. The channel is one you set up and scoped yourself, through WebCodex's allowed roots and the tunnel key. The prompt itself still passes the same egress gate: public links only and no secret shapes. The safe default is to register only the workspaces you would show a reviewer, and to stop the tunnel when you are not using it.
 
 ## Auto model-selection (toggleable)
 
