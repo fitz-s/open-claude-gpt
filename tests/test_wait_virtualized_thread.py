@@ -119,6 +119,18 @@ def test_the_js_turn_rid_parser_matches_the_python_one():
         f"BEGIN_RESPONSE:{a}x\nEND_RESPONSE:{a}x\n",
         "plain question, no sentinels\n",
         "",
+        # the head marker (the one part of a long prompt ChatGPT never collapses)
+        f"CGC_RID:{a}\n# t\nBEGIN_RESPONSE:{a}\nx\nEND_RESPONSE:{a}\n",
+        f"CGC_RID:{a}\n# a collapsed turn: no tail pair in the DOM\n",
+        f"\n  CGC_RID:{a}  \r\n# t\n",
+        f"CGC_RID:{a}\n# t\nBEGIN_RESPONSE:{b}\nx\nEND_RESPONSE:{b}\n",
+        f"CGC_RID:{a}\n# t\nquotes BEGIN_RESPONSE:{b} with no end\nBEGIN_RESPONSE:{a}\nEND_RESPONSE:{a}\n",
+        f"# t\nCGC_RID:{a}\nBEGIN_RESPONSE:{b}\nx\nEND_RESPONSE:{b}\n",
+        f"# t\nCGC_RID:{a}\n",
+        f"CGC_RID:{a}x\n# t\n",
+        f"cgc_rid:{a}\n# t\n",
+        f"CGC_RID:{a} \nCGC_RID:{b}\n# t\n",
+        f"CGC_RID:not-a-rid\nBEGIN_RESPONSE:{a}\nx\nEND_RESPONSE:{a}\n",
     ]
     if not shutil.which("node"):
         pytest.skip("node not installed")
@@ -152,6 +164,8 @@ def test_every_rendered_prompt_template_parses_to_its_rid_in_both_parsers():
                                     check=True).stdout)
     assert got["js"] == [rid] * 3
     assert [CDP._turn_canonical_rid(t) for t in got["text"]] == [rid] * 3
+    # The head marker leads (the page text opens with a blank line: the first <p> is a block).
+    assert [t.strip().split("\n")[0] for t in got["text"][:2]] == ["CGC_RID:" + rid] * 2
 
 
 # ---- the waiter, end to end, on a DOM that changes under it -----------------------------------

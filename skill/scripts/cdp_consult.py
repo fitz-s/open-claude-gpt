@@ -592,56 +592,33 @@ _TEXT_FN = ("function __cgcText(el){if(!el)return '';"
             "if(c.tagName==='BR'){out+='\\n';continue;}var b=BLOCK.test(c.tagName);if(b)out+='\\n';w(c);if(b)out+='\\n';}}})(el);"
             "return out.replace(/[ \\t]+\\n/g,'\\n').replace(/\\n{3,}/g,'\\n\\n');}")
 
-# ChatGPT collapses a long user message to its head plus "…Show more" (live 2026-10-08: the DOM held
-# 10098 of a 20707-char prompt), and the template's own sentinel pair is the LAST thing in the render —
-# so a collapsed turn's DOM can never carry the rid, and every read of "which turn is mine" went blind
-# beside a send that had landed. The turn's React item still holds the whole message the composer sent
-# (props.item.message, two fibers above the unit). A collapsed turn reads from it ONLY when it is
-# provably this turn's current text; any other turn, or a collapsed one that cannot prove it, reads
-# from the DOM exactly as before (fail closed).
-# __reactFiber$ is set at mount and never moved; React double-buffers, so after an update the committed
-# fiber may be that fiber's .alternate and the one in hand still holds the PREVIOUS message (real React
-# 18.3.1: a reused user node updated R1 -> R2 showed R2 in the DOM and R1 here). Which buffer is current
-# is not knowable from the node, so every candidate must agree: the walk runs from the host fiber and
-# its alternate, and at each fiber that carries the item both it and its alternate are read. Any
-# disagreement, or any candidate that is not a string, is DOM. The agreed message must also continue
-# the DOM: only letters and digits are compared (a rendered bubble drops the markdown markers the raw
-# message keeps: "# ", "- ", "**"), and the DOM head's first 200 of them, the button's own text
-# excluded, must be a prefix of the message's. Fewer than 20 is no identity proof: DOM.
-_USER_TEXT_FN = (
-    "function __cgcUserText(el){var t=__cgcText(el),bt=el.querySelector('button[aria-expanded=\"false\"]');"
-    "if(!bt)return t;"
-    "var k=Object.keys(el).filter(function(x){return x.indexOf('__reactFiber$')===0})[0],h=k&&el[k],ms=[];"
-    "function g(f){var p=f.memoizedProps,m=p&&p.item&&p.item.message;return typeof m==='string'?m:null;}"
-    "function w(x){return x.replace(/[^\\p{L}\\p{N}]/gu,'');}"
-    "function tx(n){var s='';for(var i=0;i<n.childNodes.length;i++){var c=n.childNodes[i];"
-    "if(c!==bt)s+=c.nodeType===3?c.nodeValue:c.nodeType===1?tx(c):'';}return s;}"
-    "[h,h&&h.alternate].forEach(function(r){if(!r)return;var f=r,i=0;"
-    "for(;f&&i<8&&g(f)===null;f=f.return,i++);"
-    "if(f&&i<8){ms.push(g(f));if(f.alternate)ms.push(g(f.alternate));}else ms.push(null);});"
-    "var m=ms[0];if(typeof m!=='string'||ms.some(function(x){return x!==m}))return t;"
-    "var d=w(tx(el)).slice(0,200);return d.length>=20&&w(m).slice(0,d.length)===d?m:t;}")
-
 # The rid regex shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) shared by every rid-reading regex in this file.
 _RID_RE_SRC = r"REQ-\d{8}-\d{6}-[0-9a-f]{6}"
 
-# The page-side mirror of _turn_canonical_rid (SHARED CONTRACT #3): a user turn's OWN rid is the rid
-# of the LAST complete, in-order BEGIN_RESPONSE:<rid>/END_RESPONSE:<rid> pair of bare lines in its
-# block-aware text. tests/test_wait_virtualized_thread.py holds the two to the same answers on every
-# ASCII rendering. They part only outside it: Python's str.strip() and \d also take \x1c-\x1f, \x85
-# and non-ASCII digits, and JS's trim() and \d take the BOM instead; each difference makes one side
-# see no pair, so a disagreement reads as "turn not found" (fail closed), never as another rid's turn.
-_RID_FN = ("function __cgcRid(t){var re=/^(BEGIN|END)_RESPONSE:(" + _RID_RE_SRC + ")$/,ob={},rid=null,"
+# The page-side mirror of _turn_canonical_rid (SHARED CONTRACT #3): a user turn's OWN rid is the rid on
+# its first non-blank line when that line is exactly CGC_RID:<rid> (the head marker, the one part of a
+# long prompt ChatGPT never collapses), else the rid of the LAST complete, in-order
+# BEGIN_RESPONSE:<rid>/END_RESPONSE:<rid> pair of bare lines in its block-aware text. A marker and a
+# pair that name DIFFERENT rids read as no rid at all (fail closed). tests/test_wait_virtualized_thread.py
+# holds the two to the same answers on every ASCII rendering. They part only outside it: Python's
+# str.strip() and \d also take \x1c-\x1f, \x85 and non-ASCII digits, and JS's trim() and \d take the BOM
+# instead; each difference makes one side see no marker or pair, so a disagreement reads as "turn not
+# found" (fail closed), never as another rid's turn.
+_RID_FN = ("function __cgcRid(t){var re=/^(BEGIN|END)_RESPONSE:(" + _RID_RE_SRC + ")$/,"
+           "mk=/^CGC_RID:(" + _RID_RE_SRC + ")$/,ob={},rid=null,M=null,first=true,"
            "ls=(t||'').replace(/\\r\\n/g,'\\n').split('\\n');"
-           "for(var i=0;i<ls.length;i++){var m=ls[i].trim().match(re);if(!m)continue;"
-           "if(m[1]==='BEGIN')ob[m[2]]=1;else if(ob[m[2]])rid=m[2];}return rid;}")
+           "for(var i=0;i<ls.length;i++){var l=ls[i].trim();"
+           "if(first&&l){first=false;var q=l.match(mk);if(q){M=q[1];continue;}}"
+           "var m=l.match(re);if(!m)continue;"
+           "if(m[1]==='BEGIN')ob[m[2]]=1;else if(ob[m[2]])rid=m[2];}"
+           "return M===null?rid:(rid===null||rid===M?M:null);}")
 
 _NODE_FN = (
-    _ROLE_FN + _TEXT_FN + _USER_TEXT_FN + _RID_FN +
+    _ROLE_FN + _TEXT_FN + _RID_FN +
     # __cgcSrc(nx, RID): index in nx of the source turn — the LAST user node whose OWN canonical rid
     # is RID (the last, so a same-rid resend owns the answer) — or -1 when it is not rendered.
     "function __cgcSrc(nx,RID){var EN='END_RESPONSE:'+RID,s=-1;"
-    "for(var j=0;j<nx.length;j++){if(__cgcRole(nx[j])==='user'&&__cgcRid(__cgcUserText(nx[j]))===RID)s=j;}"
+    "for(var j=0;j<nx.length;j++){if(__cgcRole(nx[j])==='user'&&__cgcRid(__cgcText(nx[j]))===RID)s=j;}"
     "return s;}"
     # __cgcNode(BG, RID): RID is OPTIONAL. Omitted/null -> UNSCOPED, the legacy 'auto' behavior
     # (step 1 searches the whole document; step 2 falls back to only AFTER the last user node).
@@ -825,7 +802,7 @@ def _detect_js(rid: str, *, scoped=False) -> str:
         # unscoped 'auto' wait, which by definition watches the latest turn.
         "var failed=null;(function(){var u=src>=0?nx[src]:null;"
         "if(!RID){for(var i=nx.length-1;i>=0;i--)"
-        "if(__cgcRole(nx[i])==='user'&&__cgcUserText(nx[i]).indexOf(BG)>=0){u=nx[i];break;}}"
+        "if(__cgcRole(nx[i])==='user'&&__cgcRid(__cgcText(nx[i]))===" + json.dumps(rid) + "){u=nx[i];break;}}"
         "var t=u&&u.closest('[data-turn-key]');if(!t)return;"
         # The marker is a status element whose WHOLE text is the phrase (live 2026-09-25: a lone
         # "Thinking failed" span in the turn's activity header). Matching an exact element text,
@@ -855,6 +832,7 @@ def _detect_js(rid: str, *, scoped=False) -> str:
 # Mirrored page-side by _RID_FN, which the scoped answer reads anchor on.
 _TURN_BEGIN_LINE_RE = re.compile(rf"^BEGIN_RESPONSE:({_RID_RE_SRC})$")
 _TURN_END_LINE_RE = re.compile(rf"^END_RESPONSE:({_RID_RE_SRC})$")
+_TURN_MARKER_LINE_RE = re.compile(rf"^CGC_RID:({_RID_RE_SRC})$")
 
 
 def _turn_canonical_rid(turn_text):
@@ -878,11 +856,26 @@ def _turn_canonical_rid(turn_text):
     (DOM textContent flattens markdown, so this is the only structure available to match on;
     fence-awareness is unnecessary here because picking the LAST pair already defeats an earlier
     fenced/prose quote regardless of whether it's inside a fence).
+
+    THE HEAD MARKER. Both templates now open with a plain `CGC_RID:<rid>` line. ChatGPT collapses a
+    long user message to its head plus "Show more", and the pair above is the LAST thing in the
+    render, so a collapsed turn's DOM holds the marker and never the pair. The turn's first non-blank
+    line, trimmed, being exactly that marker names the turn's rid. A marker and a complete pair that
+    disagree give None (fail closed): the head and the tail of one prompt cannot name two requests.
+    A prompt without a marker (a legacy round, the automatic continue) is read by the pair alone, so a
+    collapsed legacy turn stays unproven exactly as before. The turn's React state is NOT consulted:
+    which fiber or ancestor is current cannot be known from a DOM node.
     """
-    canonical = None
+    canonical, marker, first = None, None, True
     open_begin = set()
     for line in (turn_text or "").replace("\r\n", "\n").split("\n"):
         s = line.strip()
+        if first and s:
+            first = False
+            mm = _TURN_MARKER_LINE_RE.match(s)
+            if mm:
+                marker = mm.group(1)
+                continue
         mb = _TURN_BEGIN_LINE_RE.match(s)
         if mb:
             open_begin.add(mb.group(1))
@@ -890,7 +883,9 @@ def _turn_canonical_rid(turn_text):
         me = _TURN_END_LINE_RE.match(s)
         if me and me.group(1) in open_begin:
             canonical = me.group(1)  # scanning in order: the last completed pair wins
-    return canonical
+    if marker is None:
+        return canonical
+    return marker if canonical in (None, marker) else None
 
 
 def _last_user_text_js() -> str:
@@ -900,8 +895,8 @@ def _last_user_text_js() -> str:
     observed live: a landed send classified possibly_accepted because its own echo was unparseable).
     DOM extraction stays JS's only job here — parsing the rid out of it is Python's (via
     _turn_canonical_rid, pure and unit-tested)."""
-    return ("(function(){" + _TEXT_FN + _USER_TEXT_FN + "var u=document.querySelectorAll(" + _JS_U + ");"
-            "var n=u[u.length-1];return n?__cgcUserText(n):'';})()")
+    return ("(function(){" + _TEXT_FN + "var u=document.querySelectorAll(" + _JS_U + ");"
+            "var n=u[u.length-1];return n?__cgcText(n):'';})()")
 
 
 def _resolve_rid(c, rid):
@@ -929,8 +924,8 @@ def _all_user_texts_js() -> str:
     line-anchored parser) of EVERY user turn, DOM order — unlike _last_user_text_js (last turn
     only), this lets a retrieve locate a SOURCE rid's own turn anywhere in the conversation, even
     when later turns were sent after it."""
-    return ("(function(){" + _TEXT_FN + _USER_TEXT_FN + "var u=document.querySelectorAll(" + _JS_U + ");"
-            "return Array.prototype.map.call(u, function(n){return __cgcUserText(n);});})()")
+    return ("(function(){" + _TEXT_FN + "var u=document.querySelectorAll(" + _JS_U + ");"
+            "return Array.prototype.map.call(u, function(n){return __cgcText(n);});})()")
 
 
 def _locate_source_turn(user_texts, source_rid):
@@ -2328,12 +2323,12 @@ def _contract_js(rid):
     Counting user turns (what this used to do) only proves the page grew a message. It cannot tell
     'my prompt was sent' from 'something else appeared', and it says nothing about whether we can
     still READ the reply — the failure that burned two 25-minute rounds."""
-    tag = json.dumps(f"BEGIN_RESPONSE:{rid}")
+    tag = json.dumps(rid)
     fams = json.dumps([{"name": n, "u": u, "a": a} for n, u, a in _ADAPTERS])
-    return ("(function(){" + _TEXT_FN + _USER_TEXT_FN + "var TAG=%s,F=%s,out=[];"
+    return ("(function(){" + _TEXT_FN + _RID_FN + "var RID=%s,F=%s,out=[];"
             "for(var i=0;i<F.length;i++){"
             "var us=document.querySelectorAll(F[i].u),as=document.querySelectorAll(F[i].a),hit=false;"
-            "for(var j=0;j<us.length;j++){if(__cgcUserText(us[j]).indexOf(TAG)>=0){hit=true;break;}}"
+            "for(var j=0;j<us.length;j++){if(__cgcRid(__cgcText(us[j]))===RID){hit=true;break;}}"
             "out.push({adapter:F[i].name,ridLanded:hit,users:us.length,assistants:as.length});}"
             "var gen=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"]');"
             "return JSON.stringify({families:out,generating:gen});})()" % (tag, fams))

@@ -14,16 +14,16 @@ collapsed turn never carried the rid: the send contract saw `search-unit-v1 user
 refused to confirm a send that had landed, and the waiter and retrieve found no source turn beside a
 finished, correctly wrapped answer.
 
-- A user turn that shows a "Show more" button now reads its text from the turn's React item
-  (`props.item.message`, the exact text the composer sent). Every other turn, and a collapsed turn whose
-  item cannot be found, reads from the DOM as before, so an unprovable send still ends `unknown_send` and is
-  never auto-resent.
-- The item is used only when it is provably this turn's current text. React double-buffers, so a reused
-  node's fiber can hold the previous message after an update (real React 18.3.1: the DOM showed the new
-  round, the fiber the old one, and the send contract, source-turn lookup and salvage read the old rid). The
-  fiber and its `.alternate` must carry the same message, and the DOM head's first 200 letters and digits
-  (markdown markers and punctuation dropped, so a bubble rendered as markdown still matches; fewer than 20
-  proves nothing) must be a prefix of the message's; otherwise the turn reads from the DOM.
+- Every prompt now opens with a plain first line `CGC_RID:<rid>`, then the title. The head is the one part
+  ChatGPT never collapses, and plain text survives a markdown-rendered bubble. A turn's own rid is that line;
+  a legacy prompt (no marker) is read by its tail pair as before, so a collapsed legacy turn stays unproven
+  and still ends `unknown_send`, never auto-resent. A marker that disagrees with a complete tail pair names
+  no rid (fail closed). `logical_sha` renders the marker with `<RID>` like the sentinels, so a re-fire still
+  matches its key; a key fired before this change and re-fired after it conflicts once, because the stored
+  fingerprint hashes the old first line.
+- The turn's React state is deliberately not read: which fiber or ancestor is current cannot be known from a
+  DOM node (real React 18.3.1: a reused user node updated R1 to R2 kept R1 on its fiber, and a Context update
+  can leave an ancestor's item on R1 under a DOM showing R2).
 - The same read serves the send contract, the waiter's source-turn lookup, the failure marker, the
   `rid_echo` check of a follow-up, and `status --rid auto`.
 
