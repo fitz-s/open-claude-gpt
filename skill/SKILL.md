@@ -145,7 +145,7 @@ you `state`, `out_path`, `answer_on_disk`, and `conversation` in one read.
 | `fire` without a key | Creates a NEW consult every time — always pass a key |
 | `await` / `status` / `stats` | Always safe (read-only) |
 | `cancel --rid R` | Safe; succeeds only BEFORE the send, idempotent |
-| re-fire after `possibly_accepted` | NEVER — the first send may have landed (duplicate risk) |
+| re-fire after `possibly_accepted` | NEVER — the first send may have landed (duplicate risk). In 9 of 10 audited cases it had; check `status`, the answer file, and the workspace for delivered files first |
 
 ## Follow-up — a consult is a thread; `--parent` is the agent path
 
@@ -161,7 +161,8 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py fire --followup --pa
 concurrency. A bare `--followup` (no parent) resolves "the last thread" and REFUSES when that is
 ambiguous (another consult in flight, or two threads finished close together) — so always pass
 `--parent`. Add `--refs-file` for a fresh diff link. Loop (fire-followup → await → verify →
-again) until clean; every follow-up carries new local evidence or a new question.
+again) until clean. Every follow-up carries new local evidence or a new question, and maps each
+prior finding to its fix commit or a measured result.
 
 ## Steer the round — `--title`, `--role`, `--task` decide the answer's depth
 
@@ -176,6 +177,15 @@ You supply the delta it can't know:
   they're defined, (5) evidence it can't browse to → `--context-file` (failure bundles, perf
   numbers), (6) tell it to challenge the premise and name a superior alternative FIRST. Keep code
   out of `--task` — code travels as links via fire's deliver.
+- **What the graded history says** (24 threads, 2026-09-11 → 10-11; mean value 2.1/3, 79% changed a
+  decision or landed a fix):
+  - The best rounds state your own law, numbers, or decision as a falsifiable target and set an
+    executable bar, e.g. "a BLOCKER needs a runnable counterexample; a fix clears only if its test
+    fails when reverted". Back that bar with code the model can read: pinned links or WebCodex.
+  - Rounds are wasted when they rest on a premise you have not checked against the ledger or data,
+    or when you ask an open design question with no release test.
+  - Review loops past round 3 drift into fix-of-fix. After two corrections on one surface, restate
+    the design before the next round instead of patching again.
 - For any code/architecture/PR review, pass the scaffold
   `references/deep-review-output.md` as `--output-file` with `--output-replace` — its order
   (verify the approach → correctness → per-file → superior realization → go/no-go) is the depth
