@@ -472,7 +472,7 @@ def _release_eligible(s, prior: dict) -> bool:
     return not s.has_send_attempt(prior["rid"])
 
 
-def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str):
+def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str, a):
     """Decide what a repeated request-key means. FINGERPRINT FIRST, always: a different logical
     request under the same key is a conflict REGARDLESS of the prior's state — one key names one
     intent, and releasing a key before comparing (the S3 defect) let a different request reuse it
@@ -490,7 +490,13 @@ def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str):
         that will never move again.
 
     Returns 0 (idempotent receipt printed), 2 (conflict), or prior['rid'] (str) — the row to
-    transfer the key FROM into a fresh successor."""
+    transfer the key FROM into a fresh successor.
+
+    On the 0 outcome the round that exists is the PRIOR one, not the one the caller just rendered
+    (a re-fire mints a fresh rid, and nothing was queued under it). The caller's namespace `a` is
+    therefore re-pointed at the matched round — rid and answer path — the same way cmd_enqueue
+    re-points `a.rid` at the rid its prompt carries, so a caller that goes on to build an `await`
+    from `a` names a row that exists."""
     pspec = json.loads(prior["spec_json"]) if prior.get("spec_json") else {}
     if pspec.get("request_fingerprint") != fingerprint:
         sys.stderr.write(f"CGC_ERROR request_key_conflict: request-key {rkey!r} was already "
@@ -512,6 +518,7 @@ def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str):
             f"--rid {prior['rid']} --not-sent --evidence \"...\"` if you have verified it never "
             "sent — or use a new key.\n")
         return 2
+    a.rid, a.out = prior["rid"], prior["out_path"] or out
     sys.stderr.write(f"CGC_IDEMPOTENT request-key {rkey!r} already enqueued as "
                      f"{prior['rid']} — returning the original receipt, nothing new "
                      "queued.\n")
@@ -571,7 +578,7 @@ def _enqueue_transfer(s, a, prompt: str, out: str, prior: dict, fingerprint: str
         winner = s.round_by_request_key(rkey)
         if winner is None:
             raise
-        res = _idempotent_receipt(s, winner, fingerprint, rkey, out)
+        res = _idempotent_receipt(s, winner, fingerprint, rkey, out, a)
         if isinstance(res, int):
             return res
         return _enqueue_transfer(s, a, prompt, out, winner, fingerprint, rkey)
@@ -634,7 +641,7 @@ def enqueue_round(a, prompt: str, out: str) -> int:
         if rkey:
             prior = s.round_by_request_key(rkey)
             if prior is not None:
-                res = _idempotent_receipt(s, prior, fingerprint, rkey, out)
+                res = _idempotent_receipt(s, prior, fingerprint, rkey, out, a)
                 if isinstance(res, int):
                     return res
                 # res is the prior rid → move its released key onto this retry, atomically.
@@ -781,7 +788,7 @@ def enqueue_round(a, prompt: str, out: str) -> int:
             prior = s.round_by_request_key(rkey) if rkey else None
             if prior is None:
                 raise
-            res = _idempotent_receipt(s, prior, fingerprint, rkey, out)
+            res = _idempotent_receipt(s, prior, fingerprint, rkey, out, a)
             if isinstance(res, int):
                 return res
             # the racing winner had itself terminally failed proven-not-sent — its key is released;

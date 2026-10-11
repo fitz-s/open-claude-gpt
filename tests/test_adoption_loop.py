@@ -182,6 +182,28 @@ def test_a_round_past_use_by_never_sends_and_is_not_charged(fire):
         assert backend._release_eligible(s, row), "its request-key is released"
 
 
+def test_a_repeated_request_key_returns_the_original_rounds_await(fire, tmp_path):
+    """SKILL.md's idempotency table calls re-firing the same key safe and promises the ORIGINAL
+    receipt. The repeat mints a fresh rid in prep and queues nothing under it, so the receipt and the
+    await line must be read back from the round enqueue matched, not from the rid prep just minted."""
+    first = fire(request_key="K-same", out=str(tmp_path / "first-answer.txt"))
+    second = fire(request_key="K-same", out=str(tmp_path / "second-answer.txt"))
+    assert isinstance(first, dict) and isinstance(second, dict)
+    assert second["rid"] == first["rid"], "the repeat names the original round"
+    assert second["await_argv"][-2:] == ["--rid", first["rid"]]
+    assert first["rid"] in second["await"]
+    assert second["out"] == first["out"] == str(tmp_path / "first-answer.txt"), \
+        "the answer path is the original round's, not the repeat's --out"
+    with store_mod.Store() as s:
+        assert s.get_round(second["rid"]) is not None, "the await names a row that exists"
+        assert s.db.execute("SELECT count(*) FROM rounds").fetchone()[0] == 1, "nothing re-queued"
+
+
+def test_a_fresh_request_key_still_reports_its_own_rid(fire):
+    a, b = fire(request_key="K-one"), fire(request_key="K-two")
+    assert a["rid"] != b["rid"] and a["await_argv"][-1] == a["rid"] and b["await_argv"][-1] == b["rid"]
+
+
 @pytest.mark.parametrize("kind", ["submit", "followup"])
 def test_use_by_is_rechecked_immediately_before_the_send(fire, monkeypatch, kind):
     """Entry passes, then the gate (gh calls) or the conversation-lease wait runs past use-by: the

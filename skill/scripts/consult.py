@@ -1033,7 +1033,10 @@ def cmd_fire(a: argparse.Namespace) -> int:
         out=a.out, poll=spool.POLL_S, timeout=spool.STUCK_AFTER_S, quiet=True)
     if spool.cmd_enqueue(eq) != 0:
         return 2
-    out = os.path.abspath(a.out or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt"))
+    # enqueue may have matched an existing round instead of queuing this one (a repeated
+    # --request-key): it re-points eq at that round, so read the rid and answer path back from eq.
+    rid = eq.rid
+    out = os.path.abspath(eq.out or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt"))
     spool_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgc_spool.py")
     await_argv = ["python3", spool_py, "await", "--rid", rid]
     # argv is the canonical receipt; the string is only a copyable display (shell-quoted so a path
