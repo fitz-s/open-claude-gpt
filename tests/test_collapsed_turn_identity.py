@@ -12,7 +12,7 @@ import pytest
 
 from test_search_unit_schema import CDP, R1, R2, _eval
 
-HEAD = "# Round 7\nvisible head"
+HEAD = "# Round 7\nvisible head of the prompt"        # 28 letters/digits: past the 20 an identity proof needs
 ANSWER = "Answer belonging to R2 only. " * 100
 NO_SRC = {"present": False, "is_last": False, "observed_rid": None}
 
@@ -21,13 +21,14 @@ def _msg(rid, head=HEAD):
     return "%s\nhidden tail\nBEGIN_RESPONSE:%s\n<full answer>\nEND_RESPONSE:%s" % (head, rid, rid)
 
 
-def _page(host, alt, *, dom_head=HEAD, link_host=True, button=True):
+def _page(host, alt, *, dom_head=HEAD, dom_kids=None, link_host=True, button=True):
     """One collapsed user turn (DOM = dom_head + "Show more") followed by an unwrapped answer, with
     fibers shaped like React's: host -> mid -> item fiber, the item two fibers above the unit.
     host / alt: the message on the item fiber of the fiber the node points at, and of its alternate
     (alt None: no alternate anywhere; host None: no item anywhere). link_host=False: the alternate
-    pair exists on the item fiber only, the host fiber has none."""
-    kids = ",".join("P(%s)" % json.dumps(x) for x in dom_head.split("\n"))
+    pair exists on the item fiber only, the host fiber has none. dom_kids: the head's element
+    constructors as JS (a bubble rendered as markdown), instead of one <p> per dom_head line."""
+    kids = dom_kids or ",".join("P(%s)" % json.dumps(x) for x in dom_head.split("\n"))
     if button:
         kids += ",E('BUTTON',{'aria-expanded':'false'},[],'Show more')"
     js = ("function chain(m){var c={memoizedProps:m===null?{}:{item:{message:m}},return:null,alternate:null},"
@@ -126,15 +127,53 @@ def test_the_prefix_check_compares_past_the_first_characters():
     assert _landed(R2, setup) is True
 
 
-def test_a_short_dom_head_is_compared_whole():
-    assert _landed(R2, _page(_msg(R2, "ab"), None, dom_head="ab")) is True
-    assert _landed(R2, _page(_msg(R2, "ab"), None, dom_head="ac")) is False
-
-
 def test_whitespace_differences_between_the_dom_and_the_message_do_not_matter():
-    msg = _msg(R2, "# Round 7\n\n  visible    head")
+    msg = _msg(R2, "# Round 7\n\n  visible    head of the   prompt")
     setup = _page(msg, None)
     assert _read(setup) == msg
+
+
+# ---- the comparison keeps letters and digits only: a rendered bubble drops markdown markers -------
+
+# ChatGPT may render a user bubble as markdown. Every consult prompt opens with "# {title}" and holds
+# "- " bullets and **bold**, so a whitespace-only comparison would reject EVERY long prompt and bring
+# back the unknown_send / rid_absent this whole read exists to prevent.
+MD_RAW = "# Round 7\n\n- first goal item here\n- second goal item\n\n**Important: read this carefully**"
+MD_DOM = ("E('H1',{},[],'Round 7'),E('UL',{},[E('LI',{},[],'first goal item here'),E('LI',{},[],'second goal item')]),"
+          "E('P',{},[E('STRONG',{},[],'Important: read this carefully')]),P('…')")
+
+
+def test_a_head_rendered_as_markdown_still_matches_the_raw_message():
+    msg = MD_RAW + "\nhidden tail\nBEGIN_RESPONSE:%s\n<full answer>\nEND_RESPONSE:%s" % (R2, R2)
+    setup = _page(msg, msg, dom_kids=MD_DOM)
+    assert _read(setup) == msg
+    assert _landed(R2, setup) is True and _src(R2, setup)["present"] is True
+
+
+def test_a_markdown_rendered_head_still_defers_to_the_dom_when_the_buffers_disagree():
+    old = MD_RAW + "\nhidden tail\nBEGIN_RESPONSE:%s\n<full answer>\nEND_RESPONSE:%s" % (R1, R1)
+    new = old.replace(R1, R2)
+    setup = _page(old, new, dom_kids=MD_DOM)
+    assert _landed(R1, setup) is False and _landed(R2, setup) is False
+
+
+def test_punctuation_alone_never_separates_a_head_from_its_message():
+    dom = "Round 7: audit the cache layer, please!"
+    assert _landed(R2, _page(_msg(R2, "## Round 7 - audit the cache-layer please"), None, dom_head=dom)) is True
+
+
+def test_a_different_turn_that_differs_in_words_as_well_as_punctuation_reads_the_dom():
+    dom = "Round 7: audit the cache layer, please!"
+    other = "## Round 8 - audit the cache-layer please"             # 8 for 7: a different turn
+    setup = _page(_msg(R2, other), None, dom_head=dom)
+    _read_as_dom(setup)
+
+
+def test_a_head_under_twenty_letters_and_digits_proves_no_identity():
+    assert _landed(R2, _page(_msg(R2, "a" * 19), None, dom_head="a" * 19)) is False
+    assert _landed(R2, _page(_msg(R2, "a" * 20), None, dom_head="a" * 20)) is True
+    # punctuation does not pad the count
+    assert _landed(R2, _page(_msg(R2, "Fix it!!!"), None, dom_head="Fix it!!!")) is False
 
 
 # ---- everything else is unchanged -----------------------------------------------------------------

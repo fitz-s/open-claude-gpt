@@ -605,21 +605,22 @@ _TEXT_FN = ("function __cgcText(el){if(!el)return '';"
 # is not knowable from the node, so every candidate must agree: the walk runs from the host fiber and
 # its alternate, and at each fiber that carries the item both it and its alternate are read. Any
 # disagreement, or any candidate that is not a string, is DOM. The agreed message must also continue
-# the DOM: the collapsed text without the button's own, whitespace-stripped, is a prefix (first 200
-# characters, or all if fewer) of the message, whitespace-stripped.
+# the DOM: only letters and digits are compared (a rendered bubble drops the markdown markers the raw
+# message keeps: "# ", "- ", "**"), and the DOM head's first 200 of them, the button's own text
+# excluded, must be a prefix of the message's. Fewer than 20 is no identity proof: DOM.
 _USER_TEXT_FN = (
     "function __cgcUserText(el){var t=__cgcText(el),bt=el.querySelector('button[aria-expanded=\"false\"]');"
     "if(!bt)return t;"
     "var k=Object.keys(el).filter(function(x){return x.indexOf('__reactFiber$')===0})[0],h=k&&el[k],ms=[];"
     "function g(f){var p=f.memoizedProps,m=p&&p.item&&p.item.message;return typeof m==='string'?m:null;}"
-    "function w(x){return x.replace(/\\s+/g,'');}"
+    "function w(x){return x.replace(/[^\\p{L}\\p{N}]/gu,'');}"
     "function tx(n){var s='';for(var i=0;i<n.childNodes.length;i++){var c=n.childNodes[i];"
     "if(c!==bt)s+=c.nodeType===3?c.nodeValue:c.nodeType===1?tx(c):'';}return s;}"
     "[h,h&&h.alternate].forEach(function(r){if(!r)return;var f=r,i=0;"
     "for(;f&&i<8&&g(f)===null;f=f.return,i++);"
     "if(f&&i<8){ms.push(g(f));if(f.alternate)ms.push(g(f.alternate));}else ms.push(null);});"
     "var m=ms[0];if(typeof m!=='string'||ms.some(function(x){return x!==m}))return t;"
-    "var d=w(tx(el)).slice(0,200);return d&&w(m).slice(0,d.length)===d?m:t;}")
+    "var d=w(tx(el)).slice(0,200);return d.length>=20&&w(m).slice(0,d.length)===d?m:t;}")
 
 # The rid regex shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) shared by every rid-reading regex in this file.
 _RID_RE_SRC = r"REQ-\d{8}-\d{6}-[0-9a-f]{6}"

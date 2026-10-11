@@ -21,8 +21,9 @@ finished, correctly wrapped answer.
 - The item is used only when it is provably this turn's current text. React double-buffers, so a reused
   node's fiber can hold the previous message after an update (real React 18.3.1: the DOM showed the new
   round, the fiber the old one, and the send contract, source-turn lookup and salvage read the old rid). The
-  fiber and its `.alternate` must carry the same message, and the DOM head (whitespace-stripped, first 200
-  characters) must be a prefix of it; otherwise the turn reads from the DOM.
+  fiber and its `.alternate` must carry the same message, and the DOM head's first 200 letters and digits
+  (markdown markers and punctuation dropped, so a bubble rendered as markdown still matches; fewer than 20
+  proves nothing) must be a prefix of the message's; otherwise the turn reads from the DOM.
 - The same read serves the send contract, the waiter's source-turn lookup, the failure marker, the
   `rid_echo` check of a follow-up, and `status --rid auto`.
 
