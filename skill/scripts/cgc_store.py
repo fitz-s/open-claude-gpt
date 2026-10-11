@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import hashlib
+import json
 import os
 import sqlite3
 import sys
@@ -368,6 +369,124 @@ def _new_id() -> str:
     return uuid.uuid4().hex
 
 
+def spent_messages(db) -> list:
+    """Every outgoing paid message that may have been spent, as (rid, kind, at). `db` is any sqlite3
+    connection onto the store, including a read-only one — the SessionStart snapshot has no Store.
+
+    One round can send more than once: its base send, and the single automatic "continue" a
+    ChatGPT-failed turn gets under the SAME rid. So the unit is the message, not the round.
+      - base: the round crossed the send fence (an `attempts` row, begin_send being its only writer)
+        and carries no durable not-sent proof. An UNCERTAIN send is charged: the click may have
+        landed. `at` is the last attempt's start — the one that actually sent.
+      - continuation: a claimed `auto_continue` whose recorded result is landed, unsure, or absent
+        (the worker died between claim and result, possibly after the click). `not_sent` is free.
+    A `retrieve` never calls begin_send and never claims a continue, so it contributes nothing."""
+    base = db.execute(
+        "SELECT r.rid, r.kind, (SELECT max(a.started_at) FROM attempts a WHERE a.rid=r.rid) "
+        "FROM rounds r WHERE EXISTS(SELECT 1 FROM attempts a WHERE a.rid=r.rid) "
+        "AND (r.send_disposition IS NULL OR r.send_disposition<>?)", (NOT_SENT_PROVEN,)).fetchall()
+    cont = db.execute(
+        "SELECT r.rid, r.kind, e.at FROM rounds r JOIN events e "
+        "ON e.rid=r.rid AND e.kind='auto_continue' "
+        "WHERE COALESCE((SELECT x.detail FROM events x WHERE x.rid=r.rid "
+        "AND x.kind='auto_continue_result' ORDER BY x.id DESC LIMIT 1), 'claimed')<>'not_sent'"
+    ).fetchall()
+    return [tuple(r) for r in (*base, *cont)]
+
+
+WEEK_S = 7 * 86400   # the rolling window every weekly figure uses; no reset day to configure
+_DONE = (COMPLETED_VERIFIED, COMPLETED_UNVERIFIED)
+
+
+def _title(prompt) -> str:
+    """The round's headline: the first line of the rendered prompt is always `# <title>`."""
+    for ln in (prompt or "").splitlines():
+        if ln.strip():
+            return ln.strip()[2:].strip()[:80] if ln.startswith("# ") else ""
+    return ""
+
+
+def _spec(raw) -> dict:
+    try:
+        v = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def week_view(db, now=None) -> dict:
+    """The rolling-7-day picture the weekly review and the SessionStart line both read. ONE
+    definition, over any sqlite3 connection onto the store (a read-only one is fine), so the two
+    surfaces cannot disagree. Pure reads: nothing here writes, migrates, or touches updated_at.
+
+    Windowed by instant, never by calendar: a message counts for 7 days after it was sent, so the
+    budget frees up continuously and there is no reset day to configure. Timestamps are all written
+    by _now() (UTC isoformat), so string comparison orders them."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    t0 = (now - datetime.timedelta(seconds=WEEK_S)).isoformat()
+    t1 = now.isoformat()
+    q = lambda sql, *args: db.execute(sql, args).fetchall()  # noqa: E731
+
+    spent = [m for m in spent_messages(db) if m[2] and m[2] >= t0]
+    ungraded = [{"rid": r[0], "title": _title(r[1]), "completed_at": r[2]} for r in q(
+        "SELECT r.rid, r.rendered_prompt, r.updated_at FROM rounds r "
+        "WHERE r.state IN (?,?) AND r.kind<>'retrieve' AND r.updated_at>=? "
+        "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.rid=r.rid AND e.kind='consult_outcome') "
+        "ORDER BY r.updated_at", *_DONE, t0)]
+    # A scheduled round waits with a future not_before and no gate retries; a gate-backoff requeue
+    # (gate_retry_count>0) also has a future not_before but is a transient retry, not backlog.
+    backlog = [{"rid": r[0], "title": _title(r[1]), "not_before": r[2],
+                "use_by": _spec(r[3]).get("consult_meta", {}).get("use_by")} for r in q(
+        "SELECT rid, rendered_prompt, not_before, spec_json FROM rounds "
+        "WHERE state=? AND not_before>? AND gate_retry_count=0 ORDER BY not_before", QUEUED, t1)]
+    expired = [{"rid": r[0], "title": _title(r[1]), "error": r[2]} for r in q(
+        "SELECT rid, rendered_prompt, error_code FROM rounds "
+        "WHERE state=? AND error_code LIKE 'expired: use-by%' AND updated_at>=? ORDER BY updated_at",
+        FAILED, t0)]
+
+    by_trigger, by_mention, useful = {}, {}, 0
+    for rid, detail, spec in q(
+            "SELECT e.rid, e.detail, r.spec_json FROM events e JOIN rounds r ON r.rid=e.rid "
+            "WHERE e.kind='consult_outcome' AND e.at>=? AND e.id=(SELECT max(x.id) FROM events x "
+            "WHERE x.rid=e.rid AND x.kind='consult_outcome')", t0):
+        sp = _spec(spec)
+        g = str(_spec(detail).get("grade"))
+        trig = (sp.get("consult_meta") or {}).get("trigger") or "none"
+        ment = "with_mention" if sp.get("mentions") else "without_mention"
+        for tally, k in ((by_trigger, trig), (by_mention, ment)):
+            tally.setdefault(k, {})[g] = tally.setdefault(k, {}).get(g, 0) + 1
+        useful += g in ("1", "2")
+
+    pol = q("SELECT detail, at FROM events WHERE kind='policy_update' AND at>=? "
+            "ORDER BY id DESC LIMIT 1", t0)
+    durs = []
+    for c, u in q("SELECT created_at, updated_at FROM rounds WHERE state IN (?,?)", *_DONE):
+        try:
+            d = (datetime.datetime.fromisoformat(u) - datetime.datetime.fromisoformat(c)).total_seconds()
+        except (TypeError, ValueError):
+            continue
+        if d > 0:
+            durs.append(d)
+    durs.sort()
+    try:
+        budget = int(os.environ.get("CGC_WEEKLY_BUDGET", "").strip())
+    except ValueError:
+        budget = None
+    return {
+        "window": {"from": t0, "to": t1, "days": 7},
+        "budget": {"weekly": budget, "spent": len(spent),
+                   "available": max(0, budget - len(spent)) if budget is not None else None,
+                   **({} if budget is not None else {"note": "budget unset (set CGC_WEEKLY_BUDGET)"})},
+        "ungraded": ungraded, "backlog": backlog, "expired": expired,
+        "grades": {"by_trigger": by_trigger, "by_mention": by_mention},
+        "useful": {"outcomes": useful,
+                   "per_spent_message": round(useful / len(spent), 3) if spent else None},
+        "policy_update": ({"happened": True, "at": pol[0][1], **_spec(pol[0][0])} if pol
+                          else {"happened": False}),
+        "latency_p50_s": durs[len(durs) // 2] if durs else None,
+    }
+
+
 def new_daemon_instance_id() -> str:
     """A fresh identity per daemon process — recorded on attempts so ownership is the daemon
     INSTANCE, not a reusable OS pid."""
@@ -488,12 +607,13 @@ class Store:
                      source_mode: str | None = None, out_path: str | None = None,
                      spec_json: str | None = None, prompt: str | None = None,
                      request_key: str | None = None, parent_rid: str | None = None,
-                     state: str = QUEUED) -> None:
+                     state: str = QUEUED, not_before: str | None = None) -> None:
         """Insert a new round. `prompt` (the exact rendered bytes to send) is stored on the round at
         enqueue, so the CLI receipt is just the rid and there is no prompt PATHNAME whose contents
         could drift before the gate reads them — the store row is the one copy. `request_key` is the
         caller's logical-request identity (unique where set — the idempotency anchor); `parent_rid`
-        records which consult a follow-up causally continues."""
+        records which consult a follow-up causally continues. `not_before` (UTC ISO-8601) schedules the
+        round: claim_ready will not pick it before that instant."""
         if state not in _LEGAL:
             raise ValueError(f"unknown initial state {state!r}")
         now = _now()
@@ -511,9 +631,9 @@ class Store:
             self.db.execute(
                 "INSERT INTO rounds(rid,thread_id,kind,source_mode,spec_json,rendered_prompt,"
                 "prompt_sha256,out_path,request_key,parent_rid,state,created_at,updated_at,"
-                "schema_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "schema_version,not_before) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rid, thread_id, kind, source_mode, spec_json, prompt, psha, out_path,
-                 request_key, parent_rid, state, now, now, SCHEMA_VERSION))
+                 request_key, parent_rid, state, now, now, SCHEMA_VERSION, not_before))
             self._event("created", rid=rid, detail=f"kind={kind} state={state}")
 
     def round_by_request_key(self, key: str) -> dict | None:
@@ -565,7 +685,7 @@ class Store:
                              thread_id: str | None = None, out_path: str | None = None,
                              spec_json: str | None = None, prompt: str | None = None,
                              request_key: str, parent_rid: str | None = None,
-                             state: str = QUEUED) -> None:
+                             state: str = QUEUED, not_before: str | None = None) -> None:
         """Atomically MOVE a request-key from a terminally-failed `old_rid` to a fresh successor
         round, in ONE transaction: clear the old row's key and INSERT the new row already holding it,
         so the UNIQUE key is never momentarily free for a concurrent retry to seize (the separate
@@ -596,9 +716,9 @@ class Store:
             self.db.execute(
                 "INSERT INTO rounds(rid,thread_id,kind,source_mode,spec_json,rendered_prompt,"
                 "prompt_sha256,out_path,request_key,parent_rid,state,created_at,updated_at,"
-                "schema_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "schema_version,not_before) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rid, thread_id, kind, None, spec_json, prompt, psha, out_path,
-                 request_key, parent_rid, state, now, now, SCHEMA_VERSION))
+                 request_key, parent_rid, state, now, now, SCHEMA_VERSION, not_before))
             self._event("created", rid=rid,
                         detail=f"kind={kind} state={state} (request-key transfer from {old_rid})")
 
@@ -1094,6 +1214,19 @@ class Store:
                detail: str | None = None) -> None:
         self.db.execute("INSERT INTO events(rid,attempt_id,kind,detail,at) VALUES(?,?,?,?,?)",
                         (rid, attempt_id, kind, detail, _now()))
+
+    def record_outcome(self, rid: str, outcome: dict) -> None:
+        """A local grade of one round's answer. An event, never a column: grading must not move
+        rounds.updated_at (completion-latency stats read it), needs no migration, and the LATEST
+        consult_outcome event per rid is the grade that stands."""
+        with self._tx():
+            self._event("consult_outcome", rid=rid, detail=json.dumps(outcome, sort_keys=True))
+
+    def record_policy_update(self, policy_rev: str, text: str) -> None:
+        """The record that the weekly review happened and what it changed."""
+        with self._tx():
+            self._event("policy_update",
+                        detail=json.dumps({"policy_rev": policy_rev, "text": text}, sort_keys=True))
 
     def events(self, rid: str) -> list[dict]:
         return [dict(r) for r in self.db.execute(

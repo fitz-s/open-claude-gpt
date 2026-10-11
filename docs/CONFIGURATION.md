@@ -40,6 +40,8 @@ Any of these can be set in the environment (they win over the config file), in a
 | `CGC_MODEL_FAMILY` | `GPT-6` | Which **model** to pin, a separate dimension from the tier. GPT-6's composer (shipped 2026-09-03) lists the model itself as radio items beside the power slider (`GPT-6` / `GPT-5.6 Sol` / `GPT-5.5`; the first was labelled `Latest` until 2026-10), so "Pro tier on GPT-5.5" is reachable and would otherwise satisfy every tier check while answering on a different model than the receipt names. Selected before the tier (changing the model re-renders the slider) and fails closed, naming the families the account actually offers — but only when the switcher's open menu carries family radios in the one layout the code recognizes; a build that renders them some other way is, like a build with none at all, silently not checked. Resolved and FROZEN into the round when you fire it, then passed to the browser driver on the argv: a queued job keeps the family you configured, not whatever the daemon's environment says by the time it runs. It is part of the request-key fingerprint too, so the same key under a different family conflicts instead of returning the earlier round's receipt. `skip` disables the check; per-consult override: `--model-family "GPT-5.6 Sol"` / `--model-family skip`. |
 | `CGC_MODEL_SLUG` | *(empty)* | Which **producing models** you accept, as a comma-separated list of `fnmatch` globs over ChatGPT's own slugs — `gpt-6-*,gpt-5-6-pro`. This is the third dimension and the only one read *after* the answer exists: `wait` takes `data-message-model-slug` off the answer's own assistant node, and the round records it as `model_slug` beside the pre-send `model_badge` (selection evidence — the two are never merged). A round whose slug matches no pattern is `attribution: mismatched` and `await` hands it to a human instead of returning it as auto-consumable. Empty (the default) records the slug and judges nothing — `attribution: unchecked`. Deliberately NOT derived from `CGC_MODEL_FAMILY`: those are the composer's UI labels and these are the provider's identifiers, nothing local knows the mapping, and a guessed table would fabricate exactly the certainty this field exists to stop fabricating. When the attribute is absent the round is `attribution: unknown` — a real outcome, never a mismatch and never a failure. |
 | `CGC_APPS` | `WebCodex Demo` | ChatGPT apps/plugins `fire --mention` knows, comma-separated. `consult.py apps` prints the list so an agent never has to guess what exists; a `--mention` that case-insensitively matches, or is a unique prefix of, one entry is rewritten to that entry's spelling. Unlisted names still go through — the composer's @ popup is the authority, and when it offers no match the round fails closed pre-send with `mention_not_found`, naming the apps the popup did offer. |
+| `CGC_WORKSPACES` | *(empty)* | The local WebCodex workspaces you registered, comma-separated. An agent cannot see that registry, so this list is how it knows when `fire --workspace NAME --mention "WebCodex Demo"` applies. `consult.py apps` prints it as `"workspaces"` next to `"apps"`; once set, a `--workspace` that case-insensitively matches, or is a unique prefix of, one entry is rewritten to that entry's spelling. Unlisted names still go through. |
+| `CGC_WEEKLY_BUDGET` | *(unset)* | Your weekly ChatGPT Pro message allowance, as a number. `stats --week` and the SessionStart line compare the last 7 days of *potentially spent* messages against it ("18 of 50 used · 32 available"). Unset, they show the spend and say "budget unset". Recording only: nothing is ever refused because of it. |
 | `CGC_AUTO_APPROVE` | *(= `CGC_APPS`)* | ChatGPT apps whose approval card ("Allow file materialization?" — `[Deny] [Allow once]`) the waiter answers by itself. ChatGPT has no standing grant for these cards (a plugin's "Allow all tools" does not cover them), and an unanswered card stalls the round. The waiter already polls the consult's own tab, so it clicks "Allow once" there with a page-level `element.click()` over CDP: no mouse, no focus change, no other tab touched, so concurrent consults and your foreground work are undisturbed. A card is only answered when one line of its own text (≤400 chars, so the prompt cannot lend it a name) is exactly a listed app's name, case-insensitively — `WebCodex Demo Clone` never rides on `WebCodex Demo`; any other app's card, or one still showing after 5 clicks, ends the wait as `approval_needed` for a human. `off` disables it. |
 | `CGC_PORT` | `9333` | Remote-debugging port of the dedicated Chrome. Must be free. |
 | `CGC_PROFILE` | `~/.cgc-chrome` | Dedicated Chrome profile dir. Kept separate from your normal Chrome (CDP is disallowed on the default profile since Chrome 136). |
@@ -137,6 +139,61 @@ ways, from least to most invasive:
 - `--context-file <path>` — **supplementary** local context (failure bundles, perf numbers, an external design position). Not a substitute for a code link.
 - `--output-file <path>` — a custom output contract for non-review consults (a plan's ordered phases, a design's tradeoff matrix, a bug's ranked hypotheses).
 - `--output-replace` — when your `--output-file` defines its own findings shape/severity scale, this swaps out the default findings contract so the two don't collide.
+
+- `--workspace NAME` — the evidence is in a local WebCodex workspace, not in a pushed repo. It stands in for the code link the source rule otherwise demands (so the round no longer has to claim `--no-code`), and **requires at least one `--mention`**, because the remote model reaches the workspace only through the app. The prompt gains one short block: ``Source: local workspace `NAME`, reachable through the "<app>" app's tools; state the revision/as-of time you read.`` Every secret-shape, gist and URL-provenance gate runs unchanged; `--workspace` alone, or with `--no-code`, is refused before anything is queued. Add `--repo/--pr/--ref` too and the links ship beside it.
+
+### Intent and schedule flags on `fire`
+
+All optional, all local bookkeeping: none of it is rendered into the prompt.
+
+| Flag | Meaning |
+| --- | --- |
+| `--origin {agent,user}` | Who decided to fire: the agent on its own initiative, or the user asked. |
+| `--trigger {premise-conflict,workspace-evidence,design-fork,math,competing-causes,reviewer-disagreement,external-contract,writing,research,review,other}` | Which activation trigger applied. `stats --week` grades per trigger. |
+| `--decision TEXT` | The action this answer can change. |
+| `--baseline TEXT` | The current local or gpt-sol answer, frozen *before* the answer arrives. |
+| `--check TEXT` | How the result will be judged. |
+| `--not-before ISO8601\|+DURATION` | The daemon will not send before this time (`+90m`, `+2h`, `+1d`, `+1h30m`, or e.g. `2026-10-12T09:00:00+08:00`; a time without an offset is your local time). A complete question can wait in the backlog. To move it, `cancel` and re-fire. |
+| `--use-by ISO8601\|+DURATION` | Past this time the round never sends. At dispatch it ends `failed` with `expired: use-by <t> passed before send`, stamped not-sent-proven, so it is not counted as a spent message and its `--request-key` is free again. A `refire` replays the intent but not the deadline. |
+
+They are stored in the round's `spec_json` under `consult_meta`, together with `policy_rev`, added
+automatically: the first 12 hex digits of the sha256 over `SKILL.md`, `ACTIVATION.md` and the prompt
+templates as they were when you fired. The five intent flags join the `--request-key` fingerprint only
+when set (so existing keys keep theirs); `policy_rev` and the schedule never do.
+
+### Grading and the weekly view
+
+```bash
+cgc feedback --rid R --grade {-1,0,1,2} \
+  --reason {useful,decision-changed,defect-caught,duplicate,late,refuted,unused,transport,missing-source,wrong} \
+  --action "what you did with the answer" [--evidence "commit SHA / test / file / acceptance judgment"]
+cgc feedback --policy "what rule changed and why"      # records that the weekly review happened
+cgc stats --week                                       # the rolling 7-day view
+```
+
+`feedback` is local (no network, no browser) and writes a `consult_outcome` event; the latest event
+for a round is the grade that stands. A grade of 1 or 2 **requires `--evidence`**; an unknown rid is
+refused; a `retrieve` round's grade lands on the round it recovered. It never touches
+`rounds.updated_at`, so latency stats are unaffected. `--policy` writes a `policy_update` event
+stamped with the current `policy_rev` and takes no other flag.
+
+`stats --week` covers the **last 7 days, rolling** (a message counts for 7 days after it was sent, so
+the budget frees up continuously; there is no reset day): potentially spent messages vs
+`CGC_WEEKLY_BUDGET`, completed answers with no grade (rid and title), the ready backlog and expired
+rounds, grade counts by trigger and by with/without `--mention`, useful outcomes (grade 1 or 2) per
+spent message, and whether a `policy_update` was recorded. Plain `stats` keeps its shape; its
+`messages` block now reports `potentially_spent`, which counts one message per base send **plus one
+per automatic continue that landed, was unsure, or never recorded a result** (a `not_sent` continue and
+a `retrieve` count zero), and `free` is the number of rounds that spent nothing.
+
+### The SessionStart line
+
+`cgc activation-hook --install` points the hook at `cgc_activation.py snapshot`, which prints
+`ACTIVATION.md` and then one line, e.g. `Consult budget: 18 of 50 used (rolling 7d) · 32 available · 2
+ready in backlog · 3 answers awaiting grade (cgc feedback) · p50 28m · weekly review due`. It opens the
+store read-only (`mode=ro`), makes no network or browser call, is cut off after 0.8 s, and on any error
+prints the note alone (plus the visible `WARNING` if `ACTIVATION.md` is missing) and exits 0. Re-running
+`--install` upgrades an already-installed hook in place.
 
 ### 2. Edit the templates (repo-wide default)
 

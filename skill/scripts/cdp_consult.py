@@ -2261,6 +2261,7 @@ _CODE_URL_RE = re.compile(
 # no_code_source. Keep this predicate in lockstep with cgc_spool.validate_prompt's rule 1.
 _FOLLOWUP_SENTINEL = "continuing this consult"
 _NO_CODE_SENTINEL = "references no code"
+_WORKSPACE_SENTINEL = "source: local workspace `"   # `fire --workspace`: evidence is in a local workspace
 
 
 def _has_sendable_source(prompt: str) -> bool:
@@ -2270,7 +2271,8 @@ def _has_sendable_source(prompt: str) -> bool:
     low = prompt.lower()
     return (bool(_CODE_URL_RE.search(prompt))
             or _FOLLOWUP_SENTINEL in low
-            or _NO_CODE_SENTINEL in low)
+            or _NO_CODE_SENTINEL in low
+            or _WORKSPACE_SENTINEL in low)
 
 
 def _egress_gate(prompt: str):

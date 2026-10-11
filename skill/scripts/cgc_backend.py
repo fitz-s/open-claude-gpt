@@ -213,12 +213,8 @@ def stats_report() -> int:
             return None
 
     with store_mod.Store() as s:
-        # `charged` is DERIVED, not stored — see the ledger note below.
-        rows = [dict(r) for r in s.db.execute(
-            "SELECT state, kind, created_at, updated_at, "
-            "       (EXISTS(SELECT 1 FROM attempts a WHERE a.rid = rounds.rid) "
-            "        AND (send_disposition IS NULL OR send_disposition <> ?)) AS charged "
-            "FROM rounds", (store_mod.NOT_SENT_PROVEN,))]
+        rows = [dict(r) for r in s.db.execute("SELECT state, kind, created_at, updated_at FROM rounds")]
+        spent = store_mod.spent_messages(s.db)
     total = len(rows)
     by = {}
     for r in rows:
@@ -238,35 +234,31 @@ def stats_report() -> int:
 
     # ---- the message ledger ----------------------------------------------------------------
     # A ChatGPT Pro plan allows tens of messages a week, so "how many did we actually spend" is a
-    # fact worth being able to read. It needs NO new column: the store already answers it exactly.
-    # A round consumed a paid message iff it crossed the send fence and is not durably proven to
-    # have stopped short of the click — that is, an `attempts` row exists (begin_send is its only
-    # writer and the only path into `sending`) AND send_disposition is not NOT_SENT_PROVEN. Both
-    # halves are the same evidence _release_eligible already trusts to decide whether a retry may
-    # reuse a request-key, which is a strictly higher bar than accounting needs.
-    # Consequences, all correct and all deliberate: a `retrieve` counts zero (it attaches read-only
-    # and never calls begin_send, so it has no attempt row — no special case for it here); a
-    # gate-rejected or cancelled-while-queued round counts zero; an UNCERTAIN send counts one,
-    # because the click may have landed and the honest ledger charges for what may have been spent.
+    # fact worth being able to read. It needs NO new column: the store already answers it exactly —
+    # see store_mod.spent_messages for what counts (a base send that crossed the fence without a
+    # not-sent proof, plus an automatic continue that landed, is unsure, or never recorded a result).
+    # Consequences, all correct and all deliberate: a `retrieve` counts zero; a gate-rejected or
+    # cancelled-while-queued round counts zero; an UNCERTAIN send counts one, because the click may
+    # have landed and the honest ledger charges for what may have been spent. Messages can exceed
+    # rounds, so `free` is the number of ROUNDS that provably spent nothing, not total - spent.
     # RECORDING ONLY — nothing here reserves, admits, throttles or refuses. A number to read.
-    charged = sum(1 for r in rows if r["charged"])
-    charged_by_kind = {}
-    for r in rows:
-        if r["charged"]:
-            k = r["kind"] or "unknown"
-            charged_by_kind[k] = charged_by_kind.get(k, 0) + 1
+    spent_by_kind = {}
+    for _rid, k, _at in spent:
+        spent_by_kind[k or "unknown"] = spent_by_kind.get(k or "unknown", 0) + 1
+    spent_rids = {x[0] for x in spent}
+    free = total - len(spent_rids)
 
     report = {
         "rounds": total, "by_state": by,
         "completed": completed, "failed": fail,
         "unverified_rate": round(unv_rate, 3) if unv_rate is not None else None,
         "latency_s": {"p50": _pct(0.50), "p90": _pct(0.90), "n": len(durations)},
-        "messages": {"charged": charged, "free": total - charged, "by_kind": charged_by_kind},
+        "messages": {"potentially_spent": len(spent), "free": free, "by_kind": spent_by_kind},
     }
     print(json.dumps(report))
     if total:
-        sys.stderr.write(f"CGC_STATS {charged} of {total} rounds may have spent a paid message "
-                         f"({total - charged} provably did not) — {charged_by_kind or '{}'}.\n")
+        sys.stderr.write(f"CGC_STATS {len(spent)} potentially spent messages across {total} rounds "
+                         f"({free} rounds provably spent none) — {spent_by_kind or '{}'}.\n")
     if completed:
         sys.stderr.write(f"CGC_STATS {completed} completed ({ok} verified / {unv} unverified), "
                          f"{fail} failed, of {total} rounds.\n")
@@ -282,6 +274,94 @@ def stats_report() -> int:
                 "drift: check a recent answer file for truncation and consider re-testing the "
                 "prompt template.\n")
     return 0
+
+
+def week_report() -> int:
+    """`stats --week`: the rolling-7-day budget, backlog, grading and policy picture. JSON on
+    stdout, a short human digest on stderr — same shape as `stats`. See store_mod.week_view."""
+    with store_mod.Store() as s:
+        w = store_mod.week_view(s.db)
+    print(json.dumps(w))
+    b = w["budget"]
+    sys.stderr.write(
+        f"CGC_WEEK {b['spent']} potentially spent messages in the last 7 days — "
+        + (f"{b['available']} of {b['weekly']} available" if b["weekly"] is not None
+           else b["note"]) + f"; {w['useful']['outcomes']} useful outcome(s)"
+        + (f" ({w['useful']['per_spent_message']}/message)" if w["useful"]["per_spent_message"]
+           is not None else "") + ".\n")
+    for r in w["ungraded"]:
+        sys.stderr.write(f"CGC_WEEK ungraded {r['rid']}  {r['title']}\n")
+    for r in w["backlog"]:
+        sys.stderr.write(f"CGC_WEEK backlog {r['rid']}  not before {r['not_before']}  {r['title']}\n")
+    for r in w["expired"]:
+        sys.stderr.write(f"CGC_WEEK expired {r['rid']}  {r['title']}\n")
+    sys.stderr.write("CGC_WEEK policy review " + ("done this week." if w["policy_update"]["happened"]
+                                                  else "NOT done this week: feedback --policy \"...\"") + "\n")
+    return 0
+
+
+FEEDBACK_REASONS = ("useful", "decision-changed", "defect-caught", "duplicate", "late", "refuted",
+                    "unused", "transport", "missing-source", "wrong")
+
+
+def record_feedback(a) -> int:
+    """`feedback`: grade one round's answer, or record the weekly policy review. LOCAL only — an
+    event in the store, no network, no browser. Refuses what would corrupt the signal: an unknown
+    rid, and a positive grade with no evidence (reassurance alone earns 0)."""
+    def refuse(code, msg):
+        sys.stderr.write(f"CGC_ERROR {code}: {msg}\n")
+        return 2
+
+    if a.policy is not None:
+        if any(v is not None for v in (a.rid, a.grade, a.reason, a.action, a.evidence)):
+            return refuse("feedback_mixed", "--policy records the weekly review and takes no other "
+                                            "flag; grade a round in a separate call.")
+        text = a.policy.strip()
+        if not text:
+            return refuse("policy_empty", "--policy needs the text of what changed and why.")
+        import consult as _consult
+        rev = _consult.policy_rev()
+        with store_mod.Store() as s:
+            s.record_policy_update(rev, text)
+        print(json.dumps({"recorded": "policy_update", "policy_rev": rev}))
+        return 0
+
+    missing = [f"--{n}" for n in ("rid", "grade", "reason", "action")
+               if getattr(a, n) in (None, "")]
+    if missing:
+        return refuse("feedback_incomplete", f"{', '.join(missing)} required (or --policy \"...\").")
+    evidence = (a.evidence or "").strip()
+    if a.grade >= 1 and not evidence:
+        return refuse("evidence_required", "a grade of 1 or 2 needs --evidence: a commit SHA, a test, "
+                                           "a file, or a concrete acceptance judgment. If you cannot "
+                                           "name one, the answer earned 0.")
+    with store_mod.Store() as s:
+        row = s.get_round(a.rid)
+        if row is None:
+            return refuse("no_such_round", f"{a.rid} is not in the store.")
+        target = a.rid
+        if row["kind"] == "retrieve":
+            # A retrieve recovers ANOTHER round's answer, and the store links them through
+            # parent_rid; the answer being judged is the source's.
+            target = row.get("parent_rid") or _spec_of(row).get("parent_rid")
+            if not target or s.get_round(target) is None:
+                return refuse("retrieve_source_unknown",
+                              f"{a.rid} is a retrieve whose source round is not in the store.")
+        detail = {"grade": a.grade, "reason": a.reason, "action": a.action.strip()}
+        if evidence:
+            detail["evidence"] = evidence
+        if target != a.rid:
+            detail["via_retrieve"] = a.rid
+        s.record_outcome(target, detail)
+    print(json.dumps({"recorded": "consult_outcome", "rid": target, **detail}))
+    return 0
+
+
+def _spec_of(row) -> dict:
+    try:
+        return json.loads(row.get("spec_json") or "{}")
+    except ValueError:
+        return {}
 
 
 # ---- enqueue -----------------------------------------------------------------
@@ -305,6 +385,20 @@ def _spec_mentions(a) -> list:
     """ChatGPT apps to @mention before the prompt, frozen into the spec like the model: they route
     the request to a different tool, so they are part of the request, not of the runtime."""
     return [m for m in (getattr(a, "mentions", None) or []) if m]
+
+
+# The caller's declared intent for a consult (fire --origin/--trigger/--decision/--baseline/--check).
+# Local bookkeeping for the feedback loop, never rendered into the prompt. These five, and only when
+# set, are part of a request's identity. policy_rev (derived from install state, not caller intent)
+# and the schedule (use_by, not_before) deliberately are not: an idempotent retry must not conflict
+# because SKILL.md was edited since, or because a relative `+2h` resolved a minute later.
+_INTENT_KEYS = ("origin", "trigger", "decision", "baseline", "check")
+
+
+def _spec_consult_meta(a) -> dict:
+    """The round's consult_meta as frozen into spec_json; {} when the caller supplied none (a
+    low-level enqueue), so such rounds' specs stay byte-identical to before."""
+    return dict(getattr(a, "consult_meta", None) or {})
 
 
 def _request_fingerprint(a, prompt: str) -> str:
@@ -340,6 +434,9 @@ def _request_fingerprint(a, prompt: str) -> str:
     }
     if _spec_mentions(a):  # only when set, so every existing request-key keeps its fingerprint
         fp["mentions"] = _spec_mentions(a)
+    intent = {k: v for k, v in _spec_consult_meta(a).items() if k in _INTENT_KEYS and v}
+    if intent:  # likewise only when set
+        fp["consult_meta"] = intent
     return store_mod.sha256(json.dumps(fp, sort_keys=True))
 
 
@@ -375,7 +472,7 @@ def _release_eligible(s, prior: dict) -> bool:
     return not s.has_send_attempt(prior["rid"])
 
 
-def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str):
+def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str, a):
     """Decide what a repeated request-key means. FINGERPRINT FIRST, always: a different logical
     request under the same key is a conflict REGARDLESS of the prior's state — one key names one
     intent, and releasing a key before comparing (the S3 defect) let a different request reuse it
@@ -393,7 +490,13 @@ def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str):
         that will never move again.
 
     Returns 0 (idempotent receipt printed), 2 (conflict), or prior['rid'] (str) — the row to
-    transfer the key FROM into a fresh successor."""
+    transfer the key FROM into a fresh successor.
+
+    On the 0 outcome the round that exists is the PRIOR one, not the one the caller just rendered
+    (a re-fire mints a fresh rid, and nothing was queued under it). The caller's namespace `a` is
+    therefore re-pointed at the matched round — rid and answer path — the same way cmd_enqueue
+    re-points `a.rid` at the rid its prompt carries, so a caller that goes on to build an `await`
+    from `a` names a row that exists."""
     pspec = json.loads(prior["spec_json"]) if prior.get("spec_json") else {}
     if pspec.get("request_fingerprint") != fingerprint:
         sys.stderr.write(f"CGC_ERROR request_key_conflict: request-key {rkey!r} was already "
@@ -415,6 +518,7 @@ def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str):
             f"--rid {prior['rid']} --not-sent --evidence \"...\"` if you have verified it never "
             "sent — or use a new key.\n")
         return 2
+    a.rid, a.out = prior["rid"], prior["out_path"] or out
     sys.stderr.write(f"CGC_IDEMPOTENT request-key {rkey!r} already enqueued as "
                      f"{prior['rid']} — returning the original receipt, nothing new "
                      "queued.\n")
@@ -460,18 +564,21 @@ def _enqueue_transfer(s, a, prompt: str, out: str, prior: dict, fingerprint: str
             "model_family": _spec_model_family(a), "mentions": _spec_mentions(a),
             "conversation": inh_conv, "parent_rid": inh_parent, "poll": getattr(a, "poll", None),
             "timeout": getattr(a, "timeout", None), "request_fingerprint": fingerprint}
+    if _spec_consult_meta(a):
+        spec["consult_meta"] = _spec_consult_meta(a)
     thread = inh_conv if inh_conv not in (None, "auto", "last") else None
     try:
         s.transfer_request_key(prior["rid"], rid=a.rid, kind=a.kind, thread_id=thread,
                                out_path=out, spec_json=json.dumps(spec), prompt=prompt,
-                               request_key=rkey, parent_rid=inh_parent)
+                               request_key=rkey, parent_rid=inh_parent,
+                               not_before=getattr(a, "not_before", None))
     except store_mod.RequestKeyRaced:
         # A concurrent retry moved the key first — re-resolve to the current owner (the winner) and
         # take its receipt, so exactly one successor ever owns the key.
         winner = s.round_by_request_key(rkey)
         if winner is None:
             raise
-        res = _idempotent_receipt(s, winner, fingerprint, rkey, out)
+        res = _idempotent_receipt(s, winner, fingerprint, rkey, out, a)
         if isinstance(res, int):
             return res
         return _enqueue_transfer(s, a, prompt, out, winner, fingerprint, rkey)
@@ -534,7 +641,7 @@ def enqueue_round(a, prompt: str, out: str) -> int:
         if rkey:
             prior = s.round_by_request_key(rkey)
             if prior is not None:
-                res = _idempotent_receipt(s, prior, fingerprint, rkey, out)
+                res = _idempotent_receipt(s, prior, fingerprint, rkey, out, a)
                 if isinstance(res, int):
                     return res
                 # res is the prior rid → move its released key onto this retry, atomically.
@@ -666,10 +773,13 @@ def enqueue_round(a, prompt: str, out: str) -> int:
                 "model_family": _spec_model_family(a), "mentions": _spec_mentions(a),
                 "conversation": conv, "parent_rid": parent, "poll": getattr(a, "poll", None),
                 "timeout": getattr(a, "timeout", None), "request_fingerprint": fingerprint}
+        if _spec_consult_meta(a):
+            spec["consult_meta"] = _spec_consult_meta(a)
         thread = conv if conv not in (None, "auto", "last") else None
         try:
             s.create_round(a.rid, a.kind, thread_id=thread, out_path=out, prompt=prompt,
-                           spec_json=json.dumps(spec), request_key=rkey, parent_rid=parent)
+                           spec_json=json.dumps(spec), request_key=rkey, parent_rid=parent,
+                           not_before=getattr(a, "not_before", None))
         except sqlite3.IntegrityError:
             # Two concurrent enqueues with the same key both saw "no prior row"; the unique index
             # on request_key made exactly one insert win. The loser resolves DETERMINISTICALLY to
@@ -678,7 +788,7 @@ def enqueue_round(a, prompt: str, out: str) -> int:
             prior = s.round_by_request_key(rkey) if rkey else None
             if prior is None:
                 raise
-            res = _idempotent_receipt(s, prior, fingerprint, rkey, out)
+            res = _idempotent_receipt(s, prior, fingerprint, rkey, out, a)
             if isinstance(res, int):
                 return res
             # the racing winner had itself terminally failed proven-not-sent — its key is released;
@@ -802,7 +912,10 @@ def refire_round(old_rid: str) -> int:
         conversation=pspec.get("conversation"),
         parent=pspec.get("parent_rid") or prior.get("parent_rid"),
         poll=pspec.get("poll"), timeout=pspec.get("timeout"),
-        request_key=None, logical_sha=None, out=None, quiet=False)
+        request_key=None, logical_sha=None, out=None, quiet=False,
+        # The intent and policy_rev replay with the request. use_by does not: an expired round is
+        # exactly what an operator refires, and the same deadline would expire it again.
+        consult_meta={k: v for k, v in (pspec.get("consult_meta") or {}).items() if k != "use_by"})
     out = os.path.abspath(_spool.default_out(new_rid))
     sys.stderr.write(f"CGC_REFIRE {old_rid} -> {new_rid}: replaying its stored prompt as a fresh "
                      f"{prior['kind']} round.\n")
@@ -1158,6 +1271,43 @@ def _publish_answer(store, rid: str, text: str) -> None:
 
 
 # ---- the worker --------------------------------------------------------------
+def _expired(use_by: str) -> bool:
+    """True iff the ISO-8601 instant `use_by` has passed. An unparseable value is not expiry: the
+    deadline was validated at fire time, and a malformed one must never silently eat a paid round."""
+    try:
+        t = datetime.datetime.fromisoformat(use_by)
+    except (TypeError, ValueError):
+        return False
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return t <= datetime.datetime.now(datetime.timezone.utc)
+
+
+def _use_by(spec: dict):
+    return (spec.get("consult_meta") or {}).get("use_by")
+
+
+def _use_by_passed(spec: dict) -> bool:
+    use_by = _use_by(spec)
+    return bool(use_by) and _expired(use_by)
+
+
+def _expire_if_due(store, rid: str, spec: dict) -> bool:
+    """`fire --use-by T`: a round whose answer is useless after T never sends after it. Fails a READY
+    round past its deadline and returns True. Called at entry AND again immediately before each
+    begin_send, because the gate's gh calls and the conversation-lease wait both sit in between and
+    can run past T. Every call site is strictly pre-send (no attempts row yet), so the failure is
+    pre-send by construction: stamped not_sent_proven, which keeps it out of the message ledger and
+    releases its request-key."""
+    use_by = _use_by(spec)
+    if not (use_by and _expired(use_by)):
+        return False
+    store.set_state(rid, store_mod.FAILED, expect=store_mod.READY,
+                    send_disposition=store_mod.NOT_SENT_PROVEN,
+                    error_code=f"expired: use-by {use_by} passed before send")
+    return True
+
+
 def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate) -> str:
     """Drive one claimed (`ready`) round to a terminal or uncertain state. `run_cdp` is injected (the
     daemon wraps cdp_consult subprocesses; tests stub it); `validate(prompt) -> (ok, reason)` is the
@@ -1165,6 +1315,11 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
     rid = r["rid"]
     prompt = r["rendered_prompt"] or ""
     spec = json.loads(r["spec_json"]) if r.get("spec_json") else {}
+
+    # The one dispatch point every send passes through (a fresh claim, a gate-backoff requeue, a
+    # ready-orphan); re-checked right before each begin_send below.
+    if _expire_if_due(store, rid, spec):
+        return store_mod.FAILED
 
     # retrieve: attach to an existing conversation and wait — no gate, no send (nothing leaves).
     # It pins the SOURCE round's rid (spec["parent_rid"], from --parent at enqueue) and hands it to
@@ -1224,6 +1379,8 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         if conv_lease is None:
             raise ConversationLeaseRefused(conv)
         try:
+            if _expire_if_due(store, rid, spec):   # the lease may have been contended for a while
+                return store_mod.FAILED
             attempt = store.begin_send(rid, prompt, store_mod.sha256(prompt),
                                        daemon_instance_id=daemon_instance_id)
             # SEND only (not send+wait): so the round reaches `waiting` promptly and is reattach-able on
@@ -1277,6 +1434,8 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
     if gated is not None:
         return gated
 
+    if _expire_if_due(store, rid, spec):           # the gate's gh calls may have run past use-by
+        return store_mod.FAILED
     attempt = store.begin_send(rid, prompt, store_mod.sha256(prompt),
                                daemon_instance_id=daemon_instance_id)
     sub = run_cdp("submit", rid=rid, prompt=prompt,
@@ -1466,6 +1625,12 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
       "unsure"   the click may have happened (timeout, crash, unconfirmed echo)."""
     import cgc_spool as _spool
     prompt = _continue_prompt(rid)
+    if _use_by_passed(spec):
+        # The answer is worthless past use-by, and a continue is a second paid message for it.
+        # Declined BEFORE the claim, so no auto_continue event exists and nothing is charged; the
+        # round then ends turn_failed exactly as any declined continue does (see _wait_phase).
+        sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — use-by {_use_by(spec)} passed.\n")
+        return "not_sent"
     if not _spool.is_canonical_conversation(conv):
         return "not_sent"
     ok, why = _spool.validate_prompt(prompt)   # the same egress gate every send passes
@@ -1499,6 +1664,10 @@ def _send_continue(store, rid, conv, spec, run_cdp, prompt) -> str:
                          f"{conv} for {CONTINUE_LEASE_WAIT_S}s.\n")
         return "not_sent"
     try:
+        if _use_by_passed(spec):                 # the lease wait (up to 60 s) may have crossed it
+            sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — use-by {_use_by(spec)} "
+                             "passed while waiting for the conversation.\n")
+            return "not_sent"
         newer = _newer_send(store, rid, conv)    # again: a sibling may have sent while we waited
         if newer:
             sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — {newer['rid']} was sent into "
@@ -1623,7 +1792,9 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
         store.finish(rid, store_mod.FAILED,
                      error_code=(_stderr_error_line(res.get("stderr") or "") or "turn_failed")
                      + (" — the one automatic continue also failed" if went_out else
-                        " — no automatic continue went out")
+                        " — no automatic continue went out"
+                        + (f" (expired: use-by {_use_by(spec)} passed)" if _use_by_passed(spec)
+                           else ""))
                      + "; re-fire with a NEW --request-key only if the answer is still needed.")
         return store_mod.FAILED
     if is_retrieve:
