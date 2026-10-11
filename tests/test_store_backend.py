@@ -1386,6 +1386,42 @@ class TestTurnCanonicalRid:
         text = f"BEGIN_RESPONSE:{a}\nsome text\nEND_RESPONSE:{b}\n"
         assert cdp._turn_canonical_rid(text) is None
 
+    # ---- the head marker: a plain first line `CGC_RID:<rid>` (ChatGPT never collapses the head) ----
+    R1, R2 = "REQ-20260707-120000-0aaa01", "REQ-20260707-120500-0bbb01"
+
+    def test_the_head_marker_names_the_turn_with_no_tail_pair(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        assert cdp._turn_canonical_rid(f"CGC_RID:{self.R2}\n# a collapsed turn's head\n") == self.R2
+        assert cdp._turn_canonical_rid(f"\n  CGC_RID:{self.R2}  \r\n# t\n") == self.R2
+
+    def test_the_marker_and_a_tail_pair_of_the_same_rid_agree(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        r2 = self.R2
+        assert cdp._turn_canonical_rid(f"CGC_RID:{r2}\n# t\nBEGIN_RESPONSE:{r2}\nx\nEND_RESPONSE:{r2}\n") == r2
+
+    def test_a_marker_that_disagrees_with_the_tail_pair_yields_none(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        r1, r2 = self.R1, self.R2
+        assert cdp._turn_canonical_rid(f"CGC_RID:{r1}\n# t\nBEGIN_RESPONSE:{r2}\nx\nEND_RESPONSE:{r2}\n") is None
+
+    def test_a_quoted_incomplete_tail_does_not_unseat_the_marker(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        r1, r2 = self.R1, self.R2
+        assert cdp._turn_canonical_rid(f"CGC_RID:{r2}\nquotes BEGIN_RESPONSE:{r1}\n") == r2
+
+    def test_only_the_first_non_blank_line_can_be_the_marker(self, tmp_path):
+        """A marker quoted later in the task text is just text: the prompt's own head is the claim."""
+        cdp = self._cdp(tmp_path)
+        assert cdp._turn_canonical_rid(f"# t\nCGC_RID:{self.R1}\n") is None
+        assert cdp._turn_canonical_rid(f"CGC_RID:{self.R2}\nCGC_RID:{self.R1}\n") == self.R2
+
+    def test_a_malformed_marker_is_not_a_marker(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        r2 = self.R2
+        assert cdp._turn_canonical_rid(f"CGC_RID:{r2}x\n# t\n") is None
+        assert cdp._turn_canonical_rid(f"cgc_rid:{r2}\n# t\n") is None
+        assert cdp._turn_canonical_rid("CGC_RID:not-a-rid\n# t\n") is None
+
 
 class TestKeyReleaseRequiresNoSendProof:
     """Audit S3: a request-key releases to a retry ONLY when the store DURABLY proves the prior

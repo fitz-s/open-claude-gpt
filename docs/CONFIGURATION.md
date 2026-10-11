@@ -204,7 +204,9 @@ Two string templates drive every consult:
 - `DEFAULT_OUTPUT_BODY` / `REPLACE_OUTPUT_CLOSE` — the default vs. custom Output-section body.
 
 Edit these to change the house style (e.g. tighten the success criteria, change
-the default severity scale, add a project convention). Keep the
+the default severity scale, add a project convention). Keep the first line
+`CGC_RID:{rid}` (`RID_MARKER`) too: ChatGPT collapses a long prompt to its head,
+and that line is the only place a collapsed turn still carries its rid. Keep the
 `BEGIN_RESPONSE:{rid}` / `END_RESPONSE:{rid}` sentinel block **exactly** — the
 parser is **line-anchored AND fence-aware**. Completion fires only when an
 **unfenced** standalone trimmed line equals `BEGIN_RESPONSE:<rid>` and a later

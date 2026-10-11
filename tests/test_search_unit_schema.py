@@ -159,43 +159,95 @@ def test_an_answer_line_that_starts_like_a_failure_is_not_a_failure():
 # kept 10098 chars in the DOM), and the template's sentinel pair is the LAST thing in the render, so
 # the collapsed turn never carried the rid. The send had landed and the answer finished, but the
 # contract saw {search-unit-v1: users 1, assistants 0, ridLanded false} -> unknown_send, and the
-# waiter and the retrieve read `rid_absent` beside a complete answer. The full message the composer
-# sent stays on the turn's React item (props.item.message), two fibers above the unit.
-def _collapsed(rid, *, fiber=True, collapsed=True, answered=False):
-    head = "P('# Round 7'),P('the head that survives the collapse…')"
+# waiter and the retrieve read `rid_absent` beside a complete answer. The fix is in the part that is
+# never collapsed: every prompt now OPENS with a plain `CGC_RID:<rid>` line, and a turn's own rid is
+# that line (cdp_consult._turn_canonical_rid). The turn's React state is not consulted — which fiber
+# or ancestor is current cannot be known from a DOM node (a reused node updated R1 -> R2 kept R1 on
+# its fiber), so a stale item attached below must change nothing.
+def _collapsed(rid, *, marker=True, collapsed=True, answered=False, stale_item=None, tail=None):
+    """One user turn. marker: the head opens with CGC_RID:<rid>. collapsed: a Show more button.
+    tail: a rid whose BEGIN/END pair still shows in the DOM (a collapsed turn has none).
+    stale_item: a rid whose full message a React fiber carries on this node (it must be ignored)."""
+    head = ("P('CGC_RID:%s')," % rid if marker else "") + "P('# Round 7'),P('the head that survives the collapse…')"
     button = ",E('BUTTON',{'aria-expanded':'false'},[],'Show more')" if collapsed else ""
-    full = "# Round 7\nthe head that survives the collapse…\nthe hidden tail\nBEGIN_RESPONSE:%s\n<full answer>\nEND_RESPONSE:%s" % (rid, rid)
-    item = json.dumps({"message": full})
-    unit_fiber = ("U['__reactFiber$x']={memoizedProps:{},return:{memoizedProps:{},return:"
-                  "{memoizedProps:{item:%s}}}};" % item) if fiber else ""
-    answer = ",unit('t7:2:assistant',[md(['BEGIN_RESPONSE:%s','the verdict','END_RESPONSE:%s'])])" % (rid, rid) if answered else ""
-    return ("var U=unit('t7:0:user',[%s%s]);%s"
+    pair = (",P('BEGIN_RESPONSE:%s'),P('<full answer>'),P('END_RESPONSE:%s')" % (tail, tail)) if tail else ""
+    item = json.dumps({"message": "CGC_RID:%s\n# Round 7\nthe hidden tail\nBEGIN_RESPONSE:%s\n<full answer>\n"
+                                  "END_RESPONSE:%s" % ((stale_item,) * 3)}) if stale_item else None
+    fiber = ("U['__reactFiber$x']={memoizedProps:{},return:{memoizedProps:{},return:"
+             "{memoizedProps:{item:%s}}}};" % item) if item else ""
+    answer = (",unit('t7:2:assistant',[md(['BEGIN_RESPONSE:%s','the verdict','END_RESPONSE:%s'])])" % (rid, rid)
+              if answered else "")
+    return ("var U=unit('t7:0:user',[%s%s%s]);%s"
             "var ROOT=E('MAIN',{},[E('DIV',{'data-turn-key':'k7'},[U%s])]);"
-            "var document=ROOT;document.body=ROOT;var location={pathname:'/c/x'};" % (head, button, unit_fiber, answer))
+            "var document=ROOT;document.body=ROOT;var location={pathname:'/c/x'};"
+            % (head, pair, button, fiber, answer))
+
+
+def _landed(rid, setup):
+    got = json.loads(_eval(CDP._contract_js(rid), setup))
+    return {f["adapter"]: f["ridLanded"] for f in got["families"]}["search-unit-v1"]
+
+
+def _texts(setup):
+    return _eval(CDP._all_user_texts_js(), setup)
 
 
 def test_a_collapsed_user_turn_still_lands_the_send_contract():
     got = json.loads(_eval(CDP._contract_js(R2), _collapsed(R2)))
     fam = {f["adapter"]: f for f in got["families"]}
     assert fam["search-unit-v1"]["ridLanded"] is True and fam["search-unit-v1"]["users"] == 1
+    assert _landed(R1, _collapsed(R2)) is False
 
 
-def test_a_collapsed_turn_whose_item_cannot_be_found_stays_unproven():
-    """No React item to read: the DOM head is all there is, the rid is not in it, and the send stays
-    unknown_send (a human looks) rather than being guessed landed."""
-    got = json.loads(_eval(CDP._contract_js(R2), _collapsed(R2, fiber=False)))
-    assert {f["adapter"]: f["ridLanded"] for f in got["families"]}["search-unit-v1"] is False
+def test_a_legacy_collapsed_turn_without_the_marker_stays_unproven():
+    """No marker and the tail pair collapsed away: the DOM head is all there is, no rid is in it,
+    and the send stays unknown_send (a human looks) rather than being guessed landed."""
+    setup = _collapsed(R2, marker=False)
+    assert _landed(R2, setup) is False
+    assert CDP._locate_source_turn(_texts(setup), R2)["present"] is False
 
 
-def test_an_expanded_turn_is_read_from_the_dom_not_the_item():
-    got = json.loads(_eval(CDP._contract_js(R2), _collapsed(R2, collapsed=False)))
-    assert {f["adapter"]: f["ridLanded"] for f in got["families"]}["search-unit-v1"] is False
+def test_an_expanded_legacy_turn_is_still_read_by_its_tail_pair():
+    assert _landed(R2, _collapsed(R2, marker=False, collapsed=False, tail=R2)) is True
 
 
 def test_the_waiter_finds_a_collapsed_source_turn_and_its_answer():
     setup = _collapsed(R2, answered=True)
-    texts = _eval(CDP._all_user_texts_js(), setup)
-    assert CDP._locate_source_turn(texts, R2) == {"present": True, "is_last": True, "observed_rid": R2}
+    assert CDP._locate_source_turn(_texts(setup), R2) == {"present": True, "is_last": True, "observed_rid": R2}
     assert CDP._turn_canonical_rid(_eval(CDP._last_user_text_js(), setup)) == R2
     got = json.loads(_eval(CDP._detect_js(R2, scoped=True), setup))
     assert got["done"] is True and got["node"] == "found"
+
+
+def test_a_stale_react_item_on_the_node_changes_nothing():
+    """The reproduced defect: a reused node updated R1 -> R2 shows R2 in the DOM while its
+    __reactFiber$ still carries R1's message. React state is ignored; the head's rid is the turn's."""
+    setup = _collapsed(R2, answered=True, stale_item=R1)
+    assert _landed(R2, setup) is True and _landed(R1, setup) is False
+    assert CDP._locate_source_turn(_texts(setup), R1)["present"] is False
+    assert CDP._turn_canonical_rid(_eval(CDP._last_user_text_js(), setup)) == R2
+    assert _eval(CDP._last_assistant_js(R1, scoped=True), setup) == ""     # R2's answer is not R1's
+
+
+def test_a_rid_echo_followup_check_reads_the_marker():
+    """The follow-up's rid_echo check parses the last user turn's text, collapsed or not."""
+    for setup in (_collapsed(R2), _collapsed(R2, collapsed=False, tail=R2)):
+        assert CDP._turn_canonical_rid(_eval(CDP._last_user_text_js(), setup)) == R2
+
+
+def test_two_refire_shaped_turns_resolve_to_distinct_rids():
+    """Identical heads except the marker (a refire of the same prompt under a new rid)."""
+    def turn(n, rid):
+        return ("unit('t%d:0:user',[P('CGC_RID:%s'),P('# Round 7'),P('the same head…'),"
+                "E('BUTTON',{'aria-expanded':'false'},[],'Show more')])" % (n, rid))
+    setup = ("var ROOT=E('MAIN',{},[%s,%s]);var document=ROOT;document.body=ROOT;"
+             "var location={pathname:'/c/x'};" % (turn(1, R1), turn(2, R2)))
+    texts = _texts(setup)
+    assert [CDP._turn_canonical_rid(t) for t in texts] == [R1, R2]
+    assert CDP._locate_source_turn(texts, R1) == {"present": True, "is_last": False, "observed_rid": R2}
+    assert CDP._locate_source_turn(texts, R2) == {"present": True, "is_last": True, "observed_rid": R2}
+
+
+def test_a_marker_that_disagrees_with_the_tail_pair_names_no_rid():
+    setup = _collapsed(R2, collapsed=False, tail=R1)
+    assert _landed(R1, setup) is False and _landed(R2, setup) is False
