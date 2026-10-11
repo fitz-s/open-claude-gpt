@@ -140,6 +140,15 @@ Role: {role}
 """ + RESPONSE_WRAP
 
 
+# `fire --workspace NAME` declares that this question's evidence lives in a local WebCodex workspace,
+# reached through the --mention'd app. This is the sentence prep renders for it, and its opening is
+# the phrase every source gate keys on (compared lowercased) to accept a prompt that names a
+# workspace in place of a code link: cgc_spool.validate_prompt + cmd_enqueue, and
+# cdp_consult._has_sendable_source. It carries no URL, so every secret-shape and URL-provenance rule
+# still runs over the prompt unchanged. No "@" in the text: a literal @ pasted into the composer
+# could open the mention popup mid-paste; the app is attached by the driver, not by this prose.
+WORKSPACE_SENTINEL = "Source: local workspace `"
+
 FOLLOWUP_TEMPLATE = """# {title}
 
 Continuing this consult.
@@ -703,7 +712,11 @@ def cmd_prep(a: argparse.Namespace) -> int:
         # of ABSTRACTED PROSE is NOT the code — ChatGPT can't read the repo from a description and
         # answers BLIND ("no file access, can't cite file:line"). So --refs-file is REQUIRED for a
         # non-followup consult; --context-file is only a supplement. This is THE recurring failure.
-        if not a.followup and not refs and not a.no_code:
+        workspace = getattr(a, "workspace", None)
+        if workspace and a.no_code:
+            raise SystemExit("CGC_ERROR workspace_conflict: --workspace is a code source and --no-code "
+                             "says there is none. Pass one.")
+        if not a.followup and not refs and not a.no_code and not workspace:
             raise SystemExit(
                 "CGC_ERROR no_code_source: no actual code link attached (no --refs-file)."
                 + (" A --context-file was given, but ABSTRACTED PROSE IS NOT THE CODE — ChatGPT can't "
@@ -724,6 +737,11 @@ def cmd_prep(a: argparse.Namespace) -> int:
             context_block = f"\n## {label}\n{ctx}\n"
         # The source-handling instruction lives WITH the sources, so when no refs are
         # attached the prompt makes no dangling reference to a source section.
+        ws_block = ""
+        if workspace:
+            apps = " and ".join(f'"{m}"' for m in getattr(a, "mention", None) or []) or "its app"
+            ws_block = ("\n# Workspace\n" + WORKSPACE_SENTINEL + workspace + "`, reachable through the "
+                        + apps + " app's tools; state the revision/as-of time you read.\n")
         refs_block = ""
         if a.no_code and not refs:
             # Declares the consult carries no code, for the model AND for the daemon's gate, which
@@ -752,6 +770,7 @@ def cmd_prep(a: argparse.Namespace) -> int:
                     "code as ground truth over any inline summary. If a link won't load, try another route "
                     "and name anything you still cannot read.\n"
                     f"{refs}\n")
+        refs_block = ws_block + refs_block
         # The output contract is resolved ONCE, ABOVE the initial/continuation split. It used to
         # live inside the non-followup branch, so --output-file/--output-replace were silently
         # dropped on every follow-up and the round got FOLLOWUP_TEMPLATE's hardcoded findings
@@ -944,6 +963,14 @@ def cmd_fire(a: argparse.Namespace) -> int:
         meta["use_by"] = use_by.isoformat()
     meta["policy_rev"] = policy_rev()
 
+    workspace = getattr(a, "workspace", None)
+    if workspace and not getattr(a, "mention", None):
+        sys.stderr.write(
+            "CGC_ERROR workspace_needs_mention: --workspace names where the evidence lives, but the "
+            "remote model can only reach a local workspace through an app. Add --mention \"<app>\" "
+            "(see `consult.py apps`). Nothing was queued.\n")
+        return 2
+
     # A follow-up continues a thread — but it no longer needs a hand-tracked conversation id. A bare
     # `--followup` (or `--conversation auto`/`last`) defaults to the LAST completed consult's thread,
     # which enqueue resolves from the store while the intent is fresh. This is the whole point of
@@ -979,7 +1006,8 @@ def cmd_fire(a: argparse.Namespace) -> int:
                 "built yourself (deliver is then skipped), or the deliver args to have one built for "
                 "you. Nothing was sent.\n")
             return 2
-    elif not a.no_code:
+    elif not a.no_code and not (workspace and not any(
+            (a.repo, a.pr, a.ref, a.compare, a.pulls, a.files, a.issues))):
         d = cmd_deliver(a)
         if not isinstance(d, dict) or not d.get("refs_file"):
             note = (d or {}).get("note") or "deliver produced no refs"
@@ -1037,8 +1065,31 @@ def _mention_name(v: str) -> str:
     return exact[0] if exact else (pref[0] if len(pref) == 1 else v)
 
 
+def known_workspaces() -> list:
+    """The local WebCodex workspaces the user registered (CGC_WORKSPACES, comma-separated, default
+    none) — read like CGC_APPS. An agent cannot see that registry, so this list is how it knows
+    when the --workspace route applies."""
+    raw = os.environ.get("CGC_WORKSPACES", "")
+    return [x for x in (" ".join(p.split()) for p in raw.split(",")) if x]
+
+
+def _workspace_name(v: str) -> str:
+    """Normalize a --workspace the way _mention_name does an app: a case-insensitive exact or UNIQUE
+    prefix hit on a listed workspace becomes its canonical spelling; an unlisted name passes through.
+    The name is rendered inside backticks, so backticks and control characters are refused."""
+    v = " ".join((v or "").split())
+    if not v or len(v) > 80 or "`" in v or not v.isprintable():
+        raise argparse.ArgumentTypeError(
+            "a --workspace is the registered workspace's name, 1-80 printable chars, no backticks")
+    ws, low = known_workspaces(), v.lower()
+    exact = [x for x in ws if x.lower() == low]
+    pref = [x for x in ws if x.lower().startswith(low)]
+    return exact[0] if exact else (pref[0] if len(pref) == 1 else v)
+
+
 def cmd_apps(a) -> int:
-    print(json.dumps({"apps": known_apps(), "usage": 'fire ... --mention "<app>"',
+    print(json.dumps({"apps": known_apps(), "workspaces": known_workspaces(),
+                      "usage": 'fire ... --mention "<app>"',
                       "configure": "python3 " + os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                        "cgc_config.py") + ' set CGC_APPS "App One,App Two"'}, ensure_ascii=False))
     return 0
@@ -1156,6 +1207,11 @@ def main() -> int:
                     help="ChatGPT app/plugin to @mention (repeatable), name WITHOUT the '@', e.g. "
                          "--mention \"WebCodex Demo\". The daemon picks it from the composer's @ popup "
                          "before pasting the prompt; never write '@App' into --task.")
+    pf.add_argument("--workspace", type=_workspace_name,
+                    help="the evidence for this question lives in a local WebCodex workspace of this "
+                         "name (see `consult.py apps`), reached through --mention. It stands in for the "
+                         "code link the source rule demands, so the round no longer has to claim "
+                         "--no-code; REQUIRES at least one --mention. Every secret and URL gate still runs.")
     pf.add_argument("--origin", choices=("agent", "user"),
                     help="who decided to fire this: the agent on its own initiative, or the user asked")
     pf.add_argument("--trigger", choices=("premise-conflict", "workspace-evidence", "design-fork",

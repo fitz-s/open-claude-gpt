@@ -655,6 +655,11 @@ _GATE_MATRIX = [
     ("followup_sentinel",
      "Continuing this consult. Here are the local results since the last round.\n", True),
     ("real_code_link", "Review https://github.com/acme/widget/tree/abc123 for races.\n", True),
+    ("workspace_source",
+     "# Why does it stall\n\n# Workspace\nSource: local workspace `my repo`, reachable through the "
+     "\"WebCodex Demo\" app's tools; state the revision/as-of time you read.\nFind it.\n", True),
+    ("prose_mentioning_a_workspace_is_not_a_declaration",
+     "Please read my local workspace for the stall, it is on my machine.\n", False),
 ]
 
 

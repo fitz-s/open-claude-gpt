@@ -340,6 +340,135 @@ def test_feedback_cli_is_wired_in_cgc_spool_and_bin_cgc(tmp_path):
     assert "enqueue|await|cancel|stats|feedback)" in bin_cgc, "cgc must dispatch feedback"
 
 
+# ---- item 7: --workspace as a declared source ----------------------------------------------------
+
+@pytest.fixture
+def spool(monkeypatch):
+    import cgc_spool
+    monkeypatch.setattr(cgc_spool, "_repo_is_public", lambda slug: (True, "public"))
+    monkeypatch.setattr(cgc_spool, "_gh_exists", lambda path: (True, "exists"))
+    return cgc_spool
+
+
+def _ws_prompt(fire, **over):
+    out = fire(no_code=False, workspace="my repo", mention=["WebCodex Demo"], **over)
+    assert isinstance(out, dict), out
+    return _spec(out["rid"])
+
+
+def test_workspace_replaces_the_code_link_and_renders_a_short_source_block(fire):
+    r, spec = _ws_prompt(fire)
+    p = r["rendered_prompt"]
+    assert "Source: local workspace `my repo`, reachable through the \"WebCodex Demo\" app's tools; " \
+           "state the revision/as-of time you read." in p
+    assert "references no code" not in p, "the round no longer falsely claims --no-code"
+    assert spec["mentions"] == ["WebCodex Demo"]
+    assert "github.com" not in p, "no deliver ran: a workspace-only round needs no pushed branch"
+
+
+def test_workspace_requires_a_mention_and_refuses_no_code(fire, capsys):
+    assert fire(no_code=False, workspace="my repo", mention=[]) == 2
+    assert "workspace_needs_mention" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as e:
+        consult.cmd_prep(_fire_ns(None, no_code=True, workspace="w", mention=["A"]))
+    assert "workspace_conflict" in str(e.value)
+    with store_mod.Store() as s:
+        assert s.db.execute("SELECT count(*) FROM rounds").fetchone()[0] == 0
+
+
+def test_the_source_rule_still_demands_something_without_a_workspace(fire):
+    with pytest.raises(SystemExit) as e:
+        consult.cmd_prep(_fire_ns(None, no_code=False, workspace=None))
+    assert "no_code_source" in str(e.value)
+
+
+def test_workspace_rides_beside_links_when_both_are_given(fire, monkeypatch):
+    monkeypatch.setattr(consult, "_gh", lambda *a, **k: (None, "offline"))
+    out = fire(no_code=False, workspace="my repo", mention=["WebCodex Demo"], repo="acme/widgets",
+               ref="a" * 40)
+    p = _spec(out["rid"])[0]["rendered_prompt"]
+    assert "Source: local workspace `my repo`" in p and "https://github.com/acme/widgets/tree/" in p
+
+
+def test_workspace_block_renders_on_a_followup_too(tmp_path, monkeypatch):
+    monkeypatch.setattr(consult, "CGC_STATE_DIR", str(tmp_path))
+    st = consult.cmd_prep(_fire_ns(None, no_code=False, workspace="my repo", mention=["A"],
+                                   followup=True))
+    assert "Source: local workspace `my repo`" in open(st["prompt_file"], encoding="utf-8").read()
+
+
+def test_all_four_source_layers_agree_on_a_workspace_prompt(fire, spool):
+    """prep renders it, the enqueue pre-check, the daemon gate and the driver's send-time backstop
+    all accept it — and all refuse the same prose without the declaration."""
+    cdp = _load("cdp_consult")
+    r, _ = _ws_prompt(fire)
+    p = r["rendered_prompt"]
+    assert spool.validate_prompt(p)[0] and cdp._has_sendable_source(p)
+    assert consult.WORKSPACE_SENTINEL.lower() == spool._WORKSPACE_SENTINEL == cdp._WORKSPACE_SENTINEL
+    prose = "Please read my local workspace for the stall, it is on my machine."
+    assert not spool.validate_prompt(prose)[0] and not cdp._has_sendable_source(prose)
+
+
+def test_enqueue_precheck_requires_a_mention_for_a_workspace_prompt(fire, spool, tmp_path, capsys):
+    r, _ = _ws_prompt(fire)
+    pf = tmp_path / "p.md"
+    pf.write_text(r["rendered_prompt"], encoding="utf-8")
+
+    def ns(**over):
+        d = dict(rid=None, prompt_file=str(pf), kind="submit", project_url="https://chatgpt.com/",
+                 conversation="auto", parent=None, model="Pro", model_family="GPT-6",
+                 request_key=None, logical_sha=None, out=None, poll=1, timeout=5, quiet=True)
+        d.update(over)
+        return argparse.Namespace(**d)
+    assert spool.cmd_enqueue(ns()) == 2
+    assert "workspace_needs_mention" in capsys.readouterr().err
+    spool.cmd_enqueue(ns(mentions=["WebCodex Demo"]))
+    err = capsys.readouterr().err
+    assert "no_code_source" not in err and "workspace_needs_mention" not in err, err
+
+
+def test_a_workspace_prompt_keeps_every_secret_and_url_gate(fire, spool, monkeypatch):
+    cdp = _load("cdp_consult")
+    r, _ = _ws_prompt(fire)
+    base = r["rendered_prompt"]
+    ok, why = spool.validate_prompt(base + "\nAKIAABCDEFGHIJKLMNOP\n")
+    assert not ok and "key" in why.lower(), "secret shapes are still refused"
+    monkeypatch.setattr(spool, "_repo_is_public", lambda slug: (False, "private"))
+    ok, why = spool.validate_prompt(base + "\nhttps://github.com/acme/secret\n")
+    assert not ok and "not confirmed PUBLIC" in why, "URL provenance is still enforced"
+    ok, why = spool.validate_prompt(base + "\nhttps://gist.github.com/u/deadbeef\n")
+    assert not ok and "gist" in why
+    monkeypatch.setenv("CGC_GATE_ALLOW_GIST", "0")
+    assert cdp._has_sendable_source(base), "the backstop only decides source; the egress gate decides safety"
+
+
+@pytest.mark.parametrize("env,given,want", [
+    ("", "Anything", "Anything"),
+    ("My Repo, Data Lake", "my repo", "My Repo"),
+    ("My Repo, Data Lake", "DATA", "Data Lake"),
+    ("My Repo, My Other", "my", "my"),            # ambiguous prefix passes through
+    ("My Repo", "elsewhere", "elsewhere"),         # unlisted passes through
+])
+def test_workspace_names_snap_like_apps(monkeypatch, env, given, want):
+    monkeypatch.setenv("CGC_WORKSPACES", env)
+    assert consult._workspace_name(given) == want
+
+
+def test_workspace_name_refuses_what_would_break_the_backtick_span():
+    for bad in ("", "a`b", "x" * 81, "a\x07b"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            consult._workspace_name(bad)
+
+
+def test_apps_lists_workspaces_next_to_apps(monkeypatch, capsys):
+    monkeypatch.delenv("CGC_WORKSPACES", raising=False)
+    assert consult.cmd_apps(None) == 0
+    assert json.loads(capsys.readouterr().out)["workspaces"] == []
+    monkeypatch.setenv("CGC_WORKSPACES", "My Repo, ,Data Lake")
+    consult.cmd_apps(None)
+    assert json.loads(capsys.readouterr().out)["workspaces"] == ["My Repo", "Data Lake"]
+
+
 # ---- item 5: the week view -----------------------------------------------------------------------
 
 def _week():
