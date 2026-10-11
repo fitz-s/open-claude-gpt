@@ -596,14 +596,30 @@ _TEXT_FN = ("function __cgcText(el){if(!el)return '';"
 # 10098 of a 20707-char prompt), and the template's own sentinel pair is the LAST thing in the render —
 # so a collapsed turn's DOM can never carry the rid, and every read of "which turn is mine" went blind
 # beside a send that had landed. The turn's React item still holds the whole message the composer sent
-# (props.item.message, two fibers above the unit). A collapsed turn reads from it; any other turn, or a
-# collapsed one whose item cannot be found, reads from the DOM exactly as before.
+# (props.item.message, two fibers above the unit). A collapsed turn reads from it ONLY when it is
+# provably this turn's current text; any other turn, or a collapsed one that cannot prove it, reads
+# from the DOM exactly as before (fail closed).
+# __reactFiber$ is set at mount and never moved; React double-buffers, so after an update the committed
+# fiber may be that fiber's .alternate and the one in hand still holds the PREVIOUS message (real React
+# 18.3.1: a reused user node updated R1 -> R2 showed R2 in the DOM and R1 here). Which buffer is current
+# is not knowable from the node, so every candidate must agree: the walk runs from the host fiber and
+# its alternate, and at each fiber that carries the item both it and its alternate are read. Any
+# disagreement, or any candidate that is not a string, is DOM. The agreed message must also continue
+# the DOM: the collapsed text without the button's own, whitespace-stripped, is a prefix (first 200
+# characters, or all if fewer) of the message, whitespace-stripped.
 _USER_TEXT_FN = (
-    "function __cgcUserText(el){var t=__cgcText(el);"
-    "if(!el.querySelector('button[aria-expanded=\"false\"]'))return t;"
-    "var k=Object.keys(el).filter(function(x){return x.indexOf('__reactFiber$')===0})[0];"
-    "for(var f=k&&el[k],i=0;f&&i<8;f=f.return,i++){var m=f.memoizedProps&&f.memoizedProps.item;"
-    "if(m&&typeof m.message==='string')return m.message;}return t;}")
+    "function __cgcUserText(el){var t=__cgcText(el),bt=el.querySelector('button[aria-expanded=\"false\"]');"
+    "if(!bt)return t;"
+    "var k=Object.keys(el).filter(function(x){return x.indexOf('__reactFiber$')===0})[0],h=k&&el[k],ms=[];"
+    "function g(f){var p=f.memoizedProps,m=p&&p.item&&p.item.message;return typeof m==='string'?m:null;}"
+    "function w(x){return x.replace(/\\s+/g,'');}"
+    "function tx(n){var s='';for(var i=0;i<n.childNodes.length;i++){var c=n.childNodes[i];"
+    "if(c!==bt)s+=c.nodeType===3?c.nodeValue:c.nodeType===1?tx(c):'';}return s;}"
+    "[h,h&&h.alternate].forEach(function(r){if(!r)return;var f=r,i=0;"
+    "for(;f&&i<8&&g(f)===null;f=f.return,i++);"
+    "if(f&&i<8){ms.push(g(f));if(f.alternate)ms.push(g(f.alternate));}else ms.push(null);});"
+    "var m=ms[0];if(typeof m!=='string'||ms.some(function(x){return x!==m}))return t;"
+    "var d=w(tx(el)).slice(0,200);return d&&w(m).slice(0,d.length)===d?m:t;}")
 
 # The rid regex shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) shared by every rid-reading regex in this file.
 _RID_RE_SRC = r"REQ-\d{8}-\d{6}-[0-9a-f]{6}"

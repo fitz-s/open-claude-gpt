@@ -18,6 +18,11 @@ finished, correctly wrapped answer.
   (`props.item.message`, the exact text the composer sent). Every other turn, and a collapsed turn whose
   item cannot be found, reads from the DOM as before, so an unprovable send still ends `unknown_send` and is
   never auto-resent.
+- The item is used only when it is provably this turn's current text. React double-buffers, so a reused
+  node's fiber can hold the previous message after an update (real React 18.3.1: the DOM showed the new
+  round, the fiber the old one, and the send contract, source-turn lookup and salvage read the old rid). The
+  fiber and its `.alternate` must carry the same message, and the DOM head (whitespace-stripped, first 200
+  characters) must be a prefix of it; otherwise the turn reads from the DOM.
 - The same read serves the send contract, the waiter's source-turn lookup, the failure marker, the
   `rid_echo` check of a follow-up, and `status --rid auto`.
 
