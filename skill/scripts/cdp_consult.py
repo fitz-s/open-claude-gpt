@@ -2896,16 +2896,9 @@ def _turn_rid_conflicts(rid, prompt, mentions=()):
     something to depend on. A prompt with no marker whose tail pair is `rid` parses as `rid`: that is
     the legacy path, and only a collapsed turn would be unprovable there."""
     names = [m for m in (mentions or ()) if m]
-    # The picker matches an app label case-insensitively, so the chip it attaches can read
-    # `CGC_RID:<x>` for a requested `cgc_rid:<x>` that the case-sensitive reader would pass. Any
-    # name holding the token in any case is refused outright: no app name legitimately carries it.
-    if any("cgc_rid" in m.lower() for m in names):
-        names = [re.sub(r"(?i)cgc_rid", "CGC_RID", m) for m in names]
     texts = [prompt] if not names else [sep.join(names) + sep + prompt for sep in (" ", "\n")]
-    bad = {got for got in (_turn_canonical_rid(t) for t in texts) if got != rid}
-    if not bad and any("CGC_RID" in m for m in names):
-        bad = {None}
-    return sorted(bad, key=lambda g: g or "")
+    return sorted({got for got in (_turn_canonical_rid(t) for t in texts) if got != rid},
+                  key=lambda g: g or "")
 
 
 _AMBIGUOUS_RID_TAIL = {"submit": "NOT submitting.", "follow-up": "NOT sending the follow-up.",
@@ -2916,6 +2909,12 @@ def _refuse_ambiguous_rid(rid, prompt, mentions, what):
     """The refusal shared by submit, followup and the enqueue that precedes them: a message when the
     turn would not parse as `rid`, else None. what: "submit", "follow-up" or "enqueue". At the driver
     it exits EXIT_NOT_SENT_PRECLICK: nothing was clicked, so the round is provably unsent."""
+    # The picker matches app labels case-insensitively, so a requested `cgc_rid:<x>` can attach a
+    # `CGC_RID:<x>` chip the case-sensitive reader then reads first. No app name carries the token.
+    named = [m for m in (mentions or ()) if m and "cgc_rid" in m.lower()]
+    if named:
+        return (f"CGC_ERROR rid_ambiguous: the @mention name {named[0]!r} holds the CGC_RID token, which "
+                f"names a turn; no app name may carry it. {_AMBIGUOUS_RID_TAIL[what]}")
     bad = _turn_rid_conflicts(rid, prompt, mentions)
     if not bad:
         return None
