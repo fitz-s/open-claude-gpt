@@ -21,6 +21,7 @@ the anti-duplicate invariant holds on every path.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -178,6 +179,9 @@ def store_status(up: bool, rid: str | None = None) -> int:
         if needs_human:
             print("  NEEDS RECONCILE (possibly sent, NOT auto-resent — retrieve, don't resend): "
                   + " ".join(needs_human[:8]))
+        broken = s.broken_capabilities()
+        if broken:
+            print(f"  UI CONTRACT: {paused_text(broken)}")
         if rid:
             rr = s.get_round(rid)
             if rr:
@@ -194,6 +198,10 @@ def store_status(up: bool, rid: str | None = None) -> int:
                 # rewrites it from the store on demand.
                 fields["answer_on_disk"] = bool(out and os.path.exists(out))
                 fields["conversation"] = s.conversation_of(rid)
+                fields["send"] = s.send_evidence(rid)
+                gate = s.gated_by(rr) if rr["state"] == store_mod.QUEUED else {}
+                if gate:
+                    fields["human_action"] = paused_text(gate)
                 print(f"  round[{rid}]: {json.dumps(fields)}")
             else:
                 print(f"  round[{rid}]: (not in store)")
@@ -927,7 +935,7 @@ def refire_round(old_rid: str) -> int:
 # agent should never have to infer state by scraping prose. schema=1 is the envelope's version.
 def _emit(rid, state, *, retryable, human_action=None, next_command=None, answer_path=None,
           parent_rid=None, confidence=None, error=None, source_rid=None, observed_rid=None,
-          model_badge=None, model_slug=None, attribution=None):
+          model_badge=None, model_slug=None, attribution=None, send=None):
     import cgc_spool as _spool
     # Envelope invariant: retryable=true must always name the retry — an agent told "retryable"
     # with no next_command/human_action has a verdict but no move. Enforced structurally so no
@@ -957,7 +965,81 @@ def _emit(rid, state, *, retryable, human_action=None, next_command=None, answer
         #                 unknown / unchecked, or null for a round that predates this field.
         # `confidence` remains strictly about the rid sentinel and says nothing about identity.
         "model_badge": model_badge, "model_slug": model_slug, "attribution": attribution,
+        # send: the driver's typed outcome for the round's last send attempt (_send_evidence) —
+        # submitted (true / false / null = unknown), reason, phase, drift, the contract it observed.
+        "send": send,
     }))
+
+
+# ---- the UI contract: typed send outcomes and the capability gate -------------------------------
+def driver_rev() -> str:
+    """Which driver build produced a capability verdict: sha256[:12] of cdp_consult.py."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cdp_consult.py"), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
+
+
+_EVIDENCE_KEYS = ("submitted", "reason", "phase", "drift", "adapter", "contract", "conversation_id",
+                  "echoedRid", "wanted", "wantedFamily", "detail", "readyState")
+
+
+def _send_evidence(res: dict) -> dict:
+    """The driver's typed line for one send (its last stdout JSON), bounded: the named fields only,
+    each string cut to 300 chars, plus the exit code and the CGC_ERROR line."""
+    rec = res.get("outcome") or {}
+    ev = {k: (v[:300] if isinstance(v, str) else v) for k in _EVIDENCE_KEYS
+          if (v := rec.get(k)) not in (None, "")}
+    ev["exit"] = res.get("code")
+    err = _stderr_error_line(res.get("stderr") or "")
+    if err:
+        ev["error"] = err[:300]
+    return ev
+
+
+def _configured_model() -> tuple:
+    """The (tier, family) the composer probe checks: cdp_consult's own CGC_* reading."""
+    if os.environ.get("CGC_AUTO_MODEL", "1").strip().lower() in ("0", "false", "no", "off", ""):
+        return ("skip", "skip")
+    return (os.environ.get("CGC_MODEL", "Pro"), os.environ.get("CGC_MODEL_FAMILY", "GPT-6"))
+
+
+def _project_send(store, attempt: str, rid: str, res: dict, spec: dict) -> str | None:
+    """Record the send's typed outcome on its attempt, and mark the capability it proves broken. The
+    driver names that capability (`drift`) only for a deterministic mismatch: before the click, no
+    composer on a loaded fresh tab, a fresh tab's picker refusing the model, the @ popup never opening
+    or an app row yielding no mention; after it, selector_drift (the rid landed, no reply is
+    readable). A login, a captcha or a rate limit never carries one. A model refusal counts only for
+    the configured model: a round that froze another family into its spec (`Latest`) proves nothing
+    about the picker the probe checks. Returns the capability marked, or None."""
+    ev = _send_evidence(res)
+    store.record_attempt_evidence(attempt, json.dumps(ev, sort_keys=True))
+    cap = ev.get("drift")
+    if cap not in store_mod.CAPABILITIES:
+        return None
+    if ev.get("phase") == "model" and (spec.get("model") or "Pro",
+                                       spec.get("model_family") or "GPT-6") != _configured_model():
+        return None
+    store.mark_broken(cap, phase=f"send:{ev.get('phase') or '?'}",
+                      cause=ev.get("error") or ev.get("reason") or "driver reported drift",
+                      ref=rid, driver_rev=driver_rev())
+    sys.stderr.write(f"CGC_UI_BROKEN {cap}: {ev.get('error') or ev.get('reason')} (round {rid}) — "
+                     "rounds that need it stay queued until a probe passes.\n")
+    return cap
+
+
+def paused_text(gate: dict) -> str:
+    """The human_action of a round held by the gate."""
+    why = "; ".join(f"{k}: {(v.get('cause') or v.get('phase') or 'broken')[:200]}"
+                    for k, v in sorted(gate.items()))
+    return (f"ChatGPT UI changed ({why}) — sends paused; driver needs a fix; queued rounds are intact. "
+            "`cgc probe` re-checks it and resumes them")
+
+
+# How long `await` lets a gate stand before it reports the pause: one probe run, which a break
+# schedules at once (unless one ran in the last 30 min), takes about two minutes.
+GATE_GRACE_S = 180
 
 
 _OBSERVED_RID_RE = re.compile(r"observed_rid=(\S+)")
@@ -1026,6 +1108,7 @@ def _await_round(a) -> int:
     out = None
     deadline = time.time() + a.timeout
     down_since = None
+    gated_since = None
     while time.time() < deadline:
         with store_mod.Store() as s:
             r = s.get_round(a.rid)
@@ -1067,6 +1150,24 @@ def _await_round(a) -> int:
                           next_command=f"python3 {_spool.__file__} await --rid {a.rid}",
                           error="daemon down")
                     return 1
+        if state == store_mod.QUEUED:
+            # The UI-contract gate holds this round: nothing was sent and nothing will be until a
+            # probe clears the capability. Reported once the pause has outlasted a probe run, so a
+            # break the very next probe disproves never surfaces; the round stays queued either way.
+            with store_mod.Store() as _s:
+                gate = _s.gated_by(r)
+            if not gate:
+                gated_since = None
+            elif gated_since is None:
+                gated_since = time.time()
+            elif time.time() - gated_since >= GATE_GRACE_S:
+                why = paused_text(gate)
+                sys.stderr.write(f"CGC_PAUSED {a.rid}: {why}. Nothing was sent; the round runs once "
+                                 "the capability passes again.\n")
+                _emit(a.rid, state, retryable=True, parent_rid=parent, human_action=why,
+                      next_command=f"python3 {_spool.__file__} await --rid {a.rid}",
+                      error="ui_contract: " + ",".join(sorted(gate)))
+                return 3
         if state == store_mod.COMPLETED_VERIFIED:
             text = r["result_text"] or ""
             if not text:
@@ -1208,9 +1309,11 @@ def _await_round(a) -> int:
                    "If it names a conversation, retrieve from it (enqueue --kind retrieve "
                    f"--conversation <id> --parent {a.rid}); if it finds none, a human must look at "
                    "the ChatGPT window before any re-send.\n"))
+            with store_mod.Store() as _s:
+                send_ev = _s.send_evidence(a.rid)
             _emit(a.rid, state, retryable=False, parent_rid=parent,
                   human_action="check the ChatGPT window; retrieve by conversation before re-sending",
-                  next_command=retrieve, error=r["error_code"])
+                  next_command=retrieve, error=r["error_code"], send=send_ev)
             # 3, not 1. The documented contract is 0 answer / 3 a human must act / 1 BROKEN, and an
             # uncertain send is the definition of "a human must act" — nothing is broken, the send
             # may well have landed. Reporting it as broken is what made every one of these read as a
@@ -1396,6 +1499,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         finally:
             if hasattr(conv_lease, "close"):
                 conv_lease.close()  # mutating region done — the read-only wait below needs no lease
+        _project_send(store, attempt, rid, send, spec)
         if send.get("code") == _EXIT_NOT_SENT_PRECLICK:
             store.mark_send_not_sent(attempt, f"followup failed before the click (exit "
                                               f"{_EXIT_NOT_SENT_PRECLICK}): {(send.get('stderr') or '').strip()[:300]}")
@@ -1427,7 +1531,8 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             # that was never asked for, and leaves a human staring at "may have sent" with only a
             # resend left to try — under exactly the uncertainty the invariant exists to prevent.
             return _requeue_or_block(store, rid, _not_sent_marker(send, _NOT_SENT_RETRY))
-        store.mark_possibly_accepted(attempt, f"followup send failed (exit {send.get('code')}) — retrieve, don't resend")
+        store.mark_possibly_accepted(attempt, f"followup send failed (exit {send.get('code')}"
+                                              f"{_why_unconfirmed(send)}) — retrieve, don't resend")
         return store_mod.POSSIBLY_ACCEPTED
 
     gated = _gate(store, rid, prompt, validate)
@@ -1444,6 +1549,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                   model_family=spec.get("model_family") or "GPT-6",
                   mentions=spec.get("mentions") or [])
     conv = sub.get("conversation")
+    _project_send(store, attempt, rid, sub, spec)
 
     if sub.get("code") == _EXIT_NOT_SENT_PRECLICK:
         store.mark_send_not_sent(attempt, f"submit failed before the click (exit "
@@ -1481,10 +1587,21 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         store.link_conversation(rid, conv)
     store.mark_possibly_accepted(
         attempt,
-        f"submit did not confirm the send (exit {sub.get('code')})"
+        f"submit did not confirm the send (exit {sub.get('code')}{_why_unconfirmed(sub)})"
         + (f"; conversation {conv} recorded for read-only retrieval" if conv else
            "; no conversation captured"))
     return store_mod.POSSIBLY_ACCEPTED
+
+
+def _why_unconfirmed(res: dict) -> str:
+    """', <reason>: submitted=<true|false|unknown>' from the driver's typed line, so the uncertain
+    round's error names what the driver saw (selector_drift: sent, unreadable; unknown_send: no rid
+    seen) instead of only an exit code. Empty when the driver printed no typed line."""
+    rec = res.get("outcome") or {}
+    if not rec.get("reason"):
+        return ""
+    sub = {True: "true", False: "false"}.get(rec.get("submitted"), "unknown")
+    return f", {rec['reason']}: submitted={sub}"
 
 
 def resume_round(store, r: dict, run_cdp) -> str:

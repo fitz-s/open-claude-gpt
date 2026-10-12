@@ -2501,6 +2501,20 @@ def _composer_failure(st):
                "The page did not load in time; re-enqueue and it will retry.")
 
 
+def _composer_outcome(st, fresh):
+    """The typed line for a composer that never appeared. `drift` names the UI capability the failure
+    proves broken: only a FRESH project tab that finished loading on chatgpt.com, past any login or
+    challenge, and still holds no visible composer. A page still loading says nothing about the
+    markup, and neither does a re-opened conversation (it may be archived or no longer accessible)."""
+    reason = ("login_needed" if st.get("loginWall") else "captcha" if st.get("captcha")
+              else "wrong_page" if not st.get("onChatGPT", True) else "composer_not_ready")
+    out = {"ok": False, "submitted": False, "reason": reason, "phase": "composer",
+           "readyState": st.get("readyState")}
+    if fresh and reason == "composer_not_ready" and st.get("readyState") == "complete":
+        out["drift"] = "composer"
+    return out
+
+
 def _read_prompt(path):
     """Read the prompt to send. `-` means stdin, which is how the daemon hands over the EXACT bytes
     its egress gate validated.
@@ -2640,7 +2654,13 @@ _MENTION_OPT_SEL = _MENTION_POPUP_SEL + ' [data-list-navigation-item]'
 
 
 class _MentionFailure(_PreClickFailure):
-    """The composer never offered/accepted the requested @mention — pre-click, a human must act."""
+    """The composer never offered/accepted the requested @mention — pre-click, a human must act.
+    `drift` is True only when the failure proves the picker's markup moved (the popup never opened,
+    or an app-shaped row took no app mention node); every other cause is this account's apps."""
+
+    def __init__(self, msg, drift=False):
+        super().__init__(msg)
+        self.drift = drift
 
 
 def _norm_label(s):
@@ -2827,11 +2847,19 @@ def _insert_mention(c, name):
             raise _MentionFailure(
                 f"mention_not_found: the popup row {r['hit'][:40]!r} for '@{name}' is not an app — the "
                 f"composer took no app mention from it{residue}. Enable the app '{name}' in ChatGPT "
-                "or fix the name")
+                "or fix the name", drift=True)
     residue = _clear_after_mention_failure(c)
     raise _MentionFailure(
         f"mention_not_found: the composer offered no app named '{name}' for '@{name}' within "
-        f"{_MENTION_WAIT_S:.0f}s{residue}. {_mention_offer(popup_open, seen, unconnected, loading, unverified, ambiguous, name)}")
+        f"{_MENTION_WAIT_S:.0f}s{residue}. {_mention_offer(popup_open, seen, unconnected, loading, unverified, ambiguous, name)}",
+        drift=not popup_open)
+
+
+def _mention_outcome(e):
+    out = {"ok": False, "submitted": False, "reason": "mention_not_found", "phase": "mention"}
+    if getattr(e, "drift", False):
+        out["drift"] = "mention"
+    return out
 
 
 def _paste_prompt(c, prompt: str, mentions=()) -> None:
@@ -2983,6 +3011,7 @@ def cmd_submit(a) -> int:
         ready, _cstate = _await_composer(c)
         if not ready:
             _code, _msg = _composer_failure(_cstate)
+            print(json.dumps(_composer_outcome(_cstate, fresh=True)))
             sys.stderr.write(_msg + "\n")
             return _code
         # Model selection — fully automated (must run AFTER navigate, which resets the
@@ -2996,7 +3025,11 @@ def cmd_submit(a) -> int:
             pick = _select_model(c, target, a.model_family)
             model_confirmed, model_now, model_badge = pick.confirmed, pick.shown, pick.badge
             if not model_confirmed and not a.allow_model_mismatch:
-                print(json.dumps({"ok": False, "submitted": False,
+                # drift: a FRESH project tab could not select the configured model, so every submit
+                # refuses the same way. A follow-up's refusal names none: its thread can sit on a tier
+                # it can no longer change, which says nothing about the composer's markup.
+                print(json.dumps({"ok": False, "submitted": False, "reason": "model_not_selectable",
+                                  "phase": "model", "drift": "composer",
                                   "modelConfirmed": False, "model": model_now,
                                   "modelBadge": model_badge, "wanted": target,
                                   "wantedFamily": a.model_family, "detail": pick.error}))
@@ -3029,6 +3062,7 @@ def cmd_submit(a) -> int:
         try:
             _paste_prompt(c, prompt, a.mention)
         except _MentionFailure as e:
+            print(json.dumps(_mention_outcome(e)))
             sys.stderr.write(f"CGC_ERROR {e} — NOT submitted.\n")
             return 3
         except _PreClickFailure as e:
@@ -3092,7 +3126,7 @@ def cmd_submit(a) -> int:
             # at this window to see whether the prompt actually went. Closing it destroys
             # the only evidence. It is the one failure allowed to leave a tab behind.
             c.close()
-            print(json.dumps({"ok": False, "submitted": None, "rid": a.rid,
+            print(json.dumps({"ok": False, "submitted": None, "rid": a.rid, "phase": "contract",
                               "reason": "unknown_send", "contract": contract,
                               "conversation_id": conv}))
             sys.stderr.write(
@@ -3108,7 +3142,10 @@ def cmd_submit(a) -> int:
         if verdict == "selector_drift":
             if owns_tab:
                 c.close_tab()   # the send is confirmed and the conversation persists server-side
-            print(json.dumps({"ok": False, "submitted": True, "rid": a.rid,
+            # drift: the driver's own verdict that it cannot read replies on a page where the send
+            # landed. Every further send would spend a message into the same blind reader.
+            print(json.dumps({"ok": False, "submitted": True, "rid": a.rid, "phase": "contract",
+                              "drift": "reader",
                               "reason": "selector_drift", "adapter": adapter, "contract": contract,
                               "conversation_id": conv}))
             sys.stderr.write(
@@ -3288,6 +3325,7 @@ def cmd_followup(a) -> int:
         ready, _cstate = _await_composer(c)
         if not ready:
             _code, _msg = _composer_failure(_cstate)
+            print(json.dumps(_composer_outcome(_cstate, fresh=False)))
             sys.stderr.write(_msg + "\n")
             return _code
         # CONVERSATION-INTEGRITY GUARD (before any model-selection/insert): after attaching to a
@@ -3326,6 +3364,7 @@ def cmd_followup(a) -> int:
             _fu_ok, model_now, model_badge = pick.confirmed, pick.shown, pick.badge
             if not _fu_ok and not a.allow_model_mismatch:
                 print(json.dumps({"ok": False, "followup": True, "conversation_id": conv,
+                                  "submitted": False, "reason": "model_not_selectable", "phase": "model",
                                   "rid": rid, "modelConfirmed": False, "model": model_now,
                                   "modelBadge": pick.badge, "wanted": target,
                                   "wantedFamily": a.model_family, "detail": pick.error}))
@@ -3378,6 +3417,7 @@ def cmd_followup(a) -> int:
         try:
             _paste_prompt(c, prompt, a.mention)
         except _MentionFailure as e:
+            print(json.dumps(_mention_outcome(e)))
             sys.stderr.write(f"CGC_ERROR {e} — NOT sent.\n")
             return 3
         except _PreClickFailure as e:

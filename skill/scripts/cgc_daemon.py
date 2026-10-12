@@ -123,8 +123,10 @@ def _make_run_cdp():
                 cmd += ["--mention", m]
             code, so, se = _run(cmd, 300, kw["rid"], stdin_text=kw["prompt"], pass_fds=fds)
             rec = _last_json(so)
+            # outcome: the driver's whole typed line (submitted / reason / phase / drift / contract),
+            # which cgc_backend._project_send records on the attempt — not just the two fields above.
             return {"code": code, "conversation": rec.get("conversation_id", "") or "",
-                    "model_badge": rec.get("modelBadge"), "stderr": se}
+                    "model_badge": rec.get("modelBadge"), "stderr": se, "outcome": rec}
         if kind == "followup":
             # CONTINUE the existing conversation: attach to --conversation and SEND (no --watch, so it
             # returns after sending). The caller then runs a separate "wait", so the round reaches
@@ -139,7 +141,8 @@ def _make_run_cdp():
             for m in kw.get("mentions") or ():
                 cmd += ["--mention", m]
             code, so, se = _run(cmd, 240, kw["rid"], stdin_text=kw["prompt"], pass_fds=fds)
-            return {"code": code, "model_badge": _last_json(so).get("modelBadge"), "stderr": se}
+            rec = _last_json(so)
+            return {"code": code, "model_badge": rec.get("modelBadge"), "stderr": se, "outcome": rec}
         if kind == "wait":
             poll = str(kw.get("poll") or spool.POLL_S)
             timeout = int(kw.get("timeout") or spool.STUCK_AFTER_S)
@@ -230,10 +233,11 @@ def run_worker_store_resume(rid: str) -> int:
     return 0
 
 
-def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str) -> None:
+def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str, claim=True) -> None:
     """Claim ready rounds AND reattach orphaned accepted/waiting rounds (no live worker), each in its
     own store worker, up to the concurrency cap. Reattach never re-sends — it resumes the existing
-    conversation, so a daemon restart mid-consult does not strand or duplicate a round."""
+    conversation, so a daemon restart mid-consult does not strand or duplicate a round. claim=False
+    (a UI probe is running) claims no new queued round; everything already claimed still runs."""
     def _spawn(arg, rid, tag):
         """Spawn a worker, guarding Popen: a spawn that raises must NOT silently drop the round. A
         `ready` row whose spawn failed stays `ready` (pre-send, so re-running it is safe) and is
@@ -279,7 +283,7 @@ def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str) -
         if len(children) >= concurrency:
             return
         _spawn("--worker-store", rid, "ready-orphan(store)")
-    while len(children) < concurrency:
+    while claim and len(children) < concurrency:
         with store_mod.Store() as s:
             rnd = s.claim_ready(daemon_instance_id)
         if rnd is None:
@@ -709,6 +713,58 @@ def _maintenance_pass(children: dict, *, next_maintenance: float, maint_backoff_
             dispatched_since_sweep, last_repair)
 
 
+# The UI-contract probe (cgc_probe.py): run at daemon start, before queued paid work once the last
+# run is 6 h old, and after any capability is recorded broken — at most once per 30 min, which is
+# also how often a broken capability is re-checked until ChatGPT or the driver puts it right.
+_PROBE = os.path.join(_HERE, "cgc_probe.py")
+_PROBE_EVERY_S = 6 * 3600
+_PROBE_BACKOFF_S = 30 * 60
+_PROBE_TIMEOUT_S = 600
+
+
+def _probe_due(now: float, last_start, broken: bool, queued_paid: bool) -> bool:
+    if last_start is None:
+        return True
+    age = now - last_start
+    return age >= _PROBE_BACKOFF_S if broken else (queued_paid and age >= _PROBE_EVERY_S)
+
+
+def _tend_probe(proc, last_start):
+    """Reap or time out a running probe; start one when due. Returns (proc, last_start). The daemon
+    claims no new send while a probe runs, so a stale contract is checked BEFORE paid work drains;
+    reattach and retrieve go on (they send nothing). The probe holds a SHARED browser lease and its
+    own tabs, so live consults keep running beside it."""
+    if proc is not None:
+        if proc.poll() is None:
+            if time.time() - last_start < _PROBE_TIMEOUT_S:
+                return proc, last_start
+            proc.kill()
+            proc.wait()
+            sys.stderr.write("CGC_DAEMON UI probe timed out — inconclusive, state unchanged\n")
+        proc = None
+    try:
+        with store_mod.Store() as s:
+            broken = bool(s.broken_capabilities())
+            queued = s.db.execute(
+                "SELECT 1 FROM rounds WHERE state=? AND kind<>'retrieve' "
+                "AND (not_before IS NULL OR not_before<=?) LIMIT 1",
+                (store_mod.QUEUED, datetime.datetime.now(datetime.timezone.utc).isoformat())
+            ).fetchone() is not None
+    except Exception as e:
+        sys.stderr.write(f"CGC_DAEMON UI probe check failed ({type(e).__name__}) — not probing\n")
+        return None, last_start
+    if not _probe_due(time.time(), last_start, broken, queued):
+        return None, last_start
+    try:
+        proc = subprocess.Popen([sys.executable, _PROBE], stdout=subprocess.DEVNULL)
+    except OSError as e:
+        sys.stderr.write(f"CGC_DAEMON UI probe spawn failed: {e}\n")
+        proc = None
+    else:
+        sys.stderr.write(f"CGC_DAEMON UI probe started (pid {proc.pid}) — new sends wait for it\n")
+    return proc, time.time()
+
+
 _running = True
 
 
@@ -840,6 +896,7 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
                          f"{len(moved)} interrupted send(s) marked possibly_accepted.\n")
         next_maintenance = 0.0
         last_repair = 0.0
+        probe, probe_started = None, None   # None: not run yet, so the first loop runs it
         maint_backoff_s = _MAINT_INTERVAL_S
         browser_was_down = False
         # Has the daemon dispatched ANY worker since the last maintenance pass? If not, no tab could
@@ -866,7 +923,8 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
                         children, next_maintenance=next_maintenance, maint_backoff_s=maint_backoff_s,
                         browser_was_down=browser_was_down,
                         dispatched_since_sweep=dispatched_since_sweep, last_repair=last_repair)
-                _dispatch_store(children, concurrency, daemon_instance_id)
+                probe, probe_started = _tend_probe(probe, probe_started)
+                _dispatch_store(children, concurrency, daemon_instance_id, claim=probe is None)
                 dispatched_since_sweep = dispatched_since_sweep or bool(children)
                 if once and not children:
                     with store_mod.Store() as _s:

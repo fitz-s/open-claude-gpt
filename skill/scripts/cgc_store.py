@@ -838,7 +838,7 @@ class Store:
                 "  r.kind!='followup' OR r.thread_id IS NULL OR NOT EXISTS ("
                 "    SELECT 1 FROM rounds o WHERE o.thread_id=r.thread_id AND o.rid!=r.rid"
                 f"     AND o.state IN (?,?,?)))"
-                " ORDER BY r.created_at", (QUEUED, now, SENDING, ACCEPTED, WAITING)):
+                " ORDER BY r.created_at", (QUEUED, now, SENDING, ACCEPTED, WAITING)).fetchall():
                 if not broken.keys() & set(round_needs(cand["kind"], cand["spec_json"])):
                     row = cand
                     break
