@@ -652,3 +652,11 @@ def test_stats_week_prints_json_and_plain_stats_is_unchanged(capsys):
     rep = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert set(rep) == {"rounds", "by_state", "completed", "failed", "unverified_rate", "latency_s",
                         "messages"}
+
+
+def test_week_view_title_skips_the_rid_marker_line():
+    """Every template opens with `CGC_RID:<rid>`, so the headline is the first `# ` line, not line 1."""
+    import cgc_store
+    assert cgc_store._title("CGC_RID:REQ-20261011-120000-abcdef\n\n# Real title\n\nRole: x") == "Real title"
+    assert cgc_store._title("# Legacy title\nbody") == "Legacy title"
+    assert cgc_store._title("no heading at all") == ""

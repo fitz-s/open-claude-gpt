@@ -399,10 +399,11 @@ _DONE = (COMPLETED_VERIFIED, COMPLETED_UNVERIFIED)
 
 
 def _title(prompt) -> str:
-    """The round's headline: the first line of the rendered prompt is always `# <title>`."""
+    """The round's headline: the first `# <title>` line of the rendered prompt. The templates open with
+    the `CGC_RID:<rid>` marker line, so the title is the first heading, not the first line."""
     for ln in (prompt or "").splitlines():
-        if ln.strip():
-            return ln.strip()[2:].strip()[:80] if ln.startswith("# ") else ""
+        if ln.startswith("# "):
+            return ln[2:].strip()[:80]
     return ""
 
 
