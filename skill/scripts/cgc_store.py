@@ -487,6 +487,25 @@ def week_view(db, now=None) -> dict:
     }
 
 
+# ---- the UI contract: what a send needs from ChatGPT's page ---------------------------------
+# ChatGPT's web UI is an unversioned contract the driver reads by structure, and it moved four times
+# in three weeks. Each move was found one paid round at a time. A capability is one part of that
+# contract, recorded in `meta` under `ui.<name>` as JSON {ok, epoch, phase, cause,
+# rid_or_conversation, checked_at, driver_rev}. ABSENT means never established, which never gates:
+# only a recorded failure does. `epoch` grows on every write; a probe reads it before it starts, and
+# its pass may clear a failure only if no write happened since (Store.mark_passed).
+CAPABILITIES = ("composer", "mention", "reader")
+
+
+def round_needs(kind: str, spec_json) -> tuple:
+    """The capabilities a round's send depends on. A retrieve sends nothing, so it needs none and is
+    never gated. Every send needs the composer (select the model, paste, read it back) and the reader
+    (prove the turn landed, read the answer); a round with an @mention also needs the mention picker."""
+    if kind == "retrieve":
+        return ()
+    return ("composer", "reader") + (("mention",) if _spec(spec_json).get("mentions") else ())
+
+
 def new_daemon_instance_id() -> str:
     """A fresh identity per daemon process — recorded on attempts so ownership is the daemon
     INSTANCE, not a reusable OS pid."""
@@ -802,17 +821,26 @@ class Store:
 
         `not_before`: a round requeued with a backoff (cgc_backend._gate_requeue_or_block) is not
         eligible until that instant — this is the ONE place that fence has to be enforced, since it
-        is claiming, not requeuing, that makes a round hot-spinnable again."""
+        is claiming, not requeuing, that makes a round hot-spinnable again.
+
+        THE UI-CONTRACT GATE, for the same reason: a round that needs a capability recorded broken
+        is skipped, not failed. It stays QUEUED and intact, and is claimed once a probe clears it.
+        Read inside this transaction, so a capability recorded broken before the claim is seen."""
         now = _now()
         with self._tx():
-            row = self.db.execute(
-                "SELECT rid FROM rounds r WHERE r.state=? AND (r.not_before IS NULL OR r.not_before<=?) "
+            broken = self.broken_capabilities()
+            row = None
+            for cand in self.db.execute(
+                "SELECT rid,kind,spec_json FROM rounds r WHERE r.state=? "
+                "AND (r.not_before IS NULL OR r.not_before<=?) "
                 "AND ("
                 "  r.kind!='followup' OR r.thread_id IS NULL OR NOT EXISTS ("
                 "    SELECT 1 FROM rounds o WHERE o.thread_id=r.thread_id AND o.rid!=r.rid"
                 f"     AND o.state IN (?,?,?)))"
-                " ORDER BY r.created_at LIMIT 1", (QUEUED, now, SENDING, ACCEPTED, WAITING)
-            ).fetchone()
+                " ORDER BY r.created_at", (QUEUED, now, SENDING, ACCEPTED, WAITING)):
+                if not broken.keys() & set(round_needs(cand["kind"], cand["spec_json"])):
+                    row = cand
+                    break
             if row is None:
                 return None
             rid = row["rid"]
@@ -868,7 +896,8 @@ class Store:
             if r["state"] not in (SENDING, POSSIBLY_ACCEPTED):
                 raise IllegalTransition(f"{rid}: mark_accepted from {r['state']!r}")
             self.db.execute(
-                "UPDATE attempts SET phase=?,last_progress_at=?,remote_evidence_json=? WHERE attempt_id=?",
+                "UPDATE attempts SET phase=?,last_progress_at=?,"
+                "remote_evidence_json=COALESCE(?,remote_evidence_json) WHERE attempt_id=?",
                 (ACCEPTED, now, evidence_json, attempt_id))
             if conversation_id:
                 # A fresh submit has no thread until its conversation is first known (here). Create
@@ -1227,6 +1256,75 @@ class Store:
         with self._tx():
             self._event("policy_update",
                         detail=json.dumps({"policy_rev": policy_rev, "text": text}, sort_keys=True))
+
+    # ---- the UI contract (see CAPABILITIES) ------------------------------------
+    def capabilities(self) -> dict:
+        """{name: record} for every capability ever recorded; a never-probed one is absent."""
+        return {r["key"][3:]: _spec(r["value"]) for r in self.db.execute(
+            "SELECT key,value FROM meta WHERE key LIKE 'ui.%'") if r["key"][3:] in CAPABILITIES}
+
+    def broken_capabilities(self) -> dict:
+        return {k: v for k, v in self.capabilities().items() if v.get("ok") is False}
+
+    def capability_epoch(self) -> int:
+        """The counter every capability write advances. A probe reads it BEFORE it starts."""
+        row = self.db.execute("SELECT value FROM meta WHERE key='ui.epoch'").fetchone()
+        return int(row["value"]) if row else 0
+
+    def _write_capability(self, name: str, ok: bool, *, phase: str, cause: str | None,
+                          ref: str | None, driver_rev: str | None) -> dict:
+        if name not in CAPABILITIES:
+            raise ValueError(f"unknown capability {name!r}")
+        epoch = self.capability_epoch() + 1
+        rec = {"ok": ok, "epoch": epoch, "phase": phase, "cause": (cause or "")[:400] or None,
+               "rid_or_conversation": ref, "checked_at": _now(), "driver_rev": driver_rev}
+        self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('ui.epoch',?)", (str(epoch),))
+        self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                        ("ui." + name, json.dumps(rec, sort_keys=True)))
+        self._event("ui_" + ("pass" if ok else "broken"),
+                    detail=json.dumps({name: rec}, sort_keys=True))
+        return rec
+
+    def mark_broken(self, name: str, *, phase: str, cause: str, ref: str | None = None,
+                    driver_rev: str | None = None) -> dict:
+        """Record that `name` no longer matches ChatGPT's page. Always written: a failure is never
+        refused, whatever happened before it."""
+        with self._tx():
+            return self._write_capability(name, False, phase=phase, cause=cause, ref=ref,
+                                          driver_rev=driver_rev)
+
+    def mark_passed(self, name: str, *, started_epoch: int, phase: str, cause: str | None = None,
+                    ref: str | None = None, driver_rev: str | None = None) -> bool:
+        """Record a probe's pass, unless `name` was written after the probe started (its record's
+        epoch is past `started_epoch`): a real round's failure seen mid-probe is newer evidence than
+        a pass that began before it, so the stale pass is dropped. Read and write are one
+        transaction, so no failure can land between the comparison and the write. False when
+        dropped."""
+        with self._tx():
+            cur = self.capabilities().get(name)
+            if cur is not None and int(cur.get("epoch") or 0) > started_epoch:
+                return False
+            self._write_capability(name, True, phase=phase, cause=cause, ref=ref,
+                                   driver_rev=driver_rev)
+        return True
+
+    def gated_by(self, r: dict) -> dict:
+        """The broken capabilities this round's send needs ({} = not gated)."""
+        need = set(round_needs(r.get("kind") or "", r.get("spec_json")))
+        return {k: v for k, v in self.broken_capabilities().items() if k in need}
+
+    def record_attempt_evidence(self, attempt_id: str, evidence_json: str) -> None:
+        """The driver's typed outcome for one send attempt (cgc_backend._project_send)."""
+        with self._tx():
+            self.db.execute("UPDATE attempts SET remote_evidence_json=? WHERE attempt_id=?",
+                            (evidence_json, attempt_id))
+
+    def send_evidence(self, rid: str) -> dict | None:
+        """The current attempt's recorded driver outcome, or None (no attempt, or none recorded)."""
+        row = self.db.execute(
+            "SELECT a.remote_evidence_json v FROM rounds r JOIN attempts a "
+            "ON a.attempt_id=r.current_attempt_id WHERE r.rid=?", (rid,)).fetchone()
+        return (_spec(row["v"]) or None) if row and row["v"] else None
 
     def events(self, rid: str) -> list[dict]:
         return [dict(r) for r in self.db.execute(
