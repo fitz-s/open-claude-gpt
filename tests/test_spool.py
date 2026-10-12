@@ -41,6 +41,12 @@ def _rid(suffix="000001"):
     return f"REQ-20260707-120000-{suffix}"
 
 
+def _sendable(rid, body="please review https://github.com/acme/widgets"):
+    """What `prep` renders for a round: the head marker first, the body, the sentinel pair last. enqueue
+    refuses a prompt whose turn would not parse as its own rid, so a fixture needs the real shape."""
+    return f"CGC_RID:{rid}\n{body}\nBEGIN_RESPONSE:{rid}\n<full answer>\nEND_RESPONSE:{rid}\n"
+
+
 # ---- heartbeat / daemon_alive ------------------------------------------------
 
 def test_heartbeat_write_then_daemon_alive_is_true(spool):
@@ -149,14 +155,14 @@ def test_cmd_enqueue_secret_in_prompt_exits_2_and_does_not_queue(spool, tmp_path
 def test_cmd_enqueue_public_link_exits_0_and_queues(spool, tmp_path):
     rid = _rid()
     prompt_file = tmp_path / "prompt.txt"
-    prompt_file.write_text("please review https://github.com/acme/widgets")
+    prompt_file.write_text(_sendable(rid))
     code = spool.cmd_enqueue(_enqueue_args(rid, str(prompt_file)))
     assert code == 0
     sm = _store(spool)
     with sm.Store() as s:
         r = s.get_round(rid)
     assert r is not None and r["state"] == "queued"
-    assert r["rendered_prompt"] == "please review https://github.com/acme/widgets"
+    assert r["rendered_prompt"] == _sendable(rid)
 
 
 def test_cmd_enqueue_same_rid_same_bytes_is_idempotent(spool, tmp_path, capsys):
@@ -166,7 +172,7 @@ def test_cmd_enqueue_same_rid_same_bytes_is_idempotent(spool, tmp_path, capsys):
     request: nothing new is queued, and the caller proceeds to await."""
     rid = _rid("dd0001")
     prompt_file = tmp_path / "prompt.txt"
-    prompt_file.write_text("please review https://github.com/acme/widgets")
+    prompt_file.write_text(_sendable(rid))
     assert spool.cmd_enqueue(_enqueue_args(rid, str(prompt_file))) == 0
     assert spool.cmd_enqueue(_enqueue_args(rid, str(prompt_file))) == 0
     err = capsys.readouterr()
@@ -179,9 +185,9 @@ def test_cmd_enqueue_same_rid_different_bytes_refuses(spool, tmp_path, capsys):
     round's thread would return an answer to a question nobody asked."""
     rid = _rid("dd0002")
     prompt_file = tmp_path / "prompt.txt"
-    prompt_file.write_text("please review https://github.com/acme/widgets")
+    prompt_file.write_text(_sendable(rid))
     assert spool.cmd_enqueue(_enqueue_args(rid, str(prompt_file))) == 0
-    prompt_file.write_text("please review https://github.com/acme/widgets — and also this")
+    prompt_file.write_text(_sendable(rid, "please review https://github.com/acme/widgets — and also this"))
     assert spool.cmd_enqueue(_enqueue_args(rid, str(prompt_file))) == 2
     assert "already_enqueued" in capsys.readouterr().err
 

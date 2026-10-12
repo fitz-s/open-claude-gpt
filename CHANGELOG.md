@@ -22,6 +22,13 @@ finished, correctly wrapped answer.
   ends `unknown_send`, never auto-resent. `logical_sha` renders the marker with `<RID>` like the sentinels, so
   a re-fire still matches its key; a key fired before this change and re-fired after it conflicts once,
   because the stored fingerprint hashes the old first line.
+- A turn we send must parse as its own rid, checked before the click. `@mention` labels are typed ahead of the
+  prompt, so an app named `CGC_RID:<other>`, or a legacy `followup --prompt-file` whose body quotes one, would
+  make the sent turn read as another request and let that request's waiter take this answer. One helper
+  (`_refuse_ambiguous_rid`, the reader's own rule over "labels + prompt") now runs in `submit`, `followup`
+  and `enqueue`: a turn that would not parse as the round's rid is refused as `rid_ambiguous`, naming the
+  foreign rid, before anything is sent (exit 6, provably unsent). `--mention` and `CGC_APPS` names containing
+  `CGC_RID` are refused at input.
 - The page-side `__cgcRid` and Python `_turn_canonical_rid` now share one whitespace set, the `[0-9]` digit
   class and the marker regex by construction. `str.strip()` and `trim()` disagreed (`\x1c`-`\x1f` and U+0085
   against the BOM), so a BOM or U+0085 could make one side read R1 where the other read nothing.
