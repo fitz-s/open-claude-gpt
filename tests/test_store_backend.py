@@ -2104,7 +2104,7 @@ def test_re_enqueuing_an_existing_rid_says_what_to_do_about_it(env, capsys):
     s.finish(r["rid"], store_mod.COMPLETED_VERIFIED, result_text="done")
 
     pf = tmp / "p.md"
-    pf.write_text("continuing this consult\nhttps://github.com/o/r/pull/1\n")
+    pf.write_text(f"CGC_RID:{r['rid']}\ncontinuing this consult\nhttps://github.com/o/r/pull/1\n")
     a = argparse.Namespace(rid=r["rid"], prompt_file=str(pf), kind="submit", out=str(tmp / "o.txt"),
                            conversation="auto", parent=None, model="Pro", request_key=None,
                            logical_sha=None, project_url=None, poll=20, timeout=60, quiet=True)

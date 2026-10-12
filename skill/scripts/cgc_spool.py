@@ -736,6 +736,14 @@ def cmd_enqueue(a) -> int:
         prompt = open(a.prompt_file, encoding="utf-8").read()
         low = prompt.lower()
         is_followup = a.kind == "followup" or "continuing this consult" in low
+        # The turn this round will send must parse as THIS rid under the reader's own rule (the same
+        # helper the driver re-applies before the click): refuse now, so `fire` says so at once and
+        # not the daemon later. Imported lazily: cdp_consult is a heavy module the spool otherwise skips.
+        import cdp_consult as _cdp
+        why = _cdp._refuse_ambiguous_rid(a.rid, prompt, getattr(a, "mentions", None), "enqueue")
+        if why:
+            sys.stderr.write(why + "\n")
+            return 2
         for rx, label in _SECRET_RES:
             if rx.search(prompt):
                 sys.stderr.write(f"CGC_ERROR gate_secret: prompt looks like it contains a {label} — "

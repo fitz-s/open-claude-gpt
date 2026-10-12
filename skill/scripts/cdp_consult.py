@@ -2884,6 +2884,44 @@ def _paste_prompt(c, prompt: str, mentions=()) -> None:
                 f"the requested {wanted!r} — refusing to send the prompt with the wrong apps")
 
 
+def _turn_rid_conflicts(rid, prompt, mentions=()):
+    """The distinct rids (None = "no rid") the user turn we are about to send would PARSE as, other
+    than `rid`; empty means it parses as `rid` however the page lays it out.
+
+    The reader names a turn by the first CGC_RID token in its text, and _paste_prompt types each
+    @mention label BEFORE the prompt, so the text a turn shows is "<labels><prompt>". Any foreign
+    CGC_RID token ahead of ours — an app named `CGC_RID:<other>`, or a legacy prompt-file body that
+    discusses one while its footer is `rid` — would make the sent turn read as another request, and
+    the OTHER rid's waiter or retrieve could then take this round's answer as its own. So the
+    invariant is enforced on the write side, with the reader's own rule, before the click. The labels
+    are laid out both inline (a space) and on their own line, since the sent bubble's layout is not
+    something to depend on. A prompt with no marker whose tail pair is `rid` parses as `rid`: that is
+    the legacy path, and only a collapsed turn would be unprovable there."""
+    names = [m for m in (mentions or ()) if m]
+    texts = [prompt] if not names else [sep.join(names) + sep + prompt for sep in (" ", "\n")]
+    return sorted({got for got in (_turn_canonical_rid(t) for t in texts) if got != rid},
+                  key=lambda g: g or "")
+
+
+_AMBIGUOUS_RID_TAIL = {"submit": "NOT submitting.", "follow-up": "NOT sending the follow-up.",
+                       "enqueue": "NOT enqueuing."}
+
+
+def _refuse_ambiguous_rid(rid, prompt, mentions, what):
+    """The refusal shared by submit, followup and the enqueue that precedes them: a message when the
+    turn would not parse as `rid`, else None. what: "submit", "follow-up" or "enqueue". At the driver
+    it exits EXIT_NOT_SENT_PRECLICK: nothing was clicked, so the round is provably unsent."""
+    bad = _turn_rid_conflicts(rid, prompt, mentions)
+    if not bad:
+        return None
+    shown = ", ".join(b or "no rid" for b in bad)
+    return (f"CGC_ERROR rid_ambiguous: the turn this {what} would send reads as {shown}, not {rid} — "
+            "a CGC_RID token ahead of this round's own (in an @mention name or the prompt body), or no "
+            "rid the reader can find. Another request's waiter could take this answer as its own. "
+            f"{_AMBIGUOUS_RID_TAIL[what]} Render the prompt with consult.py prep (its first line is this "
+            "round's CGC_RID) and drop the token from the body or the mention name.")
+
+
 def cmd_submit(a) -> int:
     prompt = _read_prompt(a.prompt_file)
     # Backstop (prep already hard-blocks at render; the spool gate re-checks): refuse to send a
@@ -2912,6 +2950,10 @@ def cmd_submit(a) -> int:
     if not _ok:
         sys.stderr.write(f"CGC_ERROR gate_refused: {_reason} — NOT submitting.\n")
         return 2
+    _why = _refuse_ambiguous_rid(a.rid, prompt, getattr(a, "mention", None), "submit")
+    if _why:
+        sys.stderr.write(_why + "\n")
+        return EXIT_NOT_SENT_PRECLICK
     if not a.no_gate:
         _ensure_chrome(a.port)  # automated Step 0: start debug Chrome if down + check login
     # Tab policy: each consult gets its OWN dedicated tab by default, so multiple
@@ -3215,6 +3257,10 @@ def cmd_followup(a) -> int:
     if not _ok:
         sys.stderr.write(f"CGC_ERROR gate_refused: {_reason} — NOT sending the follow-up.\n")
         return 2
+    _why = _refuse_ambiguous_rid(rid, prompt, getattr(a, "mention", None), "follow-up")
+    if _why:
+        sys.stderr.write(_why + "\n")
+        return EXIT_NOT_SENT_PRECLICK
     # A consult is a THREAD: the conversation persists server-side at /c/<id> even after
     # its tab is closed (default), so follow-up must NOT depend on round-1 having kept the
     # tab. Attach to a live tab if one exists; otherwise RE-OPEN the conversation by URL.
