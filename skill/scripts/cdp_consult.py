@@ -782,6 +782,28 @@ def _sentinel_js(rid: str, text_expr: str) -> str:
     )
 
 
+# The page conditions only a human can clear: a login wall, a captcha or challenge, a rate-limit
+# alert. ONE definition, read by the waiter (its blocker exit), the composer wait (login/captcha
+# refusals), and every UI-contract verdict — a page showing one of these says nothing about whether
+# the driver can read ChatGPT's markup, so it never marks a capability broken.
+_BLOCKER_FN = (
+    "function __cgcBlocker(){"
+    "if(document.querySelector('input[type=\"password\"]')||/^\\/(auth|login)(\\/|$)/i.test(location.pathname))return 'login';"
+    "if(document.querySelector('iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]'))return 'captcha';"
+    "var al=document.querySelector('[role=\"alert\"]');"
+    "if(al&&/rate limit|too many requests|usage limit/i.test(al.textContent||''))return 'rate_limit';"
+    "return null;}")
+
+
+def _blocker(c):
+    """The human condition the page shows ('login', 'captcha', 'rate_limit'), or None. An unreadable
+    page reads as a blocker ('unreadable'): it cannot prove the absence of one."""
+    try:
+        return c.eval("(function(){" + _BLOCKER_FN + "return __cgcBlocker();})()")
+    except Exception:
+        return "unreadable"
+
+
 def _detect_js(rid: str, *, scoped=False) -> str:
     """Returns JSON {generating,done,blocker,failed,node,len,begin,end,ac} for the answer node.
     done comes from the canonical bare-line _sentinel_js parser (SHARED CONTRACT #1) — a line
@@ -829,10 +851,7 @@ def _detect_js(rid: str, *, scoped=False) -> str:
         "var res=" + sentinel + ";"
         "var hasB=rawT.indexOf(BG)>=0,hasE=rawT.indexOf(EN)>=0;"
         "var stop=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"],button[aria-label*=\"\\u505c\\u6b62\"]');"
-        "var blocker=null;"
-        "if(document.querySelector('input[type=\"password\"]')||/^\\/(auth|login)(\\/|$)/i.test(location.pathname))blocker='login';"
-        "else if(document.querySelector('iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]'))blocker='captcha';"
-        "else{var al=document.querySelector('[role=\"alert\"]');if(al&&/rate limit|too many requests|usage limit/i.test(al.textContent||''))blocker='rate_limit';}"
+        + _BLOCKER_FN + "var blocker=__cgcBlocker();"
         "var done=(res.done&&a.length>0);"
         "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,node:where,"
         "len:rawT.length,begin:hasB,end:hasE,ac:a.length});})()"
@@ -2452,16 +2471,23 @@ _COMPOSER_SEL = 'div[role="textbox"][contenteditable="true"],#prompt-textarea'
 
 
 def _composer_state_js():
-    js = """(function(){__RESOLVE__return JSON.stringify({
+    # loginWall/captcha come from the shared blocker rule (_BLOCKER_FN); `blocker` carries its whole
+    # verdict, rate limit included, so a UI-contract decision can rule every human condition out.
+    # form: a visible <form> — the structure the composer lives in (__cg requires one). With no
+    # visible editor, a form means the app rendered and the editor is what changed; no form means
+    # the page has not rendered the app at all, which readyState cannot tell apart.
+    js = """(function(){__RESOLVE____BLOCKER__var bl=__cgcBlocker();return JSON.stringify({
       composer: !!__cg(),
+      form: Array.prototype.some.call(document.querySelectorAll('form'), function(f){
+        var r=f.getBoundingClientRect();return r.width>0&&r.height>0;}),
       onChatGPT: /(^|\\.)chatgpt\\.com$/.test(location.hostname),
-      loginWall: !!document.querySelector('input[type="password"]')
-                 || /^\\/(auth|login)(\\/|$)/i.test(location.pathname),
-      captcha: !!document.querySelector('iframe[src*="captcha" i],iframe[title*="captcha" i]'),
+      loginWall: bl==='login',
+      captcha: bl==='captcha',
+      blocker: bl,
       readyState: document.readyState,
       path: location.pathname.slice(0,60)
     });})()"""
-    return js.replace("__RESOLVE__", _COMPOSER_RESOLVE_JS)
+    return js.replace("__RESOLVE__", _COMPOSER_RESOLVE_JS).replace("__BLOCKER__", _BLOCKER_FN)
 
 
 def _await_composer(c, seconds=60):
@@ -2501,18 +2527,12 @@ def _composer_failure(st):
                "The page did not load in time; re-enqueue and it will retry.")
 
 
-def _composer_outcome(st, fresh):
-    """The typed line for a composer that never appeared. `drift` names the UI capability the failure
-    proves broken: only a FRESH project tab that finished loading on chatgpt.com, past any login or
-    challenge, and still holds no visible composer. A page still loading says nothing about the
-    markup, and neither does a re-opened conversation (it may be archived or no longer accessible)."""
+def _composer_outcome(st):
+    """The typed line for a composer that never appeared (always pre-click: nothing was sent)."""
     reason = ("login_needed" if st.get("loginWall") else "captcha" if st.get("captcha")
               else "wrong_page" if not st.get("onChatGPT", True) else "composer_not_ready")
-    out = {"ok": False, "submitted": False, "reason": reason, "phase": "composer",
-           "readyState": st.get("readyState")}
-    if fresh and reason == "composer_not_ready" and st.get("readyState") == "complete":
-        out["drift"] = "composer"
-    return out
+    return {"ok": False, "submitted": False, "reason": reason, "phase": "composer",
+            "readyState": st.get("readyState"), "blocker": st.get("blocker"), "form": st.get("form")}
 
 
 def _read_prompt(path):
@@ -2855,13 +2875,6 @@ def _insert_mention(c, name):
         drift=not popup_open)
 
 
-def _mention_outcome(e):
-    out = {"ok": False, "submitted": False, "reason": "mention_not_found", "phase": "mention"}
-    if getattr(e, "drift", False):
-        out["drift"] = "mention"
-    return out
-
-
 def _paste_prompt(c, prompt: str, mentions=()) -> None:
     """Clear the composer and paste `prompt` in bounded chunks via execCommand('insertText') — kept
     (never a raw textContent/value assignment, which would not drive ChatGPT's React composer state)
@@ -3011,7 +3024,7 @@ def cmd_submit(a) -> int:
         ready, _cstate = _await_composer(c)
         if not ready:
             _code, _msg = _composer_failure(_cstate)
-            print(json.dumps(_composer_outcome(_cstate, fresh=True)))
+            print(json.dumps(_composer_outcome(_cstate)))
             sys.stderr.write(_msg + "\n")
             return _code
         # Model selection — fully automated (must run AFTER navigate, which resets the
@@ -3025,12 +3038,8 @@ def cmd_submit(a) -> int:
             pick = _select_model(c, target, a.model_family)
             model_confirmed, model_now, model_badge = pick.confirmed, pick.shown, pick.badge
             if not model_confirmed and not a.allow_model_mismatch:
-                # drift: a FRESH project tab could not select the configured model, so every submit
-                # refuses the same way. A follow-up's refusal names none: its thread can sit on a tier
-                # it can no longer change, which says nothing about the composer's markup.
                 print(json.dumps({"ok": False, "submitted": False, "reason": "model_not_selectable",
-                                  "phase": "model", "drift": "composer",
-                                  "modelConfirmed": False, "model": model_now,
+                                  "phase": "model", "modelConfirmed": False, "model": model_now,
                                   "modelBadge": model_badge, "wanted": target,
                                   "wantedFamily": a.model_family, "detail": pick.error}))
                 # pick.error is set only when the MODEL FAMILY is what failed — a different
@@ -3062,7 +3071,8 @@ def cmd_submit(a) -> int:
         try:
             _paste_prompt(c, prompt, a.mention)
         except _MentionFailure as e:
-            print(json.dumps(_mention_outcome(e)))
+            print(json.dumps({"ok": False, "submitted": False, "reason": "mention_not_found",
+                              "phase": "mention"}))
             sys.stderr.write(f"CGC_ERROR {e} — NOT submitted.\n")
             return 3
         except _PreClickFailure as e:
@@ -3140,12 +3150,15 @@ def cmd_submit(a) -> int:
                 + f"observed: {json.dumps(contract)}\n")
             return 3
         if verdict == "selector_drift":
+            # drift: the driver's own verdict that it cannot read replies on a page where the send
+            # landed, so every further send would spend a message into the same blind reader —
+            # unless the page shows a human condition instead (read before the tab closes).
+            _b = _blocker(c)
+            why = {"blocker": _b} if _b else {"drift": "reader"}
             if owns_tab:
                 c.close_tab()   # the send is confirmed and the conversation persists server-side
-            # drift: the driver's own verdict that it cannot read replies on a page where the send
-            # landed. Every further send would spend a message into the same blind reader.
             print(json.dumps({"ok": False, "submitted": True, "rid": a.rid, "phase": "contract",
-                              "drift": "reader",
+                              **why,
                               "reason": "selector_drift", "adapter": adapter, "contract": contract,
                               "conversation_id": conv}))
             sys.stderr.write(
@@ -3325,7 +3338,7 @@ def cmd_followup(a) -> int:
         ready, _cstate = _await_composer(c)
         if not ready:
             _code, _msg = _composer_failure(_cstate)
-            print(json.dumps(_composer_outcome(_cstate, fresh=False)))
+            print(json.dumps(_composer_outcome(_cstate)))
             sys.stderr.write(_msg + "\n")
             return _code
         # CONVERSATION-INTEGRITY GUARD (before any model-selection/insert): after attaching to a
@@ -3417,7 +3430,8 @@ def cmd_followup(a) -> int:
         try:
             _paste_prompt(c, prompt, a.mention)
         except _MentionFailure as e:
-            print(json.dumps(_mention_outcome(e)))
+            print(json.dumps({"ok": False, "submitted": False, "reason": "mention_not_found",
+                              "phase": "mention"}))
             sys.stderr.write(f"CGC_ERROR {e} — NOT sent.\n")
             return 3
         except _PreClickFailure as e:

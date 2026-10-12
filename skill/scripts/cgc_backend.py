@@ -935,8 +935,15 @@ def refire_round(old_rid: str) -> int:
 # agent should never have to infer state by scraping prose. schema=1 is the envelope's version.
 def _emit(rid, state, *, retryable, human_action=None, next_command=None, answer_path=None,
           parent_rid=None, confidence=None, error=None, source_rid=None, observed_rid=None,
-          model_badge=None, model_slug=None, attribution=None, send=None):
+          model_badge=None, model_slug=None, attribution=None):
     import cgc_spool as _spool
+    # The driver's typed outcome for this round's last send attempt, read here so EVERY envelope
+    # carries it (None: no attempt, or one that predates typed outcomes).
+    try:
+        with store_mod.Store() as _s:
+            send = _s.send_evidence(rid)
+    except Exception:
+        send = None
     # Envelope invariant: retryable=true must always name the retry — an agent told "retryable"
     # with no next_command/human_action has a verdict but no move. Enforced structurally so no
     # future branch can violate it.
@@ -981,8 +988,8 @@ def driver_rev() -> str:
         return "unknown"
 
 
-_EVIDENCE_KEYS = ("submitted", "reason", "phase", "drift", "adapter", "contract", "conversation_id",
-                  "echoedRid", "wanted", "wantedFamily", "detail", "readyState")
+_EVIDENCE_KEYS = ("submitted", "reason", "phase", "drift", "blocker", "adapter", "contract",
+                  "conversation_id", "echoedRid", "wanted", "wantedFamily", "detail", "readyState")
 
 
 def _send_evidence(res: dict) -> dict:
@@ -990,7 +997,7 @@ def _send_evidence(res: dict) -> dict:
     each string cut to 300 chars, plus the exit code and the CGC_ERROR line."""
     rec = res.get("outcome") or {}
     ev = {k: (v[:300] if isinstance(v, str) else v) for k in _EVIDENCE_KEYS
-          if (v := rec.get(k)) not in (None, "")}
+          if (v := rec.get(k)) not in (None, "") or (k == "submitted" and k in rec)}  # null = unknown
     ev["exit"] = res.get("code")
     err = _stderr_error_line(res.get("stderr") or "")
     if err:
@@ -998,28 +1005,29 @@ def _send_evidence(res: dict) -> dict:
     return ev
 
 
-def _configured_model() -> tuple:
-    """The (tier, family) the composer probe checks: cdp_consult's own CGC_* reading."""
-    if os.environ.get("CGC_AUTO_MODEL", "1").strip().lower() in ("0", "false", "no", "off", ""):
-        return ("skip", "skip")
-    return (os.environ.get("CGC_MODEL", "Pro"), os.environ.get("CGC_MODEL_FAMILY", "GPT-6"))
+def _project_send(store, attempt: str, rid: str, res: dict) -> str | None:
+    """Record the send's typed outcome on its attempt, and mark `reader` broken when the driver says
+    the send landed and its reply is unreadable (selector_drift on a page showing no login, challenge
+    or rate limit — the driver's `drift`). That is the one failure a real round may turn into a gate,
+    because it is the one that costs a message: every further send would spend another into the same
+    blind reader. A pre-click composer or mention failure costs nothing and is ambiguous from one
+    round (a deleted project, a stale frozen family, an unconnected app), so only the probe — which
+    checks the configured project, model and app — records those capabilities.
+
+    Called AFTER the round's durable state and address are written, and fail-soft: a diagnostics
+    failure is logged and swallowed, so it can never move a round or lose its conversation."""
+    try:
+        return _project_send_unchecked(store, attempt, rid, res)
+    except Exception as e:
+        sys.stderr.write(f"CGC_WARN {rid}: send outcome not recorded ({type(e).__name__}: {e})\n")
+        return None
 
 
-def _project_send(store, attempt: str, rid: str, res: dict, spec: dict) -> str | None:
-    """Record the send's typed outcome on its attempt, and mark the capability it proves broken. The
-    driver names that capability (`drift`) only for a deterministic mismatch: before the click, no
-    composer on a loaded fresh tab, a fresh tab's picker refusing the model, the @ popup never opening
-    or an app row yielding no mention; after it, selector_drift (the rid landed, no reply is
-    readable). A login, a captcha or a rate limit never carries one. A model refusal counts only for
-    the configured model: a round that froze another family into its spec (`Latest`) proves nothing
-    about the picker the probe checks. Returns the capability marked, or None."""
+def _project_send_unchecked(store, attempt, rid, res):
     ev = _send_evidence(res)
     store.record_attempt_evidence(attempt, json.dumps(ev, sort_keys=True))
     cap = ev.get("drift")
-    if cap not in store_mod.CAPABILITIES:
-        return None
-    if ev.get("phase") == "model" and (spec.get("model") or "Pro",
-                                       spec.get("model_family") or "GPT-6") != _configured_model():
+    if cap != "reader":
         return None
     store.mark_broken(cap, phase=f"send:{ev.get('phase') or '?'}",
                       cause=ev.get("error") or ev.get("reason") or "driver reported drift",
@@ -1309,11 +1317,9 @@ def _await_round(a) -> int:
                    "If it names a conversation, retrieve from it (enqueue --kind retrieve "
                    f"--conversation <id> --parent {a.rid}); if it finds none, a human must look at "
                    "the ChatGPT window before any re-send.\n"))
-            with store_mod.Store() as _s:
-                send_ev = _s.send_evidence(a.rid)
             _emit(a.rid, state, retryable=False, parent_rid=parent,
                   human_action="check the ChatGPT window; retrieve by conversation before re-sending",
-                  next_command=retrieve, error=r["error_code"], send=send_ev)
+                  next_command=retrieve, error=r["error_code"])
             # 3, not 1. The documented contract is 0 answer / 3 a human must act / 1 BROKEN, and an
             # uncertain send is the definition of "a human must act" — nothing is broken, the send
             # may well have landed. Reporting it as broken is what made every one of these read as a
@@ -1499,41 +1505,46 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         finally:
             if hasattr(conv_lease, "close"):
                 conv_lease.close()  # mutating region done — the read-only wait below needs no lease
-        _project_send(store, attempt, rid, send, spec)
-        if send.get("code") == _EXIT_NOT_SENT_PRECLICK:
-            store.mark_send_not_sent(attempt, f"followup failed before the click (exit "
-                                              f"{_EXIT_NOT_SENT_PRECLICK}): {(send.get('stderr') or '').strip()[:300]}")
-            return store_mod.FAILED
         if send.get("code") == 0:
             # same thread, confirmed — with the composer reading it selected before this send
             store.mark_accepted(attempt, conv, model_badge=send.get("model_badge"))
             store.mark_waiting(rid)
             return _wait_phase(store, rid, conv, spec, run_cdp)
-        if _not_sent_marker(send, _NOT_SENT_BLOCK):
-            # Same proof shape as _NOT_SENT_RETRY below (module docstring, _NOT_SENT_BLOCK comment
-            # above): login_needed/captcha/rate_limit fire from the preflight probe or
-            # _composer_failure, both strictly before the click, in this send-phase classifier only
-            # (the wait-phase blocker at _wait_phase's `code == 3` branch is a DIFFERENT invocation
-            # and is deliberately never stamped — that one follows a confirmed send). Stamped so an
-            # expired-login BLOCKED round — the most common real case of this class — can release its
-            # request-key once the human logs back in, instead of the model_not_selectable trap this
-            # round fixed for _NOT_SENT_RETRY recurring here.
-            store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
-                            send_disposition=store_mod.NOT_SENT_PROVEN,
-                            error_code=_block_code(send.get("stderr")))
-            return store_mod.BLOCKED
-        if _not_sent_marker(send, _NOT_SENT_RETRY):
-            # Same evidence, same verdict as a submit's. These markers are emitted FAIL-CLOSED
-            # before the click, so the follow-up provably did not send and re-queuing duplicates
-            # nothing. Omitting this check here (the submit branch always had it) filed a proven
-            # not-sent as UNCERTAIN, which is the costliest possible misfiling: it blocks the free
-            # automatic retry, burns a full auto-retrieve and then a manual one hunting an answer
-            # that was never asked for, and leaves a human staring at "may have sent" with only a
-            # resend left to try — under exactly the uncertainty the invariant exists to prevent.
-            return _requeue_or_block(store, rid, _not_sent_marker(send, _NOT_SENT_RETRY))
-        store.mark_possibly_accepted(attempt, f"followup send failed (exit {send.get('code')}"
-                                              f"{_why_unconfirmed(send)}) — retrieve, don't resend")
-        return store_mod.POSSIBLY_ACCEPTED
+        # Every other outcome: its durable state FIRST, then the driver's typed outcome (the
+        # `finally`, after whichever branch ran). _project_send is diagnostics and fail-soft, so it
+        # can never move the round or lose its address.
+        try:
+            if send.get("code") == _EXIT_NOT_SENT_PRECLICK:
+                store.mark_send_not_sent(attempt, f"followup failed before the click (exit "
+                                                  f"{_EXIT_NOT_SENT_PRECLICK}): {(send.get('stderr') or '').strip()[:300]}")
+                return store_mod.FAILED
+            if _not_sent_marker(send, _NOT_SENT_BLOCK):
+                # Same proof shape as _NOT_SENT_RETRY below (module docstring, _NOT_SENT_BLOCK comment
+                # above): login_needed/captcha/rate_limit fire from the preflight probe or
+                # _composer_failure, both strictly before the click, in this send-phase classifier only
+                # (the wait-phase blocker at _wait_phase's `code == 3` branch is a DIFFERENT invocation
+                # and is deliberately never stamped — that one follows a confirmed send). Stamped so an
+                # expired-login BLOCKED round — the most common real case of this class — can release
+                # its request-key once the human logs back in, instead of the model_not_selectable trap
+                # this round fixed for _NOT_SENT_RETRY recurring here.
+                store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
+                                send_disposition=store_mod.NOT_SENT_PROVEN,
+                                error_code=_block_code(send.get("stderr")))
+                return store_mod.BLOCKED
+            if _not_sent_marker(send, _NOT_SENT_RETRY):
+                # Same evidence, same verdict as a submit's. These markers are emitted FAIL-CLOSED
+                # before the click, so the follow-up provably did not send and re-queuing duplicates
+                # nothing. Omitting this check here (the submit branch always had it) filed a proven
+                # not-sent as UNCERTAIN, which is the costliest possible misfiling: it blocks the free
+                # automatic retry, burns a full auto-retrieve and then a manual one hunting an answer
+                # that was never asked for, and leaves a human staring at "may have sent" with only a
+                # resend left to try — under exactly the uncertainty the invariant exists to prevent.
+                return _requeue_or_block(store, rid, _not_sent_marker(send, _NOT_SENT_RETRY))
+            store.mark_possibly_accepted(attempt, f"followup send failed (exit {send.get('code')}"
+                                                  f"{_why_unconfirmed(send)}) — retrieve, don't resend")
+            return store_mod.POSSIBLY_ACCEPTED
+        finally:
+            _project_send(store, attempt, rid, send)
 
     gated = _gate(store, rid, prompt, validate)
     if gated is not None:
@@ -1549,48 +1560,54 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                   model_family=spec.get("model_family") or "GPT-6",
                   mentions=spec.get("mentions") or [])
     conv = sub.get("conversation")
-    _project_send(store, attempt, rid, sub, spec)
-
-    if sub.get("code") == _EXIT_NOT_SENT_PRECLICK:
-        store.mark_send_not_sent(attempt, f"submit failed before the click (exit "
-                                          f"{_EXIT_NOT_SENT_PRECLICK}): {(sub.get('stderr') or '').strip()[:300]}")
-        return store_mod.FAILED
 
     if conv and sub.get("code") == 0:
         store.mark_accepted(attempt, conv, model_badge=sub.get("model_badge"))
         store.mark_waiting(rid)
         return _wait_phase(store, rid, conv, spec, run_cdp)
 
-    # The click did not confirm. Distinguish PROVEN-not-sent from uncertain.
-    if _not_sent_marker(sub, _NOT_SENT_BLOCK):
-        # Both call sites of this branch run in the send-phase classifier (expect=SENDING, against
-        # stderr _run scopes to this one invocation) — login_needed/captcha are raised before the
-        # composer is even populated, so this is pre-click proof exactly like _NOT_SENT_RETRY below,
-        # and gets the same stamp. (`"usage"` also matches argparse's own `usage:` banner on a CLI
-        # misuse of cdp_consult.py — still a pre-click condition, so the stamp is correct there too;
-        # noted here so it doesn't read as an accidental substring match.)
-        store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
-                        send_disposition=store_mod.NOT_SENT_PROVEN,
-                        error_code=_block_code(sub.get("stderr")))
-        return store_mod.BLOCKED
-    if _not_sent_marker(sub, _NOT_SENT_RETRY):
-        # provably not sent → safe to re-queue (this is NOT resending a possible send), bounded
-        return _requeue_or_block(store, rid, _not_sent_marker(sub, _NOT_SENT_RETRY))
-    # UNCERTAIN. A conversation reported by a FAILING submit is an address, not a confirmation (the
-    # driver reports one whenever the post-click tab sits in a thread, including a reused tab it was
-    # already in), so the state stays possibly_accepted — but recording it is what makes this round
-    # retrievable read-only (recover()'s `retrievable` bucket, verified by its own END_RESPONSE
-    # sentinel) instead of the dead end that forced a human to copy the answer out of the window by
-    # hand. Linked ONLY here: on the proven-not-sent branches above the round is re-queued, and a
-    # thread pinned from a send that never happened would follow it into its next attempt.
-    if conv:
-        store.link_conversation(rid, conv)
-    store.mark_possibly_accepted(
-        attempt,
-        f"submit did not confirm the send (exit {sub.get('code')}{_why_unconfirmed(sub)})"
-        + (f"; conversation {conv} recorded for read-only retrieval" if conv else
-           "; no conversation captured"))
-    return store_mod.POSSIBLY_ACCEPTED
+    # Every other outcome: its durable state and address FIRST, then the driver's typed outcome (the
+    # `finally`). _project_send is diagnostics and fail-soft: it can never move the round or lose
+    # the conversation that makes an uncertain send retrievable.
+    try:
+        if sub.get("code") == _EXIT_NOT_SENT_PRECLICK:
+            store.mark_send_not_sent(attempt, f"submit failed before the click (exit "
+                                              f"{_EXIT_NOT_SENT_PRECLICK}): {(sub.get('stderr') or '').strip()[:300]}")
+            return store_mod.FAILED
+
+        # The click did not confirm. Distinguish PROVEN-not-sent from uncertain.
+        if _not_sent_marker(sub, _NOT_SENT_BLOCK):
+            # Both call sites of this branch run in the send-phase classifier (expect=SENDING, against
+            # stderr _run scopes to this one invocation) — login_needed/captcha are raised before the
+            # composer is even populated, so this is pre-click proof exactly like _NOT_SENT_RETRY
+            # below, and gets the same stamp. (`"usage"` also matches argparse's own `usage:` banner
+            # on a CLI misuse of cdp_consult.py — still a pre-click condition, so the stamp is correct
+            # there too; noted here so it doesn't read as an accidental substring match.)
+            store.set_state(rid, store_mod.BLOCKED, expect=store_mod.SENDING,
+                            send_disposition=store_mod.NOT_SENT_PROVEN,
+                            error_code=_block_code(sub.get("stderr")))
+            return store_mod.BLOCKED
+        if _not_sent_marker(sub, _NOT_SENT_RETRY):
+            # provably not sent → safe to re-queue (this is NOT resending a possible send), bounded
+            return _requeue_or_block(store, rid, _not_sent_marker(sub, _NOT_SENT_RETRY))
+        # UNCERTAIN. A conversation reported by a FAILING submit is an address, not a confirmation
+        # (the driver reports one whenever the post-click tab sits in a thread, including a reused tab
+        # it was already in), so the state stays possibly_accepted — but recording it is what makes
+        # this round retrievable read-only (recover()'s `retrievable` bucket, verified by its own
+        # END_RESPONSE sentinel) instead of the dead end that forced a human to copy the answer out of
+        # the window by hand. Linked ONLY here: on the proven-not-sent branches above the round is
+        # re-queued, and a thread pinned from a send that never happened would follow it into its
+        # next attempt.
+        if conv:
+            store.link_conversation(rid, conv)
+        store.mark_possibly_accepted(
+            attempt,
+            f"submit did not confirm the send (exit {sub.get('code')}{_why_unconfirmed(sub)})"
+            + (f"; conversation {conv} recorded for read-only retrieval" if conv else
+               "; no conversation captured"))
+        return store_mod.POSSIBLY_ACCEPTED
+    finally:
+        _project_send(store, attempt, rid, sub)
 
 
 def _why_unconfirmed(res: dict) -> str:

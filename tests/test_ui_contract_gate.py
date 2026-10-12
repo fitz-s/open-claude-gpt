@@ -56,14 +56,17 @@ class _Composer:
     """A fresh project tab, from the probe's side: answers the JS the composer + mention probes
     evaluate. Records every key and every Input.* call, so a send attempt is visible."""
 
-    def __init__(self, app="WebCodex Demo", popup=True):
+    def __init__(self, app="WebCodex Demo", popup=True, blocker=None):
         self.text, self.mentions, self.pending = "", [], []
-        self.app, self.popup = app.lower(), popup
+        self.app, self.popup, self.blocker = app.lower(), popup, blocker
         self.keys, self.calls, self.closed = [], [], 0
 
     def eval(self, js, timeout=None):
         if "loginWall" in js:
-            return json.dumps({"composer": True, "onChatGPT": True, "readyState": "complete"})
+            return json.dumps({"composer": True, "form": True, "onChatGPT": True,
+                               "readyState": "complete", "blocker": self.blocker})
+        if "return __cgcBlocker();" in js:
+            return self.blocker
         if "readyState" in js:
             return True
         if "selectAll" in js:
@@ -179,17 +182,20 @@ def _load_dom():
 
 
 class _NodeTab:
-    """A read-only tab whose eval runs the driver's real JS in node against a fixed page."""
+    """A read-only tab whose eval runs the driver's real JS in node against a page. `pages` is a
+    list: each read of the turn list advances one page, so a test can model a thread hydrating."""
 
-    def __init__(self, page):
+    def __init__(self, *pages):
         if not shutil.which("node"):
             pytest.skip("node not installed")
-        self.page, self.calls = page, []
+        self.pages, self.calls = list(pages), []
 
     def eval(self, js, timeout=None):
         if "scrollTop" in js:
             return 1
-        src = _load_dom() + self.page + "\nconsole.log(JSON.stringify(" + js + "));"
+        if "Array.prototype.map.call(u" in js and len(self.pages) > 1:
+            self.pages.pop(0)                # one poll's worth of hydration
+        src = _load_dom() + self.pages[0] + "\nconsole.log(JSON.stringify(" + js + "));"
         out = subprocess.run(["node", "-e", src], capture_output=True, text=True, check=True).stdout
         return json.loads(out)
 
@@ -198,47 +204,85 @@ class _NodeTab:
         return {}
 
 
-def _collapsed_page(rid, *, answered=True, head_marker=True):
+# The shared mock DOM matches `=` and `$=` attribute selectors; the blocker rule also uses `*=`
+# (with the ` i` flag), so the pages here add it, and answer `main` by hand.
+_MAIN = ("var _m=match;match=function(el,sel){return sel.split(',').some(function(s){s=s.trim();"
+         "var m=s.match(/^([a-z]*)\\[([\\w-]+)\\*=\"([^\"]*)\"(?: i)?\\]$/i);if(!m)return _m(el,s);"
+         "if(m[1]&&el.tagName.toLowerCase()!==m[1].toLowerCase())return false;var v=el.getAttribute(m[2]);"
+         "return v!=null&&v.toLowerCase().indexOf(m[3].toLowerCase())>=0;});};"
+         "var q=ROOT.querySelector;ROOT.querySelector=function(s){return s==='main'?ROOT:q.call(ROOT,s)};")
+
+
+def _collapsed_page(rid, *, answered=True, head_marker=True, extra=""):
     """A finished long turn ChatGPT collapsed: the DOM keeps the head (the CGC_RID marker) and a
-    Show more button, never the tail pair; the answer below it is wrapped."""
+    Show more button, never the tail pair; the answer below it is wrapped. (The mock DOM matches
+    attribute selectors only, so `main` is answered by hand.)"""
     head = ("P('CGC_RID:%s')," % rid if head_marker else "") + "P('# Review'),P('the head…')"
     answer = (",unit('t1:2:assistant',[md(['BEGIN_RESPONSE:%s','the verdict','END_RESPONSE:%s'])])"
               % (rid, rid)) if answered else ""
     return ("var U=unit('t1:0:user',[%s,E('BUTTON',{'aria-expanded':'false'},[],'Show more')]);"
-            "var ROOT=E('MAIN',{},[E('DIV',{'data-turn-key':'k1'},[U%s])]);"
-            "var document=ROOT;document.body=ROOT;var location={pathname:'/c/x'};" % (head, answer))
+            "var ROOT=E('MAIN',{},[E('DIV',{'data-turn-key':'k1'},[U%s])%s]);" % (head, answer, extra)
+            + _MAIN + "var document=ROOT;document.body=ROOT;var location={pathname:'/c/x'};")
+
+
+def _fast(monkeypatch, cdp):
+    monkeypatch.setattr(cdp.time, "sleep", lambda s: None)
+    monkeypatch.setattr(cdp, "STALE_RELOAD_SETTLE_S", 0)
+    monkeypatch.setattr(cdp, "_await_thread_rendered", lambda c, seconds=0: True)
 
 
 def test_the_reader_probe_reads_a_collapsed_marker_turn(env, monkeypatch):
-    monkeypatch.setattr(env.cdp.time, "sleep", lambda s: None)
+    _fast(monkeypatch, env.cdp)
     tab = _NodeTab(_collapsed_page(RID))
-    n = env.probe.probe_reader(env.probe._NoSend(tab), RID)
+    n = env.probe.probe_reader(env.probe._NoSend(tab), RID, settle=0)
     assert n == len("the verdict")
     assert tab.calls == [], "read-only: no reload was needed and nothing was dispatched"
 
 
+def test_finding1_a_thread_still_hydrating_is_read_not_judged(env, monkeypatch):
+    """The user turn renders first, the assistant turn seconds later. An early read sees no
+    assistant turn; the probe keeps reading until the settle window, and passes."""
+    _fast(monkeypatch, env.cdp)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(env.probe.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(env.probe.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    early = _collapsed_page(RID, answered=False)
+    tab = _NodeTab(early, early, _collapsed_page(RID))
+    assert env.probe.probe_reader(env.probe._NoSend(tab), RID, settle=60) == len("the verdict")
+
+
+def test_finding1_a_thread_that_never_hydrates_is_inconclusive(env, monkeypatch):
+    """No assistant turn by the end of the window, and the rid is NOT rendered in <main>: the page
+    never showed the conversation, so nothing is proven and nothing is marked."""
+    _fast(monkeypatch, env.cdp)
+    page = ("var ROOT=E('MAIN',{},[]);" + _MAIN +
+            "var document=ROOT;document.body=ROOT;var location={pathname:'/c/x'};")
+    with pytest.raises(env.probe.Transient) as e:
+        env.probe.probe_reader(env.probe._NoSend(_NodeTab(page)), RID, settle=0)
+    assert not isinstance(e.value, env.probe.Blocked)
+
+
 def test_a_page_that_hides_its_turns_from_the_reader_is_drift(env, monkeypatch):
-    monkeypatch.setattr(env.cdp.time, "sleep", lambda s: None)
-    monkeypatch.setattr(env.cdp, "STALE_RELOAD_SETTLE_S", 0)
+    _fast(monkeypatch, env.cdp)
     # The rid is visibly on the page, but in a user turn no turn selector reads any more.
-    # (The mock DOM matches attribute selectors only, so `main` is answered by hand.)
     page = ("var ROOT=E('MAIN',{},[E('DIV',{'data-new-turn':'user'},[P('CGC_RID:%s'),P('ask')])]);"
-            "var q=ROOT.querySelector;ROOT.querySelector=function(s){return s==='main'?ROOT:q.call(ROOT,s)};"
-            "var document=ROOT;document.body=ROOT;var location={pathname:'/c/x'};" % RID)
-    tab = _NodeTab(page)
-    monkeypatch.setattr(env.cdp, "_await_thread_rendered", lambda c, seconds=0: True)
+            % RID + _MAIN + "var document=ROOT;document.body=ROOT;var location={pathname:'/c/x'};")
     with pytest.raises(env.probe.Drift) as d:
-        env.probe.probe_reader(env.probe._NoSend(tab), RID)
+        env.probe.probe_reader(env.probe._NoSend(_NodeTab(page)), RID, settle=0)
     assert d.value.cap == "reader" and d.value.phase == "rid"
 
 
-def test_a_page_without_the_conversation_is_inconclusive_not_drift(env, monkeypatch):
-    monkeypatch.setattr(env.cdp.time, "sleep", lambda s: None)
-    monkeypatch.setattr(env.cdp, "_await_thread_rendered", lambda c, seconds=0: False)
-    tab = _NodeTab("var ROOT=E('MAIN',{},[]);var document=ROOT;document.body=ROOT;"
-                   "var location={pathname:'/c/x'};")
-    with pytest.raises(env.probe.Transient):
-        env.probe.probe_reader(env.probe._NoSend(tab), RID)
+@pytest.mark.parametrize("overlay,blocker", [
+    (",E('DIV',{'id':'cf-challenge-running'},[],'Verify you are human')", "captcha"),
+    (",E('DIV',{'role':'alert'},[],'Too many requests. Try again later.')", "rate_limit"),
+])
+def test_finding2_a_challenge_or_rate_limit_overlay_never_breaks_the_reader(env, monkeypatch,
+                                                                            overlay, blocker):
+    _fast(monkeypatch, env.cdp)
+    page = _collapsed_page(RID, answered=False, extra=overlay)
+    with pytest.raises(env.probe.Blocked) as e:
+        env.probe.probe_reader(env.probe._NoSend(_NodeTab(page)), RID, settle=0)
+    assert e.value.blocker == blocker
 
 
 def test_the_reader_round_prefers_a_long_marker_prompt_and_takes_a_short_legacy_one(env):
@@ -318,6 +362,81 @@ def test_a_confirmed_break_is_recorded_after_its_retry(env, monkeypatch):
     assert rep["composer"]["verdict"] == "broken" and len(tabs) == 2
     cap = env.s.capabilities()["composer"]
     assert cap["ok"] is False and cap["phase"] == "probe:model" and "GPT-6" in cap["cause"]
+    assert [t.closed for t in tabs] == [1, 1], "each attempt closed its own tab"
+
+
+@pytest.mark.parametrize("blocker", ["login", "captcha"])
+def test_a_challenge_or_login_page_leaves_every_record_untouched(env, monkeypatch, blocker):
+    """The composer probe on a tab showing a login wall or a challenge: inconclusive, the human
+    condition reported, every capability record exactly as it was — even with a picker that would
+    otherwise read as broken."""
+    cdp, probe, s = env.cdp, env.probe, env.s
+    monkeypatch.setattr(cdp.time, "sleep", lambda s: None)
+    s.mark_broken("reader", phase="probe:rid", cause="an earlier break")
+    before = s.capabilities()
+    monkeypatch.setattr(cdp, "_select_model", lambda c, t, f: cdp._ModelPick(False, None, None,
+                                                                            "no picker", False))
+    monkeypatch.setattr(cdp, "CDP", lambda port, match=None, create_url=None: _Composer(blocker=blocker))
+    monkeypatch.setenv("CGC_APPS", "")
+    rep = probe.run_probe("composer")
+    assert rep["composer"]["verdict"] == "transient" and rep["composer"]["phase"] == "human:" + blocker
+    assert s.capabilities() == before
+    assert probe.print_states(rep) == 3       # reader is still broken; nothing new was written
+
+
+def test_finding3_composer_drift_needs_the_apps_own_structure(env, monkeypatch):
+    """No editor on a page whose app never rendered its form (readyState alone is 'complete' early)
+    is inconclusive; no editor inside a rendered form is drift; a challenge is a blocker."""
+    cdp, probe = env.cdp, env.probe
+
+    class Page(_Composer):
+        def __init__(self, st):
+            super().__init__()
+            self.st = st
+
+        def eval(self, js, timeout=None):
+            if "loginWall" in js:
+                return json.dumps(self.st)
+            return super().eval(js, timeout)
+    monkeypatch.setattr(cdp, "_await_composer", lambda c, seconds=60: (False, json.loads(c.eval("loginWall"))))
+    base = {"composer": False, "onChatGPT": True, "readyState": "complete", "blocker": None}
+    with pytest.raises(probe.Transient):
+        probe.probe_composer(probe._NoSend(Page({**base, "form": False})), model="skip", family="skip", app=None)
+    with pytest.raises(probe.Drift):
+        probe.probe_composer(probe._NoSend(Page({**base, "form": True})), model="skip", family="skip", app=None)
+    with pytest.raises(probe.Blocked):
+        probe.probe_composer(probe._NoSend(Page({**base, "form": True, "blocker": "captcha",
+                                                 "captcha": True})), model="skip", family="skip", app=None)
+    # The shared rule: the composer state reads the same blocker function the waiter does.
+    assert cdp._BLOCKER_FN in cdp._composer_state_js() and cdp._BLOCKER_FN in cdp._detect_js(RID)
+    assert '[id*="challenge"]' in cdp._BLOCKER_FN
+
+
+def test_finding4_a_mention_break_is_rechecked_on_its_own_app(env, monkeypatch):
+    probe, s = env.probe, env.s
+    monkeypatch.setenv("CGC_APPS", "")
+    assert probe.probe_app(s) is None
+    s.mark_broken("mention", phase="probe:mention", cause="popup never opened", ref="app:Notion")
+    assert probe.probe_app(s) == "Notion", "the app the break was recorded on"
+    assert probe.probe_app(s, "Canva") == "Canva", "--mention wins"
+    monkeypatch.setenv("CGC_APPS", "WebCodex Demo")
+    s.mark_passed("mention", started_epoch=s.capability_epoch(), phase="probe", ref="app:Notion")
+    assert probe.probe_app(s) == "WebCodex Demo"
+
+
+def test_finding4_with_no_app_the_probe_says_how_to_name_one(env, monkeypatch, capsys):
+    cdp, probe = env.cdp, env.probe
+    monkeypatch.setattr(cdp.time, "sleep", lambda s: None)
+    monkeypatch.setattr(cdp, "_select_model", lambda c, t, f: cdp._ModelPick(True, t, "6", None, False))
+    monkeypatch.setattr(cdp, "CDP", lambda port, match=None, create_url=None: _Composer())
+    monkeypatch.setenv("CGC_APPS", "")
+    rep = probe.run_probe("mention")
+    assert rep["mention"]["verdict"] == "unestablished"
+    probe.print_states(rep)
+    assert 'cgc probe --mention "<app>"' in capsys.readouterr().err
+    rep = probe.run_probe("mention", "WebCodex Demo")
+    assert rep["mention"]["verdict"] == "pass" and rep["mention"]["recorded"]
+    assert env.s.capabilities()["mention"]["rid_or_conversation"] == "app:WebCodex Demo"
 
 
 # ---- the gate ---------------------------------------------------------------------------------
@@ -352,6 +471,17 @@ def test_retrieve_is_never_gated(env):
     assert s.claim_ready("d1")["rid"] == RID
 
 
+def test_finding10_the_unbroken_claim_takes_the_one_row_fast_path(env, monkeypatch):
+    s = env.s
+    for i in range(3):
+        _queue(env, "REQ-20261011-120000-0000c%d" % i)
+    seen = []
+    s.db.set_trace_callback(seen.append)
+    assert s.claim_ready("d1")["rid"] == "REQ-20261011-120000-0000c0"
+    s.db.set_trace_callback(None)
+    assert any("ORDER BY r.created_at LIMIT 1" in q for q in seen)
+
+
 def test_a_gated_rounds_await_names_the_pause(env, monkeypatch, capsys):
     backend, s = env.backend, env.s
     _queue(env, RID, mentions=["WebCodex Demo"])
@@ -367,6 +497,72 @@ def test_a_gated_rounds_await_names_the_pause(env, monkeypatch, capsys):
     assert s.get_round(RID)["state"] == env.store_mod.QUEUED, "await never moves the round"
 
 
+# ---- finding 6: the reader fixture is never deadlocked by the gate ------------------------------
+
+def _completed(e, rid, prompt, conv):
+    s, store_mod = e.s, e.store_mod
+    s.create_round(rid, "submit", prompt=prompt)
+    s.set_state(rid, store_mod.READY)
+    aid = s.begin_send(rid, prompt, store_mod.sha256(prompt), daemon_instance_id="d")
+    s.mark_accepted(aid, conv)
+    s.mark_waiting(rid)
+    s.finish(rid, store_mod.COMPLETED_VERIFIED, result_text="the verdict")
+
+
+def test_finding6_a_gated_newer_followup_does_not_block_the_only_fixture(env, monkeypatch):
+    """reader broken; the only completed thread has a NEWER follow-up the gate holds queued. The
+    probe still picks that thread, passes, clears reader, and the follow-up then claims."""
+    cdp, probe, s, store_mod = env.cdp, env.probe, env.s, env.store_mod
+    _completed(env, RID, "CGC_RID:%s\n\n# q\nask\nBEGIN_RESPONSE:%s\n<a>\nEND_RESPONSE:%s\n" % (RID, RID, RID),
+               CONV)
+    s.create_round(RID2, "followup", thread_id=CONV, prompt="continuing this consult",
+                   spec_json=json.dumps({"conversation": CONV, "model": "Pro"}))
+    s.mark_broken("reader", phase="send:contract", cause="selector_drift")
+    assert s.claim_ready("d1") is None, "the follow-up is held by the gate"
+    pick = probe.pick_reader_round(s)
+    assert pick and pick["rid"] == RID, "a queued (unsent) newer round never disqualifies the fixture"
+    _fast(monkeypatch, cdp)
+    monkeypatch.setattr(env.spool, "acquire_conversation_lease", lambda conv: type("L", (), {
+        "close": lambda self: None})())
+    tabs = []
+
+    def open_tab(port, match=None, create_url=None):
+        assert create_url == "https://chatgpt.com/c/" + CONV
+        tabs.append(_NodeTab(_collapsed_page(RID)))
+        tabs[-1].close_tab = lambda: None
+        tabs[-1].close = lambda: None
+        return tabs[-1]
+    monkeypatch.setattr(cdp, "CDP", open_tab)
+    rep = probe.run_probe("reader")
+    assert rep["reader"]["verdict"] == "pass" and rep["reader"]["recorded"]
+    assert s.capabilities()["reader"]["ok"] is True
+    assert s.claim_ready("d1")["rid"] == RID2
+
+
+def test_finding6_a_thread_with_a_sent_newer_round_or_active_work_is_not_a_fixture(env):
+    probe, s, store_mod = env.probe, env.s, env.store_mod
+    _completed(env, RID, "CGC_RID:%s\n\nask" % RID, CONV)
+    s.create_round(RID2, "followup", thread_id=CONV, prompt="p")
+    s.set_state(RID2, store_mod.READY)
+    s.begin_send(RID2, "p", store_mod.sha256("p"), daemon_instance_id="d")   # it touched the thread
+    assert probe.pick_reader_round(s) is None
+
+
+def test_finding6_a_queued_retrieve_flows_while_a_probe_runs(env, monkeypatch):
+    sys.modules["cgc_spool"] = env.spool
+    d = _load("cgc_daemon")
+    _queue(env, RID)
+    env.s.create_round(RID2, "retrieve", spec_json=json.dumps({"conversation": CONV, "parent_rid": RID}))
+    spawned = []
+    monkeypatch.setattr(d.subprocess, "Popen", lambda argv, **k: spawned.append(argv[-1]) or
+                        type("P", (), {"pid": 1})())
+    d._dispatch_store({}, 3, "d1", sends=False)
+    assert spawned == [RID2], "the retrieve is claimed; the send waits for the probe"
+    assert env.s.get_round(RID)["state"] == env.store_mod.QUEUED
+    d._dispatch_store({}, 3, "d1")
+    assert env.s.get_round(RID)["state"] == env.store_mod.READY
+
+
 # ---- real rounds: typed outcomes, marking, and no resend ----------------------------------------
 
 def _ready(e, rid, **kw):
@@ -375,49 +571,46 @@ def _ready(e, rid, **kw):
     return e.s.get_round(rid)
 
 
-def test_a_real_rounds_deterministic_preclick_drift_marks_the_capability(env):
+@pytest.mark.parametrize("outcome", [
+    {"reason": "mention_not_found", "phase": "mention"},
+    {"reason": "model_not_selectable", "phase": "model"},
+    {"reason": "composer_not_ready", "phase": "composer", "form": True},
+])
+def test_finding5_a_preclick_failure_never_marks_a_capability(env, outcome):
+    """A pre-click failure spends nothing and, from one round, cannot tell a UI change from a
+    deleted project, a stale frozen family or an unconnected app — so only the probe (on the
+    configured project, model and app) records composer/mention. The round blocks or requeues."""
     r = _ready(env, RID, mentions=["WebCodex Demo"])
-    res = {"code": 3, "conversation": "", "outcome": {"ok": False, "submitted": False,
-           "reason": "mention_not_found", "phase": "mention", "drift": "mention"},
-           "stderr": "CGC_ERROR mention_not_found: The @ popup never opened — NOT submitted.\n"}
-    final = env.backend.process_round(env.s, r, lambda kind, **kw: res, daemon_instance_id="d",
-                                      validate=lambda p: (True, "ok"))
-    assert final == env.store_mod.BLOCKED
-    cap = env.s.capabilities()["mention"]
-    assert cap["ok"] is False and cap["phase"] == "send:mention" and cap["rid_or_conversation"] == RID
+    res = {"code": 3, "conversation": "", "outcome": {"ok": False, "submitted": False, **outcome},
+           "stderr": f"CGC_ERROR {outcome['reason']}: refused — NOT submitted.\n"}
+    env.backend.process_round(env.s, r, lambda kind, **kw: res, daemon_instance_id="d",
+                              validate=lambda p: (True, "ok"))
+    assert env.s.capabilities() == {}
+    assert env.s.send_evidence(RID)["reason"] == outcome["reason"], "the typed outcome is kept"
 
 
 @pytest.mark.parametrize("marker", ["login_needed", "captcha", "rate_limit"])
 def test_login_captcha_and_rate_limit_never_mark_a_capability(env, marker):
     r = _ready(env, RID)
     res = {"code": 3, "conversation": "", "outcome": {"ok": False, "submitted": False,
-           "reason": marker, "phase": "composer"},
+           "reason": marker, "phase": "composer", "blocker": marker.split("_")[0]},
            "stderr": f"CGC_ERROR {marker}: a human must act\n"}
     env.backend.process_round(env.s, r, lambda kind, **kw: res, daemon_instance_id="d",
                               validate=lambda p: (True, "ok"))
     assert env.s.capabilities() == {}
 
 
-def test_a_model_refusal_for_a_stale_frozen_family_marks_nothing(env, monkeypatch):
-    monkeypatch.setenv("CGC_MODEL_FAMILY", "GPT-6")
-    env.s.create_round(RID, "submit", prompt="p",
-                       spec_json=json.dumps({"model": "Pro", "model_family": "Latest"}))
-    env.s.set_state(RID, env.store_mod.READY)
-    res = {"code": 3, "conversation": "", "outcome": {"submitted": False, "reason": "model_not_selectable",
-           "phase": "model", "drift": "composer"},
-           "stderr": "CGC_ERROR model_not_selectable: model family 'Latest' is not offered\n"}
-    env.backend.process_round(env.s, env.s.get_round(RID), lambda kind, **kw: res,
-                              daemon_instance_id="d", validate=lambda p: (True, "ok"))
-    assert env.s.capabilities() == {}, "the round's own stale spec is not a UI change"
-
-
-def test_composer_drift_needs_a_loaded_fresh_tab(env):
-    out = env.cdp._composer_outcome
-    loaded = {"onChatGPT": True, "readyState": "complete"}
-    assert out(loaded, fresh=True)["drift"] == "composer"
-    assert "drift" not in out(loaded, fresh=False), "a re-opened thread may simply be gone"
-    assert "drift" not in out({"onChatGPT": True, "readyState": "loading"}, fresh=True)
-    assert "drift" not in out({"loginWall": True, "readyState": "complete"}, fresh=True)
+def test_a_selector_drift_on_a_blocked_page_marks_nothing(env):
+    """The driver read a rate limit / challenge on the tab where its rid landed and no reply showed:
+    it reports `blocker`, not `drift`, and the round stays uncertain without touching reader."""
+    r = _ready(env, RID)
+    res = {"code": 1, "conversation": CONV, "stderr": "CGC_ERROR selector_drift: the prompt WAS sent\n",
+           "outcome": {"submitted": True, "reason": "selector_drift", "phase": "contract",
+                       "blocker": "rate_limit", "conversation_id": CONV}}
+    final = env.backend.process_round(env.s, r, lambda kind, **kw: res, daemon_instance_id="d",
+                                      validate=lambda p: (True, "ok"))
+    assert final == env.store_mod.POSSIBLY_ACCEPTED and env.s.capabilities() == {}
+    assert env.s.conversation_of(RID) == CONV
 
 
 def test_an_uncertain_send_never_auto_resends_and_keeps_its_typed_outcome(env, monkeypatch, capsys):
@@ -450,6 +643,43 @@ def test_an_uncertain_send_never_auto_resends_and_keeps_its_typed_outcome(env, m
     assert "enqueue --kind retrieve" in env_json["next_command"], "retrieve, never resend"
 
 
+@pytest.mark.parametrize("broken", ["record_attempt_evidence", "mark_broken"])
+def test_finding5b_a_diagnostics_failure_never_moves_the_round_or_loses_its_address(env, monkeypatch,
+                                                                                    broken):
+    def boom(*a, **k):
+        raise RuntimeError("disk full")
+    monkeypatch.setattr(env.s, broken, boom)
+    r = _ready(env, RID)
+    res = {"code": 1, "conversation": CONV, "stderr": "CGC_ERROR selector_drift: the prompt WAS sent\n",
+           "outcome": {"submitted": True, "reason": "selector_drift", "phase": "contract",
+                       "drift": "reader", "conversation_id": CONV}}
+    final = env.backend.process_round(env.s, r, lambda kind, **kw: res, daemon_instance_id="d",
+                                      validate=lambda p: (True, "ok"))
+    assert final == env.store_mod.POSSIBLY_ACCEPTED
+    assert env.s.get_round(RID)["state"] == env.store_mod.POSSIBLY_ACCEPTED
+    assert env.s.conversation_of(RID) == CONV
+
+
+def test_finding9_every_envelope_carries_the_typed_outcome_and_a_null_submitted(env, monkeypatch, capsys):
+    r = _ready(env, RID)
+    res = {"code": 3, "conversation": "", "stderr": "CGC_ERROR unknown_send: clicked send\n",
+           "outcome": {"submitted": None, "reason": "unknown_send", "phase": "contract"}}
+    env.backend.process_round(env.s, r, lambda kind, **kw: res, daemon_instance_id="d",
+                              validate=lambda p: (True, "ok"))
+    ev = env.s.send_evidence(RID)
+    assert "submitted" in ev and ev["submitted"] is None, "unknown stays unknown, never dropped"
+    # A BLOCKED round's envelope carries it too.
+    r2 = _ready(env, RID2)
+    blk = {"code": 3, "conversation": "", "stderr": "CGC_ERROR login_needed: log in\n",
+           "outcome": {"submitted": False, "reason": "login_needed", "phase": "composer", "blocker": "login"}}
+    env.backend.process_round(env.s, r2, lambda kind, **kw: blk, daemon_instance_id="d",
+                              validate=lambda p: (True, "ok"))
+    monkeypatch.setattr(env.spool, "daemon_alive", lambda: True)
+    env.backend.await_round(argparse.Namespace(rid=RID2, out=str(env.tmp / "b.txt"), poll=0.01, timeout=2))
+    env_json = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert env_json["state"] == "blocked" and env_json["send"]["reason"] == "login_needed"
+
+
 def test_the_daemon_carries_the_drivers_typed_line(env, monkeypatch):
     spool = env.spool
     sys.modules["cgc_spool"] = spool
@@ -462,7 +692,7 @@ def test_the_daemon_carries_the_drivers_typed_line(env, monkeypatch):
     assert got["outcome"] == line and got["conversation"] == CONV
 
 
-# ---- scheduling -------------------------------------------------------------------------------
+# ---- scheduling and the daemon's ownership of the probe ----------------------------------------
 
 def test_probe_schedule(env):
     sys.modules["cgc_spool"] = env.spool
@@ -476,14 +706,23 @@ def test_probe_schedule(env):
     assert due(30 * 60, 0, True, False)
 
 
-def test_no_new_send_is_claimed_while_a_probe_runs(env, monkeypatch):
+def test_finding7_shutdown_terminates_and_reaps_the_probe(env, monkeypatch):
     sys.modules["cgc_spool"] = env.spool
     d = _load("cgc_daemon")
-    _queue(env, RID)
-    spawned = []
-    monkeypatch.setattr(d.subprocess, "Popen", lambda argv, **k: spawned.append(argv) or
-                        type("P", (), {"pid": 1})())
-    d._dispatch_store({}, 3, "d1", claim=False)
-    assert spawned == [] and env.s.get_round(RID)["state"] == env.store_mod.QUEUED
-    d._dispatch_store({}, 3, "d1")
-    assert spawned and env.s.get_round(RID)["state"] == env.store_mod.READY
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    d._stop_probe(child)
+    assert child.poll() is not None, "the probe child is ended and reaped"
+    src = open(os.path.join(SCRIPTS, "cgc_daemon.py"), encoding="utf-8").read()
+    assert "_stop_probe(probe)" in src.split("def run_loop", 1)[1], "run_loop's shutdown ends it"
+    psrc = open(os.path.join(SCRIPTS, "cgc_probe.py"), encoding="utf-8").read()
+    assert "signal.SIGTERM" in psrc, "SIGTERM unwinds the probe's finally blocks (its tab closes)"
+
+
+def test_finding8_once_ends_when_only_gated_rounds_remain(env):
+    sys.modules["cgc_spool"] = env.spool
+    d = _load("cgc_daemon")
+    _queue(env, RID, mentions=["WebCodex Demo"])
+    assert d._claimable()
+    env.s.mark_broken("mention", phase="probe", cause="x")
+    assert not d._claimable(), "a gated round is not claimable work: --once may exit"
+    assert env.s.get_round(RID)["state"] == env.store_mod.QUEUED

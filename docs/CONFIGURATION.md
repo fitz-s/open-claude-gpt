@@ -302,6 +302,33 @@ no network access from the agent's Bash call, so the classifier never triggers.
 See [docs/ARCHITECTURE.md](ARCHITECTURE.md) for the full data flow and the
 validating egress gate the daemon runs before every send.
 
+### When ChatGPT's page changes: `cgc probe`
+
+The daemon checks, without sending anything, that ChatGPT's page still works the way the driver
+reads it. It checks three capabilities: the composer (model picker, paste), the @mention picker,
+and the reader (finding a finished turn and its answer). It runs these checks at start, before
+queued work once the last check is 6 h old, and again (at most every 30 min) after one breaks.
+
+When one breaks, rounds that need it **stay queued**: nothing is failed and nothing is spent.
+`cgc await` reports `ChatGPT UI changed (<capability>: <cause>) — sends paused; driver needs a fix;
+queued rounds are intact`, and `cgc queue` shows the same line. A retrieve is never paused.
+
+```bash
+bin/cgc probe                        # check now, then print each capability's state
+bin/cgc probe --only reader
+bin/cgc probe --mention "WebCodex Demo"   # the app the mention check inserts
+bin/cgc probe --status               # print the recorded states; no browser
+```
+
+The probe opens its own background tabs, closes only those, and never sends. The composer check
+selects `CGC_MODEL_FAMILY`/`CGC_MODEL` on a `CGC_PROJECT_URL` tab. The mention check uses an app
+in this order: `--mention`, then the app a recorded mention failure names, then the first app in
+`CGC_APPS`. With none of those, the probe says so. If the app is not connected on your account,
+mention is reported "not established", which is not the same as broken. A check that fails for a
+reason unrelated to the page changes nothing: Chrome down, a timeout, or a login, challenge or
+rate-limit page, which is printed as `CGC_PROBE_BLOCKER` for you to clear. Exit codes: 0 all ok,
+3 something is broken, 1 the probe was inconclusive.
+
 ## The dedicated Chrome, in one place
 
 The launcher [`cdp_launch.sh`](../skill/scripts/cdp_launch.sh) reads

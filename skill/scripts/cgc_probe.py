@@ -30,6 +30,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sys
 import time
 
@@ -44,10 +45,11 @@ DUMMY = "".join(f"cgc no-send composer probe, line {i:03d}: this draft is cleare
 LONG_PROMPT = 12_000      # a marker round at least this long exercises the collapsed-turn read
 LEGACY_MAX = 6_000        # a legacy (no marker) turn this short is not collapsed (20.7 KB kept 10 KB)
 RENDER_S = 30             # how long a loaded conversation may take to render its first user turn
-ANSWER_S = 20             # how long its answer may take to mount after a force-render
+HYDRATE_S = 60            # how long the whole thread may take to hydrate before a miss is judged
 
-# What the send path's JS and keys look like. A probe step that would evaluate one is refused.
-_SEND_JS = re.compile(r"send-button|\bEnter\b|requestSubmit|\.submit\(")
+# What the send path's JS looks like (its button selector, a form submit). A probe step that would
+# evaluate one is refused; Enter is a key, refused in _NoSend.key.
+_SEND_JS = re.compile(r"send-button|requestSubmit|\.submit\(")
 
 
 class SendRefused(AssertionError):
@@ -58,12 +60,27 @@ class Transient(Exception):
     """Nothing about the page's contract is known: Chrome, the network, a login, a load."""
 
 
+class Blocked(Transient):
+    """The page shows a condition only a human can clear (login, captcha/challenge, rate limit)."""
+
+    def __init__(self, blocker):
+        super().__init__(f"ChatGPT shows {blocker} — a human must clear it in the debug Chrome")
+        self.blocker = blocker
+
+
 class Drift(Exception):
     """A deterministic contract mismatch: the page loaded and does not read the way the driver reads."""
 
     def __init__(self, cap, phase, cause):
         super().__init__(f"{cap}/{phase}: {cause}")
         self.cap, self.phase, self.cause = cap, phase, cause
+
+
+def _confirm(t, drift):
+    """Every broken verdict passes here: the send path's own blocker rule (cdp._blocker) runs on the
+    page first, and a login wall, a challenge or a rate limit turns the verdict into Blocked."""
+    b = cdp._blocker(t)
+    return Blocked(b) if b else drift
 
 
 class _NoSend:
@@ -110,7 +127,7 @@ def _close(raw):
 def _cleared(t):
     left = t.eval(cdp._clear_composer_js(), timeout=45)
     if left != 0:
-        raise Drift("composer", "clear", f"the composer still holds {left} chars after a clear")
+        raise _confirm(t, Drift("composer", "clear", f"the composer still holds {left} chars after a clear"))
 
 
 # ---- composer + mention -------------------------------------------------------------------------
@@ -119,21 +136,26 @@ def probe_composer(t, *, model, family, app):
     The mention probe runs only once the composer has passed."""
     ready, st = cdp._await_composer(t)
     if not ready:
-        out = cdp._composer_outcome(st, fresh=True)
-        if out.get("drift"):
-            raise Drift("composer", "composer", f"no composer on a loaded page (path {st.get('path')!r})")
-        raise Transient(out["reason"])
+        out = cdp._composer_outcome(st)
+        if out.get("blocker"):
+            raise Blocked(out["blocker"])
+        # The app loaded (its form rendered, on chatgpt.com) and holds no visible editor: the
+        # editor's markup moved. A page that never rendered the form says nothing about it.
+        if out["reason"] == "composer_not_ready" and out.get("form"):
+            raise _confirm(t, Drift("composer", "composer",
+                                    f"the app rendered but no composer editor (path {st.get('path')!r})"))
+        raise Transient(f"{out['reason']} (path {st.get('path')!r}, form={bool(out.get('form'))})")
     if model and model.lower() != "skip":
         pick = cdp._select_model(t, model, family)
         if not pick.confirmed:
-            raise Drift("composer", "model", pick.error or
-                        f"wanted {model!r} on {family!r}; the picker shows {pick.shown!r}")
+            raise _confirm(t, Drift("composer", "model", pick.error or
+                                    f"wanted {model!r} on {family!r}; the picker shows {pick.shown!r}"))
     try:
         cdp._paste_prompt(t, DUMMY)
     except cdp._PreClickFailure as e:
         if e.__cause__ is not None:         # a CDP timeout or socket error, wrapped by the driver
             raise Transient(str(e)) from None
-        raise Drift("composer", "paste", str(e)) from None
+        raise _confirm(t, Drift("composer", "paste", str(e))) from None
     _cleared(t)
     res = {"composer": ("pass", f"{len(DUMMY)}-char draft pasted, read back whole, cleared")}
     if app:
@@ -141,7 +163,7 @@ def probe_composer(t, *, model, family, app):
             cdp._insert_mention(t, app)
         except cdp._MentionFailure as e:
             if getattr(e, "drift", False):
-                raise Drift("mention", "mention", str(e)) from None
+                raise _confirm(t, Drift("mention", "mention", str(e))) from None
             res["mention"] = ("unestablished", str(e))   # this account's apps, not the page's markup
         except cdp._PreClickFailure as e:
             raise Transient(str(e)) from None
@@ -152,23 +174,36 @@ def probe_composer(t, *, model, family, app):
 
 
 # ---- reader -------------------------------------------------------------------------------------
-_LIVE = tuple(sorted(set(store_mod._LEGAL) - store_mod.TERMINAL))
+# A round in one of these states may have a browser tab driving its conversation right now. A QUEUED
+# round does not (gated or not), so it never excludes a fixture: if it did, a broken reader whose
+# only finished thread has a queued follow-up could never be re-checked, and nothing would clear it.
+_ACTIVE = (store_mod.READY, store_mod.SENDING, store_mod.ACCEPTED, store_mod.WAITING)
+
+
+def _thread_active(s, conv) -> bool:
+    return s.db.execute(
+        "SELECT 1 FROM rounds r JOIN threads t ON t.thread_id=r.thread_id "
+        "WHERE t.conversation_id=? AND r.state IN (?,?,?,?) LIMIT 1", (conv, *_ACTIVE)).fetchone() is not None
 
 
 def pick_reader_round(s):
-    """The finished round the reader probe reads, or None: the LAST round of a thread with no live
-    round (nothing else drives that conversation, and its turn is the one a force-render mounts).
-    Preferred: a CGC_RID-marker prompt long enough to collapse (the path that broke last), then any
-    marker round, then a legacy round short enough never to collapse, whose rid its tail pair proves.
-    A long legacy round is never picked: its rid is unprovable by design."""
+    """The finished round the reader probe reads, or None: a completed_verified round that is the
+    LAST turn its thread was sent (so it is the turn a force-render mounts, never one a long thread
+    has virtualized away), in a thread with no round in an active browser state. "Sent" is the
+    ledger's evidence: an attempt exists (begin_send ran) and no not-sent proof. A round that never
+    crossed the send fence (queued, gated or not) never touched the thread, so it disqualifies
+    nothing. Preferred: a CGC_RID-marker prompt long enough to collapse (the path that broke last),
+    then any marker round, then the shortest legacy round under the collapse length, whose rid its
+    tail pair proves. A long legacy round is never picked: its rid is unprovable by design."""
     rows = s.db.execute(
         "SELECT r.rid, r.rendered_prompt p, t.conversation_id conv FROM rounds r "
         "JOIN threads t ON t.thread_id=r.thread_id "
         "WHERE r.state=? AND r.kind IN ('submit','followup') AND t.conversation_id IS NOT NULL "
         "AND NOT EXISTS (SELECT 1 FROM rounds o WHERE o.thread_id=r.thread_id AND ("
-        "  o.state IN (%s) OR (o.kind IN ('submit','followup') AND o.created_at>r.created_at))) "
-        "ORDER BY r.updated_at DESC LIMIT 200" % ",".join("?" * len(_LIVE)),
-        (store_mod.COMPLETED_VERIFIED, *_LIVE)).fetchall()
+        "  o.state IN (?,?,?,?) OR (o.created_at>r.created_at AND o.current_attempt_id IS NOT NULL "
+        "  AND (o.send_disposition IS NULL OR o.send_disposition<>?)))) "
+        "ORDER BY r.updated_at DESC LIMIT 200",
+        (store_mod.COMPLETED_VERIFIED, *_ACTIVE, store_mod.NOT_SENT_PROVEN)).fetchall()
     best = None
     for r in rows:
         p = r["p"] or ""
@@ -185,50 +220,84 @@ def pick_reader_round(s):
     return best[1] if best else None
 
 
-def probe_reader(t, rid):
-    """The answer's length, or Drift/Transient. `t` is a tab on rid's finished conversation; the
-    reads are the ones the send contract and the waiter make. A miss is a drift only while the rid
-    is visibly on the page (_rid_in_main, which reads no turn selector): then the conversation is
-    there and the reader cannot see it. Otherwise nothing proves the page is that conversation."""
-    def miss(phase, cause):
-        if cdp._rid_in_main(t, rid):
-            return Drift("reader", phase, cause)
-        return Transient(f"{rid} is not on the page ({phase}: {cause})")
-
-    if not cdp._await_thread_rendered(t, seconds=RENDER_S):
-        raise miss("turns", "a loaded conversation shows no user turn")
-    texts, loc = [], {"present": False, "observed_rid": None}
-    for reload in (False, True):           # the waiter's own one reload for a tab that fell behind
-        if reload:
-            cdp._reload_stale_tab(t, f"probe: {rid} not among the rendered user turns")
-            cdp._await_thread_rendered(t, seconds=RENDER_S)
-        t.eval(cdp._FORCE_RENDER_JS)
-        texts = t.eval(cdp._all_user_texts_js()) or []
-        loc = cdp._locate_source_turn(texts, rid)
-        if loc["present"]:
-            break
+def _read(t, rid):
+    """One pass of the reads the send contract and the waiter make: (answer, miss), where miss is
+    (phase, cause) for the first read that came up empty, or None when the answer was read."""
+    t.eval(cdp._FORCE_RENDER_JS)
+    texts = t.eval(cdp._all_user_texts_js()) or []
+    loc = cdp._locate_source_turn(texts, rid)
     if not loc["present"]:
-        raise miss("rid", f"{rid}'s turn not identified among {len(texts)} user turns "
-                          f"(the last reads as {loc['observed_rid'] or 'no rid'})")
+        return "", ("rid", f"{rid}'s turn not identified among {len(texts)} user turns "
+                           f"(the last reads as {loc['observed_rid'] or 'no rid'})")
     # The post-click send contract's own "ok": a turn family carries the rid AND shows an assistant
-    # turn. A send that lands on a page failing this ends unknown_send or selector_drift.
+    # turn. A send landing on a page that fails this ends unknown_send or selector_drift.
     contract = json.loads(t.eval(cdp._contract_js(rid)) or "{}")
     if not any(f.get("ridLanded") and f.get("assistants", 0) > 0 for f in contract.get("families", [])):
-        raise Drift("reader", "contract", f"the send contract would not confirm {rid} on its own "
-                                          f"finished thread: {json.dumps(contract)[:300]}")
-    st, ans, end = {}, "", time.time() + ANSWER_S
-    while not ans:
-        t.eval(cdp._FORCE_RENDER_JS)
-        st = json.loads(t.eval(cdp._detect_js(rid, scoped=True)) or "{}")
-        if st.get("done"):
-            ans = t.eval(cdp._extract_js(rid, scoped=True)) or ""
-        if ans or time.time() >= end:
+        return "", ("contract", f"the send contract would not confirm {rid} on its own finished "
+                                f"thread: {json.dumps(contract)[:300]}")
+    st = json.loads(t.eval(cdp._detect_js(rid, scoped=True)) or "{}")
+    ans = (t.eval(cdp._extract_js(rid, scoped=True)) or "") if st.get("done") else ""
+    if ans:
+        return ans, None
+    return "", ("answer", f"no wrapped answer read for {rid} (node={st.get('node')} "
+                          f"len={st.get('len')} done={st.get('done')})")
+
+
+def probe_reader(t, rid, marker=True, settle=None):
+    """The answer's length, or Drift/Transient. `t` is a tab on rid's finished conversation.
+
+    The reads are polled for `settle` seconds (default HYDRATE_S): a re-opened thread renders its
+    user turns first and the assistant turns seconds later, so an early miss is hydration, not drift.
+    Only the reads' state once that window has passed is judged, and the waiter's one reload is spent
+    halfway. A miss is a drift only when the page shows no human condition (the shared blocker rule)
+    AND the rid is visibly on it (_rid_in_main, which reads no turn selector): then the conversation
+    is there and the reader cannot see it. Otherwise nothing proves the page is that conversation.
+    `marker`: rid's prompt opens with CGC_RID. A legacy turn can only be named by its tail pair, which
+    a collapsed turn hides, so a legacy rid miss is never evidence of drift."""
+    settle = HYDRATE_S if settle is None else settle
+    start = time.time()
+    reloaded, miss = False, ("turns", "a loaded conversation shows no user turn")
+    while True:
+        if cdp._await_thread_rendered(t, seconds=min(RENDER_S, settle)):
+            ans, miss = _read(t, rid)
+            if not miss:
+                return len(ans)
+        elapsed = time.time() - start
+        if elapsed >= settle:
             break
-        time.sleep(1.0)
-    if not ans:
-        raise Drift("reader", "answer", f"no wrapped answer read for {rid} (node={st.get('node')} "
-                                        f"len={st.get('len')} done={st.get('done')})")
-    return len(ans)
+        if not reloaded and elapsed >= settle / 2:
+            reloaded = True                 # the waiter's own one reload for a tab that fell behind
+            cdp._reload_stale_tab(t, f"probe: {rid} not read yet ({miss[0]})")
+            continue
+        time.sleep(2.0)
+    phase, cause = miss
+    b = cdp._blocker(t)
+    if b:
+        raise Blocked(b)
+    # Hydrated = the rid's text is rendered in <main>. Without that the page never showed the
+    # conversation, which is inconclusive whatever the cause.
+    if (marker or phase != "rid") and cdp._rid_in_main(t, rid):
+        raise Drift("reader", phase, cause)
+    raise Transient(f"{rid} not read ({phase}: {cause})")
+
+
+_APP_REF = "app:"
+
+
+def probe_app(s, override=None):
+    """The app the mention probe inserts, or None: `--mention`; else, while mention is recorded broken,
+    the app that failure was recorded on (its `rid_or_conversation` is `app:<name>`), so the break is
+    re-checked — and can be cleared — on the app that broke even if CGC_APPS has changed since; else
+    the first CGC_APPS app."""
+    if override:
+        return override
+    import consult
+    rec = s.capabilities().get("mention") or {}
+    ref = rec.get("rid_or_conversation") or ""
+    if rec.get("ok") is False and ref.startswith(_APP_REF):
+        return ref[len(_APP_REF):]
+    apps = consult.known_apps()
+    return apps[0] if apps else None
 
 
 # ---- one run ------------------------------------------------------------------------------------
@@ -245,6 +314,9 @@ def _attempt(composer, reader, pick, *, model, family, app):
             out[d.cap] = ("broken", d.phase, d.cause)
             for cap in caps:
                 out.setdefault(cap, ("unestablished", d.phase, f"not reached: {d.cap} broke first"))
+        except Blocked as e:
+            for cap in caps:
+                out[cap] = ("transient", "human:" + str(e.blocker), str(e))
         except Transient as e:
             for cap in caps:
                 out[cap] = ("transient", "browser", str(e))
@@ -269,13 +341,19 @@ def _attempt(composer, reader, pick, *, model, family, app):
             return out
 
         def reader():
+            # The mutators' own conversation lease, then a re-check under it: a round that began
+            # driving this thread after the pick (its waiter needs no lease) makes the probe step
+            # aside rather than read a thread that is moving.
             lease = spool.acquire_conversation_lease(pick["conversation"])
             if lease is None:
                 raise Transient(f"conversation {pick['conversation']} is busy")
             try:
+                with store_mod.Store() as s:
+                    if _thread_active(s, pick["conversation"]):
+                        raise Transient(f"conversation {pick['conversation']} became active")
                 t, raw = _open(f"https://chatgpt.com/c/{pick['conversation']}")
                 try:
-                    n = probe_reader(t, pick["rid"])
+                    n = probe_reader(t, pick["rid"], marker=pick["kind"] == "marker")
                 finally:
                     _close(raw)
             finally:
@@ -286,17 +364,20 @@ def _attempt(composer, reader, pick, *, model, family, app):
     return out
 
 
-def run_probe(only=None) -> dict:
+def run_probe(only=None, mention=None) -> dict:
     """Run the probes, retry once what failed, record the verdicts. {cap: {verdict, phase, detail,
-    recorded}}; a pass started before a newer failure is not recorded (Store.mark_passed)."""
-    import consult
-    apps = consult.known_apps()
-    app = apps[0] if apps and only in (None, "mention") else None
+    recorded}}; a pass started before a newer failure is not recorded (Store.mark_passed).
+    `mention`: the app the mention probe inserts (default: probe_app)."""
     model, family = cdp.CGC_MODEL, cdp.CGC_MODEL_FAMILY
     composer, reader = only != "reader", only in (None, "reader")
     with store_mod.Store() as s:
         started = s.capability_epoch()
         pick = pick_reader_round(s)
+        app = probe_app(s, mention) if only in (None, "mention") else None
+    no_app = None
+    if only in (None, "mention") and not app:
+        no_app = {"verdict": "unestablished", "phase": "app", "recorded": False,
+                  "detail": "no app to insert: set CGC_APPS, or run `cgc probe --mention \"<app>\"`"}
     lease = spool.acquire_browser_lease(shared=True)
     if lease is None:
         caps = (("composer", "mention") if app else ("composer",)) * composer + ("reader",) * reader
@@ -316,7 +397,8 @@ def run_probe(only=None) -> dict:
     report = {}
     with store_mod.Store() as s:
         for cap, (verdict, phase, detail) in res.items():
-            ref = f"{pick['rid']}@{pick['conversation']}" if cap == "reader" and pick else None
+            ref = (f"{pick['rid']}@{pick['conversation']}" if cap == "reader" and pick
+                   else _APP_REF + app if cap == "mention" and app else None)
             rec = False
             if verdict == "pass":
                 rec = s.mark_passed(cap, started_epoch=started, phase="probe", cause=detail, ref=ref,
@@ -325,6 +407,8 @@ def run_probe(only=None) -> dict:
                 s.mark_broken(cap, phase=f"probe:{phase}", cause=detail, ref=ref, driver_rev=rev)
                 rec = True
             report[cap] = {"verdict": verdict, "phase": phase, "detail": detail, "recorded": rec}
+    if no_app:
+        report.setdefault("mention", no_app)
     return report
 
 
@@ -341,6 +425,11 @@ def print_states(report=None) -> int:
         sys.stderr.write(f"CGC_PROBE {cap}: {words[v['verdict']]} — {v['detail']}"
                          + (" (not recorded: a newer failure arrived while it ran)" if stale else "")
                          + "\n")
+    human = sorted({v["phase"][6:] for v in (report or {}).values() if v["phase"].startswith("human:")})
+    if human:
+        sys.stderr.write(f"CGC_PROBE_BLOCKER {', '.join(human)}: ChatGPT is showing a page a human must "
+                         "clear in the debug Chrome window (login, challenge or rate limit). No "
+                         "capability was changed.\n")
     for cap in store_mod.CAPABILITIES:
         v = caps.get(cap)
         sys.stderr.write(f"CGC_UI {cap}: " + ("never established" if v is None else
@@ -352,12 +441,19 @@ def print_states(report=None) -> int:
 
 
 def main() -> int:
+    # The daemon ends a probe it owns with SIGTERM (shutdown, or the timeout). Raised as SystemExit,
+    # so every `finally` runs: the probe's own tab is closed and its leases released; nothing is
+    # recorded for an unfinished run.
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(1))
     p = argparse.ArgumentParser(prog="cgc_probe.py",
                                 description="no-send check of the ChatGPT UI contract the driver reads")
     p.add_argument("--only", choices=("composer", "mention", "reader"))
+    p.add_argument("--mention", metavar="APP",
+                   help="the app the mention probe inserts (default: the app a recorded mention "
+                        "failure names, else the first CGC_APPS app)")
     p.add_argument("--status", action="store_true", help="print the recorded states; no browser")
     a = p.parse_args()
-    return print_states(None if a.status else run_probe(a.only))
+    return print_states(None if a.status else run_probe(a.only, a.mention))
 
 
 if __name__ == "__main__":

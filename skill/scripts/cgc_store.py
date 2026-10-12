@@ -803,7 +803,7 @@ class Store:
         self.db.execute(f"UPDATE rounds SET {assigns} WHERE rid=?", (*cols.values(), rid))
 
     # ---- claiming ------------------------------------------------------------
-    def claim_ready(self, daemon_instance_id: str) -> dict | None:
+    def claim_ready(self, daemon_instance_id: str, retrieve_only: bool = False) -> dict | None:
         """Atomically pick ONE queued round and move it to `ready`, returning it — the store-native
         replacement for the pending→processing rename. IMMEDIATE transaction + single-writer means
         two daemons cannot both claim the same round (and phase 5 enforces one daemon anyway).
@@ -826,22 +826,26 @@ class Store:
 
         THE UI-CONTRACT GATE, for the same reason: a round that needs a capability recorded broken
         is skipped, not failed. It stays QUEUED and intact, and is claimed once a probe clears it.
-        Read inside this transaction, so a capability recorded broken before the claim is seen."""
+        Read inside this transaction, so a capability recorded broken before the claim is seen.
+        `retrieve_only` (a UI probe is running): only read-only retrieves are claimed; sends wait."""
         now = _now()
         with self._tx():
-            broken = self.broken_capabilities()
-            row = None
-            for cand in self.db.execute(
+            broken = self.broken_capabilities().keys()
+            # Nothing broken (the common case): the first eligible row, as before. Otherwise walk the
+            # cursor in order and stop at the first round that needs nothing broken.
+            cur = self.db.execute(
                 "SELECT rid,kind,spec_json FROM rounds r WHERE r.state=? "
+                + ("AND r.kind='retrieve' " if retrieve_only else "") +
                 "AND (r.not_before IS NULL OR r.not_before<=?) "
                 "AND ("
                 "  r.kind!='followup' OR r.thread_id IS NULL OR NOT EXISTS ("
                 "    SELECT 1 FROM rounds o WHERE o.thread_id=r.thread_id AND o.rid!=r.rid"
                 f"     AND o.state IN (?,?,?)))"
-                " ORDER BY r.created_at", (QUEUED, now, SENDING, ACCEPTED, WAITING)).fetchall():
-                if not broken.keys() & set(round_needs(cand["kind"], cand["spec_json"])):
-                    row = cand
-                    break
+                " ORDER BY r.created_at" + ("" if broken else " LIMIT 1"),
+                (QUEUED, now, SENDING, ACCEPTED, WAITING))
+            row = next((c for c in cur
+                        if not broken & set(round_needs(c["kind"], c["spec_json"]))), None)
+            cur.close()
             if row is None:
                 return None
             rid = row["rid"]
