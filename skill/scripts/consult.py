@@ -114,11 +114,13 @@ BEGIN_RESPONSE:{rid}
 END_RESPONSE:{rid}"""
 
 
-# The rid marker: the FIRST line of every rendered prompt, plain text so a markdown-rendered bubble
+# The rid marker: the FIRST thing in every rendered prompt, plain text so a markdown-rendered bubble
 # keeps it verbatim. ChatGPT collapses a long user message to its head plus "Show more" and the sentinel
 # pair is the LAST thing in the render, so a collapsed turn's DOM never carries the pair; the head is the
-# one part that is never collapsed. cdp_consult._turn_canonical_rid reads the turn's own rid from it
-# (SHARED CONTRACT #3). `{rid}` is substituted like the sentinels' — logical_sha renders "<RID>" here too.
+# one part that is never collapsed. cdp_consult._turn_canonical_rid reads the turn's own rid from the first
+# such token in the turn (SHARED CONTRACT #3); an @mention label may be pasted ahead of the prompt, which is
+# why it is a token and not "the first line". `{rid}` is substituted like the sentinels' — logical_sha
+# renders "<RID>" here too.
 RID_MARKER = "CGC_RID:{rid}\n\n"
 
 PROMPT_TEMPLATE = RID_MARKER + """# {title}

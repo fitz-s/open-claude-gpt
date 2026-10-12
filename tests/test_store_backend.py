@@ -1334,7 +1334,7 @@ class TestTurnCanonicalRid:
         text = f"BEGIN_RESPONSE:{a}\nsome text\nEND_RESPONSE:{b}\n"
         assert cdp._turn_canonical_rid(text) is None
 
-    # ---- the head marker: a plain first line `CGC_RID:<rid>` (ChatGPT never collapses the head) ----
+    # ---- the head marker: the FIRST `CGC_RID:<rid>` token in the turn (ChatGPT never collapses the head) ----
     R1, R2 = "REQ-20260707-120000-0aaa01", "REQ-20260707-120500-0bbb01"
 
     def test_the_head_marker_names_the_turn_with_no_tail_pair(self, tmp_path):
@@ -1342,33 +1342,53 @@ class TestTurnCanonicalRid:
         assert cdp._turn_canonical_rid(f"CGC_RID:{self.R2}\n# a collapsed turn's head\n") == self.R2
         assert cdp._turn_canonical_rid(f"\n  CGC_RID:{self.R2}  \r\n# t\n") == self.R2
 
-    def test_the_marker_and_a_tail_pair_of_the_same_rid_agree(self, tmp_path):
+    def test_a_mention_label_ahead_of_the_marker_does_not_hide_it(self, tmp_path):
+        """_paste_prompt types the @mention first, so the turn's text can open with the app's label,
+        inline on the marker's line or on a line of its own."""
         cdp = self._cdp(tmp_path)
-        r2 = self.R2
+        assert cdp._turn_canonical_rid(f"WebCodex Demo CGC_RID:{self.R2}\n# t\n") == self.R2
+        assert cdp._turn_canonical_rid(f"WebCodex Demo\nCGC_RID:{self.R2}\n# t\n") == self.R2
+
+    def test_a_collapsed_turn_quoting_another_rids_pair_still_reads_its_own_marker(self, tmp_path):
+        """The reviewer's hole: the label precedes the marker, a QUOTED complete R1 pair is visible in
+        the body, and R2's own tail is hidden by the collapse."""
+        cdp = self._cdp(tmp_path)
+        r1, r2 = self.R1, self.R2
+        text = f"WebCodex Demo CGC_RID:{r2}\n# t\nyou wrote:\nBEGIN_RESPONSE:{r1}\nold\nEND_RESPONSE:{r1}\n"
+        assert cdp._turn_canonical_rid(text) == r2
+
+    def test_the_marker_is_authoritative_over_a_tail_pair(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        r1, r2 = self.R1, self.R2
         assert cdp._turn_canonical_rid(f"CGC_RID:{r2}\n# t\nBEGIN_RESPONSE:{r2}\nx\nEND_RESPONSE:{r2}\n") == r2
+        assert cdp._turn_canonical_rid(f"CGC_RID:{r1}\n# t\nBEGIN_RESPONSE:{r2}\nx\nEND_RESPONSE:{r2}\n") == r1
 
-    def test_a_marker_that_disagrees_with_the_tail_pair_yields_none(self, tmp_path):
+    def test_the_first_marker_wins_over_a_later_quoted_one(self, tmp_path):
         cdp = self._cdp(tmp_path)
         r1, r2 = self.R1, self.R2
-        assert cdp._turn_canonical_rid(f"CGC_RID:{r1}\n# t\nBEGIN_RESPONSE:{r2}\nx\nEND_RESPONSE:{r2}\n") is None
+        assert cdp._turn_canonical_rid(f"CGC_RID:{r2}\n# t\nthe old prompt began CGC_RID:{r1}\n") == r2
+        assert cdp._turn_canonical_rid(f"CGC_RID:{r2}\nCGC_RID:{r1}\n") == r2
 
-    def test_a_quoted_incomplete_tail_does_not_unseat_the_marker(self, tmp_path):
+    def test_a_marker_glued_to_a_word_or_a_longer_rid_is_not_ours(self, tmp_path):
         cdp = self._cdp(tmp_path)
         r1, r2 = self.R1, self.R2
-        assert cdp._turn_canonical_rid(f"CGC_RID:{r2}\nquotes BEGIN_RESPONSE:{r1}\n") == r2
+        for glued in (f"xCGC_RID:{r2}", f"_CGC_RID:{r2}", f"CGC_RID:{r2}x", f"CGC_RID:{r2}0",
+                      f"cgc_rid:{r2}", "CGC_RID:not-a-rid"):
+            assert cdp._turn_canonical_rid(f"{glued}\n# t\n") is None, glued
+            tail = f"{glued}\nBEGIN_RESPONSE:{r1}\nx\nEND_RESPONSE:{r1}\n"
+            assert cdp._turn_canonical_rid(tail) == r1, glued            # falls to the legacy pair rule
 
-    def test_only_the_first_non_blank_line_can_be_the_marker(self, tmp_path):
-        """A marker quoted later in the task text is just text: the prompt's own head is the claim."""
+    def test_a_marker_in_punctuation_still_counts(self, tmp_path):
         cdp = self._cdp(tmp_path)
-        assert cdp._turn_canonical_rid(f"# t\nCGC_RID:{self.R1}\n") is None
-        assert cdp._turn_canonical_rid(f"CGC_RID:{self.R2}\nCGC_RID:{self.R1}\n") == self.R2
+        assert cdp._turn_canonical_rid(f"(CGC_RID:{self.R2}) # t\n") == self.R2
+        assert cdp._turn_canonical_rid(f"-CGC_RID:{self.R2}.\n") == self.R2
 
-    def test_a_malformed_marker_is_not_a_marker(self, tmp_path):
+    def test_with_no_marker_the_legacy_pair_rule_is_unchanged(self, tmp_path):
         cdp = self._cdp(tmp_path)
-        r2 = self.R2
-        assert cdp._turn_canonical_rid(f"CGC_RID:{r2}x\n# t\n") is None
-        assert cdp._turn_canonical_rid(f"cgc_rid:{r2}\n# t\n") is None
-        assert cdp._turn_canonical_rid("CGC_RID:not-a-rid\n# t\n") is None
+        r1, r2 = self.R1, self.R2
+        text = f"quoted:\nBEGIN_RESPONSE:{r1}\nold\nEND_RESPONSE:{r1}\nnow:\nBEGIN_RESPONSE:{r2}\nx\nEND_RESPONSE:{r2}\n"
+        assert cdp._turn_canonical_rid(text) == r2
+        assert cdp._turn_canonical_rid(f"plain question about {r1}\n") is None
 
 
 class TestKeyReleaseRequiresNoSendProof:

@@ -15,12 +15,16 @@ refused to confirm a send that had landed, and the waiter and retrieve found no 
 finished, correctly wrapped answer.
 
 - Every prompt now opens with a plain first line `CGC_RID:<rid>`, then the title. The head is the one part
-  ChatGPT never collapses, and plain text survives a markdown-rendered bubble. A turn's own rid is that line;
-  a legacy prompt (no marker) is read by its tail pair as before, so a collapsed legacy turn stays unproven
-  and still ends `unknown_send`, never auto-resent. A marker that disagrees with a complete tail pair names
-  no rid (fail closed). `logical_sha` renders the marker with `<RID>` like the sentinels, so a re-fire still
-  matches its key; a key fired before this change and re-fired after it conflicts once, because the stored
-  fingerprint hashes the old first line.
+  ChatGPT never collapses, and plain text survives a markdown-rendered bubble. A turn's own rid is the rid of
+  the first `CGC_RID:` token anywhere in its text, so an `@mention` label pasted ahead of the prompt cannot
+  hide it, and it is authoritative: a collapsed turn's last visible `BEGIN`/`END` pair can be a quote. A legacy
+  prompt (no marker) is read by its tail pair as before, so a collapsed legacy turn stays unproven and still
+  ends `unknown_send`, never auto-resent. `logical_sha` renders the marker with `<RID>` like the sentinels, so
+  a re-fire still matches its key; a key fired before this change and re-fired after it conflicts once,
+  because the stored fingerprint hashes the old first line.
+- The page-side `__cgcRid` and Python `_turn_canonical_rid` now share one whitespace set, the `[0-9]` digit
+  class and the marker regex by construction. `str.strip()` and `trim()` disagreed (`\x1c`-`\x1f` and U+0085
+  against the BOM), so a BOM or U+0085 could make one side read R1 where the other read nothing.
 - The turn's React state is deliberately not read: which fiber or ancestor is current cannot be known from a
   DOM node (real React 18.3.1: a reused user node updated R1 to R2 kept R1 on its fiber, and a Context update
   can leave an ancestor's item on R1 under a DOM showing R2).
