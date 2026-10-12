@@ -248,6 +248,59 @@ def test_two_refire_shaped_turns_resolve_to_distinct_rids():
     assert CDP._locate_source_turn(texts, R2) == {"present": True, "is_last": True, "observed_rid": R2}
 
 
-def test_a_marker_that_disagrees_with_the_tail_pair_names_no_rid():
+def test_the_marker_is_authoritative_over_a_tail_pair_of_another_rid():
+    """No cross-check: in a collapsed turn the last VISIBLE pair can be a quote (a follow-up quoting
+    its parent). A refire rewrites the rid everywhere, so our own tail always equals our marker."""
     setup = _collapsed(R2, collapsed=False, tail=R1)
-    assert _landed(R1, setup) is False and _landed(R2, setup) is False
+    assert _landed(R2, setup) is True and _landed(R1, setup) is False
+
+
+# ---- an @mention round: _paste_prompt types the app's label BEFORE the prompt ------------------------
+# The live-recorded composer (tests/fixtures/mention_popup.json: composer_after_pick) holds an inline
+# label span, "WebCodex Demo", ahead of the pasted text. Whether the SENT bubble echoes that label on the
+# marker's line, on a line of its own or not at all is not something the reader may depend on: the marker
+# is the FIRST CGC_RID token in the turn, wherever the label sits.
+def _mention_turn(rid, *, label="inline", quoted=None, collapsed=True):
+    """label: 'inline' (the label span shares the marker's <p>), 'block' (its own <p>), None."""
+    lab = "E('SPAN',{'app-mention-name':'webcodex-demo'},[E('SPAN',{},[],'WebCodex Demo')])"
+    marker = "CGC_RID:%s" % rid
+    # E() puts its text node BEFORE its children, so the pasted text is its own child after the label.
+    first = {"inline": "E('P',{},[%s,E('SPAN',{},[],' %s')])" % (lab, marker),
+             "block": "E('P',{},[%s]),P('%s')" % (lab, marker), None: "P('%s')" % marker}[label]
+    quote = (",P('you wrote:'),P('BEGIN_RESPONSE:%s'),P('the old answer'),P('END_RESPONSE:%s')"
+             % (quoted, quoted)) if quoted else ""
+    button = ",E('BUTTON',{'aria-expanded':'false'},[],'Show more')" if collapsed else ""
+    return ("var U=unit('t7:0:user',[%s,P('# Round 7')%s%s]);"
+            "var ROOT=E('MAIN',{},[E('DIV',{'data-turn-key':'k7'},"
+            "[U,unit('t7:2:assistant',[md(['an unwrapped answer of R2'])])])]);"
+            "var document=ROOT;document.body=ROOT;var location={pathname:'/c/x'};" % (first, quote, button))
+
+
+@pytest.mark.parametrize("label", ("inline", "block", None))
+def test_a_mention_label_ahead_of_the_marker_does_not_hide_it(label):
+    setup = _mention_turn(R2, label=label)
+    assert _landed(R2, setup) is True and _landed(R1, setup) is False
+    assert CDP._locate_source_turn(_texts(setup), R2) == {"present": True, "is_last": True, "observed_rid": R2}
+
+
+@pytest.mark.parametrize("label", ("inline", "block", None))
+def test_a_visible_quoted_pair_of_another_rid_never_names_the_collapsed_turn(label):
+    """The reviewer's hole: label + R2's marker, a QUOTED complete R1 pair visible in the body and R2's
+    own tail hidden by the collapse. The last-pair rule returned R1 here, so ridLanded(R1) was true,
+    the source turn read as R1's, and the scoped read of R1 returned R2's unwrapped answer."""
+    setup = _mention_turn(R2, label=label, quoted=R1)
+    assert _landed(R1, setup) is False and _landed(R2, setup) is True
+    assert CDP._locate_source_turn(_texts(setup), R1)["present"] is False
+    assert CDP._turn_canonical_rid(_eval(CDP._last_user_text_js(), setup)) == R2
+    assert _eval(CDP._last_assistant_js(R1, scoped=True), setup) == ""
+
+
+def test_a_body_quoting_another_marker_after_the_real_one_reads_the_real_one():
+    setup = _mention_turn(R2, label="inline").replace(
+        "P('# Round 7')", "P('# Round 7'),P('the old prompt began CGC_RID:%s')" % R1)
+    assert _landed(R2, setup) is True and _landed(R1, setup) is False
+
+
+def test_a_marker_glued_to_a_word_is_not_ours():
+    setup = _mention_turn(R2, label=None).replace("CGC_RID:%s" % R2, "xCGC_RID:%s" % R2)
+    assert _landed(R2, setup) is False

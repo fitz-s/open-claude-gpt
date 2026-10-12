@@ -593,25 +593,36 @@ _TEXT_FN = ("function __cgcText(el){if(!el)return '';"
             "return out.replace(/[ \\t]+\\n/g,'\\n').replace(/\\n{3,}/g,'\\n\\n');}")
 
 # The rid regex shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) shared by every rid-reading regex in this file.
-_RID_RE_SRC = r"REQ-\d{8}-\d{6}-[0-9a-f]{6}"
+# ASCII digits spelled out: \d is Unicode-aware in Python and ASCII-only in JS.
+_RID_RE_SRC = r"REQ-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}"
 
-# The page-side mirror of _turn_canonical_rid (SHARED CONTRACT #3): a user turn's OWN rid is the rid on
-# its first non-blank line when that line is exactly CGC_RID:<rid> (the head marker, the one part of a
-# long prompt ChatGPT never collapses), else the rid of the LAST complete, in-order
-# BEGIN_RESPONSE:<rid>/END_RESPONSE:<rid> pair of bare lines in its block-aware text. A marker and a
-# pair that name DIFFERENT rids read as no rid at all (fail closed). tests/test_wait_virtualized_thread.py
-# holds the two to the same answers on every ASCII rendering. They part only outside it: Python's
-# str.strip() and \d also take \x1c-\x1f, \x85 and non-ASCII digits, and JS's trim() and \d take the BOM
-# instead; each difference makes one side see no marker or pair, so a disagreement reads as "turn not
-# found" (fail closed), never as another rid's turn.
-_RID_FN = ("function __cgcRid(t){var re=/^(BEGIN|END)_RESPONSE:(" + _RID_RE_SRC + ")$/,"
-           "mk=/^CGC_RID:(" + _RID_RE_SRC + ")$/,ob={},rid=null,M=null,first=true,"
-           "ls=(t||'').replace(/\\r\\n/g,'\\n').split('\\n');"
-           "for(var i=0;i<ls.length;i++){var l=ls[i].trim();"
-           "if(first&&l){first=false;var q=l.match(mk);if(q){M=q[1];continue;}}"
-           "var m=l.match(re);if(!m)continue;"
-           "if(m[1]==='BEGIN')ob[m[2]]=1;else if(ob[m[2]])rid=m[2];}"
-           "return M===null?rid:(rid===null||rid===M?M:null);}")
+# THE ONE whitespace set of the user-turn identity rule, as the source of a regex character class that
+# Python's re and JS's RegExp read identically: ASCII space, \t \n \v \f \r, U+0085, U+00A0, U+1680,
+# U+2000-200A, U+2028, U+2029, U+202F, U+205F, U+3000 and the BOM U+FEFF. Python's str.strip() and JS's
+# trim() disagree about it (strip() takes \x1c-\x1f and U+0085 and not the BOM; trim() the reverse), so
+# neither is used on a rid path; both sides trim a line with this class and nothing else.
+_WS_SRC = r"\t\n\x0b\x0c\r \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+
+# The head marker token: needs a character that is not [A-Za-z0-9_] (or the text's start) before it and
+# one after the rid, so a glued "xCGC_RID:..." or a longer rid is not ours. Written once for both sides.
+_MARKER_RE_SRC = r"(?<![A-Za-z0-9_])CGC_RID:(" + _RID_RE_SRC + r")(?![A-Za-z0-9_])"
+
+# The page-side mirror of _turn_canonical_rid (SHARED CONTRACT #3): a user turn's OWN rid is the rid of
+# the FIRST CGC_RID:<rid> token anywhere in its text (the head marker: the template puts it before
+# everything else, so only an @mention label can precede it, and ChatGPT never collapses the head), else
+# the rid of the LAST complete, in-order BEGIN_RESPONSE:<rid>/END_RESPONSE:<rid> pair of bare lines in its
+# block-aware text. A marker is authoritative: in a collapsed turn the last VISIBLE pair can be a quote.
+# The two sides share the whitespace set (_WS_SRC), the digit class and the marker regex (_MARKER_RE_SRC)
+# by construction, and split lines on "\n" alone after folding "\r\n", so they return the same rid on
+# every input; tests/test_wait_virtualized_thread.py pins that on a corpus that includes the BOM, U+0085,
+# U+00A0, \x1c-\x1f and non-ASCII digits. A rid in a shape one side cannot read reads as no rid (the turn
+# is "not found", fail closed) on BOTH.
+_RID_FN = ("function __cgcRid(t){t=t||'';"
+           "var q=t.match(/" + _MARKER_RE_SRC + "/);if(q)return q[1];"
+           "var re=/^(BEGIN|END)_RESPONSE:(" + _RID_RE_SRC + ")$/,tr=/^[" + _WS_SRC + "]+|[" + _WS_SRC + "]+$/g,"
+           "ob={},rid=null,ls=t.replace(/\\r\\n/g,'\\n').split('\\n');"
+           "for(var i=0;i<ls.length;i++){var m=ls[i].replace(tr,'').match(re);if(!m)continue;"
+           "if(m[1]==='BEGIN')ob[m[2]]=1;else if(ob[m[2]])rid=m[2];}return rid;}")
 
 _NODE_FN = (
     _ROLE_FN + _TEXT_FN + _RID_FN +
@@ -832,7 +843,8 @@ def _detect_js(rid: str, *, scoped=False) -> str:
 # Mirrored page-side by _RID_FN, which the scoped answer reads anchor on.
 _TURN_BEGIN_LINE_RE = re.compile(rf"^BEGIN_RESPONSE:({_RID_RE_SRC})$")
 _TURN_END_LINE_RE = re.compile(rf"^END_RESPONSE:({_RID_RE_SRC})$")
-_TURN_MARKER_LINE_RE = re.compile(rf"^CGC_RID:({_RID_RE_SRC})$")
+_TURN_MARKER_RE = re.compile(_MARKER_RE_SRC)
+_WS_TRIM_RE = re.compile(rf"^[{_WS_SRC}]+|[{_WS_SRC}]+$")
 
 
 def _turn_canonical_rid(turn_text):
@@ -857,25 +869,25 @@ def _turn_canonical_rid(turn_text):
     fence-awareness is unnecessary here because picking the LAST pair already defeats an earlier
     fenced/prose quote regardless of whether it's inside a fence).
 
-    THE HEAD MARKER. Both templates now open with a plain `CGC_RID:<rid>` line. ChatGPT collapses a
-    long user message to its head plus "Show more", and the pair above is the LAST thing in the
-    render, so a collapsed turn's DOM holds the marker and never the pair. The turn's first non-blank
-    line, trimmed, being exactly that marker names the turn's rid. A marker and a complete pair that
-    disagree give None (fail closed): the head and the tail of one prompt cannot name two requests.
-    A prompt without a marker (a legacy round, the automatic continue) is read by the pair alone, so a
-    collapsed legacy turn stays unproven exactly as before. The turn's React state is NOT consulted:
-    which fiber or ancestor is current cannot be known from a DOM node.
+    THE HEAD MARKER. Both templates open with a plain `CGC_RID:<rid>` token. ChatGPT collapses a long
+    user message to its head plus "Show more", and the pair above is the LAST thing in the render, so a
+    collapsed turn's DOM holds the marker and never its own pair. The turn's rid is the rid of the FIRST
+    such token anywhere in the text (a non-word character or the text's start before it, a non-word
+    character after the rid): the template puts it ahead of everything, so only an @mention label can
+    precede it, and a body that quotes another marker comes later. A marker is AUTHORITATIVE, with no
+    cross-check against a tail pair: in a collapsed turn the last VISIBLE complete pair can be a quote
+    (a follow-up quoting its parent), and a refire rewrites the rid everywhere, so our own tail always
+    equals our marker. With no marker anywhere (a legacy round, the automatic continue) the pair rule
+    above applies unchanged, so a collapsed legacy turn stays unproven. The turn's React state is NOT
+    consulted: which fiber or ancestor is current cannot be known from a DOM node.
     """
-    canonical, marker, first = None, None, True
+    marker = _TURN_MARKER_RE.search(turn_text or "")
+    if marker:
+        return marker.group(1)
+    canonical = None
     open_begin = set()
     for line in (turn_text or "").replace("\r\n", "\n").split("\n"):
-        s = line.strip()
-        if first and s:
-            first = False
-            mm = _TURN_MARKER_LINE_RE.match(s)
-            if mm:
-                marker = mm.group(1)
-                continue
+        s = _WS_TRIM_RE.sub("", line)        # NOT str.strip(): the two sides share _WS_SRC
         mb = _TURN_BEGIN_LINE_RE.match(s)
         if mb:
             open_begin.add(mb.group(1))
@@ -883,9 +895,7 @@ def _turn_canonical_rid(turn_text):
         me = _TURN_END_LINE_RE.match(s)
         if me and me.group(1) in open_begin:
             canonical = me.group(1)  # scanning in order: the last completed pair wins
-    if marker is None:
-        return canonical
-    return marker if canonical in (None, marker) else None
+    return canonical
 
 
 def _last_user_text_js() -> str:
