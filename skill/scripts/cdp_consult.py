@@ -2896,9 +2896,16 @@ def _turn_rid_conflicts(rid, prompt, mentions=()):
     something to depend on. A prompt with no marker whose tail pair is `rid` parses as `rid`: that is
     the legacy path, and only a collapsed turn would be unprovable there."""
     names = [m for m in (mentions or ()) if m]
+    # The picker matches an app label case-insensitively, so the chip it attaches can read
+    # `CGC_RID:<x>` for a requested `cgc_rid:<x>` that the case-sensitive reader would pass. Any
+    # name holding the token in any case is refused outright: no app name legitimately carries it.
+    if any("cgc_rid" in m.lower() for m in names):
+        names = [re.sub(r"(?i)cgc_rid", "CGC_RID", m) for m in names]
     texts = [prompt] if not names else [sep.join(names) + sep + prompt for sep in (" ", "\n")]
-    return sorted({got for got in (_turn_canonical_rid(t) for t in texts) if got != rid},
-                  key=lambda g: g or "")
+    bad = {got for got in (_turn_canonical_rid(t) for t in texts) if got != rid}
+    if not bad and any("CGC_RID" in m for m in names):
+        bad = {None}
+    return sorted(bad, key=lambda g: g or "")
 
 
 _AMBIGUOUS_RID_TAIL = {"submit": "NOT submitting.", "follow-up": "NOT sending the follow-up.",
