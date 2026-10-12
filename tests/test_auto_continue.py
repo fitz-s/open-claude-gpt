@@ -206,17 +206,19 @@ def test_the_continue_prompt_passes_the_egress_gate_and_resolves_to_its_rid(env)
 class _FollowupTab:
     """Just enough of a live tab for cmd_followup's send + landed-confirmation path."""
 
-    def __init__(self, turns, lands):
+    def __init__(self, turns, lands, send="clicked"):
         self.turns, self.lands, self.clicked = list(turns), lands, False
+        self.send, self.keys, self.tab_closed = send, [], 0
 
     def eval(self, expr, timeout=None):
         if ".length" in expr and "querySelectorAll" in expr and "function" not in expr:
             return len(self.turns)
-        if "b.click()" in expr:
-            self.clicked = True
-            if self.lands:
-                self.turns.append(self.lands)
-            return True
+        if "return 'clicked'" in expr:                      # the send eval
+            if self.send == "clicked":
+                self.clicked = True
+                if self.lands:
+                    self.turns.append(self.lands)
+            return self.send
         if "location.pathname" in expr:
             return "/c/" + CONV
         return None
@@ -225,13 +227,16 @@ class _FollowupTab:
         return {}
 
     def key(self, *a):
-        pass
+        self.keys.append(a)
 
     def conversation_id(self):
         return CONV
 
     def close(self):
         pass
+
+    def close_tab(self):
+        self.tab_closed += 1
 
 
 def _run_followup(monkeypatch, tab, rid, blank_last=False):
@@ -368,3 +373,361 @@ def test_a_same_rid_resend_without_a_baseline_refuses_before_clicking(env, monke
     tab = _FollowupTab([_turn(RID)], lands=_turn(RID) + "\n")
     assert _run_followup(monkeypatch, tab, RID, blank_last=True) == c.EXIT_NOT_SENT_PRECLICK
     assert not tab.clicked
+
+
+# ---- a follow-up's mention refusal must not leave its own tab behind, and must wait for the thread ----
+
+def _run_followup_refusing(monkeypatch, tab, reopened, exc):
+    """cmd_followup with _paste_prompt raising `exc`; `reopened` decides whether CDP() first says the
+    tab is gone (so the command opens it itself)."""
+    import types
+    import cdp_consult as c
+
+    def fake_cdp(port, match=None, create_url=None):
+        if match is not None and reopened:
+            raise SystemExit("CGC_ERROR conversation_not_found: no tab")
+        return tab
+
+    monkeypatch.setattr(c, "CDP", fake_cdp)
+    monkeypatch.setattr(c, "_await_composer", lambda *a, **k: (True, {}))
+    monkeypatch.setattr(c, "_await_thread_rendered", lambda *a, **k: True)
+    monkeypatch.setattr(c, "_egress_gate", lambda p: (True, "ok"))
+    monkeypatch.setattr(c, "_last_user_text_js", lambda: "LAST")
+    monkeypatch.setattr(c, "_write_state", lambda **k: None)
+
+    def refuse(*a, **k):
+        raise exc
+    monkeypatch.setattr(c, "_paste_prompt", refuse)
+    orig = tab.eval
+    tab.eval = lambda e, timeout=None: tab.turns[-1] if e == "LAST" else orig(e, timeout)
+    monkeypatch.setattr(c.time, "sleep", lambda s: None)
+    pf = os.path.join(os.environ["CGC_STATE_DIR"], "p2.md")
+    open(pf, "w").write("Continuing.\nBEGIN_RESPONSE:%s\nx\nEND_RESPONSE:%s\n" % (RID, RID))
+    ns = types.SimpleNamespace(no_gate=True, conversation=CONV, prompt_file=pf, task=None, rid=RID,
+                               model="skip", model_family="skip", allow_model_mismatch=False,
+                               port=9333, mention=["WebCodex Demo"], watch=False, out=None)
+    return c.cmd_followup(ns)
+
+
+def test_a_mention_refusal_closes_the_tab_the_followup_reopened(env, monkeypatch):
+    import cdp_consult as c
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)
+    closed = []
+    tab.close_tab = lambda: closed.append(1)
+    rc = _run_followup_refusing(monkeypatch, tab, reopened=True,
+                                exc=c._MentionFailure("mention_not_found: not an app"))
+    assert rc == 3 and closed == [1], "a tab this command opened must not outlive a refusal"
+
+
+def test_a_mention_refusal_leaves_a_live_tab_it_did_not_open_alone(env, monkeypatch):
+    import cdp_consult as c
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)
+    closed = []
+    tab.close_tab = lambda: closed.append(1)
+    rc = _run_followup_refusing(monkeypatch, tab, reopened=False,
+                                exc=c._MentionFailure("mention_not_found: not an app"))
+    assert rc == 3 and closed == [], "a tab the user or another round holds is not ours to close"
+
+
+def test_a_preclick_failure_closes_the_reopened_tab_too(env, monkeypatch):
+    import cdp_consult as c
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)
+    closed = []
+    tab.close_tab = lambda: closed.append(1)
+    rc = _run_followup_refusing(monkeypatch, tab, reopened=True, exc=c._PreClickFailure("paste truncated"))
+    assert rc == c.EXIT_NOT_SENT_PRECLICK and closed == [1]
+
+
+# ---- hydration is a precondition; tab ownership on EVERY exit ---------------------------------------
+
+def _followup_env(monkeypatch, tab, reopened, hydrated, paste=None, select_raises=None,
+                  mention=("WebCodex Demo",), select=None):
+    """cmd_followup with the page's hydration forced, recording whether it pasted or clicked."""
+    import types
+    import cdp_consult as c
+    rec = {"pasted": 0, "clicked": 0, "closed": 0, "mentions": []}
+
+    def fake_cdp(port, match=None, create_url=None):
+        if match is not None and reopened:
+            raise SystemExit("CGC_ERROR conversation_not_found: no tab")
+        return tab
+
+    def do_paste(*a, **k):
+        rec["pasted"] += 1
+        rec["mentions"].append(list(a[2]) if len(a) > 2 else None)
+        if paste is not None:
+            raise paste
+
+    monkeypatch.setattr(c, "CDP", fake_cdp)
+    monkeypatch.setattr(c, "_await_composer", lambda *a, **k: (True, {}))
+    monkeypatch.setattr(c, "_await_thread_rendered", lambda *a, **k: hydrated)
+    monkeypatch.setattr(c, "_egress_gate", lambda p: (True, "ok"))
+    monkeypatch.setattr(c, "_last_user_text_js", lambda: "LAST")
+    monkeypatch.setattr(c, "_write_state", lambda **k: None)
+    monkeypatch.setattr(c, "_paste_prompt", do_paste)
+    if select_raises is not None:
+        def boom(*a, **k):
+            raise select_raises
+        monkeypatch.setattr(c, "_select_model", boom)
+    if select is not None:
+        monkeypatch.setattr(c, "_select_model", select)
+    orig = tab.eval
+
+    def ev(e, timeout=None):
+        if "return 'clicked'" in e:
+            rec["clicked"] += 1
+        return tab.turns[-1] if e == "LAST" else orig(e, timeout)
+    tab.eval = ev
+    tab.close_tab = lambda: rec.__setitem__("closed", rec["closed"] + 1)
+    tab.rec = rec
+    clock = {"now": 0.0}
+    monkeypatch.setattr(c.time, "time", lambda: clock.__setitem__("now", clock["now"] + 1) or clock["now"])
+    monkeypatch.setattr(c.time, "sleep", lambda s: None)
+    pf = os.path.join(os.environ["CGC_STATE_DIR"], "p3.md")
+    open(pf, "w").write("Continuing.\nBEGIN_RESPONSE:%s\nx\nEND_RESPONSE:%s\n" % (RID, RID))
+    ns = types.SimpleNamespace(no_gate=True, conversation=CONV, prompt_file=pf, task=None, rid=RID,
+                               model="Pro" if (select_raises or select) else "skip", model_family="skip",
+                               allow_model_mismatch=False, port=9333, mention=list(mention),
+                               watch=False, out=None)
+    return c.cmd_followup(ns), rec
+
+
+def test_a_thread_that_never_renders_is_refused_before_any_paste_or_click(env, monkeypatch, capsys):
+    """The page shows no user turn on a thread that has at least one: not hydrated. A stale same-rid
+    turn appearing after the click would read as a fresh send, so nothing is pasted or clicked."""
+    import cdp_consult as c
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=_turn(RID))
+    rc, rec = _followup_env(monkeypatch, tab, reopened=True, hydrated=False)
+    assert rc == c.EXIT_NOT_SENT_PRECLICK
+    assert rec["pasted"] == 0 and rec["clicked"] == 0, "not one keystroke or click before hydration"
+    assert rec["closed"] == 1, "the tab this command re-opened must not be leaked"
+    assert "never rendered" in capsys.readouterr().err
+
+
+def test_an_unhydrated_live_tab_is_refused_but_never_closed(env, monkeypatch):
+    import cdp_consult as c
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)
+    rc, rec = _followup_env(monkeypatch, tab, reopened=False, hydrated=False)
+    assert rc == c.EXIT_NOT_SENT_PRECLICK and rec["pasted"] == 0 and rec["clicked"] == 0
+    assert rec["closed"] == 0, "a tab we attached to is the user's or another round's, never ours to close"
+
+
+def test_a_reopened_tab_is_closed_when_a_pre_click_step_raises(env, monkeypatch):
+    """The cleanup owner is the finally block, so an exception (not just a return) cannot leak it."""
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)
+    with pytest.raises(RuntimeError):
+        _followup_env(monkeypatch, tab, reopened=True, hydrated=True, select_raises=RuntimeError("boom"))
+    assert tab.rec["closed"] == 1 and tab.rec["clicked"] == 0, \
+        "an exception before the click must still close the tab this command re-opened"
+
+
+def _labelled_tab(reads):
+    """A follow-up tab whose switcher labels (_cand_labels_js) come from `reads`, the last repeating."""
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=_turn(RID))
+    orig, now = tab.eval, {"v": []}
+
+    def ev(e, timeout=None):
+        if ".map(function(b){" in e:
+            now["v"] = next(reads, now["v"])
+            return now["v"]
+        return orig(e, timeout)
+    tab.eval, tab.labels = ev, now
+    return tab
+
+
+def test_a_reopened_followup_picks_the_model_only_once_the_switchers_settle(env, monkeypatch):
+    """Live 2026-09-30: a re-opened thread renders the mode toggle ['Explore'] first and the tier
+    switcher ~2.5 s later. Releasing on any label handed _select_model a composer with no tier picker
+    to open; it must see the full label set, unchanged across two reads."""
+    import cdp_consult as c
+    tab = _labelled_tab(iter([[], ["Explore"], ["Explore"], ["Explore", "Pro"], ["Explore", "Pro"]]))
+    seen = []
+
+    def pick(_c, target, family=None):
+        seen.append(list(tab.labels["v"]))
+        return c._ModelPick(True, "Pro", "Pro", None, False)
+    rc, rec = _followup_env(monkeypatch, tab, reopened=True, hydrated=True, mention=[], select=pick)
+    assert seen == [["Explore", "Pro"]], seen
+    assert rc == 0 and rec["clicked"] == 1
+
+
+def test_a_reopened_followup_whose_switchers_never_settle_still_reaches_the_model_gate(env, monkeypatch):
+    """The settle is bounded: a composer that never shows two stable labels still gets one
+    _select_model verdict, and a refusal there still sends nothing."""
+    import cdp_consult as c
+    tab = _labelled_tab(iter([["Explore"]]))
+    calls = []
+
+    def pick(_c, target, family=None):
+        calls.append(target)
+        return c._ModelPick(False, "Explore", None, "no tier picker", False)
+    rc, rec = _followup_env(monkeypatch, tab, reopened=True, hydrated=True, mention=[], select=pick)
+    assert calls == ["Pro"] and rc == 2
+    assert rec["pasted"] == 0 and rec["clicked"] == 0
+
+
+class _SleepClock:
+    """Only sleep moves time, so a settle window is measured in the seconds it really waits."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def time(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def _settle_on(monkeypatch, timeline):
+    """Run _settled_labels against labels that change at given virtual seconds:
+    timeline = [(from_second, labels), ...]. Returns (labels returned, seconds spent)."""
+    import types
+    import cdp_consult as c
+    clock = _SleepClock()
+    monkeypatch.setattr(c, "time", clock)
+
+    def ev(_e):
+        return [lab for t0, lab in timeline if clock.t >= t0][-1]
+    got = c._settled_labels(types.SimpleNamespace(eval=ev))
+    return got, clock.t
+
+
+def test_a_single_stable_switcher_settles_at_the_hold_not_the_bound(env, monkeypatch):
+    """A build with one switcher (the ['6'] badge) must not pay the full 20 s on every re-open."""
+    got, spent = _settle_on(monkeypatch, [(0, ["6"])])
+    assert got == ["6"] and 4 <= spent < 5
+
+
+def test_a_tier_switcher_that_hydrates_late_is_waited_for(env, monkeypatch):
+    """The live shape: ['Explore'] alone, then 'Pro' ~2.5 s later. Two equal reads 1 s apart would
+    release on ['Explore']; the hold outlasts the gap."""
+    got, spent = _settle_on(monkeypatch, [(0, []), (0.5, ["Explore"]), (3.0, ["Explore", "Pro"])])
+    assert got == ["Explore", "Pro"] and spent < 8
+
+
+def test_labels_that_never_settle_stop_at_the_bound(env, monkeypatch):
+    got, spent = _settle_on(monkeypatch, [(t, ["Pro"] if int(t) % 2 else ["6"]) for t in range(40)])
+    assert 20 <= spent < 21
+
+
+def test_a_composer_that_never_shows_a_switcher_stops_at_the_bound(env, monkeypatch):
+    got, spent = _settle_on(monkeypatch, [(0, [])])
+    assert got == [] and 20 <= spent < 21
+
+
+def test_a_reopened_tab_stays_open_once_the_click_was_attempted(env, monkeypatch):
+    """After the click nothing is provably unsent: the tab is the evidence, so it is not closed even
+    though the landed check then fails."""
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)   # click lands nothing
+    rc, rec = _followup_env(monkeypatch, tab, reopened=True, hydrated=True)
+    assert rec["clicked"] == 1 and rc != 0, "the click was made and the send never confirmed"
+    assert rec["closed"] == 0, "an uncertain post-click tab is kept, not closed"
+
+
+def test_a_reopened_tab_is_closed_on_a_pre_click_mention_refusal(env, monkeypatch):
+    import cdp_consult as c
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None)
+    rc, rec = _followup_env(monkeypatch, tab, reopened=True, hydrated=True,
+                            paste=c._MentionFailure("mention_not_found: not an app"))
+    assert rc == 3 and rec["clicked"] == 0 and rec["closed"] == 1
+
+
+def test_a_followup_without_a_mention_is_a_first_class_path(env, monkeypatch):
+    """The first round of a thread carries the app; a follow-up needs no mention and must not touch the
+    popup. cmd_followup hands the paste an EMPTY mention list, so _insert_mention is never reached."""
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=_turn(RID))
+    rc, rec = _followup_env(monkeypatch, tab, reopened=False, hydrated=True, mention=[])
+    assert rec["pasted"] == 1 and rec["mentions"] == [[]], "pasted with no mention to insert"
+    assert rec["clicked"] == 1 and rc == 0, "and it sends normally"
+
+
+# ---- the send verdict at BOTH click sites: nothing but clicked/no-send may go on, Enter only for no-send ----
+
+@pytest.mark.parametrize("verdict", ["no-composer", "ambiguous", None, "disabled", "no-focus", "weird"])
+def test_followup_never_presses_enter_or_sends_on_a_refused_send_target(env, monkeypatch, verdict):
+    import cdp_consult as c
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=_turn(RID), send=verdict)
+    rc, rec = _followup_env(monkeypatch, tab, reopened=True, hydrated=True)
+    assert rc == c.EXIT_NOT_SENT_PRECLICK, verdict
+    assert tab.keys == [] and tab.clicked is False, "no Enter, no click"
+    assert rec["closed"] == 1, "the tab this command re-opened is closed: nothing was sent"
+
+
+def test_followup_presses_enter_only_when_the_composer_has_no_send_button_and_holds_focus(env, monkeypatch):
+    tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=None, send="no-send")
+    _followup_env(monkeypatch, tab, reopened=False, hydrated=True)
+    assert tab.keys == [("Enter", "Enter", 13)], "the pre-existing fallback, for 'no-send' only"
+
+
+def _run_submit(monkeypatch, tab, reuse_tab=False, mention=(), paste=None):
+    """cmd_submit with the browser faked: attach, composer, model and paste stubbed, the send verdict real."""
+    import types
+    import cdp_consult as c
+    made = {}
+
+    def fake_cdp(port, match=None, create_url=None):
+        made["create_url"] = create_url
+        return tab
+
+    monkeypatch.setattr(c, "CDP", fake_cdp)
+    monkeypatch.setattr(c, "_await_composer", lambda *a, **k: (True, {}))
+    monkeypatch.setattr(c, "_egress_gate", lambda p: (True, "ok"))
+    monkeypatch.setattr(c, "_has_sendable_source", lambda p: True)
+    monkeypatch.setattr(c, "_ensure_chrome", lambda port: None)
+    monkeypatch.setattr(c, "_write_state", lambda **k: None)
+
+    def do_paste(*a, **k):
+        if paste is not None:
+            raise paste
+    monkeypatch.setattr(c, "_paste_prompt", do_paste)
+    tab.call = lambda *a, **k: {}
+    clock = {"now": 0.0}     # a virtual clock: the post-click waits run out instantly on the fake tab
+    monkeypatch.setattr(c.time, "time", lambda: clock.__setitem__("now", clock["now"] + 1) or clock["now"])
+    monkeypatch.setattr(c.time, "sleep", lambda s: None)
+    pf = os.path.join(os.environ["CGC_STATE_DIR"], "sub.md")
+    open(pf, "w").write("Review https://github.com/acme/w\nBEGIN_RESPONSE:%s\nx\nEND_RESPONSE:%s\n" % (RID, RID))
+    ns = types.SimpleNamespace(rid=RID, prompt_file=pf, project_url="https://chatgpt.com/", model="skip",
+                               model_family="skip", allow_model_mismatch=False, reuse_tab=reuse_tab,
+                               no_gate=True, port=9333, mention=list(mention), watch=False, out=None)
+    return c.cmd_submit(ns)
+
+
+@pytest.mark.parametrize("verdict", ["no-composer", "ambiguous", None, "disabled", "no-focus"])
+def test_submit_never_presses_enter_or_sends_on_a_refused_send_target(env, monkeypatch, verdict):
+    import cdp_consult as c
+    tab = _FollowupTab([], lands=None, send=verdict)
+    assert _run_submit(monkeypatch, tab) == c.EXIT_NOT_SENT_PRECLICK, verdict
+    assert tab.keys == [] and tab.clicked is False
+    assert tab.tab_closed == 1, "the tab submit opened is closed: nothing was sent"
+
+
+def test_submit_presses_enter_only_for_no_send(env, monkeypatch):
+    tab = _FollowupTab([], lands=None, send="no-send")
+    _run_submit(monkeypatch, tab)
+    assert tab.keys == [("Enter", "Enter", 13)]
+
+
+def test_submit_never_closes_a_tab_it_did_not_open_on_any_pre_click_exit(env, monkeypatch):
+    """--reuse-tab attaches to a tab that was already there: a refusal before the click must leave it."""
+    import cdp_consult as c
+    for verdict in ("no-composer", "no-focus"):
+        tab = _FollowupTab([], lands=None, send=verdict)
+        assert _run_submit(monkeypatch, tab, reuse_tab=True) == c.EXIT_NOT_SENT_PRECLICK
+        assert tab.tab_closed == 0, verdict
+    tab = _FollowupTab([], lands=None)
+    assert _run_submit(monkeypatch, tab, reuse_tab=True, paste=c._MentionFailure("mention_not_found")) == 3
+    assert tab.tab_closed == 0
+    tab = _FollowupTab([], lands=None)
+    assert _run_submit(monkeypatch, tab, reuse_tab=True, paste=c._PreClickFailure("truncated")) == c.EXIT_NOT_SENT_PRECLICK
+    assert tab.tab_closed == 0
+
+
+def test_submit_closes_the_tab_it_opened_on_a_pre_click_refusal_and_keeps_none_after_a_click(env, monkeypatch):
+    import cdp_consult as c
+    tab = _FollowupTab([], lands=None)
+    assert _run_submit(monkeypatch, tab, paste=c._MentionFailure("mention_not_found")) == 3
+    assert tab.tab_closed == 1
+    tab = _FollowupTab([], lands=None)
+    assert _run_submit(monkeypatch, tab, paste=c._PreClickFailure("truncated")) == c.EXIT_NOT_SENT_PRECLICK
+    assert tab.tab_closed == 1

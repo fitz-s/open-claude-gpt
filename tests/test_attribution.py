@@ -56,7 +56,7 @@ CONV = "11111111-1111-4111-8111-111111111111"
 
 
 def _ready(store_mod, s, rid, kind="submit", **spec):
-    base = {"project_url": "https://chatgpt.com/", "model": "Pro", "model_family": "Latest"}
+    base = {"project_url": "https://chatgpt.com/", "model": "Pro", "model_family": "GPT-6"}
     base.update(spec)
     s.create_round(rid, kind, prompt="review https://github.com/acme/x/tree/deadbeef please",
                    spec_json=json.dumps(base))
@@ -240,14 +240,15 @@ class TestSlugRead:
         return _load("cdp_consult", tmp_path / "control.db")
 
     def test_the_js_reads_the_named_attribute_off_the_rid_scoped_node(self, cdp):
-        js = cdp._model_slug_js("REQ-20260906-000000-00000c", turn_index=3)
+        js = cdp._model_slug_js("REQ-20260906-000000-00000c", scoped=True)
         assert "data-message-model-slug" in js
         # scoped to THIS rid's own turn interval, never "the last assistant message" — a stale tab
         # under-reports how many assistant turns exist.
-        assert "BEGIN_RESPONSE:REQ-20260906-000000-00000c" in js and "__cgcNode(" in js and ",3)" in js
+        assert '__cgcNode("BEGIN_RESPONSE:REQ-20260906-000000-00000c","REQ-20260906-000000-00000c")' in js
 
-    def test_unscoped_read_omits_the_turn_index(self, cdp):
-        assert ",3)" not in cdp._model_slug_js("REQ-20260906-000000-00000c")
+    def test_unscoped_read_names_no_source_turn(self, cdp):
+        assert '__cgcNode("BEGIN_RESPONSE:REQ-20260906-000000-00000c")' in \
+            cdp._model_slug_js("REQ-20260906-000000-00000c")
 
     def test_read_degrades_to_none_never_raises(self, cdp):
         class Boom:
@@ -386,7 +387,7 @@ class TestFamilyIsFrozenIntoTheRequest:
         pf = str(tmp_path / "p.txt")
         open(pf, "w").write("a maths question, no code")
         first = _enq("REQ-20260906-000000-0000d1", pf, request_key="k-fam",
-                     logical_sha="a" * 64, model_family="Latest")
+                     logical_sha="a" * 64, model_family="GPT-6")
         assert backend.enqueue_round(first, "a maths question, no code", str(tmp_path / "1.txt")) == 0
         capsys.readouterr()
         second = _enq("REQ-20260906-000000-0000d2", pf, request_key="k-fam",
@@ -400,9 +401,13 @@ class TestFamilyIsFrozenIntoTheRequest:
         pf = str(tmp_path / "p2.txt")
         open(pf, "w").write("a maths question, no code")
         for rid in ("REQ-20260906-000000-0000d3", "REQ-20260906-000000-0000d4"):
-            a = _enq(rid, pf, request_key="k-same", logical_sha="b" * 64, model_family="Latest")
+            a = _enq(rid, pf, request_key="k-same", logical_sha="b" * 64, model_family="GPT-6")
             assert backend.enqueue_round(a, "a maths question, no code", str(tmp_path / "s.txt")) == 0
         assert s.get_round("REQ-20260906-000000-0000d4") is None, "the second fire reuses the first"
+
+    def test_the_default_family_is_the_pickers_current_label(self, env):
+        store_mod, backend, s, _t = env   # the env fixture has already unset CGC_MODEL_FAMILY
+        assert backend._spec_model_family(types.SimpleNamespace()) == "GPT-6"
 
     def test_refire_inherits_the_recorded_family_not_todays_environment(self, env, monkeypatch):
         store_mod, backend, s, _t = env

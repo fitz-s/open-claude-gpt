@@ -45,9 +45,8 @@ the agent, which reads the `answer_path` off `await`'s JSON outcome envelope.
 ## 3. Verify, then follow up only if something is still unresolved
 
 Read the answer and **verify each `verify locally: <check>` claim in your repo**.
-A follow-up spends one of the account's few weekly Pro messages, so send one only
-when a finding is still open after checking — not to report back that everything
-was clean:
+Send a follow-up when a finding is still open after checking, or when your local
+results raise a new question. Do not send one only to report that everything was clean:
 
 ```bash
 bin/cgc fire --followup --parent <rid> --no-code \

@@ -274,6 +274,19 @@ def test_the_logical_sha_still_identifies_the_render_it_came_from(tmp_path, foll
         "the identity must hash the render that was actually written"
 
 
+@pytest.mark.parametrize("kind", KINDS)
+def test_every_render_opens_with_its_own_rid_marker_then_the_title(renders, kind):
+    """A long prompt collapses in ChatGPT to its head plus "Show more"; the sentinel pair is the LAST
+    thing in the render, so the head is the only place a collapsed turn can carry its rid. The first
+    line is a plain `CGC_RID:<rid>` (a markdown-rendered bubble keeps it verbatim), then the title."""
+    text = renders[kind]
+    first, blank, title = text.split("\n", 2)[0], text.split("\n", 2)[1], text.split("\n", 2)[2].split("\n")[0]
+    m = re.fullmatch(r"CGC_RID:(REQ-\d{8}-\d{6}-[0-9a-f]{6})", first)
+    assert m and blank == "" and title == "# " + TITLE
+    assert text.count("BEGIN_RESPONSE:" + m.group(1)) == 1, "the marker is not a second sentinel"
+    assert text.count("CGC_RID:") == 1
+
+
 def test_output_replace_leaves_the_findings_shape_to_the_caller(renders):
     """The replace arm must not re-ask for anything the spec owns — including the verify-locally
     tag, which is a field of whichever findings shape is in force."""

@@ -69,24 +69,24 @@ def test_the_sent_turn_is_visible_to_the_send_contract():
 
 
 def test_a_finished_answer_is_done_despite_attachment_cards_after_it():
-    got = json.loads(_eval(CDP._detect_js(R1, 0), _page()))
+    got = json.loads(_eval(CDP._detect_js(R1, scoped=True), _page()))
     assert got["done"] is True and got["ac"] == 1
 
 
 def test_an_unanswered_turn_is_not_done():
-    got = json.loads(_eval(CDP._detect_js(R2, 1), _page()))
+    got = json.loads(_eval(CDP._detect_js(R2, scoped=True), _page()))
     assert got["done"] is False
 
 
 def test_extract_returns_the_body_without_the_cards():
-    body = _eval(CDP._extract_js(R1, 0), _page())
+    body = _eval(CDP._extract_js(R1, scoped=True), _page())
     assert body.strip() == "the verdict"
 
 
 def test_the_no_sentinel_salvage_read_skips_the_attachment_cards():
     setup = _page().replace("md(['BEGIN_RESPONSE:%s','the verdict','END_RESPONSE:%s'])" % (R1, R1),
                             "md(['an unwrapped answer'])")
-    raw = _eval(CDP._last_assistant_js(R1, 0), setup)
+    raw = _eval(CDP._last_assistant_js(R1, scoped=True), setup)
     assert raw.strip() == "an unwrapped answer" and "Open file" not in raw
 
 
@@ -132,19 +132,19 @@ def _turned(extra_r2=""):
 
 
 def test_chatgpts_failure_marker_on_the_source_turn_is_read():
-    got = json.loads(_eval(CDP._detect_js(R2, 1), _turned(",E('SPAN',{},[],'Thinking failed')")))
+    got = json.loads(_eval(CDP._detect_js(R2, scoped=True), _turned(",E('SPAN',{},[],'Thinking failed')")))
     assert got["failed"] == "Thinking failed" and got["done"] is False
 
 
 def test_a_failure_on_a_later_turn_is_not_attributed_to_an_earlier_one():
-    """R2's prompt quotes R1's BEGIN token and R2 failed. Pinned by turn_index, R1 is unaffected."""
+    """R2's prompt quotes R1's BEGIN token and R2 failed. Scoped to its own turn, R1 is unaffected."""
     setup = _turned(",E('SPAN',{},[],'Thinking failed')")
-    assert json.loads(_eval(CDP._detect_js(R1, 0), setup))["failed"] is None
-    assert json.loads(_eval(CDP._detect_js(R2, 1), setup))["failed"] == "Thinking failed"
+    assert json.loads(_eval(CDP._detect_js(R1, scoped=True), setup))["failed"] is None
+    assert json.loads(_eval(CDP._detect_js(R2, scoped=True), setup))["failed"] == "Thinking failed"
 
 
 def test_no_marker_means_no_failure():
-    assert json.loads(_eval(CDP._detect_js(R2, 1), _turned()))["failed"] is None
+    assert json.loads(_eval(CDP._detect_js(R2, scoped=True), _turned()))["failed"] is None
 
 
 
@@ -152,4 +152,155 @@ def test_an_answer_line_that_starts_like_a_failure_is_not_a_failure():
     """Review S1: the marker is a lone status element outside any message body. An unwrapped answer
     whose last line is "Network error handling is untested" must not read as a failed turn."""
     setup = _turned(",unit('t2:2:assistant',[md(['Network error handling is untested in cgc_spool.'])])")
-    assert json.loads(_eval(CDP._detect_js(R2, 1), setup))["failed"] is None
+    assert json.loads(_eval(CDP._detect_js(R2, scoped=True), setup))["failed"] is None
+
+
+# 2026-10-08: ChatGPT collapses a long user message to its head plus "…Show more" (a 20.7 KB prompt
+# kept 10098 chars in the DOM), and the template's sentinel pair is the LAST thing in the render, so
+# the collapsed turn never carried the rid. The send had landed and the answer finished, but the
+# contract saw {search-unit-v1: users 1, assistants 0, ridLanded false} -> unknown_send, and the
+# waiter and the retrieve read `rid_absent` beside a complete answer. The fix is in the part that is
+# never collapsed: every prompt now OPENS with a plain `CGC_RID:<rid>` line, and a turn's own rid is
+# that line (cdp_consult._turn_canonical_rid). The turn's React state is not consulted — which fiber
+# or ancestor is current cannot be known from a DOM node (a reused node updated R1 -> R2 kept R1 on
+# its fiber), so a stale item attached below must change nothing.
+def _collapsed(rid, *, marker=True, collapsed=True, answered=False, stale_item=None, tail=None):
+    """One user turn. marker: the head opens with CGC_RID:<rid>. collapsed: a Show more button.
+    tail: a rid whose BEGIN/END pair still shows in the DOM (a collapsed turn has none).
+    stale_item: a rid whose full message a React fiber carries on this node (it must be ignored)."""
+    head = ("P('CGC_RID:%s')," % rid if marker else "") + "P('# Round 7'),P('the head that survives the collapse…')"
+    button = ",E('BUTTON',{'aria-expanded':'false'},[],'Show more')" if collapsed else ""
+    pair = (",P('BEGIN_RESPONSE:%s'),P('<full answer>'),P('END_RESPONSE:%s')" % (tail, tail)) if tail else ""
+    item = json.dumps({"message": "CGC_RID:%s\n# Round 7\nthe hidden tail\nBEGIN_RESPONSE:%s\n<full answer>\n"
+                                  "END_RESPONSE:%s" % ((stale_item,) * 3)}) if stale_item else None
+    fiber = ("U['__reactFiber$x']={memoizedProps:{},return:{memoizedProps:{},return:"
+             "{memoizedProps:{item:%s}}}};" % item) if item else ""
+    answer = (",unit('t7:2:assistant',[md(['BEGIN_RESPONSE:%s','the verdict','END_RESPONSE:%s'])])" % (rid, rid)
+              if answered else "")
+    return ("var U=unit('t7:0:user',[%s%s%s]);%s"
+            "var ROOT=E('MAIN',{},[E('DIV',{'data-turn-key':'k7'},[U%s])]);"
+            "var document=ROOT;document.body=ROOT;var location={pathname:'/c/x'};"
+            % (head, pair, button, fiber, answer))
+
+
+def _landed(rid, setup):
+    got = json.loads(_eval(CDP._contract_js(rid), setup))
+    return {f["adapter"]: f["ridLanded"] for f in got["families"]}["search-unit-v1"]
+
+
+def _texts(setup):
+    return _eval(CDP._all_user_texts_js(), setup)
+
+
+def test_a_collapsed_user_turn_still_lands_the_send_contract():
+    got = json.loads(_eval(CDP._contract_js(R2), _collapsed(R2)))
+    fam = {f["adapter"]: f for f in got["families"]}
+    assert fam["search-unit-v1"]["ridLanded"] is True and fam["search-unit-v1"]["users"] == 1
+    assert _landed(R1, _collapsed(R2)) is False
+
+
+def test_a_legacy_collapsed_turn_without_the_marker_stays_unproven():
+    """No marker and the tail pair collapsed away: the DOM head is all there is, no rid is in it,
+    and the send stays unknown_send (a human looks) rather than being guessed landed."""
+    setup = _collapsed(R2, marker=False)
+    assert _landed(R2, setup) is False
+    assert CDP._locate_source_turn(_texts(setup), R2)["present"] is False
+
+
+def test_an_expanded_legacy_turn_is_still_read_by_its_tail_pair():
+    assert _landed(R2, _collapsed(R2, marker=False, collapsed=False, tail=R2)) is True
+
+
+def test_the_waiter_finds_a_collapsed_source_turn_and_its_answer():
+    setup = _collapsed(R2, answered=True)
+    assert CDP._locate_source_turn(_texts(setup), R2) == {"present": True, "is_last": True, "observed_rid": R2}
+    assert CDP._turn_canonical_rid(_eval(CDP._last_user_text_js(), setup)) == R2
+    got = json.loads(_eval(CDP._detect_js(R2, scoped=True), setup))
+    assert got["done"] is True and got["node"] == "found"
+
+
+def test_a_stale_react_item_on_the_node_changes_nothing():
+    """The reproduced defect: a reused node updated R1 -> R2 shows R2 in the DOM while its
+    __reactFiber$ still carries R1's message. React state is ignored; the head's rid is the turn's."""
+    setup = _collapsed(R2, answered=True, stale_item=R1)
+    assert _landed(R2, setup) is True and _landed(R1, setup) is False
+    assert CDP._locate_source_turn(_texts(setup), R1)["present"] is False
+    assert CDP._turn_canonical_rid(_eval(CDP._last_user_text_js(), setup)) == R2
+    assert _eval(CDP._last_assistant_js(R1, scoped=True), setup) == ""     # R2's answer is not R1's
+
+
+def test_a_rid_echo_followup_check_reads_the_marker():
+    """The follow-up's rid_echo check parses the last user turn's text, collapsed or not."""
+    for setup in (_collapsed(R2), _collapsed(R2, collapsed=False, tail=R2)):
+        assert CDP._turn_canonical_rid(_eval(CDP._last_user_text_js(), setup)) == R2
+
+
+def test_two_refire_shaped_turns_resolve_to_distinct_rids():
+    """Identical heads except the marker (a refire of the same prompt under a new rid)."""
+    def turn(n, rid):
+        return ("unit('t%d:0:user',[P('CGC_RID:%s'),P('# Round 7'),P('the same head…'),"
+                "E('BUTTON',{'aria-expanded':'false'},[],'Show more')])" % (n, rid))
+    setup = ("var ROOT=E('MAIN',{},[%s,%s]);var document=ROOT;document.body=ROOT;"
+             "var location={pathname:'/c/x'};" % (turn(1, R1), turn(2, R2)))
+    texts = _texts(setup)
+    assert [CDP._turn_canonical_rid(t) for t in texts] == [R1, R2]
+    assert CDP._locate_source_turn(texts, R1) == {"present": True, "is_last": False, "observed_rid": R2}
+    assert CDP._locate_source_turn(texts, R2) == {"present": True, "is_last": True, "observed_rid": R2}
+
+
+def test_the_marker_is_authoritative_over_a_tail_pair_of_another_rid():
+    """No cross-check: in a collapsed turn the last VISIBLE pair can be a quote (a follow-up quoting
+    its parent). A refire rewrites the rid everywhere, so our own tail always equals our marker."""
+    setup = _collapsed(R2, collapsed=False, tail=R1)
+    assert _landed(R2, setup) is True and _landed(R1, setup) is False
+
+
+# ---- an @mention round: _paste_prompt types the app's label BEFORE the prompt ------------------------
+# The live-recorded composer (tests/fixtures/mention_popup.json: composer_after_pick) holds an inline
+# label span, "WebCodex Demo", ahead of the pasted text. Whether the SENT bubble echoes that label on the
+# marker's line, on a line of its own or not at all is not something the reader may depend on: the marker
+# is the FIRST CGC_RID token in the turn, wherever the label sits.
+def _mention_turn(rid, *, label="inline", quoted=None, collapsed=True):
+    """label: 'inline' (the label span shares the marker's <p>), 'block' (its own <p>), None."""
+    lab = "E('SPAN',{'app-mention-name':'webcodex-demo'},[E('SPAN',{},[],'WebCodex Demo')])"
+    marker = "CGC_RID:%s" % rid
+    # E() puts its text node BEFORE its children, so the pasted text is its own child after the label.
+    first = {"inline": "E('P',{},[%s,E('SPAN',{},[],' %s')])" % (lab, marker),
+             "block": "E('P',{},[%s]),P('%s')" % (lab, marker), None: "P('%s')" % marker}[label]
+    quote = (",P('you wrote:'),P('BEGIN_RESPONSE:%s'),P('the old answer'),P('END_RESPONSE:%s')"
+             % (quoted, quoted)) if quoted else ""
+    button = ",E('BUTTON',{'aria-expanded':'false'},[],'Show more')" if collapsed else ""
+    return ("var U=unit('t7:0:user',[%s,P('# Round 7')%s%s]);"
+            "var ROOT=E('MAIN',{},[E('DIV',{'data-turn-key':'k7'},"
+            "[U,unit('t7:2:assistant',[md(['an unwrapped answer of R2'])])])]);"
+            "var document=ROOT;document.body=ROOT;var location={pathname:'/c/x'};" % (first, quote, button))
+
+
+@pytest.mark.parametrize("label", ("inline", "block", None))
+def test_a_mention_label_ahead_of_the_marker_does_not_hide_it(label):
+    setup = _mention_turn(R2, label=label)
+    assert _landed(R2, setup) is True and _landed(R1, setup) is False
+    assert CDP._locate_source_turn(_texts(setup), R2) == {"present": True, "is_last": True, "observed_rid": R2}
+
+
+@pytest.mark.parametrize("label", ("inline", "block", None))
+def test_a_visible_quoted_pair_of_another_rid_never_names_the_collapsed_turn(label):
+    """The reviewer's hole: label + R2's marker, a QUOTED complete R1 pair visible in the body and R2's
+    own tail hidden by the collapse. The last-pair rule returned R1 here, so ridLanded(R1) was true,
+    the source turn read as R1's, and the scoped read of R1 returned R2's unwrapped answer."""
+    setup = _mention_turn(R2, label=label, quoted=R1)
+    assert _landed(R1, setup) is False and _landed(R2, setup) is True
+    assert CDP._locate_source_turn(_texts(setup), R1)["present"] is False
+    assert CDP._turn_canonical_rid(_eval(CDP._last_user_text_js(), setup)) == R2
+    assert _eval(CDP._last_assistant_js(R1, scoped=True), setup) == ""
+
+
+def test_a_body_quoting_another_marker_after_the_real_one_reads_the_real_one():
+    setup = _mention_turn(R2, label="inline").replace(
+        "P('# Round 7')", "P('# Round 7'),P('the old prompt began CGC_RID:%s')" % R1)
+    assert _landed(R2, setup) is True and _landed(R1, setup) is False
+
+
+def test_a_marker_glued_to_a_word_is_not_ours():
+    setup = _mention_turn(R2, label=None).replace("CGC_RID:%s" % R2, "xCGC_RID:%s" % R2)
+    assert _landed(R2, setup) is False

@@ -6,6 +6,262 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-12
+
+### Added — a no-send UI-contract probe, and sends pause instead of failing when ChatGPT's page moves
+
+ChatGPT's page changed four times in three weeks:
+
+- `Latest` became `GPT-6`;
+- the @-mention popup changed;
+- long user turns now collapse;
+- re-opened threads render late.
+
+Each change was found one round at a time. A reader break was the worst case: the message was
+spent, and the round then waited up to 90 minutes before ending uncertain.
+
+- **`cgc probe`** checks the contract without sending anything. It selects the configured model on
+  a fresh project tab, pastes and reads back a 17 KB draft, inserts the first `CGC_APPS` app's
+  mention, and clears the composer. It also opens a finished conversation read-only and reads its
+  source turn and wrapped answer through the waiter's own reads. Every check opens its own
+  background tab and closes only that tab. A handle that refuses the send button, Enter and
+  `Input.*` events is the only way the probe reaches its tab.
+- **Capability state** is stored in `meta` (`ui.composer`, `ui.model`, `ui.mention`, `ui.reader`). A failing
+  probe marks a capability broken, after one retry. A real round marks only `reader`, on
+  `selector_drift`, which is the break that spends messages. A pre-click failure costs nothing, and
+  from one round it can be a deleted project or an unconnected app, so it never gates. A login,
+  challenge or rate-limit page never marks anything, and the probe reports it (`CGC_PROBE_BLOCKER`).
+  An inconclusive probe changes nothing. That covers a thread still hydrating after 60 s, and a page
+  that never showed the conversation. A pass clears a failure only if the probe started after that
+  failure was recorded.
+- **Sends pause, rounds stay queued.** The daemon claims no round that needs a broken capability:
+  every send needs `composer` and `reader`, and a `--mention` round also needs `mention`. Retrieves
+  are never paused. `await` says `ChatGPT UI changed (<capability>: <cause>) — sends paused; driver
+  needs a fix; queued rounds are intact`. The daemon probes at start, before queued work once the
+  last probe is 6 h old, and every 30 min while something is broken.
+- **The model picker is its own capability (`model`).** A probe that cannot select the configured
+  family and tier pauses only the rounds that select that pair. A `--model skip` round, or one
+  pinned to another family, still sends. The reader probe judges a page only after its switcher
+  labels settle, the follow-up's own hydration signal. A page that never settles is
+  inconclusive. `--once` no longer waits for a round scheduled later with `--not-before`.
+- **Only what can be re-proven gates.** A real round's `selector_drift` pauses sends only when a
+  finished round exists for the probe to re-read. Otherwise it is logged (`ui_drift_ungated`) and
+  sends go on. A `reader` break the probe can no longer re-check (its finished round is gone) is
+  cleared as `unprovable`, so a break can never lock sends for good.
+- **`--use-by` holds at the click.** The claim pass expires a queued round past its use-by even
+  while a paused capability holds it. The driver re-checks `--not-after` immediately before the
+  click, after model selection and the paste.
+- **The message ledger no longer charges a proven pre-click retry.** A `model_not_selectable` (or
+  any other pre-click) requeue is stamped not-sent-proven, and the next `begin_send` clears the
+  stamp. A requeued round that is then cancelled is free, and one that later sends is charged once.
+  (This predates the gate; it was in 0.4.0.)
+- **The driver's typed outcome is kept.** Its failure line (`submitted`, `reason`, `phase`, the
+  contract it observed) is stored on the attempt and returned by `await` as `send`. An uncertain
+  send's error now says, for example, `selector_drift: submitted=true`. It still keeps its
+  conversation id and is still never resent.
+
+### Added — a usage feedback loop: intent, backlog, grading, a weekly view, and a budget line at session start
+
+Agents almost never fired on their own (1 of 13 consult sessions in 30 days), nothing measured whether
+an answer was useful, and nothing said how much allowance was left. Prompts and usage rules can now be
+tuned from graded results. Everything here is local: no network, no browser, no schema change.
+
+- **Intent on `fire`.** `--origin`, `--trigger`, `--decision`, `--baseline`, `--check` are stored in
+  `spec_json.consult_meta` with an automatic `policy_rev` (sha256[:12] of `SKILL.md`, `ACTIVATION.md`
+  and the prompt templates). Nothing new is rendered into the prompt. The five intent flags join the
+  request fingerprint only when set, so existing request-keys keep theirs.
+- **Backlog.** `fire --not-before` (written to `rounds.not_before`, which `claim_ready` already
+  honoured) holds a complete question until later; `--use-by` makes a round that missed its window end
+  `failed` (`expired: use-by <t> passed before send`) before the gate and `begin_send`, stamped
+  not-sent-proven so it is never charged and its request-key is released. There is no `reschedule`:
+  cancel and re-fire.
+- **`cgc feedback`.** Grades an answer (`consult_outcome` event, latest per rid wins; grade 1 or 2
+  requires `--evidence`; unknown rids refused; a retrieve resolves to its source round) and records the
+  weekly review (`feedback --policy`). It never touches `rounds.updated_at`.
+- **`stats --week`.** A rolling 7-day view: potentially spent messages vs `CGC_WEEKLY_BUDGET`, ungraded
+  answers, backlog and expired rounds, grades by trigger and by mention, useful outcomes per message,
+  and whether the policy review happened.
+- **A budget line at session start.** `cgc_activation.py snapshot` prints `ACTIVATION.md` plus one
+  line of that state, read-only and bounded under a second, and never fails a session start.
+  `cgc activation-hook --install` upgrades an installed hook in place.
+- **`fire --workspace NAME`** (with a required `--mention`) declares a local WebCodex workspace as the
+  question's source, so a code question whose evidence is local no longer has to claim `--no-code`.
+  The source rule accepts it in the same three places that accept the no-code and follow-up
+  declarations (`validate_prompt`, the enqueue pre-check, the driver's send-time backstop); every
+  secret and URL gate is unchanged. `CGC_WORKSPACES` lists your registered workspaces, and
+  `consult.py apps` prints them.
+
+### Fixed — the message ledger under-counted: an automatic continue is a second message
+
+`stats` charged at most one message per rid, but the "continue" sent after a ChatGPT turn failure is a
+second outgoing message under the same rid. The metric is now `potentially_spent`: base sends plus
+continuations whose recorded result is `landed`, `unsure`, or absent (the worker died between claim and
+result, possibly after the click). A `not_sent` continuation and a `retrieve` count zero. `free` is now
+the number of rounds that spent nothing; it was `total - charged`, which cannot hold once messages can
+exceed rounds. The JSON key `messages.charged` is renamed `messages.potentially_spent`.
+
+### Fixed — a long prompt's send was reported `unknown_send` and its answer `rid_absent`, though both existed
+
+ChatGPT collapses a long user message in the DOM to its head plus "…Show more" (a 20.7 KB prompt kept
+10098 characters). The template's `BEGIN_RESPONSE`/`END_RESPONSE` pair is the last thing in the render, so a
+collapsed turn never carried the rid: the send contract saw `search-unit-v1 users:1, ridLanded:false` and
+refused to confirm a send that had landed, and the waiter and retrieve found no source turn beside a
+finished, correctly wrapped answer.
+
+- Every prompt now opens with a plain first line `CGC_RID:<rid>`, then the title. The head is the one part
+  ChatGPT never collapses, and plain text survives a markdown-rendered bubble. A turn's own rid is the rid of
+  the first `CGC_RID:` token anywhere in its text, so an `@mention` label pasted ahead of the prompt cannot
+  hide it, and it is authoritative: a collapsed turn's last visible `BEGIN`/`END` pair can be a quote. A legacy
+  prompt (no marker) is read by its tail pair as before, so a collapsed legacy turn stays unproven and still
+  ends `unknown_send`, never auto-resent. `logical_sha` renders the marker with `<RID>` like the sentinels, so
+  a re-fire still matches its key; a key fired before this change and re-fired after it conflicts once,
+  because the stored fingerprint hashes the old first line.
+- A turn we send must parse as its own rid, checked before the click. `@mention` labels are typed ahead of the
+  prompt, so an app named `CGC_RID:<other>`, or a legacy `followup --prompt-file` whose body quotes one, would
+  make the sent turn read as another request and let that request's waiter take this answer. One helper
+  (`_refuse_ambiguous_rid`, the reader's own rule over "labels + prompt") now runs in `submit`, `followup`
+  and `enqueue`: a turn that would not parse as the round's rid is refused as `rid_ambiguous`, naming the
+  foreign rid, before anything is sent (exit 6, provably unsent). `--mention` and `CGC_APPS` names containing
+  `CGC_RID` are refused at input.
+- The page-side `__cgcRid` and Python `_turn_canonical_rid` now share one whitespace set, the `[0-9]` digit
+  class and the marker regex by construction. `str.strip()` and `trim()` disagreed (`\x1c`-`\x1f` and U+0085
+  against the BOM), so a BOM or U+0085 could make one side read R1 where the other read nothing.
+- The turn's React state is deliberately not read: which fiber or ancestor is current cannot be known from a
+  DOM node (real React 18.3.1: a reused user node updated R1 to R2 kept R1 on its fiber, and a Context update
+  can leave an ancestor's item on R1 under a DOM showing R2).
+- The same read serves the send contract, the waiter's source-turn lookup, the failure marker, the
+  `rid_echo` check of a follow-up, and `status --rid auto`.
+
+### Fixed — the model picker renamed `Latest` to `GPT-6`, so every consult refused to send
+
+The composer's model radios now read `GPT-6` / `GPT-5.6 Sol` / `GPT-5.5`; the first is the same model
+the old `Latest` entry named. The default `CGC_MODEL_FAMILY` was still `Latest`, so the family guard
+failed closed before the click (`model_not_selectable: model family 'Latest' is not offered`) — nothing
+was sent, but nothing could be.
+
+- The default family is `GPT-6` in the driver, the enqueue path, the daemon's send fallbacks, the CLI
+  flag defaults, `doctor`, and the docs. `Latest` is not accepted as an alias: it is refused with the
+  list of what the picker offers, like any other label the picker does not carry.
+- A round enqueued earlier froze `model_family` into its spec. Such a round, and a `refire` of it, keeps
+  `Latest` and is refused again; resend it as a fresh `fire` under a new `--request-key`.
+
+### Fixed — a follow-up into a long, re-opened thread never saw its own finished answer
+
+A follow-up that had to re-open its thread's tab watched for the full 90 minutes printing
+`CGC_WAIT alive: ... len=0 ... begin=False end=False` while ChatGPT wrote a complete, correctly wrapped
+answer in that same tab. At the timeout the salvage path took it anyway, but as an *unwrapped* answer,
+so the round ended `completed_unverified` and `await` reported it stuck.
+
+The waiter found its round's user turn once, at the start, and remembered it by ordinal ("the 5th user
+turn"). A re-opened thread first renders every turn and then unmounts the older ones (the heartbeat's
+`ac` fell 4 → 2 and 6 → 3), so the ordinal soon named no turn at all: the scoped answer read returned
+nothing, and the heartbeat printed that as an empty answer. The timeout salvage worked only because it
+looked the turn up again.
+
+- Every scoped read now finds the round's turn by its own rid on every poll: the last user turn whose
+  own sentinel pair (the same rule `_turn_canonical_rid` applies, now mirrored in the page JS) names the
+  rid. The answer is still read only between that turn and the next user turn, so a later round's reply
+  that quotes the wrapper is never taken, however the turns above it mount and unmount.
+- The ChatGPT failure marker is read from that same turn. A re-sent rid (auto-continue) resolves to
+  the later turn, so the first turn's "Thinking failed" no longer applies to the continue.
+- The heartbeat carries `node=found|none|source_unrendered`, so `len=0` because the turn is not
+  rendered can be told apart from `len=0` because nothing has been written yet.
+- A wrapped answer is graded `completed_verified` whichever exit of the wait finds it. The daemon
+  grades by the mere presence of `<out>.raw`, and two paths could hand it one beside a wrapped
+  answer. First, the timeout's extract and its salvage read are separate evals, so a wrapper only
+  the salvage read saw was written as `CGC_UNWRAPPED`; salvaged text is now run through the
+  canonical parser first. Second, a stub-stable dump earlier in the same wait stayed on disk
+  through a later verified exit; every verified exit now removes it. An unwrapped salvage is still
+  `completed_unverified`, and a later round's echo of the wrapper is still never taken.
+
+Pinned by `tests/test_wait_virtualized_thread.py`: the waiter's real JS runs in node against a thread
+whose older turns unmount mid-wait, and whose answer appears only after the timeout's force-render
+scroll. The daemon's own verdict and `await`'s envelope are checked end to end, and the page-side
+rid parser is checked against the Python one.
+
+### Fixed — a re-opened follow-up could pick its model before the tier switcher existed
+
+A re-opened thread renders the composer's mode toggle (`Explore`) first and the tier switcher ~2.5 s
+later. The follow-up released its pre-selection wait on the first label it saw, so `_select_model` could
+act on a composer with no tier picker to open. It now waits until the switcher labels are non-empty and
+unchanged for 4 s — longer than that gap, so two equal reads of `['Explore']` do not release it — with
+no assumed label count, so a one-switcher build (`['6']`) settles at 4 s rather than the 20 s bound. If
+they never settle, the model gate still runs and still refuses to send on a model it could not confirm.
+
+### Fixed — `fire --mention` found no popup entries, ever
+
+Every `--mention` failed `mention_not_found ... The popup offered: nothing`, for apps that were
+enabled. The picker looked for ARIA roles (`option`, `menuitem`, `listbox li`); the composer's @ popup
+has none. Probed live (2026-09-29), it is a floating panel whose scroll area is
+`[data-mention-list-scroll-area]`, and every row is a plain `<button data-list-navigation-item>`, so
+the old selector matched zero nodes. The picker now reads those rows, and hardens around them:
+
+- **The name is matched exactly, never by prefix.** A prefix rule cannot tell a different app from the
+  one asked for: with only "Notion Calendar" enabled, `--mention Notion` would click it, every later
+  check would pass, and the prompt would go out with the wrong app. Short names are still snapped to the
+  known-apps list by the CLI before this; an unlisted short name now fails closed and the error names
+  what the popup did offer.
+- **A candidate must be shaped like an app row**, read off the popup's own markup: a connector icon
+  (`rounded-2xs`; Add actions and file rows use other icons) under the **Plugins** header, or in a bare
+  single-section popup. Any other row is never clicked and is reported as unverified. This is an
+  inference from today's markup, not a documented contract.
+- **A row counts as connected only if the whole button reads exactly icon, label, description**, with the
+  label and the description each a leaf element holding a single text node. An unconnected app carries a
+  **Connect** control or text; the shapes this refuses (each is a test) are: text inside the label, a button
+  or a second text node inside the description, a bare text node or a button in the content block, and an
+  element or text beside the content block, in any UI language. None of those is clicked (it would start an
+  authorization flow), and an unconnected exact app is refused, never replaced by another. The rule is
+  structural and cannot read meaning: text that is PART of the description's single text node ("Notion docs
+  and Connect") cannot be told from a description that really says so, and reads as connected.
+- **Two rows with the same exact name are refused as ambiguous** ("ambiguous: 2 rows named ..."), since
+  they may be different apps.
+- **Success is the requested app's own mention node.** After the one click the composer's
+  `[app-mention-name]` nodes are polled for (~2.4s) and the one that appeared must carry the requested
+  name; a node for another app, or none, clears the composer and refuses. After the prompt is pasted the
+  composer must still hold exactly the requested apps.
+- The failure names which thing happened: popup never opened (a DOM/code bug), only its loading
+  skeleton (ChatGPT's own state while it searches), opened empty, app listed but not connected, a row
+  present but not app-shaped, other apps offered, or a click that produced the wrong app or none.
+
+Follow-up route, found live on the same day:
+
+- Every follow-up on a conversation re-opened by URL failed `composer holds 0 normalized chars, prompt
+  needs >= N - paste looks truncated by a DOM stall`, with or without a `--mention`. The whole prompt HAD
+  landed: the page holds a hidden 0x0 editor BEFORE the visible one and `document.querySelector` returned
+  it, while `execCommand('insertText')` acts on the focused editable (the visible one). The paste went to
+  the visible editor, the verification read the hidden one, and the full prompt was left behind as a
+  persisted draft. It reproduced with the thread fully rendered (not a hydration race) and with no
+  mention (not the @ popup). A mention hit the same wrong-editor read ("the composer took no app mention").
+- The composer is now found by structure, and every step of the send path uses the same expression: the
+  visible editor inside a `<form>` (an edit-message box in a turn is not in one; focus breaks a tie), no
+  fallback to a hidden editor (readiness fails while none is visible), and the send button is the single
+  visible one inside that composer's own form. The expression is re-evaluated on each call, and
+  deterministically: it does not cache a node, so it follows the page if the editor is replaced. Several
+  send buttons, a disabled one, no visible composer, or focus outside the composer refuse before the click
+  and Enter is not pressed; Enter remains only for a composer with no send button yet whose focus is
+  verified inside it.
+- A follow-up with no `--mention` never opens the @ popup or types an `@`.
+- A follow-up waits for the thread's turns to render before reading its baseline (the composer appears
+  ~5s before them) and refuses before any paste or click if they never do. A tab a command opened is
+  closed on every exit before the send click; a tab it attached to (including `--reuse-tab`) is never
+  closed, and after a click attempt the tab stays as evidence.
+- `await` no longer calls a pre-click refusal "already sent". A follow-up inherits its parent's
+  conversation at enqueue, so the envelope's old test (the round has a conversation) was true for every
+  follow-up, and a refusal that provably never clicked told the caller to RETRIEVE a reply that did not
+  exist. It now branches on the durable not-sent stamp: stamped means `pre-send`, `retryable:true`,
+  `next_command` = `cgc_spool.py refire --rid <rid>`; an unstamped blocker after a confirmed send stays
+  `post-send` / retrieve.
+- `enqueue --kind retrieve` refuses a parent that is itself a retrieve, and a parent the store proves
+  never sent (`retrieve_parent_never_sent`), instead of watching ten minutes for a turn that never
+  existed. An explicit `--conversation` is honoured (a retrieve is read-only, and the caller may know of a
+  send made out of band), which also keeps a round migrated from the old spool (no stored prompt) usable.
+
+Not verified: whether an app attached by a thread's first message stays active for later messages (the
+thread DOM shows no marker either way), and what clicking a file row leaves attached outside the composer.
+
+Pinned by `tests/fixtures/mention_popup.json`, a scrubbed capture of the live popup (private app names
+replaced), run through the real picker JS in node against a DOM rebuilt from it.
+
 ## [0.4.0] — 2026-09-25
 
 ### Added — a failed ChatGPT turn gets one automatic "continue"

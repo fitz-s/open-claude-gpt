@@ -876,10 +876,62 @@ class TestStats:
 
         assert backend.stats_report() == 0
         rep = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-        assert rep["messages"]["charged"] == 2, rep["messages"]
+        assert rep["messages"]["potentially_spent"] == 2, rep["messages"]
         assert rep["messages"]["free"] == 3, rep["messages"]
         assert rep["messages"]["by_kind"] == {"submit": 2}, \
             "a retrieve must never appear in the ledger — it sends nothing"
+
+    def _waiting_round(self, store_mod, s, rid, kind="submit"):
+        s.create_round(rid, kind, prompt="p")
+        s.set_state(rid, store_mod.READY)
+        aid = s.begin_send(rid, "p", "h" * 64, daemon_instance_id="d")
+        s.mark_accepted(aid, "conv-" + rid[-3:])
+        s.mark_waiting(rid)
+        return rid
+
+    def _spent(self, backend, capsys):
+        assert backend.stats_report() == 0
+        return json.loads(capsys.readouterr().out.strip().splitlines()[-1])["messages"]
+
+    def test_a_landed_continuation_is_a_second_message_under_the_same_rid(self, env, capsys):
+        """ChatGPT failing a turn makes the worker send ONE automatic continue under the same rid —
+        a second outgoing message. Counting one per rid under-reported spend against a weekly
+        allowance."""
+        store_mod, backend, s, _ = env
+        rid = self._waiting_round(store_mod, s, "REQ-20260707-120000-0c0001")
+        assert s.claim_auto_continue(rid, "x")
+        s.record_auto_continue(rid, "landed")
+        m = self._spent(backend, capsys)
+        assert m["potentially_spent"] == 2 and m["by_kind"] == {"submit": 2}
+        assert m["free"] == 0, "free counts rounds that spent nothing, not total - spent"
+
+    def test_a_not_sent_continuation_counts_zero(self, env, capsys):
+        store_mod, backend, s, _ = env
+        rid = self._waiting_round(store_mod, s, "REQ-20260707-120000-0c0002")
+        assert s.claim_auto_continue(rid, "x")
+        s.record_auto_continue(rid, "not_sent")
+        assert self._spent(backend, capsys)["potentially_spent"] == 1
+
+    @pytest.mark.parametrize("result", ["unsure", None])
+    def test_an_unsure_or_unresolved_continuation_is_charged(self, env, capsys, result):
+        """A claim with no recorded result means the worker died between claim and result — possibly
+        after the click — so the honest ledger charges it, like an uncertain base send."""
+        store_mod, backend, s, _ = env
+        rid = self._waiting_round(store_mod, s, "REQ-20260707-120000-0c0003")
+        assert s.claim_auto_continue(rid, "x")
+        if result:
+            s.record_auto_continue(rid, result)
+        assert self._spent(backend, capsys)["potentially_spent"] == 2
+
+    def test_a_retrieve_counts_zero_even_beside_a_continued_round(self, env, capsys):
+        store_mod, backend, s, _ = env
+        rid = self._waiting_round(store_mod, s, "REQ-20260707-120000-0c0004")
+        assert s.claim_auto_continue(rid, "x")
+        s.record_auto_continue(rid, "landed")
+        r = "REQ-20260707-120000-0c0005"
+        s.create_round(r, "retrieve", prompt="p", parent_rid=rid)
+        m = self._spent(backend, capsys)
+        assert m["potentially_spent"] == 2 and m["free"] == 1 and "retrieve" not in m["by_kind"]
 
 
 class TestRequestFingerprint:
@@ -1200,7 +1252,7 @@ class TestSourceTurnMatching:
                  "BEGIN_RESPONSE:REQ-20260707-120000-0aaa01\nthe answer\nEND_RESPONSE:REQ-20260707-120000-0aaa01\n"]
         loc = cdp._locate_source_turn(turns, "REQ-20260707-120000-0aaa01")
         assert loc == {"present": True, "is_last": True,
-                       "observed_rid": "REQ-20260707-120000-0aaa01", "turn_index": 0}
+                       "observed_rid": "REQ-20260707-120000-0aaa01"}
 
     def test_source_turn_not_last_when_a_later_turn_was_sent(self, tmp_path):
         """The exact shape of the audit's race: R1's turn exists, but R2 was sent afterward —
@@ -1216,7 +1268,6 @@ class TestSourceTurnMatching:
         assert loc["present"] is True
         assert loc["is_last"] is False
         assert loc["observed_rid"] == "REQ-20260707-120500-0bbb01"
-        assert loc["turn_index"] == 0
 
     def test_source_turn_absent_reports_observed_latest(self, tmp_path):
         cdp = self._cdp(tmp_path)
@@ -1224,12 +1275,12 @@ class TestSourceTurnMatching:
                  "BEGIN_RESPONSE:REQ-20260707-120500-0bbb01\nthe ask\nEND_RESPONSE:REQ-20260707-120500-0bbb01\n"]
         loc = cdp._locate_source_turn(turns, "REQ-20260707-120000-0aaa01")
         assert loc == {"present": False, "is_last": False,
-                       "observed_rid": "REQ-20260707-120500-0bbb01", "turn_index": None}
+                       "observed_rid": "REQ-20260707-120500-0bbb01"}
 
     def test_no_turns_at_all(self, tmp_path):
         cdp = self._cdp(tmp_path)
         assert cdp._locate_source_turn([], "REQ-20260707-120000-0aaa01") == \
-            {"present": False, "is_last": False, "observed_rid": None, "turn_index": None}
+            {"present": False, "is_last": False, "observed_rid": None}
 
     def test_substring_quote_of_an_old_rid_never_steals_its_identity(self, tmp_path):
         """[S3] audit fixture: R1 is being recovered because no valid sentinel-wrapped R1 answer is
@@ -1250,7 +1301,7 @@ class TestSourceTurnMatching:
             f"BEGIN_RESPONSE:{r2}\nmy real ask\nEND_RESPONSE:{r2}\n"
         )
         loc = cdp._locate_source_turn([r1_turn, r2_prose], r1)
-        assert loc["present"] is True and loc["is_last"] is False and loc["turn_index"] == 0
+        assert loc["present"] is True and loc["is_last"] is False
         assert loc["observed_rid"] == r2
 
         # (b) quoted inside a code fence (DOM textContent flattens the fence markers to plain lines)
@@ -1262,7 +1313,7 @@ class TestSourceTurnMatching:
             f"BEGIN_RESPONSE:{r2}\nmy real ask\nEND_RESPONSE:{r2}\n"
         )
         loc = cdp._locate_source_turn([r1_turn, r2_fence], r1)
-        assert loc["present"] is True and loc["is_last"] is False and loc["turn_index"] == 0
+        assert loc["present"] is True and loc["is_last"] is False
         assert loc["observed_rid"] == r2
 
         # (c) a FULLY quoted BEGIN+END R1 pair, followed by R2's own canonical footer
@@ -1272,7 +1323,7 @@ class TestSourceTurnMatching:
             f"BEGIN_RESPONSE:{r2}\nmy real ask\nEND_RESPONSE:{r2}\n"
         )
         loc = cdp._locate_source_turn([r1_turn, r2_full_pair], r1)
-        assert loc["present"] is True and loc["is_last"] is False and loc["turn_index"] == 0
+        assert loc["present"] is True and loc["is_last"] is False
         assert loc["observed_rid"] == r2
 
 
@@ -1334,6 +1385,62 @@ class TestTurnCanonicalRid:
         a, b = "REQ-20260707-120000-0aaa01", "REQ-20260707-120500-0bbb01"
         text = f"BEGIN_RESPONSE:{a}\nsome text\nEND_RESPONSE:{b}\n"
         assert cdp._turn_canonical_rid(text) is None
+
+    # ---- the head marker: the FIRST `CGC_RID:<rid>` token in the turn (ChatGPT never collapses the head) ----
+    R1, R2 = "REQ-20260707-120000-0aaa01", "REQ-20260707-120500-0bbb01"
+
+    def test_the_head_marker_names_the_turn_with_no_tail_pair(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        assert cdp._turn_canonical_rid(f"CGC_RID:{self.R2}\n# a collapsed turn's head\n") == self.R2
+        assert cdp._turn_canonical_rid(f"\n  CGC_RID:{self.R2}  \r\n# t\n") == self.R2
+
+    def test_a_mention_label_ahead_of_the_marker_does_not_hide_it(self, tmp_path):
+        """_paste_prompt types the @mention first, so the turn's text can open with the app's label,
+        inline on the marker's line or on a line of its own."""
+        cdp = self._cdp(tmp_path)
+        assert cdp._turn_canonical_rid(f"WebCodex Demo CGC_RID:{self.R2}\n# t\n") == self.R2
+        assert cdp._turn_canonical_rid(f"WebCodex Demo\nCGC_RID:{self.R2}\n# t\n") == self.R2
+
+    def test_a_collapsed_turn_quoting_another_rids_pair_still_reads_its_own_marker(self, tmp_path):
+        """The reviewer's hole: the label precedes the marker, a QUOTED complete R1 pair is visible in
+        the body, and R2's own tail is hidden by the collapse."""
+        cdp = self._cdp(tmp_path)
+        r1, r2 = self.R1, self.R2
+        text = f"WebCodex Demo CGC_RID:{r2}\n# t\nyou wrote:\nBEGIN_RESPONSE:{r1}\nold\nEND_RESPONSE:{r1}\n"
+        assert cdp._turn_canonical_rid(text) == r2
+
+    def test_the_marker_is_authoritative_over_a_tail_pair(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        r1, r2 = self.R1, self.R2
+        assert cdp._turn_canonical_rid(f"CGC_RID:{r2}\n# t\nBEGIN_RESPONSE:{r2}\nx\nEND_RESPONSE:{r2}\n") == r2
+        assert cdp._turn_canonical_rid(f"CGC_RID:{r1}\n# t\nBEGIN_RESPONSE:{r2}\nx\nEND_RESPONSE:{r2}\n") == r1
+
+    def test_the_first_marker_wins_over_a_later_quoted_one(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        r1, r2 = self.R1, self.R2
+        assert cdp._turn_canonical_rid(f"CGC_RID:{r2}\n# t\nthe old prompt began CGC_RID:{r1}\n") == r2
+        assert cdp._turn_canonical_rid(f"CGC_RID:{r2}\nCGC_RID:{r1}\n") == r2
+
+    def test_a_marker_glued_to_a_word_or_a_longer_rid_is_not_ours(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        r1, r2 = self.R1, self.R2
+        for glued in (f"xCGC_RID:{r2}", f"_CGC_RID:{r2}", f"CGC_RID:{r2}x", f"CGC_RID:{r2}0",
+                      f"cgc_rid:{r2}", "CGC_RID:not-a-rid"):
+            assert cdp._turn_canonical_rid(f"{glued}\n# t\n") is None, glued
+            tail = f"{glued}\nBEGIN_RESPONSE:{r1}\nx\nEND_RESPONSE:{r1}\n"
+            assert cdp._turn_canonical_rid(tail) == r1, glued            # falls to the legacy pair rule
+
+    def test_a_marker_in_punctuation_still_counts(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        assert cdp._turn_canonical_rid(f"(CGC_RID:{self.R2}) # t\n") == self.R2
+        assert cdp._turn_canonical_rid(f"-CGC_RID:{self.R2}.\n") == self.R2
+
+    def test_with_no_marker_the_legacy_pair_rule_is_unchanged(self, tmp_path):
+        cdp = self._cdp(tmp_path)
+        r1, r2 = self.R1, self.R2
+        text = f"quoted:\nBEGIN_RESPONSE:{r1}\nold\nEND_RESPONSE:{r1}\nnow:\nBEGIN_RESPONSE:{r2}\nx\nEND_RESPONSE:{r2}\n"
+        assert cdp._turn_canonical_rid(text) == r2
+        assert cdp._turn_canonical_rid(f"plain question about {r1}\n") is None
 
 
 class TestKeyReleaseRequiresNoSendProof:
@@ -1997,7 +2104,7 @@ def test_re_enqueuing_an_existing_rid_says_what_to_do_about_it(env, capsys):
     s.finish(r["rid"], store_mod.COMPLETED_VERIFIED, result_text="done")
 
     pf = tmp / "p.md"
-    pf.write_text("continuing this consult\nhttps://github.com/o/r/pull/1\n")
+    pf.write_text(f"CGC_RID:{r['rid']}\ncontinuing this consult\nhttps://github.com/o/r/pull/1\n")
     a = argparse.Namespace(rid=r["rid"], prompt_file=str(pf), kind="submit", out=str(tmp / "o.txt"),
                            conversation="auto", parent=None, model="Pro", request_key=None,
                            logical_sha=None, project_url=None, poll=20, timeout=60, quiet=True)
@@ -2448,3 +2555,197 @@ class TestRefire:
         capsys.readouterr()
         assert backend.refire_round("REQ-20260707-120000-0nope01") == 2
         assert "no_such_round" in capsys.readouterr().err
+
+
+# ---- a follow-up's pre-click refusal is not "already sent" ---------------------------------------
+# Live incident 2026-09-29: a follow-up whose @mention could not be confirmed exited 3 before the click
+# and was stamped not_sent_proven, yet `await` printed "(post-send) ... already sent to conversation
+# ... RETRIEVE it", retryable:false. It keyed on conversation_of(), which is truthy for EVERY follow-up
+# (it inherits its parent's thread at enqueue). An honest agent followed it and waited for an answer
+# that never existed.
+
+_MENTION_REFUSAL = ("CGC_ERROR mention_not_found: the popup row 'atlas' for '@Atlas' is not an app — the "
+                    "composer took no app mention from it. Enable the app 'Atlas' in ChatGPT or fix the "
+                    "name — NOT sent.")
+_CONV_FU = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+
+
+def _blocked_followup(store_mod, backend, s, tmp, rid="REQ-20260721-000000-0000f1"):
+    """A follow-up that inherited its parent's thread, then hit the driver's exit-3 mention refusal."""
+    s.create_round("REQ-20260721-000000-0000f0", "submit", prompt="p", thread_id=_CONV_FU)
+    s.create_round(rid, "followup", out_path=str(tmp / "f.txt"),
+                   prompt=f"next question\nBEGIN_RESPONSE:{rid}\n...\nEND_RESPONSE:{rid}",
+                   thread_id=_CONV_FU, parent_rid="REQ-20260721-000000-0000f0",
+                   spec_json=json.dumps({"conversation": _CONV_FU, "mentions": ["Atlas"],
+                                         "parent_rid": "REQ-20260721-000000-0000f0"}))
+    s.set_state(rid, store_mod.READY)
+    calls = []
+
+    def cdp(kind, **kw):
+        calls.append(kind)
+        return {"code": 3, "stderr": _MENTION_REFUSAL}
+
+    final = backend.process_round(s, s.get_round(rid), cdp, daemon_instance_id="d1", validate=_OK_GATE)
+    assert final == store_mod.BLOCKED and calls == ["followup"], "one send attempt, no wait"
+    return rid
+
+
+def test_followup_mention_refusal_is_stamped_not_sent_and_release_eligible(env):
+    store_mod, backend, s, tmp = env
+    rid = _blocked_followup(store_mod, backend, s, tmp)
+    r = s.get_round(rid)
+    assert r["send_disposition"] == store_mod.NOT_SENT_PROVEN
+    assert s.conversation_of(rid) == _CONV_FU, "the inherited thread is why conversation_of is no proof"
+    assert backend._release_eligible(s, r)
+
+
+def test_await_reports_a_stamped_followup_refusal_as_pre_send_with_the_supported_refire(env, capsys):
+    store_mod, backend, s, tmp = env
+    rid = _blocked_followup(store_mod, backend, s, tmp)
+    capsys.readouterr()
+    code = backend.await_round(types.SimpleNamespace(rid=rid, timeout=2, poll=1))
+    cap = capsys.readouterr()
+    env_json = json.loads(cap.out.strip().splitlines()[-1])
+    assert code == 3 and env_json["state"] == "blocked"
+    assert env_json["retryable"] is True, "nothing was sent, so a re-fire cannot duplicate"
+    assert f"refire --rid {rid}" in env_json["next_command"] and "retrieve" not in env_json["next_command"]
+    assert "(pre-send)" in cap.err and "(post-send)" not in cap.err
+    assert "already sent" not in cap.err and "Do NOT retrieve" in cap.err
+
+
+def test_await_still_calls_an_unstamped_blocker_after_a_confirmed_send_post_send(env, capsys):
+    """The other half of the split: a blocker hit DURING the wait carries no stamp and keeps its
+    retrieve-don't-resend advice. Only the durable stamp may downgrade it to pre-send."""
+    store_mod, backend, s, tmp = env
+    r = _ready_round(store_mod, s)
+    rid = r["rid"]
+    aid = s.begin_send(rid, "p", store_mod.sha256("p"), daemon_instance_id="d1")
+    s.mark_accepted(aid, _CONV_FU)
+    s.mark_waiting(rid)
+    backend._wait_phase(s, rid, _CONV_FU, {},
+                        lambda kind, **kw: {"code": 3, "stderr": "CGC_ERROR rate_limit: try again later"})
+    capsys.readouterr()
+    backend.await_round(types.SimpleNamespace(rid=rid, timeout=2, poll=1))
+    cap = capsys.readouterr()
+    env_json = json.loads(cap.out.strip().splitlines()[-1])
+    assert env_json["retryable"] is False and "kind retrieve" in env_json["next_command"]
+    assert "(post-send)" in cap.err
+
+
+def test_refire_replays_a_stamped_followup_refusal_under_a_fresh_rid(env, capsys):
+    store_mod, backend, s, tmp = env
+    rid = _blocked_followup(store_mod, backend, s, tmp)
+    assert backend.refire_round(rid) == 0
+    new = [x for x in s.db.execute("SELECT rid FROM rounds WHERE rid != ? AND kind='followup'", (rid,))]
+    assert len(new) == 1, "exactly one fresh follow-up is enqueued"
+    row = s.get_round(new[0]["rid"])
+    assert json.loads(row["spec_json"])["mentions"] == ["Atlas"] and row["parent_rid"] == "REQ-20260721-000000-0000f0"
+
+
+def test_a_retrieve_of_a_round_the_store_proves_never_sent_is_refused(env, capsys):
+    """The lead's retrieve sat 'waiting' ten minutes hunting a turn that never existed. The store
+    already knows the parent was proven not-sent, so enqueue says so and names the refire."""
+    store_mod, backend, s, tmp = env
+    rid = _blocked_followup(store_mod, backend, s, tmp)
+    capsys.readouterr()
+    rc = backend.enqueue_round(_enq_ns("REQ-20260721-000000-0000f9", None, kind="retrieve",
+                                       conversation="auto", parent=rid), "", str(tmp / "r.txt"))
+    err = capsys.readouterr().err
+    assert rc == 2 and "retrieve_parent_never_sent" in err and f"refire --rid {rid}" in err
+    assert s.get_round("REQ-20260721-000000-0000f9") is None, "nothing may be enqueued"
+
+
+def test_a_retrieve_of_an_uncertain_round_is_still_allowed(env):
+    """The guard is only for durable not-sent proof. A possibly_accepted parent is exactly what a
+    retrieve exists for."""
+    store_mod, backend, s, tmp = env
+    s.create_round("REQ-20260721-000000-0000e0", "submit", prompt="p", thread_id=_CONV_FU)
+    s.set_state("REQ-20260721-000000-0000e0", store_mod.READY)
+    aid = s.begin_send("REQ-20260721-000000-0000e0", "p", store_mod.sha256("p"), daemon_instance_id="d1")
+    s.mark_possibly_accepted(aid, "send failed (exit 1) - retrieve, don't resend")
+    rc = backend.enqueue_round(_enq_ns("REQ-20260721-000000-0000e1", None, kind="retrieve",
+                                       conversation="auto", parent="REQ-20260721-000000-0000e0"),
+                               "", str(tmp / "r2.txt"))
+    assert rc == 0 and s.get_round("REQ-20260721-000000-0000e1") is not None
+
+
+# ---- the retrieve guard: what it refuses, and what it must not ------------------------------------
+
+def _retrieve(backend, s, tmp, rid, parent, conversation="auto"):
+    return backend.enqueue_round(_enq_ns(rid, None, kind="retrieve", conversation=conversation, parent=parent),
+                                 "", str(tmp / (rid[-6:] + ".txt")))
+
+
+def test_an_explicit_conversation_overrides_the_never_sent_proof(env, capsys):
+    """A retrieve is read-only, and an explicit --conversation is the caller asserting a send the store
+    cannot know about (made out of band). The guard only speaks when the conversation is taken FROM the
+    store."""
+    store_mod, backend, s, tmp = env
+    rid = _blocked_followup(store_mod, backend, s, tmp)
+    assert backend._release_eligible(s, s.get_round(rid)), "the store proves this parent never sent"
+    capsys.readouterr()
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000e2", rid, conversation=_CONV_FU) == 0
+    spec = json.loads(s.get_round("REQ-20260721-000000-0000e2")["spec_json"])
+    assert spec["conversation"] == _CONV_FU and spec["parent_rid"] == rid
+
+
+def test_a_gate_rejected_parent_is_refused_with_the_gate_named(env, capsys):
+    store_mod, backend, s, tmp = env
+    rid = "REQ-20260721-000000-0000d0"
+    s.create_round(rid, "submit", prompt="p", thread_id=_CONV_FU)
+    s.set_state(rid, store_mod.READY)
+    s.gate_reject(rid, "unverified: gh timed out")
+    capsys.readouterr()
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000d1", rid) == 2
+    err = capsys.readouterr().err
+    assert "retrieve_parent_never_sent" in err and "gate refused it before any send" in err
+    assert f"refire --rid {rid}" in err and "--conversation <id>" in err
+    assert s.get_round("REQ-20260721-000000-0000d1") is None
+
+
+def test_a_retrieve_of_a_retrieve_is_refused_whatever_conversation_is_named(env, capsys):
+    """A retrieve sends nothing, so its rid was never on any page: the wait could only time out. The
+    missing thing is on the page, not in the store, so an explicit --conversation does not help."""
+    store_mod, backend, s, tmp = env
+    s.create_round("REQ-20260721-000000-0000c0", "submit", prompt="p", thread_id=_CONV_FU)
+    s.set_state("REQ-20260721-000000-0000c0", store_mod.READY)
+    aid = s.begin_send("REQ-20260721-000000-0000c0", "p", store_mod.sha256("p"), daemon_instance_id="d1")
+    s.mark_possibly_accepted(aid, "send failed - retrieve, don't resend")
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000c1", "REQ-20260721-000000-0000c0") == 0
+    capsys.readouterr()
+    for conv in ("auto", _CONV_FU):
+        assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000c2", "REQ-20260721-000000-0000c1",
+                         conversation=conv) == 2
+        err = capsys.readouterr().err
+        assert "retrieve_parent_sends_nothing" in err and "itself a retrieve" in err
+    assert s.get_round("REQ-20260721-000000-0000c2") is None
+
+
+def test_a_parent_with_no_stored_prompt_is_refused_only_when_the_conversation_would_come_from_the_store(env, capsys):
+    """import_round (the old-spool migration) writes no rendered_prompt, so such a round is a real retrieve
+    target when the caller says where it lives; without that there is nothing to resolve from."""
+    store_mod, backend, s, tmp = env
+    s.create_round("REQ-20260721-000000-0000b0", "submit", thread_id=_CONV_FU)   # no prompt stored
+    capsys.readouterr()
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000b1", "REQ-20260721-000000-0000b0") == 2
+    err = capsys.readouterr().err
+    assert "retrieve_parent_sends_nothing" in err and "no stored prompt" in err and "--conversation <id>" in err
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000b2", "REQ-20260721-000000-0000b0",
+                     conversation=_CONV_FU) == 0
+    assert json.loads(s.get_round("REQ-20260721-000000-0000b2")["spec_json"])["conversation"] == _CONV_FU
+
+
+def test_a_migrated_round_is_a_retrieve_target_with_an_explicit_conversation(env):
+    store_mod, backend, s, tmp = env
+    s.import_round("REQ-20260721-000000-0000b9", "submit", store_mod.POSSIBLY_ACCEPTED, thread_id=_CONV_FU)
+    assert s.get_round("REQ-20260721-000000-0000b9").get("rendered_prompt") in (None, "")
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000ba", "REQ-20260721-000000-0000b9",
+                     conversation=_CONV_FU) == 0
+
+
+def test_an_unknown_parent_with_an_explicit_conversation_is_still_allowed(env):
+    """Recovering a round this store never heard of (sent from another machine, or before the store):
+    nothing to second-guess, and it is read-only."""
+    store_mod, backend, s, tmp = env
+    assert _retrieve(backend, s, tmp, "REQ-20260721-000000-0000a1", "REQ-20260721-000000-0000a0",
+                     conversation=_CONV_FU) == 0

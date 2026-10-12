@@ -103,7 +103,7 @@ except ImportError:
 #   CGC_STATE_DIR    scratch dir for state + answer files           (default /tmp/cgc)
 #   CGC_AUTO_MODEL   auto-pick the model tier before sending? 1/0    (default 1 = on)
 #   CGC_MODEL        which tier to pick when auto-model is on        (default "Pro")
-#   CGC_MODEL_FAMILY which MODEL to pin in the same picker menu      (default "Latest")
+#   CGC_MODEL_FAMILY which MODEL to pin in the same picker menu      (default "GPT-6")
 #                    — new on the GPT-6 composer (2026-09-03); "skip" disables the check
 #   CGC_PROJECT_URL  ChatGPT URL a fresh consult opens; set this to YOUR project
 #                    (…/g/g-p-<id>-<slug>/project) to keep consults in one project,
@@ -129,7 +129,7 @@ CGC_MODEL = os.environ.get("CGC_MODEL", "Pro") if CGC_AUTO_MODEL else "skip"
 # The MODEL, as distinct from the tier — a second dimension the composer only started exposing
 # with GPT-6 (2026-09-03). Same toggle, same "skip" escape hatch as CGC_MODEL: auto-model OFF
 # means the picker is not touched at all, so neither dimension is enforced.
-CGC_MODEL_FAMILY = os.environ.get("CGC_MODEL_FAMILY", "Latest") if CGC_AUTO_MODEL else "skip"
+CGC_MODEL_FAMILY = os.environ.get("CGC_MODEL_FAMILY", "GPT-6") if CGC_AUTO_MODEL else "skip"
 # App approval cards ("<App> — Allow file materialization? [Deny] [Allow once]") pause generation until
 # answered, and ChatGPT offers no standing grant for them (the plugin's "Allow all tools" does not cover
 # them). The waiter already polls the consult's own tab, so it answers them there: only for apps named
@@ -583,30 +583,72 @@ _ROLE_FN = ("function __cgcRole(el){return el.getAttribute('data-message-author-
             "el.getAttribute('data-turn')||"
             "((el.getAttribute('data-chatgpt-search-unit-key')||'').split(':').pop())||'';}")
 
+# Layout-independent innerText approximation: a textContent walk that re-inserts newlines at block
+# boundaries, so the extracted answer keeps its line structure WITHOUT needing the tab rendered.
+_TEXT_FN = ("function __cgcText(el){if(!el)return '';"
+            "var BLOCK=/^(P|DIV|LI|UL|OL|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE|TABLE|TR|THEAD|TBODY|SECTION|ARTICLE|HR)$/;"
+            "var out='';(function w(n){for(var i=0;i<n.childNodes.length;i++){var c=n.childNodes[i];"
+            "if(c.nodeType===3){out+=c.nodeValue;}else if(c.nodeType===1){"
+            "if(c.tagName==='BR'){out+='\\n';continue;}var b=BLOCK.test(c.tagName);if(b)out+='\\n';w(c);if(b)out+='\\n';}}})(el);"
+            "return out.replace(/[ \\t]+\\n/g,'\\n').replace(/\\n{3,}/g,'\\n\\n');}")
+
+# The rid regex shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) shared by every rid-reading regex in this file.
+# ASCII digits spelled out: \d is Unicode-aware in Python and ASCII-only in JS.
+_RID_RE_SRC = r"REQ-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}"
+
+# THE ONE whitespace set of the user-turn identity rule, as the source of a regex character class that
+# Python's re and JS's RegExp read identically: ASCII space, \t \n \v \f \r, U+0085, U+00A0, U+1680,
+# U+2000-200A, U+2028, U+2029, U+202F, U+205F, U+3000 and the BOM U+FEFF. Python's str.strip() and JS's
+# trim() disagree about it (strip() takes \x1c-\x1f and U+0085 and not the BOM; trim() the reverse), so
+# neither is used on a rid path; both sides trim a line with this class and nothing else.
+_WS_SRC = r"\t\n\x0b\x0c\r \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+
+# The head marker token: needs a character that is not [A-Za-z0-9_] (or the text's start) before it and
+# one after the rid, so a glued "xCGC_RID:..." or a longer rid is not ours. Written once for both sides.
+_MARKER_RE_SRC = r"(?<![A-Za-z0-9_])CGC_RID:(" + _RID_RE_SRC + r")(?![A-Za-z0-9_])"
+
+# The page-side mirror of _turn_canonical_rid (SHARED CONTRACT #3): a user turn's OWN rid is the rid of
+# the FIRST CGC_RID:<rid> token anywhere in its text (the head marker: the template puts it before
+# everything else, so only an @mention label can precede it, and ChatGPT never collapses the head), else
+# the rid of the LAST complete, in-order BEGIN_RESPONSE:<rid>/END_RESPONSE:<rid> pair of bare lines in its
+# block-aware text. A marker is authoritative: in a collapsed turn the last VISIBLE pair can be a quote.
+# The two sides share the whitespace set (_WS_SRC), the digit class and the marker regex (_MARKER_RE_SRC)
+# by construction, and split lines on "\n" alone after folding "\r\n", so they return the same rid on
+# every input; tests/test_wait_virtualized_thread.py pins that on a corpus that includes the BOM, U+0085,
+# U+00A0, \x1c-\x1f and non-ASCII digits. A rid in a shape one side cannot read reads as no rid (the turn
+# is "not found", fail closed) on BOTH.
+_RID_FN = ("function __cgcRid(t){t=t||'';"
+           "var q=t.match(/" + _MARKER_RE_SRC + "/);if(q)return q[1];"
+           "var re=/^(BEGIN|END)_RESPONSE:(" + _RID_RE_SRC + ")$/,tr=/^[" + _WS_SRC + "]+|[" + _WS_SRC + "]+$/g,"
+           "ob={},rid=null,ls=t.replace(/\\r\\n/g,'\\n').split('\\n');"
+           "for(var i=0;i<ls.length;i++){var m=ls[i].replace(tr,'').match(re);if(!m)continue;"
+           "if(m[1]==='BEGIN')ob[m[2]]=1;else if(ob[m[2]])rid=m[2];}return rid;}")
+
 _NODE_FN = (
-    _ROLE_FN +
-    # __cgcNode(BG, turnIndex): turnIndex is OPTIONAL. Omitted/undefined/negative -> UNSCOPED,
-    # the legacy 'auto' behavior (step 1 searches the whole document; step 2 falls back to only
-    # AFTER the last user node). Given (0-based ordinal of a user turn, DOM order, among
-    # querySelectorAll(_JS_ANY)'s user-role matches) -> SCOPED to the interval strictly between
-    # that turn and the NEXT user turn (or end of conversation): this is the [S3] fix — a
-    # source-pinned retrieve's answer may come ONLY from assistant nodes inside its own turn's
-    # interval, never from a later round's nodes, even when they happen to contain the same BEGIN
-    # token (e.g. the model echoing/quoting it). Returns null when turnIndex is scoped but that
-    # ordinal's user node is not currently in the DOM (virtualized away) — the caller must fail
+    _ROLE_FN + _TEXT_FN + _RID_FN +
+    # __cgcSrc(nx, RID): index in nx of the source turn — the LAST user node whose OWN canonical rid
+    # is RID (the last, so a same-rid resend owns the answer) — or -1 when it is not rendered.
+    "function __cgcSrc(nx,RID){var EN='END_RESPONSE:'+RID,s=-1;"
+    "for(var j=0;j<nx.length;j++){if(__cgcRole(nx[j])==='user'&&__cgcRid(__cgcText(nx[j]))===RID)s=j;}"
+    "return s;}"
+    # __cgcNode(BG, RID): RID is OPTIONAL. Omitted/null -> UNSCOPED, the legacy 'auto' behavior
+    # (step 1 searches the whole document; step 2 falls back to only AFTER the last user node).
+    # Given -> SCOPED to the interval strictly between the source turn (__cgcSrc) and the NEXT user
+    # node (or end of conversation): this is the [S3] fix — a source-pinned wait's answer may come
+    # ONLY from assistant nodes inside its own turn's interval, never from a later round's nodes,
+    # even when they happen to contain the same BEGIN token (e.g. the model echoing/quoting it).
+    # The source turn is found by WHAT it says, on every call, never by its ordinal: a re-opened
+    # long thread renders every turn and then unmounts the older ones, so "the 5th user turn" named
+    # no turn at all (the waiter read len=0 for 90 minutes beside a finished answer) or, worse, a
+    # LATER round's turn. Returns null when the source turn is not rendered — the caller must fail
     # closed rather than search outside the (unresolvable) interval.
     "function __cgcBody(n,BG){var m=n.querySelectorAll('[data-markdown-text-style=\"assistant-message\"]');"
     "for(var i=m.length-1;i>=0;i--){if((m[i].textContent||'').indexOf(BG)>=0)return m[i];}return n;}"
-    "function __cgcNode(BG,turnIndex){"
+    "function __cgcNode(BG,RID){"
     "var nx=document.querySelectorAll(" + _JS_ANY + ");"
-    "var scoped=(turnIndex!==undefined&&turnIndex!==null&&turnIndex>=0);"
-    "var lo=-1,hi=nx.length;"
-    "if(scoped){"
-    "var seen=-1;lo=-1;hi=nx.length;"
-    "for(var j=0;j<nx.length;j++){if(__cgcRole(nx[j])==='user'){seen++;"
-    "if(seen===turnIndex){lo=j;}else if(seen===turnIndex+1){hi=j;break;}}}"
-    "if(lo<0)return null;"
-    "}"
+    "var scoped=!!RID,lo=-1,hi=nx.length;"
+    "if(scoped){lo=__cgcSrc(nx,RID);if(lo<0)return null;"
+    "for(var j=lo+1;j<nx.length;j++){if(__cgcRole(nx[j])==='user'){hi=j;break;}}}"
     # 1) exact: any assistant node containing our (unique) BEGIN sentinel, newest-first. Scoped ->
     #    within [lo,hi) only. Unscoped -> the whole document (lo=-1,hi=nx.length), matching the
     #    original global search.
@@ -625,14 +667,11 @@ _NODE_FN = (
     "return best?__cgcBody(best,''):best;}"
 )
 
-# Layout-independent innerText approximation: a textContent walk that re-inserts newlines at block
-# boundaries, so the extracted answer keeps its line structure WITHOUT needing the tab rendered.
-_TEXT_FN = ("function __cgcText(el){if(!el)return '';"
-            "var BLOCK=/^(P|DIV|LI|UL|OL|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE|TABLE|TR|THEAD|TBODY|SECTION|ARTICLE|HR)$/;"
-            "var out='';(function w(n){for(var i=0;i<n.childNodes.length;i++){var c=n.childNodes[i];"
-            "if(c.nodeType===3){out+=c.nodeValue;}else if(c.nodeType===1){"
-            "if(c.tagName==='BR'){out+='\\n';continue;}var b=BLOCK.test(c.tagName);if(b)out+='\\n';w(c);if(b)out+='\\n';}}})(el);"
-            "return out.replace(/[ \\t]+\\n/g,'\\n').replace(/\\n{3,}/g,'\\n\\n');}")
+
+def _node_call(rid, scoped):
+    """The __cgcNode call for rid's answer — scoped to rid's own turn, or the legacy unscoped read."""
+    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
+    return f"__cgcNode({begin},{json.dumps(rid)})" if scoped else f"__cgcNode({begin})"
 
 
 # ---- SHARED CONTRACT #1: fence-aware line-anchored sentinel parser (v3) -----
@@ -743,37 +782,60 @@ def _sentinel_js(rid: str, text_expr: str) -> str:
     )
 
 
-def _detect_js(rid: str, turn_index=None) -> str:
-    """Returns JSON {generating,done,blocker,len,begin,end,ac} for the answer node.
+# The page conditions only a human can clear: a login wall, a captcha or challenge, a rate-limit
+# alert. ONE definition, read by the waiter (its blocker exit), the composer wait (login/captcha
+# refusals), and every UI-contract verdict — a page showing one of these says nothing about whether
+# the driver can read ChatGPT's markup, so it never marks a capability broken.
+_BLOCKER_FN = (
+    "function __cgcBlocker(){"
+    "if(document.querySelector('input[type=\"password\"]')||/^\\/(auth|login)(\\/|$)/i.test(location.pathname))return 'login';"
+    "if(document.querySelector('iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]'))return 'captcha';"
+    "var al=document.querySelector('[role=\"alert\"]');"
+    "if(al&&/rate limit|too many requests|usage limit/i.test(al.textContent||''))return 'rate_limit';"
+    "return null;}")
+
+
+def _blocker(c):
+    """The human condition the page shows ('login', 'captcha', 'rate_limit'), or None. An unreadable
+    page reads as a blocker ('unreadable'): it cannot prove the absence of one."""
+    try:
+        return c.eval("(function(){" + _BLOCKER_FN + "return __cgcBlocker();})()")
+    except Exception:
+        return "unreadable"
+
+
+def _detect_js(rid: str, *, scoped=False) -> str:
+    """Returns JSON {generating,done,blocker,failed,node,len,begin,end,ac} for the answer node.
     done comes from the canonical bare-line _sentinel_js parser (SHARED CONTRACT #1) — a line
     merely CONTAINING BEGIN/END_RESPONSE:<rid> (quoted in prose or a code block) never counts,
     only a bare standalone sentinel line does. This is NOT stop-button driven: the model writes
     END_RESPONSE only as its final line, so its presence == complete + extractable. Depending on
     the stop-button was fragile — if that UI selector ever persists, done would never fire and
-    wait would only return on timeout. begin/end/ac are diagnostics for the heartbeat.
+    wait would only return on timeout. node/begin/end/ac are diagnostics for the heartbeat: node
+    is 'found', 'none' (no assistant node in the interval yet) or 'source_unrendered' (the scoped
+    source turn is not in the DOM, so there is no interval to read) — len=0 alone cannot tell
+    "not answered yet" from "looking in the wrong place".
 
-    turn_index: when given (a source-pinned wait — see cmd_wait/_locate_source_turn), the answer
-    node is looked up SCOPED to that turn's interval via __cgcNode's turnIndex ([S3] fix: an
-    answer may only come from its own source turn's interval, never a later round's). Omitted
-    (None) keeps the legacy unscoped 'auto' lookup."""
+    scoped: a source-pinned wait (cmd_wait with a concrete rid) reads the answer ONLY from rid's
+    own turn's interval ([S3] fix: never a later round's), re-finding that turn by its canonical
+    rid on every call. False keeps the legacy unscoped 'auto' lookup."""
     begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
     end = json.dumps(f"END_RESPONSE:{rid}")
     sentinel = _sentinel_js(rid, "__cgcText(node)")
-    node_call = f"__cgcNode({begin})" if turn_index is None else f"__cgcNode({begin},{int(turn_index)})"
-    ti_js = "-1" if turn_index is None else str(int(turn_index))
     return (
-        "(function(){" + _NODE_FN + _TEXT_FN +
+        "(function(){" + _NODE_FN +
         "var a=document.querySelectorAll(" + _JS_A + ");"
-        "var BG=" + begin + ",EN=" + end + ";"
-        "var node=" + node_call + ";"
+        "var BG=" + begin + ",EN=" + end + ",RID=" + (json.dumps(rid) if scoped else "null") + ";"
+        "var node=" + _node_call(rid, scoped) + ";"
+        "var nx=document.querySelectorAll(" + _JS_ANY + "),src=RID?__cgcSrc(nx,RID):-1;"
+        "var where=node?'found':(RID&&src<0)?'source_unrendered':'none';"
         # ChatGPT's own "this turn will never answer" marker, read from the SOURCE turn's container:
-        # the user node at turn_index when the caller resolved one (a later prompt can quote the BEGIN
-        # token, so a substring match could read another turn's marker); the last user node carrying
-        # BG only for an unscoped 'auto' wait, which by definition watches the latest turn.
-        "var failed=null;(function(){var us=[].slice.call(document.querySelectorAll(" + _JS_ANY + "))"
-        ".filter(function(e){return __cgcRole(e)==='user';}),u=null,TI=" + ti_js + ";"
-        "if(TI>=0){u=us[TI]||null;}else{for(var i=us.length-1;i>=0;i--)"
-        "if((us[i].textContent||'').indexOf(BG)>=0){u=us[i];break;}}"
+        # rid's own turn for a scoped wait (a later prompt can quote the BEGIN token, so a substring
+        # match could read another turn's marker); the last user node carrying BG only for an
+        # unscoped 'auto' wait, which by definition watches the latest turn.
+        "var failed=null;(function(){var u=src>=0?nx[src]:null;"
+        "if(!RID){for(var i=nx.length-1;i>=0;i--)"
+        "if(__cgcRole(nx[i])==='user'&&__cgcRid(__cgcText(nx[i]))===" + json.dumps(rid) + "){u=nx[i];break;}}"
         "var t=u&&u.closest('[data-turn-key]');if(!t)return;"
         # The marker is a status element whose WHOLE text is the phrase (live 2026-09-25: a lone
         # "Thinking failed" span in the turn's activity header). Matching an exact element text,
@@ -789,20 +851,19 @@ def _detect_js(rid: str, turn_index=None) -> str:
         "var res=" + sentinel + ";"
         "var hasB=rawT.indexOf(BG)>=0,hasE=rawT.indexOf(EN)>=0;"
         "var stop=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"],button[aria-label*=\"\\u505c\\u6b62\"]');"
-        "var blocker=null;"
-        "if(document.querySelector('input[type=\"password\"]')||/^\\/(auth|login)(\\/|$)/i.test(location.pathname))blocker='login';"
-        "else if(document.querySelector('iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]'))blocker='captcha';"
-        "else{var al=document.querySelector('[role=\"alert\"]');if(al&&/rate limit|too many requests|usage limit/i.test(al.textContent||''))blocker='rate_limit';}"
+        + _BLOCKER_FN + "var blocker=__cgcBlocker();"
         "var done=(res.done&&a.length>0);"
-        "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,len:rawT.length,begin:hasB,end:hasE,ac:a.length});})()"
+        "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,node:where,"
+        "len:rawT.length,begin:hasB,end:hasE,ac:a.length});})()"
     )
 
 
 # ---- SHARED CONTRACT #3: canonical per-turn request-rid parser ([S3] fix) --------------------
-# The rid regex shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) shared by every rid-reading regex in this file.
-_RID_RE_SRC = r"REQ-\d{8}-\d{6}-[0-9a-f]{6}"
+# Mirrored page-side by _RID_FN, which the scoped answer reads anchor on.
 _TURN_BEGIN_LINE_RE = re.compile(rf"^BEGIN_RESPONSE:({_RID_RE_SRC})$")
 _TURN_END_LINE_RE = re.compile(rf"^END_RESPONSE:({_RID_RE_SRC})$")
+_TURN_MARKER_RE = re.compile(_MARKER_RE_SRC)
+_WS_TRIM_RE = re.compile(rf"^[{_WS_SRC}]+|[{_WS_SRC}]+$")
 
 
 def _turn_canonical_rid(turn_text):
@@ -826,11 +887,26 @@ def _turn_canonical_rid(turn_text):
     (DOM textContent flattens markdown, so this is the only structure available to match on;
     fence-awareness is unnecessary here because picking the LAST pair already defeats an earlier
     fenced/prose quote regardless of whether it's inside a fence).
+
+    THE HEAD MARKER. Both templates open with a plain `CGC_RID:<rid>` token. ChatGPT collapses a long
+    user message to its head plus "Show more", and the pair above is the LAST thing in the render, so a
+    collapsed turn's DOM holds the marker and never its own pair. The turn's rid is the rid of the FIRST
+    such token anywhere in the text (a non-word character or the text's start before it, a non-word
+    character after the rid): the template puts it ahead of everything, so only an @mention label can
+    precede it, and a body that quotes another marker comes later. A marker is AUTHORITATIVE, with no
+    cross-check against a tail pair: in a collapsed turn the last VISIBLE complete pair can be a quote
+    (a follow-up quoting its parent), and a refire rewrites the rid everywhere, so our own tail always
+    equals our marker. With no marker anywhere (a legacy round, the automatic continue) the pair rule
+    above applies unchanged, so a collapsed legacy turn stays unproven. The turn's React state is NOT
+    consulted: which fiber or ancestor is current cannot be known from a DOM node.
     """
+    marker = _TURN_MARKER_RE.search(turn_text or "")
+    if marker:
+        return marker.group(1)
     canonical = None
     open_begin = set()
     for line in (turn_text or "").replace("\r\n", "\n").split("\n"):
-        s = line.strip()
+        s = _WS_TRIM_RE.sub("", line)        # NOT str.strip(): the two sides share _WS_SRC
         mb = _TURN_BEGIN_LINE_RE.match(s)
         if mb:
             open_begin.add(mb.group(1))
@@ -903,10 +979,8 @@ def _locate_source_turn(user_texts, source_rid):
       _detect_js/_extract_js) can still be safely attributed to the source turn; unwrapped salvage
       must be refused (rid_superseded/ambiguous) since a later turn's own interval now exists.
 
-    turn_index: the 0-based ordinal (DOM order) of the located turn among ALL user turns, or None
-    when absent. The caller threads this into __cgcNode's turnIndex so assistant-answer selection
-    is scoped to the exact interval between this turn and the next user turn — an answer may never
-    come from outside it (see _detect_js/_extract_js/_last_assistant_js).
+    No ordinal is returned: the answer reads re-find the source turn by its canonical rid on every
+    call (__cgcSrc), because a turn's ordinal shifts as a long thread mounts and unmounts turns.
 
     observed_rid is the CANONICAL rid of the LAST user turn, if any — 'what the conversation is
     actually on now', surfaced in error text and the outcome envelope so a refusal is legible, not
@@ -917,43 +991,34 @@ def _locate_source_turn(user_texts, source_rid):
         if _turn_canonical_rid(t) == source_rid:
             idx = i  # keep the LAST turn whose OWN canonical rid is source_rid (a legitimate resend)
     observed = _turn_canonical_rid(user_texts[-1]) if user_texts else None
-    if idx is None:
-        return {"present": False, "is_last": False, "observed_rid": observed, "turn_index": None}
-    return {"present": True, "is_last": idx == len(user_texts) - 1,
-            "observed_rid": observed, "turn_index": idx}
+    return {"present": idx is not None, "is_last": idx is not None and idx == len(user_texts) - 1,
+            "observed_rid": observed}
 
 
 def _salvage_allowed(c, rid):
     """Re-check, AT THE MOMENT unwrapped salvage is considered (not just once at wait-start),
     whether rid's own turn is still the conversation's LAST — a later turn can land WHILE the wait
     is in progress, which is exactly the race a retrieve recovery must close. Returns
-    (allowed: bool, observed_rid, turn_index, present). Cheap (one DOM query), so re-checking on
-    every salvage attempt costs nothing against a poll loop measured in seconds. turn_index/present
-    are the fresh (this-instant) values from _locate_source_turn — the caller should use THIS
-    turn_index (not a cached one) for the salvage extraction that immediately follows, since the
-    DOM composition may have shifted since the wait started."""
+    (allowed: bool, observed_rid, present). Cheap (one DOM query), so re-checking on every salvage
+    attempt costs nothing against a poll loop measured in seconds."""
     loc = _locate_source_turn(c.eval(_all_user_texts_js()) or [], rid)
-    return loc["is_last"] and loc["present"], loc["observed_rid"], loc["turn_index"], loc["present"]
+    return loc["is_last"], loc["observed_rid"], loc["present"]
 
 
-def _last_assistant_js(rid: str, turn_index=None) -> str:
+def _last_assistant_js(rid: str, *, scoped=False) -> str:
     """Reconstructed text of the answer node (no sentinel slicing) — for the stall raw dump.
-    turn_index: see _detect_js — scopes the lookup to the source turn's interval when given."""
-    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
-    node_call = f"__cgcNode({begin})" if turn_index is None else f"__cgcNode({begin},{int(turn_index)})"
-    return ("(function(){" + _NODE_FN + _TEXT_FN +
-            "return __cgcText(" + node_call + ");})()")
+    scoped: see _detect_js — reads only rid's own turn's interval."""
+    return ("(function(){" + _NODE_FN +
+            "return __cgcText(" + _node_call(rid, scoped) + ");})()")
 
 
-def _extract_js(rid: str, turn_index=None) -> str:
+def _extract_js(rid: str, *, scoped=False) -> str:
     """Returns the answer text BETWEEN the bare-line sentinels of the answer node (SHARED
     CONTRACT #1, via the canonical _sentinel_js parser), or '' if no valid wrapper is present.
-    turn_index: see _detect_js — scopes the lookup to the source turn's interval when given."""
-    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
-    node_call = f"__cgcNode({begin})" if turn_index is None else f"__cgcNode({begin},{int(turn_index)})"
-    sentinel = _sentinel_js(rid, f"__cgcText({node_call})")
+    scoped: see _detect_js — reads only rid's own turn's interval."""
+    sentinel = _sentinel_js(rid, f"__cgcText({_node_call(rid, scoped)})")
     return (
-        "(function(){" + _NODE_FN + _TEXT_FN +
+        "(function(){" + _NODE_FN +
         "var res=" + sentinel + ";"
         "return res.done?res.body:'';})()"
     )
@@ -987,27 +1052,37 @@ def _extract_js(rid: str, turn_index=None) -> str:
 # The attribute lives on the MESSAGE node while __cgcNode may legitimately resolve the TURN
 # wrapper (_SEL_A matches either shape) — hence self -> descendant -> ancestor, all three confined
 # to that one resolved node.
-def _model_slug_js(rid: str, turn_index=None) -> str:
+def _model_slug_js(rid: str, *, scoped=False) -> str:
     """JS returning the producing model's slug for the rid's OWN answer node, or '' when the
     provider has not written one (a legitimate outcome — see SHARED CONTRACT #4)."""
-    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
-    node_call = f"__cgcNode({begin})" if turn_index is None else f"__cgcNode({begin},{int(turn_index)})"
     return ("(function(){" + _NODE_FN + "var A='data-message-model-slug';"
-            "var n=" + node_call + ";if(!n)return '';"
+            "var n=" + _node_call(rid, scoped) + ";if(!n)return '';"
             "var v=n.getAttribute(A);if(v)return v;"
             "var d=n.querySelector('['+A+']');if(d){v=d.getAttribute(A);if(v)return v;}"
             "var p=n.closest?n.closest('['+A+']'):null;"
             "return (p&&p.getAttribute(A))||'';})()")
 
 
-def _read_attribution(c, rid, turn_index=None):
+def _read_attribution(c, rid, *, scoped=False):
     """The producing model's slug for this rid's answer, or None when absent/unreadable. Never
     raises: attribution is evidence ABOUT an answer, so failing to read it must not fail a consult
     that otherwise succeeded — it degrades to 'unknown', reported honestly as null."""
     try:
-        return (c.eval(_model_slug_js(rid, turn_index)) or "").strip() or None
+        return (c.eval(_model_slug_js(rid, scoped=scoped)) or "").strip() or None
     except Exception:
         return None
+
+
+def _write_verified(out, ans):
+    """Write a sentinel-verified answer. The daemon grades a round unverified by the mere presence of
+    the `<out>.raw` sidecar (cgc_backend._wait_phase), and a stub-stable or ambiguous-stable read
+    earlier in this same wait leaves one behind as a diagnostic dump — so a verified exit removes
+    it, or a wrapped answer is recorded as an unwrapped salvage."""
+    _write_private(out, ans)
+    try:
+        os.remove(out + ".raw")
+    except FileNotFoundError:
+        pass
 
 
 def _wait_receipt(rid, out, slug):
@@ -1037,20 +1112,6 @@ def _reload_stale_tab(c, reason):
         sys.stderr.write(f"CGC_WAIT stale-tab: reload failed ({e}); continuing on the current DOM\n")
         return
     time.sleep(STALE_RELOAD_SETTLE_S)
-
-
-def _scoped_raw(c, rid, strict, turn_index):
-    """Fetch unwrapped-salvage raw text via _last_assistant_js, honoring the [S3] interval
-    guarantee. STRICT (source-pinned) mode: the answer may come ONLY from the source turn's own
-    interval — if turn_index is None (that turn is no longer resolvable in the current DOM, e.g.
-    virtualized away), refuse outright rather than falling back to an unscoped 'current turn'
-    search that could read a LATER round's answer. Non-strict ('auto') mode keeps the legacy
-    unscoped lookup, since there is no pinned source turn to violate."""
-    if strict:
-        if turn_index is None:
-            return ""
-        return c.eval(_last_assistant_js(rid, turn_index)) or ""
-    return c.eval(_last_assistant_js(rid)) or ""
 
 
 # ChatGPT VIRTUALIZES message nodes on a backgrounded/inactive tab: the completed answer node
@@ -1103,7 +1164,7 @@ def cmd_status(a) -> int:
 # family would sit unguarded: "Pro tier on GPT-5.5" satisfies every tier check this file makes
 # while being a DIFFERENT MODEL than the receipt claims answered. A consult that silently runs
 # weaker than it says is precisely the failure this whole guard exists to prevent, so the family
-# is pinned too now — CGC_MODEL_FAMILY, default "Latest" — with the tier's own discipline: fail
+# is pinned too now — CGC_MODEL_FAMILY, default "GPT-6" — with the tier's own discipline: fail
 # closed, never send on an unconfirmed model.
 #
 # Live readings from a logged-in Pro tab, 2026-09-06 (verbatim, this is the build being fixed):
@@ -1113,6 +1174,8 @@ def cmd_status(a) -> int:
 #   [data-testid="composer-intelligence-picker-content"] innerText lines:
 #     0 "6"  1 "Pro"  2 "Pro, 5 of 5."  3 "Use Left and Right arrow keys to adjust power."
 #     4 "Latest" (menuitemradio, aria-checked=true)  5 "GPT-5.6 Sol"  6 "GPT-5.5"
+#   (2026-10: the "Latest" radio was relabelled "GPT-6" — same model, same slot. Every "Latest" in
+#   a dated reading in this file is today's "GPT-6".)
 #   span[role=slider]: aria-valuemin=0 aria-valuemax=4 aria-valuenow=4, textContent "", NO
 #     aria-valuetext. Its [role=menuitem] ancestor is aria-label="Power" with EMPTY innerText
 #     AND textContent, carrying aria-describedby="_r_cn_ _r_co_" whose first id reads
@@ -1609,7 +1672,8 @@ def _submenu_try(c, target):
 
 # ---- model FAMILY path (new dimension; see the law at the top of this section) ----
 # Live 2026-09-06: the open picker carries the MODEL itself as [role="menuitemradio"] items —
-# "Latest" (aria-checked=true), "GPT-5.6 Sol", "GPT-5.5" — in the SAME menu as the power slider.
+# "Latest" (aria-checked=true; relabelled "GPT-6" in 2026-10), "GPT-5.6 Sol", "GPT-5.5" — in the
+# SAME menu as the power slider.
 # Read as {label, checked} pairs so the "already correct" case can be distinguished from the
 # "must click" case without a click: this is the one control in the picker where a redundant
 # gesture is not free (a Radix radio click also closes the menu, which would drop the slider out
@@ -1644,7 +1708,7 @@ _FamilyObs = collections.namedtuple("_FamilyObs", "status entries detail")
 The old signal was a fail-open: the list-shaped family read turned a null read, a non-list read
 and a malformed read all into [], and [] meant "this build has no family control — exempt".
 The reachable counterexample: a composer sitting on GPT-5.5 whose family probe returns null during
-a React render transition while the Pro slider reads fine. Nothing established `Latest`, and the
+a React render transition while the Pro slider reads fine. Nothing established `GPT-6`, and the
 guard reported the model confirmed. An unreadable control is not evidence that the control is
 right; it is the absence of evidence, which is the one thing a fail-closed guard must never treat
 as a pass.
@@ -1847,6 +1911,25 @@ def _cand_labels_js():
     entries are other switchers (ChatGPT splits model and reasoning effort) or modes."""
     return ("(function(){return %s.map(function(b){"
             "return (b.innerText||'').trim().split('\\n')[0];});})()" % _ALL_CAND_JS)
+
+
+def _settled_labels(c, hold=4.0, bound=20.0):
+    """Wait until the composer's switcher labels are non-empty and have not changed for `hold`
+    seconds, or `bound` seconds pass; return the last read. Live 2026-09-30 a re-opened thread
+    rendered the mode toggle ['Explore'] and the tier switcher 'Pro' ~2.5 s later, so a label set
+    stable across only two reads 1 s apart can still be half-built — `hold` must outlast that gap.
+    No label count is assumed: a build with one switcher (['6']) settles at `hold`, not `bound`."""
+    end = time.time() + bound
+    prev, since = None, time.time()
+    while True:
+        now = [x for x in (c.eval(_cand_labels_js()) or []) if x]
+        if now != prev:
+            prev, since = now, time.time()
+        elif now and time.time() - since >= hold:
+            return now
+        if time.time() >= end:
+            return now
+        time.sleep(0.5)
 
 
 def _matches(label, target):
@@ -2219,6 +2302,7 @@ _CODE_URL_RE = re.compile(
 # no_code_source. Keep this predicate in lockstep with cgc_spool.validate_prompt's rule 1.
 _FOLLOWUP_SENTINEL = "continuing this consult"
 _NO_CODE_SENTINEL = "references no code"
+_WORKSPACE_SENTINEL = "source: local workspace `"   # `fire --workspace`: evidence is in a local workspace
 
 
 def _has_sendable_source(prompt: str) -> bool:
@@ -2228,7 +2312,8 @@ def _has_sendable_source(prompt: str) -> bool:
     low = prompt.lower()
     return (bool(_CODE_URL_RE.search(prompt))
             or _FOLLOWUP_SENTINEL in low
-            or _NO_CODE_SENTINEL in low)
+            or _NO_CODE_SENTINEL in low
+            or _WORKSPACE_SENTINEL in low)
 
 
 def _egress_gate(prompt: str):
@@ -2269,12 +2354,12 @@ def _contract_js(rid):
     Counting user turns (what this used to do) only proves the page grew a message. It cannot tell
     'my prompt was sent' from 'something else appeared', and it says nothing about whether we can
     still READ the reply — the failure that burned two 25-minute rounds."""
-    tag = json.dumps(f"BEGIN_RESPONSE:{rid}")
+    tag = json.dumps(rid)
     fams = json.dumps([{"name": n, "u": u, "a": a} for n, u, a in _ADAPTERS])
-    return ("(function(){var TAG=%s,F=%s,out=[];"
+    return ("(function(){" + _TEXT_FN + _RID_FN + "var RID=%s,F=%s,out=[];"
             "for(var i=0;i<F.length;i++){"
             "var us=document.querySelectorAll(F[i].u),as=document.querySelectorAll(F[i].a),hit=false;"
-            "for(var j=0;j<us.length;j++){if((us[j].textContent||'').indexOf(TAG)>=0){hit=true;break;}}"
+            "for(var j=0;j<us.length;j++){if(__cgcRid(__cgcText(us[j]))===RID){hit=true;break;}}"
             "out.push({adapter:F[i].name,ridLanded:hit,users:us.length,assistants:as.length});}"
             "var gen=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"]');"
             "return JSON.stringify({families:out,generating:gen});})()" % (tag, fams))
@@ -2386,16 +2471,23 @@ _COMPOSER_SEL = 'div[role="textbox"][contenteditable="true"],#prompt-textarea'
 
 
 def _composer_state_js():
-    js = """(function(){return JSON.stringify({
-      composer: !!document.querySelector(__SEL__),
+    # loginWall/captcha come from the shared blocker rule (_BLOCKER_FN); `blocker` carries its whole
+    # verdict, rate limit included, so a UI-contract decision can rule every human condition out.
+    # form: a visible <form> — the structure the composer lives in (__cg requires one). With no
+    # visible editor, a form means the app rendered and the editor is what changed; no form means
+    # the page has not rendered the app at all, which readyState cannot tell apart.
+    js = """(function(){__RESOLVE____BLOCKER__var bl=__cgcBlocker();return JSON.stringify({
+      composer: !!__cg(),
+      form: Array.prototype.some.call(document.querySelectorAll('form'), function(f){
+        var r=f.getBoundingClientRect();return r.width>0&&r.height>0;}),
       onChatGPT: /(^|\\.)chatgpt\\.com$/.test(location.hostname),
-      loginWall: !!document.querySelector('input[type="password"]')
-                 || /^\\/(auth|login)(\\/|$)/i.test(location.pathname),
-      captcha: !!document.querySelector('iframe[src*="captcha" i],iframe[title*="captcha" i]'),
+      loginWall: bl==='login',
+      captcha: bl==='captcha',
+      blocker: bl,
       readyState: document.readyState,
       path: location.pathname.slice(0,60)
     });})()"""
-    return js.replace("__SEL__", json.dumps(_COMPOSER_SEL))
+    return js.replace("__RESOLVE__", _COMPOSER_RESOLVE_JS).replace("__BLOCKER__", _BLOCKER_FN)
 
 
 def _await_composer(c, seconds=60):
@@ -2435,6 +2527,27 @@ def _composer_failure(st):
                "The page did not load in time; re-enqueue and it will retry.")
 
 
+_NOT_AFTER_HELP = ("the round's use-by (ISO-8601): re-checked immediately before the click; past it "
+                   "nothing is clicked (exit 6, provably not sent)")
+
+
+def _past(instant):
+    """Has the round's use-by passed? cgc_store.past, the one definition (lazy import, like
+    _is_canonical's, so the driver stays standalone-runnable; no --not-after means no deadline)."""
+    if not instant:
+        return False
+    import cgc_store
+    return cgc_store.past(instant)
+
+
+def _composer_outcome(st):
+    """The typed line for a composer that never appeared (always pre-click: nothing was sent)."""
+    reason = ("login_needed" if st.get("loginWall") else "captcha" if st.get("captcha")
+              else "wrong_page" if not st.get("onChatGPT", True) else "composer_not_ready")
+    return {"ok": False, "submitted": False, "reason": reason, "phase": "composer",
+            "readyState": st.get("readyState"), "blocker": st.get("blocker"), "form": st.get("form")}
+
+
 def _read_prompt(path):
     """Read the prompt to send. `-` means stdin, which is how the daemon hands over the EXACT bytes
     its egress gate validated.
@@ -2467,8 +2580,58 @@ class _PreClickFailure(Exception):
     """Raised only for a failure PROVEN to precede the send click — never after it."""
 
 
+# The composer is found by stable structure through ONE shared expression, re-evaluated on each call
+# (deterministically, no cached node), and everything on the send path is bound to it: the editor the keystrokes and the picked app go to, the reads that verify them, the
+# clear, and the send button. Probed live 2026-09-29: a conversation re-opened by URL holds TWO forms, a
+# hidden 0x0 one (with its own editor and its own buttons) before the visible one; the project page holds
+# one. The send button lives INSIDE the composer's form and only exists once there is text. So:
+#   composer = the VISIBLE editor inside a <form> (an edit-message box in a turn is not in one);
+#              the one holding focus wins if several qualify. Nothing visible means no composer: there is
+#              no fallback to a hidden editor, because a read or a paste that lands there is silent.
+#   send     = the send button INSIDE that composer's own form, never a document-wide first match.
+_COMPOSER_RESOLVE_JS = (
+    "function __cg(){var l=Array.prototype.slice.call(document.querySelectorAll("
+    + json.dumps(_COMPOSER_SEL) + ")).filter(function(e){var r=e.getBoundingClientRect();"
+    "return r.width>0&&r.height>0&&!!e.closest('form')&&!e.closest('article,[data-message-author-role]');});"
+    "var f=l.filter(function(e){return e===document.activeElement||e.contains(document.activeElement);});"
+    "return f[0]||l[0]||null;}")
+
+
 def _composer_get_js():
-    return "document.querySelector(" + json.dumps(_COMPOSER_SEL) + ")"
+    return "(function(){" + _COMPOSER_RESOLVE_JS + "return __cg();})()"
+
+
+def _send_click_js():
+    """Click the send button of the resolved composer's own form. Returns one of:
+      'clicked'      the form's single visible send button was clicked;
+      'no-composer'  no visible composer form (nothing to send from);
+      'ambiguous'    several visible send buttons in that form (picking one would be a guess);
+      'disabled'     exactly one, but it is disabled;
+      'no-send'      no send button yet AND focus is inside the resolved editor (Enter would act on it);
+      'no-focus'     no send button and focus is NOT inside the resolved editor (Enter would act elsewhere).
+    Only 'clicked' and 'no-send' may go on to send; see _send_verdict."""
+    return ("(function(){" + _COMPOSER_RESOLVE_JS + "var d=__cg();if(!d)return 'no-composer';"
+            "var f=d.closest('form');var b=Array.prototype.slice.call(f.querySelectorAll("
+            "'button[data-testid=\"send-button\"],button[aria-label*=\"Send\" i],"
+            "button[aria-label*=\"\\u53d1\\u9001\"]')).filter(function(x){var r=x.getBoundingClientRect();"
+            "return r.width>0&&r.height>0;});"
+            "if(b.length>1)return 'ambiguous';if(b.length===1){if(b[0].disabled)return 'disabled';"
+            "b[0].click();return 'clicked';}"
+            "var a=document.activeElement;return (a===d||d.contains(a))?'no-send':'no-focus';})()")
+
+
+def _send_verdict(sent_via):
+    """(may_proceed, press_enter, note). The send eval must return one of the values above. Anything else,
+    including None (the eval timed out or returned nothing), 'disabled', 'ambiguous', 'no-composer' and
+    'no-focus', means NOTHING was clicked and Enter must not be pressed: Enter submits whatever is
+    focused, and on a composer we could not name or focus that may be nothing or the wrong thing. The
+    only Enter fallback is 'no-send' (a composer whose send button has not rendered) with focus verified
+    inside that composer, the pre-existing behaviour."""
+    if sent_via == "clicked":
+        return True, False, ""
+    if sent_via == "no-send":
+        return True, True, ""
+    return False, False, f"send target {sent_via!r}"
 
 
 def _settle_composer(c, seconds=5):
@@ -2510,16 +2673,27 @@ def _composer_text_js():
 # ---- @mention (ChatGPT apps/plugins) ------------------------------------------------------------
 # A plugin is not text: typing "@WebCodex Demo" as prose sends a literal string and the app is never
 # invoked. The composer turns "@<query>" into a popup of apps; picking one inserts a mention node.
-# So a mention is a composer ACTION done before the paste: type "@<name>", click the popup option
-# whose label matches, verify the composer changed. Unresolvable -> CGC_ERROR mention_not_found,
-# strictly pre-click (nothing sent), and a human fixes the name or enables the app.
+# So a mention is a composer ACTION done before the paste: type "@<name>", click the popup Plugins
+# row whose label matches, verify the composer gained an APP mention. Unresolvable -> CGC_ERROR
+# mention_not_found, strictly pre-click (nothing sent); the error says whether the popup never
+# opened, opened empty, listed the app unconnected, or offered other entries.
 _MENTION_WAIT_S = 8.0
-_MENTION_OPT_SEL = ('[role="option"],[role="menuitem"],[role="menuitemradio"],'
-                    '[role="listbox"] li,[data-radix-popper-content-wrapper] button')
+_MENTION_SETTLE_POLLS = 6  # x0.4s for the composer to show the picked app's mention node
+# Probed live 2026-09-29: the popup carries NO ARIA roles. It is a floating panel whose scroll area
+# is [data-mention-list-scroll-area]; every row (plugin, file, ...) is a plain
+# <button data-list-navigation-item> inside it. The roles this once guessed matched nothing.
+_MENTION_POPUP_SEL = '[data-mention-list-scroll-area]'
+_MENTION_OPT_SEL = _MENTION_POPUP_SEL + ' [data-list-navigation-item]'
 
 
 class _MentionFailure(_PreClickFailure):
-    """The composer never offered/accepted the requested @mention — pre-click, a human must act."""
+    """The composer never offered/accepted the requested @mention — pre-click, a human must act.
+    `drift` is True only when the failure proves the picker's markup moved (the popup never opened,
+    or an app-shaped row took no app mention node); every other cause is this account's apps."""
+
+    def __init__(self, msg, drift=False):
+        super().__init__(msg)
+        self.drift = drift
 
 
 def _norm_label(s):
@@ -2539,53 +2713,179 @@ def _mention_type_js(name, token):
             + _mention_visible_js() + ".forEach(function(e){e.setAttribute('data-cgc-pre',"
             + json.dumps(token) + ");});d.focus();"
             "document.execCommand('insertText',false," + json.dumps("@" + name) + ");"
-            "return d.innerHTML;})()")
+            "return true;})()")
 
 
 def _mention_pick_js(name, token):
-    # Visible options the typing produced; exact label wins, else a UNIQUE prefix match (the popup
-    # may append a description line). Returns the picked label, or null. Never guesses.
+    # Visible rows the typing produced. The requested name is matched EXACTLY (case- and whitespace-
+    # insensitive) against a row's label, and only among app rows: never by prefix. A prefix rule cannot be
+    # told apart from a different app that merely starts with the same text ('Notion' vs 'Notion Calendar',
+    # 'Atlas' vs 'Atlas Pro'): with only that other app enabled it is the ONLY prefix match, so it would be
+    # clicked and the prompt sent with the wrong app attached. The short-name snapping the CLI does
+    # (`--mention webcodex` -> 'WebCodex Demo') happens BEFORE this, against the known-apps list, so an
+    # unlisted short name fails closed here and the error names what the popup DID offer.
+    # A candidate must be shaped like an APP row, read off the popup's own markup (probed live 2026-09-29): a
+    # content block whose leading icon carries `rounded-2xs` (connector icons; Add actions use
+    # `icon-leading`/CompactSource, files `text-file-document`), under the Plugins header or in a bare
+    # single-section popup. "Headerless" alone proves nothing. A candidate is CONNECTED only if the whole
+    # button reads exactly `label` + `description`, with the description in its own element and nothing else
+    # anywhere in the row: an unconnected app carries a "Connect" control or text (inside the label, next to
+    # the description, or beside the content block), so the test is structural and holds in any UI language.
+    # Label and description must be LEAVES (one text node, no element inside), so a control or a second text
+    # node appended inside either cannot hide there. The inherent limit that remains: text that is PART of the
+    # single description text node ('Notion docs and Connect') cannot be told from a description that really
+    # says so; the rule is structural and cannot read meaning.
+    # An unconnected exact app is refused and reported, never replaced by another; a row in an allowed section
+    # that is not app-shaped is never clicked and is reported as `unverified`. `open` / `loading`: the popup
+    # exists / still shows its "Loading suggestions" skeleton.
     return ("(function(){var want=" + json.dumps(_norm_label(name)) + ";var os=" + _mention_visible_js()
             + ".filter(function(e){return e.getAttribute('data-cgc-pre')!==" + json.dumps(token) + ";});"
-            "function lab(e){return (e.innerText||e.textContent||'').split('\\n')[0].replace(/\\s+/g,' ')"
-            ".trim().replace(/^@/,'').toLowerCase();}"
-            "var ex=os.filter(function(e){return lab(e)===want;});"
-            "var pf=os.filter(function(e){return lab(e).indexOf(want)===0;});"
-            "var hit=ex.length===1?ex[0]:(!ex.length&&pf.length===1?pf[0]:null);"
-            "if(!hit)return {hit:null,seen:os.map(lab).filter(Boolean).slice(0,20)};"
-            "hit.click();return {hit:lab(hit),seen:[]};})()")
+            "function sp(s){return (s||'').replace(/\\s+/g,' ').trim();}"
+            "function lab(e){return sp((e.innerText||e.textContent||'').split('\\n')[0]).replace(/^@/,'')"
+            ".toLowerCase();}"
+            "function row(n){return n.hasAttribute('data-list-navigation-item');}"
+            "function txt(n){return (n.innerText||'').trim();}"
+            "function hdr(e){var p=e.previousElementSibling;while(p&&(row(p)||!txt(p)))"
+            "p=p.previousElementSibling;return p?txt(p).toLowerCase():null;}"
+            "function headed(e){var k=e.parentElement.children;for(var i=0;i<k.length;i++)"
+            "if(!row(k[i])&&txt(k[i]))return true;return false;}"
+            "function body(e){return e.querySelector('[data-menu-row-content]');}"
+            "function tok(n,c){return ((n&&n.getAttribute&&n.getAttribute('class'))||'').split(/\\s+/)"
+            ".indexOf(c)>=0;}"
+            "function appish(e){var c=body(e);if(!c)return false;var l=c.firstElementChild;"
+            "var i=l&&l.firstElementChild;return !!i&&tok(i,'rounded-2xs');}"
+            "function nw(s){return (s||'').replace(/\\s+/g,'');}"
+            # a LEAF holds one text node and no element: every captured description and label is exactly that,
+            # so a second text node (a bare ' Connect' appended after the description) fails it as well
+            "function leaf(n){return !!n&&n.children.length===0&&n.childNodes.length<=1;}"
+            "function plain(e){var c=body(e);if(!c||e.children.length!==1||c.children.length!==2)return false;"
+            "var d=c.querySelector('.text-codex-description');if(!d||!leaf(d))return false;"
+            # the label element is the description's first text sibling: the innermost element holding the
+            # label. Both must be LEAVES (no element inside them), so a Connect control nested inside the
+            # description or the label cannot hide there, and the whole button must read exactly label +
+            # description. textContent concatenates adjacent spans with no whitespace (live DOM), so the
+            # comparison ignores whitespace: any extra text still adds characters and fails it.
+            "var w=d.parentElement,lb=null;for(var i=0;i<w.children.length;i++)"
+            "if(w.children[i]!==d&&!w.children[i].contains(d)){lb=w.children[i];break;}"
+            "if(!leaf(lb))return false;"
+            "return nw(e.textContent)===nw(lb.textContent+d.textContent);}"
+            "var open=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL) + ");"
+            "var loading=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL + ' [role="status"]') + ");"
+            "var sect=os.filter(function(e){var h=hdr(e);return h==='plugins'||(h===null&&!headed(e));});"
+            "var pl=sect.filter(appish);"
+            "var ex=pl.filter(function(e){return lab(e)===want;});"
+            "var hit=ex.length===1?ex[0]:null;var amb=ex.length>1?ex.length:0;"
+            "var un=pl.filter(function(e){return !plain(e);}).map(lab).filter(function(l){return l===want;});"
+            "var uv=sect.filter(function(e){return !appish(e);}).map(lab).filter(function(l){return l===want;});"
+            "if(hit&&!plain(hit)){un=[lab(hit)];hit=null;}"
+            "if(!hit)return {hit:null,open:open,loading:loading,"
+            "seen:pl.filter(plain).map(lab).filter(Boolean).slice(0,20),unconnected:un,unverified:uv,"
+            "ambiguous:amb};"
+            "hit.click();return {hit:lab(hit),open:open,loading:false,seen:[],unconnected:[],"
+            "unverified:[],ambiguous:0};})()")
 
 
-def _composer_html_js():
-    return "(function(){var d=" + _composer_get_js() + ";return d?d.innerHTML:null;})()"
+def _composer_mentions_js():
+    # The composer's APP mention nodes: a picked app becomes <span app-mention-name=... app-mention-display-name=...>;
+    # a picked file or any other row does not. Returns the normalized display names ([] when there is no composer).
+    return ("(function(){var d=" + _composer_get_js() + ";if(!d)return [];"
+            "return Array.prototype.map.call(d.querySelectorAll('[app-mention-name]'),function(e){"
+            "return (e.getAttribute('app-mention-display-name')||e.getAttribute('app-mention-name')||'')"
+            ".replace(/\\s+/g,' ').trim().toLowerCase();});})()")
+
+
+def _mention_offer(popup_open, seen, unconnected=(), loading=False, unverified=(), ambiguous=0,
+                   name=""):
+    """What the popup showed, in words that say what to do: never opened (a code/DOM problem),
+    listed but not connected (a human connects it), still on its loading skeleton (nothing matched,
+    or ChatGPT is slow), opened empty (the app is not enabled here, or the name is wrong), or
+    offered other entries."""
+    if ambiguous:
+        return (f"ambiguous: {ambiguous} rows named {name!r} — the driver will not pick one of several "
+                "identically named entries (they may be different apps). A human must disambiguate in "
+                "ChatGPT (rename or disconnect the duplicate)")
+    if unconnected:
+        return ("The popup lists " + ", ".join(repr(x[:40]) for x in dict.fromkeys(unconnected))
+                + " but it is NOT connected on this account (its row carries a Connect control) — a human "
+                  "must connect it in ChatGPT; the daemon never authorizes an app")
+    if unverified:
+        return ("The popup lists " + ", ".join(repr(x[:40]) for x in dict.fromkeys(unverified))
+                + " but its row is not shaped like a connected app (no app icon or description), so the "
+                  "driver will not click it: it may be a file, an action, or an app whose row changed. "
+                  "A human must check it in ChatGPT; if it is an app, this is a driver fix")
+    if not popup_open:
+        return (f"The @ popup never opened ({_MENTION_POPUP_SEL} absent) — the composer's DOM changed "
+                "or it lost focus; that is a code fix, not an app to enable")
+    if not seen and loading:
+        return (f"The popup opened but only ever showed its loading skeleton — no app of that name "
+                f"came back in {_MENTION_WAIT_S:.0f}s: not enabled for this account/project, the name "
+                "is wrong, or ChatGPT is slow; a human must check in ChatGPT")
+    if not seen:
+        return ("The popup opened but nothing matched — no app of that name is enabled for this "
+                "account/project (or the name is wrong); a human must enable it in ChatGPT")
+    return ("The popup offered: " + ", ".join(repr(x[:40]) for x in dict.fromkeys(seen))
+            + " — re-fire with one of those as --mention (and add it to CGC_APPS via cgc_config.py "
+              "set), or enable the app")
+
+
+def _clear_after_mention_failure(c):
+    """Leave no half-typed "@name" behind; either way the round is not sent. Returns the residue note."""
+    try:
+        left = c.eval(_clear_composer_js(), timeout=45)
+    except Exception:
+        left = None
+    return "" if left == 0 else " (and the composer could not be proven cleared)"
 
 
 def _insert_mention(c, name):
     token = os.urandom(4).hex()
-    typed = c.eval(_mention_type_js(name, token), timeout=45)
-    if typed is None:
+    want = _norm_label(name)
+    have = list(c.eval(_composer_mentions_js(), timeout=45) or [])
+    if c.eval(_mention_type_js(name, token), timeout=45) is None:
         raise _PreClickFailure("composer not found while typing @mention")
     end = time.time() + _MENTION_WAIT_S
-    seen = []
+    seen, unconnected, unverified, popup_open, loading, ambiguous = [], [], [], False, False, 0
     while time.time() < end:
         time.sleep(0.4)
         r = c.eval(_mention_pick_js(name, token), timeout=45) or {}
         seen = r.get("seen") or seen
+        unconnected = r.get("unconnected") or unconnected
+        unverified = r.get("unverified") or unverified
+        ambiguous = r.get("ambiguous") or ambiguous
+        popup_open = popup_open or bool(r.get("open"))
+        loading = bool(r.get("loading"))
         if r.get("hit"):
-            time.sleep(0.4)
-            if c.eval(_composer_html_js(), timeout=45) != typed:
+            # One click, ever. The composer inserts the mention node a beat later, so give it
+            # _MENTION_SETTLE_POLLS looks before concluding the row was not an app.
+            got = []
+            for _ in range(_MENTION_SETTLE_POLLS):
+                time.sleep(0.4)
+                got = list(c.eval(_composer_mentions_js(), timeout=45) or [])
+                if len(got) > len(have):
+                    break
+            appeared = list(got)
+            for h in have:                       # what was ALREADY there is not what this click added
+                if h in appeared:
+                    appeared.remove(h)
+            if appeared == [want]:
                 c.eval(_paste_chunk_js(" "), timeout=45)
                 return
-    try:  # leave no half-typed "@name" behind; either way the round is not sent
-        left = c.eval(_clear_composer_js(), timeout=45)
-    except Exception:
-        left = None
-    residue = "" if left == 0 else " (and the composer could not be proven cleared)"
+            # Not the requested app: nothing appeared (the row was not an app), or something else did.
+            # Either way the prompt would go out without the app that was asked for.
+            residue = _clear_after_mention_failure(c)
+            if appeared:
+                raise _MentionFailure(
+                    f"mention_not_found: '@{name}' produced the app mention {appeared!r}, not {want!r} — "
+                    f"refusing to send with the wrong app attached{residue}")
+            raise _MentionFailure(
+                f"mention_not_found: the popup row {r['hit'][:40]!r} for '@{name}' is not an app — the "
+                f"composer took no app mention from it{residue}. Enable the app '{name}' in ChatGPT "
+                "or fix the name", drift=True)
+    residue = _clear_after_mention_failure(c)
     raise _MentionFailure(
         f"mention_not_found: the composer offered no app named '{name}' for '@{name}' within "
-        f"{_MENTION_WAIT_S:.0f}s{residue}. The popup offered: "
-        + (", ".join(repr(x) for x in dict.fromkeys(seen)) or "nothing")
-        + " — re-fire with one of those as --mention (and add it to CGC_APPS via cgc_config.py set), or enable the app")
+        f"{_MENTION_WAIT_S:.0f}s{residue}. {_mention_offer(popup_open, seen, unconnected, loading, unverified, ambiguous, name)}",
+        drift=not popup_open)
 
 
 def _paste_prompt(c, prompt: str, mentions=()) -> None:
@@ -2629,6 +2929,57 @@ def _paste_prompt(c, prompt: str, mentions=()) -> None:
         raise _PreClickFailure(
             f"composer holds {got_len} normalized chars, prompt needs >= {want_len} — paste "
             "looks truncated by a DOM stall")
+    if mentions:
+        kept = sorted(c.eval(_composer_mentions_js(), timeout=45) or [])
+        wanted = sorted(_norm_label(m) for m in mentions)
+        if kept != wanted:
+            raise _MentionFailure(
+                f"mention_not_found: the composer holds the app mentions {kept!r} after the paste, not "
+                f"the requested {wanted!r} — refusing to send the prompt with the wrong apps")
+
+
+def _turn_rid_conflicts(rid, prompt, mentions=()):
+    """The distinct rids (None = "no rid") the user turn we are about to send would PARSE as, other
+    than `rid`; empty means it parses as `rid` however the page lays it out.
+
+    The reader names a turn by the first CGC_RID token in its text, and _paste_prompt types each
+    @mention label BEFORE the prompt, so the text a turn shows is "<labels><prompt>". Any foreign
+    CGC_RID token ahead of ours — an app named `CGC_RID:<other>`, or a legacy prompt-file body that
+    discusses one while its footer is `rid` — would make the sent turn read as another request, and
+    the OTHER rid's waiter or retrieve could then take this round's answer as its own. So the
+    invariant is enforced on the write side, with the reader's own rule, before the click. The labels
+    are laid out both inline (a space) and on their own line, since the sent bubble's layout is not
+    something to depend on. A prompt with no marker whose tail pair is `rid` parses as `rid`: that is
+    the legacy path, and only a collapsed turn would be unprovable there."""
+    names = [m for m in (mentions or ()) if m]
+    texts = [prompt] if not names else [sep.join(names) + sep + prompt for sep in (" ", "\n")]
+    return sorted({got for got in (_turn_canonical_rid(t) for t in texts) if got != rid},
+                  key=lambda g: g or "")
+
+
+_AMBIGUOUS_RID_TAIL = {"submit": "NOT submitting.", "follow-up": "NOT sending the follow-up.",
+                       "enqueue": "NOT enqueuing."}
+
+
+def _refuse_ambiguous_rid(rid, prompt, mentions, what):
+    """The refusal shared by submit, followup and the enqueue that precedes them: a message when the
+    turn would not parse as `rid`, else None. what: "submit", "follow-up" or "enqueue". At the driver
+    it exits EXIT_NOT_SENT_PRECLICK: nothing was clicked, so the round is provably unsent."""
+    # The picker matches app labels case-insensitively, so a requested `cgc_rid:<x>` can attach a
+    # `CGC_RID:<x>` chip the case-sensitive reader then reads first. No app name carries the token.
+    named = [m for m in (mentions or ()) if m and "cgc_rid" in m.lower()]
+    if named:
+        return (f"CGC_ERROR rid_ambiguous: the @mention name {named[0]!r} holds the CGC_RID token, which "
+                f"names a turn; no app name may carry it. {_AMBIGUOUS_RID_TAIL[what]}")
+    bad = _turn_rid_conflicts(rid, prompt, mentions)
+    if not bad:
+        return None
+    shown = ", ".join(b or "no rid" for b in bad)
+    return (f"CGC_ERROR rid_ambiguous: the turn this {what} would send reads as {shown}, not {rid} — "
+            "a CGC_RID token ahead of this round's own (in an @mention name or the prompt body), or no "
+            "rid the reader can find. Another request's waiter could take this answer as its own. "
+            f"{_AMBIGUOUS_RID_TAIL[what]} Render the prompt with consult.py prep (its first line is this "
+            "round's CGC_RID) and drop the token from the body or the mention name.")
 
 
 def cmd_submit(a) -> int:
@@ -2659,6 +3010,10 @@ def cmd_submit(a) -> int:
     if not _ok:
         sys.stderr.write(f"CGC_ERROR gate_refused: {_reason} — NOT submitting.\n")
         return 2
+    _why = _refuse_ambiguous_rid(a.rid, prompt, getattr(a, "mention", None), "submit")
+    if _why:
+        sys.stderr.write(_why + "\n")
+        return EXIT_NOT_SENT_PRECLICK
     if not a.no_gate:
         _ensure_chrome(a.port)  # automated Step 0: start debug Chrome if down + check login
     # Tab policy: each consult gets its OWN dedicated tab by default, so multiple
@@ -2671,6 +3026,8 @@ def cmd_submit(a) -> int:
         c.call("Page.navigate", {"url": a.project_url})
     else:
         c = CDP(a.port, create_url=a.project_url)
+    owns_tab = not a.reuse_tab   # a --reuse-tab tab was already there: never ours to close
+    pre_click = True             # False from just before the send eval: after it the tab is evidence, not garbage
     try:
         # (The old reuse-tab user-message COUNT guard lived here. It became dead when the post-send
         # check moved to _await_contract, which matches THIS request's rid inside a user turn — an
@@ -2680,7 +3037,7 @@ def cmd_submit(a) -> int:
         ready, _cstate = _await_composer(c)
         if not ready:
             _code, _msg = _composer_failure(_cstate)
-            c.close_tab()   # nothing was sent and this page never loaded — do not leak it
+            print(json.dumps(_composer_outcome(_cstate)))
             sys.stderr.write(_msg + "\n")
             return _code
         # Model selection — fully automated (must run AFTER navigate, which resets the
@@ -2694,11 +3051,8 @@ def cmd_submit(a) -> int:
             pick = _select_model(c, target, a.model_family)
             model_confirmed, model_now, model_badge = pick.confirmed, pick.shown, pick.badge
             if not model_confirmed and not a.allow_model_mismatch:
-                if not a.reuse_tab:
-                    c.close_tab()  # don't orphan the dedicated tab we opened for this submit
-                c.close()
-                print(json.dumps({"ok": False, "submitted": False,
-                                  "modelConfirmed": False, "model": model_now,
+                print(json.dumps({"ok": False, "submitted": False, "reason": "model_not_selectable",
+                                  "phase": "model", "modelConfirmed": False, "model": model_now,
                                   "modelBadge": model_badge, "wanted": target,
                                   "wantedFamily": a.model_family, "detail": pick.error}))
                 # pick.error is set only when the MODEL FAMILY is what failed — a different
@@ -2730,11 +3084,11 @@ def cmd_submit(a) -> int:
         try:
             _paste_prompt(c, prompt, a.mention)
         except _MentionFailure as e:
-            c.close_tab()
+            print(json.dumps({"ok": False, "submitted": False, "reason": "mention_not_found",
+                              "phase": "mention"}))
             sys.stderr.write(f"CGC_ERROR {e} — NOT submitted.\n")
             return 3
         except _PreClickFailure as e:
-            c.close_tab()   # nothing was sent; don't leak the tab
             sys.stderr.write(f"CGC_ERROR not_sent_preclick: {e} — NOT submitted; safe to retry with "
                              "the same --request-key.\n")
             return EXIT_NOT_SENT_PRECLICK
@@ -2753,14 +3107,24 @@ def cmd_submit(a) -> int:
             before_conv = c.conversation_id()
         except Exception:
             before_conv = "?unknown"
+        # `fire --use-by`: the last instant a send may happen, re-checked here because model selection
+        # and the paste above can take a minute past the daemon's own check. Past it, nothing clicks.
+        if _past(getattr(a, "not_after", None)):
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: expired: use-by {getattr(a, 'not_after', None)} passed before "
+                             "send — NOT submitted.\n")
+            return EXIT_NOT_SENT_PRECLICK
         # Submit. Prefer the send button; fall back to Enter. (POST-click from here: a failure past
         # this point is uncertain, never provably-not-sent.)
-        clicked = c.eval(
-            "(function(){var b=document.querySelector('button[data-testid=\"send-button\"],"
-            "button[aria-label*=\"Send\" i],button[aria-label*=\"\\u53d1\\u9001\"]');"
-            "if(b&&!b.disabled){b.click();return true;}return false;})()")
-        if not clicked:
-            c.key("Enter", "Enter", 13)
+        pre_click = False        # the eval below may click: from here a failure is uncertain
+        may_send, press_enter, why = _send_verdict(c.eval(_send_click_js()))
+        if not may_send:
+            # Nothing was clicked and Enter is not pressed, so this is still provably unsent.
+            pre_click = True
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: {why} — NOT submitted; safe to retry with the "
+                             "same --request-key.\n")
+            return EXIT_NOT_SENT_PRECLICK
+        if press_enter:
+            c.key("Enter", "Enter", 13)   # no send button rendered yet, focus verified inside the composer
         # Confirm a user message actually landed (poll — render lags the click). On a reused
         # tab, requiring merely "count > 0" would false-positive on OLD messages already in
         # the thread if THIS send's composer insert/click silently failed — so require the
@@ -2791,7 +3155,7 @@ def cmd_submit(a) -> int:
             # at this window to see whether the prompt actually went. Closing it destroys
             # the only evidence. It is the one failure allowed to leave a tab behind.
             c.close()
-            print(json.dumps({"ok": False, "submitted": None, "rid": a.rid,
+            print(json.dumps({"ok": False, "submitted": None, "rid": a.rid, "phase": "contract",
                               "reason": "unknown_send", "contract": contract,
                               "conversation_id": conv}))
             sys.stderr.write(
@@ -2805,8 +3169,15 @@ def cmd_submit(a) -> int:
                 + f"observed: {json.dumps(contract)}\n")
             return 3
         if verdict == "selector_drift":
-            c.close_tab()   # the send is confirmed and the conversation persists server-side
-            print(json.dumps({"ok": False, "submitted": True, "rid": a.rid,
+            # drift: the driver's own verdict that it cannot read replies on a page where the send
+            # landed, so every further send would spend a message into the same blind reader —
+            # unless the page shows a human condition instead (read before the tab closes).
+            _b = _blocker(c)
+            why = {"blocker": _b} if _b else {"drift": "reader"}
+            if owns_tab:
+                c.close_tab()   # the send is confirmed and the conversation persists server-side
+            print(json.dumps({"ok": False, "submitted": True, "rid": a.rid, "phase": "contract",
+                              **why,
                               "reason": "selector_drift", "adapter": adapter, "contract": contract,
                               "conversation_id": conv}))
             sys.stderr.write(
@@ -2834,8 +3205,9 @@ def cmd_submit(a) -> int:
                 "the tab's URL shows a /c/<id>.\n")
             return 2
         _write_state(conversation=conv, rid=a.rid)  # so `followup`/`wait` can auto-resolve
-        print(json.dumps({"ok": True, "userMsgs": n, "model": model_now, "adapter": adapter,
-                          "modelBadge": model_badge,
+        print(json.dumps({"ok": True, "submitted": True, "reason": "landed", "phase": "contract",
+                          "userMsgs": n, "model": model_now, "adapter": adapter,
+                          "modelBadge": model_badge, "contract": contract,
                           "modelConfirmed": model_confirmed, "conversation_id": conv}))
         out = os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
         # Hand the agent the exact waiter to run (run_in_background:true). It holds the whole
@@ -2849,6 +3221,12 @@ def cmd_submit(a) -> int:
             "answer lands silently and you wait forever.\n")
         return 0
     finally:
+        # ONE owner of tab cleanup. A tab this command opened is closed on every exit BEFORE the send
+        # click, a return or an exception, since it holds nothing but a possible draft. After the click
+        # it is the evidence for an uncertain send and each outcome above decides for itself (and only
+        # ever for a tab it owns). A --reuse-tab tab was already there and is never closed here.
+        if owns_tab and pre_click:
+            c.close_tab()
         c.close()
 
 
@@ -2901,6 +3279,19 @@ def _extract_rid_from_prompt_file(prompt_file: str) -> str:
     return rids[0]
 
 
+def _await_thread_rendered(c, seconds=30):
+    """A follow-up continues a thread that already holds at least one user turn, so a page that shows
+    none has not hydrated yet: the composer appears seconds before the turns do (2.8s vs 7.1s on a
+    re-opened conversation). The baseline count below, the same-rid guard and the landed check all
+    read the turns, and an early read of 0 made the first new turn look like a confirmation."""
+    end = time.time() + seconds
+    while time.time() < end:
+        if (c.eval("document.querySelectorAll(" + _JS_U + ").length") or 0) > 0:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def cmd_followup(a) -> int:
     """Continue a consult THREAD (ChatGPT keeps the conversation's full context + model).
     Two ways to call it, both zero-bookkeeping:
@@ -2942,10 +3333,15 @@ def cmd_followup(a) -> int:
     if not _ok:
         sys.stderr.write(f"CGC_ERROR gate_refused: {_reason} — NOT sending the follow-up.\n")
         return 2
+    _why = _refuse_ambiguous_rid(rid, prompt, getattr(a, "mention", None), "follow-up")
+    if _why:
+        sys.stderr.write(_why + "\n")
+        return EXIT_NOT_SENT_PRECLICK
     # A consult is a THREAD: the conversation persists server-side at /c/<id> even after
     # its tab is closed (default), so follow-up must NOT depend on round-1 having kept the
     # tab. Attach to a live tab if one exists; otherwise RE-OPEN the conversation by URL.
     reopened = False
+    click_attempted = False   # flips just before the send click: after it, nothing is provably unsent
     try:
         c = CDP(a.port, match=conv)
     except SystemExit as e:
@@ -2962,6 +3358,7 @@ def cmd_followup(a) -> int:
         ready, _cstate = _await_composer(c)
         if not ready:
             _code, _msg = _composer_failure(_cstate)
+            print(json.dumps(_composer_outcome(_cstate)))
             sys.stderr.write(_msg + "\n")
             return _code
         # CONVERSATION-INTEGRITY GUARD (before any model-selection/insert): after attaching to a
@@ -2991,20 +3388,16 @@ def cmd_followup(a) -> int:
         if a.model and a.model.lower() != "skip":
             target = a.model
             if reopened:
-                # ROBUSTNESS: a freshly re-opened composer reports the model-tier switcher as
-                # None on the first probes (the switcher button hasn't hydrated yet) — reading
-                # that as "unselectable" is the recurring false refusal on reopen. Wait up to
-                # ~8s for the switcher to hydrate before letting _select_model act; only if it
-                # NEVER resolves do we fall through to the fail-closed path below. (_select_model
-                # itself then opens the picker and selects — this settle just gives it a live DOM
-                # to act on; the fail-closed guarantee is unchanged.)
-                _settle = time.time() + 8
-                while not (c.eval(_cand_labels_js()) or []) and time.time() < _settle:
-                    time.sleep(0.5)
+                # ROBUSTNESS: a freshly re-opened composer hydrates its switchers late — reading
+                # a half-built composer as "unselectable" is the recurring false refusal on reopen.
+                # Let them settle first (_settled_labels); if they never do, _select_model still
+                # runs and the fail-closed path below is unchanged.
+                _settled_labels(c)
             pick = _select_model(c, target, a.model_family)
             _fu_ok, model_now, model_badge = pick.confirmed, pick.shown, pick.badge
             if not _fu_ok and not a.allow_model_mismatch:
                 print(json.dumps({"ok": False, "followup": True, "conversation_id": conv,
+                                  "submitted": False, "reason": "model_not_selectable", "phase": "model",
                                   "rid": rid, "modelConfirmed": False, "model": model_now,
                                   "modelBadge": pick.badge, "wanted": target,
                                   "wantedFamily": a.model_family, "detail": pick.error}))
@@ -3021,6 +3414,16 @@ def cmd_followup(a) -> int:
                 return 2
         # Count user messages BEFORE sending so we can confirm a NEW one landed (the
         # thread already has >=1 user message, so an absolute >0 check would false-pass).
+        if not _await_thread_rendered(c):
+            # A follow-up continues a thread that already holds a user turn, so none rendering means
+            # the page has not hydrated. Every read below (baseline count, last-turn echo, the landed
+            # check) would then start from an empty page: the old turns hydrating after the click
+            # would look like growth, and a same-rid turn like a fresh echo. Nothing is pasted or
+            # clicked; the caller may retry.
+            sys.stderr.write("CGC_ERROR not_sent_preclick: the conversation's turns never rendered "
+                             "(page not hydrated), so a landed send could not be told from the old "
+                             "turns appearing — NOT sent; safe to retry with the same --request-key.\n")
+            return EXIT_NOT_SENT_PRECLICK
         u_before = c.eval("document.querySelectorAll(" + _JS_U + ").length") or 0
         # The last user turn's text before sending. A retry of the SAME rid (the automatic continue
         # after a failed turn) sends into a thread whose last turn already echoes that rid, so the
@@ -3047,6 +3450,8 @@ def cmd_followup(a) -> int:
         try:
             _paste_prompt(c, prompt, a.mention)
         except _MentionFailure as e:
+            print(json.dumps({"ok": False, "submitted": False, "reason": "mention_not_found",
+                              "phase": "mention"}))
             sys.stderr.write(f"CGC_ERROR {e} — NOT sent.\n")
             return 3
         except _PreClickFailure as e:
@@ -3054,12 +3459,20 @@ def cmd_followup(a) -> int:
                              "same --request-key.\n")
             return EXIT_NOT_SENT_PRECLICK
         time.sleep(0.3)
-        clicked = c.eval(
-            "(function(){var b=document.querySelector('button[data-testid=\"send-button\"],"
-            "button[aria-label*=\"Send\" i],button[aria-label*=\"\\u53d1\\u9001\"]');"
-            "if(b&&!b.disabled){b.click();return true;}return false;})()")
-        if not clicked:
-            c.key("Enter", "Enter", 13)
+        if _past(getattr(a, "not_after", None)):    # `fire --use-by`, at the click (see cmd_submit)
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: expired: use-by {getattr(a, 'not_after', None)} passed before "
+                             "send — NOT sent.\n")
+            return EXIT_NOT_SENT_PRECLICK
+        click_attempted = True    # from here on a failure is post-click: uncertain, tab kept as evidence
+        may_send, press_enter, why = _send_verdict(c.eval(_send_click_js()))
+        if not may_send:
+            # Nothing was clicked and Enter is not pressed, so this is still provably unsent.
+            click_attempted = False
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: {why} — NOT sent; safe to retry with the "
+                             "same --request-key.\n")
+            return EXIT_NOT_SENT_PRECLICK
+        if press_enter:
+            c.key("Enter", "Enter", 13)   # no send button rendered yet, focus verified inside the composer
         # Landed-confirmation: on a long thread the DOM virtualizes older turns, so the rendered
         # user-turn COUNT can stay flat forever after a real send (observed live: a landed follow-up
         # returned ok:false because the render window kept its size). Count-increase is only the
@@ -3139,10 +3552,17 @@ def cmd_followup(a) -> int:
         # modelBadge here is the same PRE-SEND selection evidence submit reports (SHARED CONTRACT
         # #4): a follow-up re-asserts the tier/family on the thread, so it has its own selection
         # evidence and its own round row to carry it. It is NOT attribution — `wait`'s modelSlug is.
-        print(json.dumps({"ok": True, "userMsgs": n, "conversation_id": conv, "rid": rid,
-                          "followup": True, "modelBadge": model_badge,
+        print(json.dumps({"ok": True, "submitted": True, "reason": "landed", "phase": "echo",
+                          "userMsgs": n, "conversation_id": conv, "rid": rid,
+                          "followup": True, "modelBadge": model_badge, "echoedRid": echoed,
                           "wait_out": default_out, "watching": bool(a.watch)}))
     finally:
+        # A tab THIS command re-opened, left by any exit before the send click (a return or an
+        # exception), holds nothing but a possible draft and would leak: close it. A tab we attached
+        # to was already there (the user's, or another round's) and is never ours to close. After a
+        # click attempt the tab is the evidence for an uncertain send and stays.
+        if reopened and not click_attempted:
+            c.close_tab()
         c.close()
     if a.watch:
         # Same process now waits for the answer → the agent runs ONE backgrounded command for
@@ -3254,14 +3674,11 @@ def cmd_wait(a) -> int:
         # possibly several — most notably a retrieve's --parent source_rid, which must be located
         # and verified, never assumed to be the latest (that is the causal-substitution bug this
         # closes: a later same-thread send must never be mistaken for an earlier round's answer).
+        # strict also scopes every answer read below to rid's own turn's interval ([S3] fix), each
+        # read re-finding that turn by its canonical rid; 'auto' keeps the legacy unscoped lookup.
         strict = a.rid != "auto"
         rid = None
         observed_rid = None
-        # Set only in the strict branch, from _locate_source_turn's turn_index: the ordinal (DOM
-        # order) of the source turn among user turns, threaded into every _detect_js/_extract_js/
-        # _last_assistant_js call below so the answer can only come from THAT turn's interval
-        # ([S3] fix). Stays None for 'auto' — the legacy unscoped lookup.
-        turn_index = None
         rdl = time.time() + min(600, a.timeout)
         # At most ONE stale-tab reload per WAIT (see _reload_stale_tab) — one budget shared by
         # both triggers, the missing-source-turn one below and the frozen-stub one in the watch
@@ -3283,7 +3700,6 @@ def cmd_wait(a) -> int:
                 observed_rid = loc["observed_rid"]
                 if loc["present"]:
                     rid = a.rid
-                    turn_index = loc["turn_index"]
                     break
                 if not reloaded and time.time() >= stale_deadline:
                     reloaded = True
@@ -3331,7 +3747,7 @@ def cmd_wait(a) -> int:
             except Exception:
                 pass
             try:
-                st = json.loads(c.eval(_detect_js(rid, turn_index)) or "{}")
+                st = json.loads(c.eval(_detect_js(rid, scoped=strict)) or "{}")
             except Exception as e:
                 # transient CDP/eval hiccup — log and keep waiting, don't die
                 sys.stderr.write(f"CGC_WAIT eval-retry: {e}\n")
@@ -3339,9 +3755,10 @@ def cmd_wait(a) -> int:
                 continue
             ticks += 1
             if ticks == 1 or ticks % 5 == 0:  # heartbeat so the .output shows it's alive + diagnosable
-                sys.stderr.write(f"CGC_WAIT alive: gen={st.get('generating')} len={st.get('len')} "
-                                 f"done={st.get('done')} begin={st.get('begin')} end={st.get('end')} "
-                                 f"ac={st.get('ac')} t+{int(time.time()-(deadline-a.timeout))}s\n")
+                sys.stderr.write(f"CGC_WAIT alive: gen={st.get('generating')} node={st.get('node')} "
+                                 f"len={st.get('len')} done={st.get('done')} begin={st.get('begin')} "
+                                 f"end={st.get('end')} ac={st.get('ac')} "
+                                 f"t+{int(time.time()-(deadline-a.timeout))}s\n")
             card = _answer_approval(c)
             if card:
                 app, text = card
@@ -3375,7 +3792,7 @@ def cmd_wait(a) -> int:
                 # A RECOVERY wait (retrieve) looks at a turn sent long ago: if it is not generating
                 # and holds no answer now, none is coming. Watching it for the full budget held a
                 # worker slot for 90 minutes each and starved new sends queued behind it.
-                raw = _scoped_raw(c, rid, strict, turn_index)
+                raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
                 _write_private(a.out + ".raw", raw)
                 sys.stderr.write(
                     f"CGC_ERROR timeout_no_answer: {rid}'s turn has no answer and has not moved for "
@@ -3385,11 +3802,11 @@ def cmd_wait(a) -> int:
                     c.close_tab()
                 return 4
             if st.get("done"):
-                ans = c.eval(_extract_js(rid, turn_index)) or ""
-                _write_private(a.out, ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
-                # Attribution is read from the SAME turn_index that produced `ans`, and BEFORE the
+                ans = c.eval(_extract_js(rid, scoped=strict)) or ""
+                _write_verified(a.out, ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
+                # Attribution is read from the SAME scoped node that produced `ans`, and BEFORE the
                 # tab is closed below — afterwards the node is gone and the fact is unrecoverable.
-                _wait_receipt(rid, a.out, _read_attribution(c, rid, turn_index))
+                _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
                 sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out}\n")
                 conv = conv or c.conversation_id()
                 _write_state(conversation=conv, status="answered")  # mark this job answered
@@ -3425,26 +3842,29 @@ def cmd_wait(a) -> int:
                 if settle_start is None:
                     settle_start = time.time()
                 elif time.time() - settle_start >= a.settle_seconds:
-                    ans = c.eval(_extract_js(rid, turn_index)) or ""
+                    ans = c.eval(_extract_js(rid, scoped=strict)) or ""
+                    # Unwrapped salvage grabs the largest assistant node in the source turn's
+                    # interval with no rid anchor at all — re-check RIGHT NOW whether rid's turn is
+                    # still the conversation's latest (a later turn may have landed while we
+                    # waited): if not, that later turn now owns its own interval, so salvage must be
+                    # refused.
+                    allowed, observed_rid, _present = _salvage_allowed(c, rid)
+                    raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
+                    # The extract and this read are separate evals of one node, so an answer can
+                    # finish between them: text the canonical parser finds wrapped is never
+                    # salvaged as unwrapped.
+                    ans = ans or _sentinel_parse(raw, rid)[1]
                     if ans:
-                        _write_private(a.out, ans)
-                        _wait_receipt(rid, a.out, _read_attribution(c, rid, turn_index))
+                        _write_verified(a.out, ans)
+                        _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
                         sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out} (recovered at settle)\n")
                         if not a.keep_tab:
                             c.close_tab()
                         return 0
-                    # No sentinel wrapper yet. Unwrapped salvage grabs the largest assistant node in
-                    # the source turn's interval with no rid anchor at all — re-check RIGHT NOW
-                    # whether rid's turn is still the conversation's latest (a later turn may have
-                    # landed while we waited): if not, that later turn now owns its own interval, so
-                    # salvage must be refused. Use the FRESH turn_index from this check (DOM
-                    # composition may have shifted since the wait started), not the cached one.
-                    allowed, observed_rid, fresh_turn_index, _present = _salvage_allowed(c, rid)
-                    raw = _scoped_raw(c, rid, strict, fresh_turn_index)
                     if allowed and len(raw) >= a.min_unwrapped:
                         _write_private(a.out, raw)
                         _write_private(a.out + ".raw", raw)
-                        _wait_receipt(rid, a.out, _read_attribution(c, rid, fresh_turn_index))
+                        _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
                         sys.stderr.write(
                             f"CGC_UNWRAPPED wrote {len(raw)} chars to {a.out} (also saved to {a.out}.raw): "
                             f"the model did NOT emit BEGIN/END_RESPONSE:{rid}, so the whole last message "
@@ -3480,13 +3900,6 @@ def cmd_wait(a) -> int:
                                 c, f"{stub_cycles} consecutive stub-stable reads for {rid}, all "
                                    f"frozen at {stub_len} chars with no generation "
                                    f"(~{int(stub_cycles * a.settle_seconds)}s of a motionless DOM)")
-                            # The turn ordinal was read off the DOM we just declared untrustworthy;
-                            # re-locate the source turn on the rebuilt page rather than keep scoping
-                            # the answer by an ordinal that may have shifted.
-                            if strict:
-                                _ok, _obs, fresh_idx, fresh_present = _salvage_allowed(c, rid)
-                                if fresh_present:
-                                    turn_index = fresh_idx
             else:
                 # Generating, or the byte count moved: the round is alive. This is the reset that
                 # keeps the frozen-stub trigger off every legitimate thinking/streaming pause.
@@ -3511,19 +3924,20 @@ def cmd_wait(a) -> int:
         #   present answer).
         # - empty / only short streaming stubs → exit 4, a genuine no-answer timeout, DISTINCT from
         #   the salvage case above (they do not conflict).
-        rescue = c.eval(_extract_js(rid, turn_index)) or ""
+        rescue = c.eval(_extract_js(rid, scoped=strict)) or ""
+        # Re-check (see the settle-time comment above) whether rid's turn is still the
+        # conversation's latest before considering unwrapped salvage — a later turn may have landed
+        # anywhere during the whole wait, not just at the settle instant.
+        allowed, observed_rid, present = _salvage_allowed(c, rid)
+        raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
+        rescue = rescue or _sentinel_parse(raw, rid)[1]   # wrapped text is never salvaged as unwrapped
         if rescue:
-            _write_private(a.out, rescue)
-            _wait_receipt(rid, a.out, _read_attribution(c, rid, turn_index))
+            _write_verified(a.out, rescue)
+            _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
             sys.stderr.write(f"CGC_DONE wrote {len(rescue)} chars to {a.out} (rescued at timeout)\n")
             if not a.keep_tab:
                 c.close_tab()
             return 0
-        # No sentinel wrapper. Re-check (see the settle-time comment above) whether rid's turn is
-        # still the conversation's latest before considering unwrapped salvage — a later turn may
-        # have landed anywhere during the whole wait, not just at the settle instant.
-        allowed, observed_rid, fresh_turn_index, present = _salvage_allowed(c, rid)
-        raw = _scoped_raw(c, rid, strict, fresh_turn_index)
         if not present and strict:
             sys.stderr.write(
                 f"CGC_WAIT interval_unresolved: source_rid={rid}'s own turn could no longer be "
@@ -3532,7 +3946,7 @@ def cmd_wait(a) -> int:
         if allowed and len(raw) >= a.min_unwrapped:
             _write_private(a.out, raw)
             _write_private(a.out + ".raw", raw)
-            _wait_receipt(rid, a.out, _read_attribution(c, rid, fresh_turn_index))
+            _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
             sys.stderr.write(
                 f"CGC_UNWRAPPED wrote {len(raw)} chars to {a.out} (also saved to {a.out}.raw): the "
                 f"model did NOT emit BEGIN/END_RESPONSE:{rid} — best-effort salvage at timeout; "
@@ -3675,13 +4089,14 @@ def main() -> int:
                          "Medium/Instant/etc. Pass 'skip' to leave as-is.")
     su.add_argument("--model-family", default=CGC_MODEL_FAMILY,
                     help="MODEL to pin in the same picker menu, a separate dimension from the tier "
-                         "(default $CGC_MODEL_FAMILY or 'Latest'). GPT-6's composer lists the model "
+                         "(default $CGC_MODEL_FAMILY or 'GPT-6'). GPT-6's composer lists the model "
                          "as radios beside the power slider, so 'Pro on GPT-5.5' is reachable and "
                          "would otherwise pass the tier check silently. 'skip' = don't check. A "
                          "build with no such radios ignores this.")
     su.add_argument("--reuse-tab", action="store_true",
                     help="navigate the existing single tab instead of opening a dedicated one "
                          "(default: own tab per consult, for safe concurrency)")
+    su.add_argument("--not-after", metavar="ISO", help=_NOT_AFTER_HELP)
     su.add_argument("--allow-model-mismatch", action="store_true",
                     help="send even if the target model could not be selected (default: fail-closed, "
                          "do not submit on the wrong model)")
@@ -3713,7 +4128,7 @@ def main() -> int:
                          "leave as-is (old behavior).")
     fu.add_argument("--model-family", default=CGC_MODEL_FAMILY,
                     help="MODEL to re-assert on the thread alongside the tier (default "
-                         "$CGC_MODEL_FAMILY or 'Latest'). 'skip' = don't check; a build without the "
+                         "$CGC_MODEL_FAMILY or 'GPT-6'). 'skip' = don't check; a build without the "
                          "model radios ignores it.")
     fu.add_argument("--allow-model-mismatch", action="store_true",
                     help="send the follow-up even if the target tier can't be selected (default: "
@@ -3723,6 +4138,7 @@ def main() -> int:
     # --watch: send AND wait in ONE process, so a follow-up is a single backgrounded command
     # (run_in_background:true) whose exit wakes the agent — no separate `wait` step to forget
     # or mis-arm. This is the recommended way to run a follow-up.
+    fu.add_argument("--not-after", metavar="ISO", help=_NOT_AFTER_HELP)
     fu.add_argument("--watch", action="store_true",
                     help="after sending, wait inline for the answer and write it to --out, then exit "
                          "(one-shot send+wait; the exit is the wake). REQUIRES --out.")

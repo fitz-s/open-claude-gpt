@@ -32,6 +32,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import pathlib
@@ -114,7 +115,16 @@ BEGIN_RESPONSE:{rid}
 END_RESPONSE:{rid}"""
 
 
-PROMPT_TEMPLATE = """# {title}
+# The rid marker: the FIRST thing in every rendered prompt, plain text so a markdown-rendered bubble
+# keeps it verbatim. ChatGPT collapses a long user message to its head plus "Show more" and the sentinel
+# pair is the LAST thing in the render, so a collapsed turn's DOM never carries the pair; the head is the
+# one part that is never collapsed. cdp_consult._turn_canonical_rid reads the turn's own rid from the first
+# such token in the turn (SHARED CONTRACT #3); an @mention label may be pasted ahead of the prompt, which is
+# why it is a token and not "the first line". `{rid}` is substituted like the sentinels' — logical_sha
+# renders "<RID>" here too.
+RID_MARKER = "CGC_RID:{rid}\n\n"
+
+PROMPT_TEMPLATE = RID_MARKER + """# {title}
 
 Role: {role}
 
@@ -139,7 +149,16 @@ Role: {role}
 """ + RESPONSE_WRAP
 
 
-FOLLOWUP_TEMPLATE = """# {title}
+# `fire --workspace NAME` declares that this question's evidence lives in a local WebCodex workspace,
+# reached through the --mention'd app. This is the sentence prep renders for it, and its opening is
+# the phrase every source gate keys on (compared lowercased) to accept a prompt that names a
+# workspace in place of a code link: cgc_spool.validate_prompt + cmd_enqueue, and
+# cdp_consult._has_sendable_source. It carries no URL, so every secret-shape and URL-provenance rule
+# still runs over the prompt unchanged. No "@" in the text: a literal @ pasted into the composer
+# could open the mention popup mid-paste; the app is attached by the driver, not by this prose.
+WORKSPACE_SENTINEL = "Source: local workspace `"
+
+FOLLOWUP_TEMPLATE = RID_MARKER + """# {title}
 
 Continuing this consult.
 
@@ -597,6 +616,46 @@ def cmd_deliver(a: argparse.Namespace) -> int:
     return out
 
 
+def policy_rev() -> str:
+    """Which version of the consult policy a round was fired under: sha256[:12] over SKILL.md,
+    ACTIVATION.md and the prompt text (both templates and the output arms), read NOW. The feedback
+    loop attributes graded outcomes to the policy that produced them, so an edit to any of these
+    must change the revision; a missing file contributes nothing rather than failing a fire."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    h = hashlib.sha256()
+    for name in ("SKILL.md", "ACTIVATION.md"):
+        try:
+            h.update(pathlib.Path(root, name).read_bytes())
+        except OSError:
+            pass
+        h.update(b"\0")
+    for t in (PROMPT_TEMPLATE, FOLLOWUP_TEMPLATE, DEFAULT_OUTPUT_BODY, REPLACE_OUTPUT_OPEN,
+              OUTPUT_CLOSE):
+        h.update(t.encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()[:12]
+
+
+_DUR_UNIT_S = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+_DUR_RE = re.compile(r"^\+(?:\d+[smhd])+$")
+
+
+def _when(v: str) -> datetime.datetime:
+    """`ISO8601 | +DURATION` (+90m, +2h, +1d, +1h30m) -> an aware UTC datetime. A naive ISO time is
+    the caller's local time. Raises ValueError naming the accepted forms on anything else."""
+    v = (v or "").strip()
+    if _DUR_RE.match(v):
+        secs = sum(int(n) * _DUR_UNIT_S[u] for n, u in re.findall(r"(\d+)([smhd])", v))
+        return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=secs)
+    try:
+        t = datetime.datetime.fromisoformat(v[:-1] + "+00:00" if v.endswith("Z") else v)
+    except ValueError:
+        raise ValueError(f"{v!r} is neither an ISO-8601 time nor a +DURATION like +90m / +2h / +1d")
+    if t.tzinfo is None:
+        t = t.astimezone()
+    return t.astimezone(datetime.timezone.utc)
+
+
 def cmd_prep(a: argparse.Namespace) -> int:
     if a.target_chars < 2000 or a.hard_chars < a.target_chars:
         raise SystemExit("CGC_ERROR bad_chunk_sizes: need target-chars>=2000 and hard-chars>=target-chars")
@@ -662,7 +721,11 @@ def cmd_prep(a: argparse.Namespace) -> int:
         # of ABSTRACTED PROSE is NOT the code — ChatGPT can't read the repo from a description and
         # answers BLIND ("no file access, can't cite file:line"). So --refs-file is REQUIRED for a
         # non-followup consult; --context-file is only a supplement. This is THE recurring failure.
-        if not a.followup and not refs and not a.no_code:
+        workspace = getattr(a, "workspace", None)
+        if workspace and a.no_code:
+            raise SystemExit("CGC_ERROR workspace_conflict: --workspace is a code source and --no-code "
+                             "says there is none. Pass one.")
+        if not a.followup and not refs and not a.no_code and not workspace:
             raise SystemExit(
                 "CGC_ERROR no_code_source: no actual code link attached (no --refs-file)."
                 + (" A --context-file was given, but ABSTRACTED PROSE IS NOT THE CODE — ChatGPT can't "
@@ -683,6 +746,11 @@ def cmd_prep(a: argparse.Namespace) -> int:
             context_block = f"\n## {label}\n{ctx}\n"
         # The source-handling instruction lives WITH the sources, so when no refs are
         # attached the prompt makes no dangling reference to a source section.
+        ws_block = ""
+        if workspace:
+            apps = " and ".join(f'"{m}"' for m in getattr(a, "mention", None) or []) or "its app"
+            ws_block = ("\n# Workspace\n" + WORKSPACE_SENTINEL + workspace + "`, reachable through the "
+                        + apps + " app's tools; state the revision/as-of time you read.\n")
         refs_block = ""
         if a.no_code and not refs:
             # Declares the consult carries no code, for the model AND for the daemon's gate, which
@@ -711,6 +779,7 @@ def cmd_prep(a: argparse.Namespace) -> int:
                     "code as ground truth over any inline summary. If a link won't load, try another route "
                     "and name anything you still cannot read.\n"
                     f"{refs}\n")
+        refs_block = ws_block + refs_block
         # The output contract is resolved ONCE, ABOVE the initial/continuation split. It used to
         # live inside the non-followup branch, so --output-file/--output-replace were silently
         # dropped on every follow-up and the round got FOLLOWUP_TEMPLATE's hardcoded findings
@@ -885,6 +954,32 @@ def cmd_fire(a: argparse.Namespace) -> int:
     debugging and for anyone who wants to edit the refs or the prompt in between."""
     import cgc_spool as spool
 
+    # Schedule and intent, validated BEFORE deliver/prep so a bad flag costs nothing.
+    try:
+        not_before = _when(a.not_before) if getattr(a, "not_before", None) else None
+        use_by = _when(a.use_by) if getattr(a, "use_by", None) else None
+    except ValueError as e:
+        sys.stderr.write(f"CGC_ERROR bad_schedule: {e}. Nothing was queued.\n")
+        return 2
+    if use_by and (use_by <= datetime.datetime.now(datetime.timezone.utc)
+                   or (not_before and use_by <= not_before)):
+        sys.stderr.write("CGC_ERROR bad_schedule: --use-by must be later than now and than "
+                         "--not-before, or the round could never send. Nothing was queued.\n")
+        return 2
+    meta = {k: getattr(a, k, None) for k in ("origin", "trigger", "decision", "baseline", "check")}
+    meta = {k: v for k, v in meta.items() if v}
+    if use_by:
+        meta["use_by"] = use_by.isoformat()
+    meta["policy_rev"] = policy_rev()
+
+    workspace = getattr(a, "workspace", None)
+    if workspace and not getattr(a, "mention", None):
+        sys.stderr.write(
+            "CGC_ERROR workspace_needs_mention: --workspace names where the evidence lives, but the "
+            "remote model can only reach a local workspace through an app. Add --mention \"<app>\" "
+            "(see `consult.py apps`). Nothing was queued.\n")
+        return 2
+
     # A follow-up continues a thread — but it no longer needs a hand-tracked conversation id. A bare
     # `--followup` (or `--conversation auto`/`last`) defaults to the LAST completed consult's thread,
     # which enqueue resolves from the store while the intent is fresh. This is the whole point of
@@ -920,7 +1015,8 @@ def cmd_fire(a: argparse.Namespace) -> int:
                 "built yourself (deliver is then skipped), or the deliver args to have one built for "
                 "you. Nothing was sent.\n")
             return 2
-    elif not a.no_code:
+    elif not a.no_code and not (workspace and not any(
+            (a.repo, a.pr, a.ref, a.compare, a.pulls, a.files, a.issues))):
         d = cmd_deliver(a)
         if not isinstance(d, dict) or not d.get("refs_file"):
             note = (d or {}).get("note") or "deliver produced no refs"
@@ -941,11 +1037,15 @@ def cmd_fire(a: argparse.Namespace) -> int:
         project_url=a.project_url, conversation=(a.conversation or "auto"),
         parent=getattr(a, "parent", None), model=a.model, mentions=getattr(a, "mention", None) or [],
         request_key=getattr(a, "request_key", None),
-        logical_sha=st.get("logical_sha"),
+        logical_sha=st.get("logical_sha"), consult_meta=meta,
+        not_before=not_before.isoformat() if not_before else None,
         out=a.out, poll=spool.POLL_S, timeout=spool.STUCK_AFTER_S, quiet=True)
     if spool.cmd_enqueue(eq) != 0:
         return 2
-    out = os.path.abspath(a.out or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt"))
+    # enqueue may have matched an existing round instead of queuing this one (a repeated
+    # --request-key): it re-points eq at that round, so read the rid and answer path back from eq.
+    rid = eq.rid
+    out = os.path.abspath(eq.out or os.path.join(spool.CGC_STATE_DIR, f"answer_{rid}.txt"))
     spool_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgc_spool.py")
     await_argv = ["python3", spool_py, "await", "--rid", rid]
     # argv is the canonical receipt; the string is only a copyable display (shell-quoted so a path
@@ -956,12 +1056,19 @@ def cmd_fire(a: argparse.Namespace) -> int:
 
 DEFAULT_APPS = "WebCodex Demo"
 
+# An @mention label is pasted into the composer AHEAD of the prompt, so the turn's text opens with it.
+# A name carrying the rid marker token would put a foreign `CGC_RID:` first and the turn would read as
+# another request (cdp_consult._turn_canonical_rid takes the FIRST token). Refused at input, in any case.
+_MARKER_NAME_RE = re.compile(r"cgc_rid", re.IGNORECASE)
+_MARKER_NAME_WHY = ("an app name may not contain 'CGC_RID': the label is pasted ahead of the prompt and "
+                    "would put a foreign rid marker first, so the turn would read as another request")
+
 
 def known_apps() -> list:
     """The ChatGPT apps this user has told us about (CGC_APPS, comma-separated) — the list an agent
     reads with `consult.py apps` instead of reasoning about what exists."""
     raw = os.environ.get("CGC_APPS", DEFAULT_APPS)
-    return [x for x in (" ".join(p.split()).lstrip("@").strip() for p in raw.split(",")) if x]
+    return [x for x in (" ".join(p.split()).lstrip("@").strip() for p in raw.split(",")) if x and not _MARKER_NAME_RE.search(x)]
 
 
 def _mention_name(v: str) -> str:
@@ -971,14 +1078,39 @@ def _mention_name(v: str) -> str:
     v = " ".join((v or "").split()).lstrip("@").strip()
     if not v or len(v) > 80:
         raise argparse.ArgumentTypeError("a --mention is the app's name as ChatGPT shows it, 1-80 chars")
+    if _MARKER_NAME_RE.search(v):
+        raise argparse.ArgumentTypeError(_MARKER_NAME_WHY)
     apps, low = known_apps(), v.lower()
     exact = [x for x in apps if x.lower() == low]
     pref = [x for x in apps if x.lower().startswith(low)]
     return exact[0] if exact else (pref[0] if len(pref) == 1 else v)
 
 
+def known_workspaces() -> list:
+    """The local WebCodex workspaces the user registered (CGC_WORKSPACES, comma-separated, default
+    none) — read like CGC_APPS. An agent cannot see that registry, so this list is how it knows
+    when the --workspace route applies."""
+    raw = os.environ.get("CGC_WORKSPACES", "")
+    return [x for x in (" ".join(p.split()) for p in raw.split(",")) if x]
+
+
+def _workspace_name(v: str) -> str:
+    """Normalize a --workspace the way _mention_name does an app: a case-insensitive exact or UNIQUE
+    prefix hit on a listed workspace becomes its canonical spelling; an unlisted name passes through.
+    The name is rendered inside backticks, so backticks and control characters are refused."""
+    v = " ".join((v or "").split())
+    if not v or len(v) > 80 or "`" in v or not v.isprintable():
+        raise argparse.ArgumentTypeError(
+            "a --workspace is the registered workspace's name, 1-80 printable chars, no backticks")
+    ws, low = known_workspaces(), v.lower()
+    exact = [x for x in ws if x.lower() == low]
+    pref = [x for x in ws if x.lower().startswith(low)]
+    return exact[0] if exact else (pref[0] if len(pref) == 1 else v)
+
+
 def cmd_apps(a) -> int:
-    print(json.dumps({"apps": known_apps(), "usage": 'fire ... --mention "<app>"',
+    print(json.dumps({"apps": known_apps(), "workspaces": known_workspaces(),
+                      "usage": 'fire ... --mention "<app>"',
                       "configure": "python3 " + os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                        "cgc_config.py") + ' set CGC_APPS "App One,App Two"'}, ensure_ascii=False))
     return 0
@@ -1096,6 +1228,26 @@ def main() -> int:
                     help="ChatGPT app/plugin to @mention (repeatable), name WITHOUT the '@', e.g. "
                          "--mention \"WebCodex Demo\". The daemon picks it from the composer's @ popup "
                          "before pasting the prompt; never write '@App' into --task.")
+    pf.add_argument("--workspace", type=_workspace_name,
+                    help="the evidence for this question lives in a local WebCodex workspace of this "
+                         "name (see `consult.py apps`), reached through --mention. It stands in for the "
+                         "code link the source rule demands, so the round no longer has to claim "
+                         "--no-code; REQUIRES at least one --mention. Every secret and URL gate still runs.")
+    pf.add_argument("--origin", choices=("agent", "user"),
+                    help="who decided to fire this: the agent on its own initiative, or the user asked")
+    pf.add_argument("--trigger", choices=("premise-conflict", "workspace-evidence", "design-fork",
+                                          "math", "competing-causes", "reviewer-disagreement",
+                                          "external-contract", "writing", "research", "review",
+                                          "other"),
+                    help="which activation trigger applied (graded per trigger in `stats --week`)")
+    pf.add_argument("--decision", help="the action this answer can change")
+    pf.add_argument("--baseline", help="your current answer (or gpt-sol's), frozen BEFORE the answer")
+    pf.add_argument("--check", help="how the result will be judged")
+    pf.add_argument("--not-before", help="ISO-8601 time or +DURATION (+90m, +2h, +1d): the daemon will "
+                                         "not send before it, so a complete question can wait in the "
+                                         "backlog")
+    pf.add_argument("--use-by", help="ISO-8601 time or +DURATION: past it the round never sends — it "
+                                     "ends `failed` (expired), not charged")
     pf.set_defaults(fn=cmd_fire)
 
     sub.add_parser("apps", help="list the ChatGPT apps --mention knows (CGC_APPS); local, no network"

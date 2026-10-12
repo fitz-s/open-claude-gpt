@@ -98,6 +98,13 @@ STUCK_AFTER_S = 5400
 # How often to look. An interval, not a deadline.
 POLL_S = 20
 
+# The three phrases that declare a LEGITIMATE reason a prompt carries no code LINK (compared against
+# the lowercased prompt): a follow-up, a self-contained no-code question, or a question whose evidence
+# lives in a local WebCodex workspace (`fire --workspace`, which requires a --mention). Honoured by
+# validate_prompt and cmd_enqueue here and by cdp_consult._has_sendable_source; tests/test_parity.py
+# pins all three together. None of them exempts any other rule.
+_WORKSPACE_SENTINEL = "source: local workspace `"
+
 # rid shape must match cdp_consult.py exactly.
 _RID_RE = re.compile(r"^REQ-\d{8}-\d{6}-[0-9a-f]{6}$")
 
@@ -611,8 +618,9 @@ def validate_prompt(prompt_text: str) -> tuple:
     the external ChatGPT session. Rules, all fail-closed:
       1. Must contain at least one real public-code link (github/gist/raw), UNLESS it is a follow-up
          (the thread already holds the code) or a declared no-code consult — `prep --no-code`, for a
-         maths/research/writing question, renders "references no code". Rules 2-4 still apply to
-         both. Note what this rule is and isn't: it stops a *code* consult from going out as blind
+         maths/research/writing question, renders "references no code" — or a `fire --workspace`
+         question, whose evidence is in a local WebCodex workspace, renders "Source: local
+         workspace `NAME`". Rules 2-4 still apply to all of them. Note what this rule is and isn't: it stops a *code* consult from going out as blind
          prose, which is a quality guard; the security guarantees are rules 2-4 (nothing private,
          nothing secret), and they are untouched by the exemption.
       2. Every github/raw repo slug in the prompt must be a gh-confirmed PUBLIC repo. Any private /
@@ -633,7 +641,8 @@ def validate_prompt(prompt_text: str) -> tuple:
             return False, f"refused: prompt contains what looks like a {label} — will not send it to an external service"
 
     links = _CODE_URL_RE.findall(text)
-    if not links and not is_followup and "references no code" not in low:
+    if (not links and not is_followup and "references no code" not in low
+            and _WORKSPACE_SENTINEL not in low):
         return False, "refused: no public code link (github/gist/raw URL) in the prompt — nothing safe to send"
 
     # 3. gists
@@ -727,15 +736,33 @@ def cmd_enqueue(a) -> int:
         prompt = open(a.prompt_file, encoding="utf-8").read()
         low = prompt.lower()
         is_followup = a.kind == "followup" or "continuing this consult" in low
+        # The turn this round will send must parse as THIS rid under the reader's own rule (the same
+        # helper the driver re-applies before the click): refuse now, so `fire` says so at once and
+        # not the daemon later. Imported lazily: cdp_consult is a heavy module the spool otherwise skips.
+        import cdp_consult as _cdp
+        why = _cdp._refuse_ambiguous_rid(a.rid, prompt, getattr(a, "mentions", None), "enqueue")
+        if why:
+            sys.stderr.write(why + "\n")
+            return 2
         for rx, label in _SECRET_RES:
             if rx.search(prompt):
                 sys.stderr.write(f"CGC_ERROR gate_secret: prompt looks like it contains a {label} — "
                                  "NOT enqueuing. Remove the secret from the prompt/context file, "
                                  "re-render it, then enqueue again.\n")
                 return 2
-        if not _CODE_URL_RE.search(prompt) and not is_followup and "references no code" not in low:
+        if _WORKSPACE_SENTINEL in low and not getattr(a, "mentions", None):
+            # The text claims its evidence is in a local workspace, which the remote model can only
+            # reach through an app. The gates see prompt text alone, so the requirement is enforced
+            # here, where the mentions are known (fire passes them; a bare `enqueue` has none).
+            sys.stderr.write("CGC_ERROR workspace_needs_mention: the prompt names a local workspace "
+                             "as its source, but the round has no --mention to reach it. Use "
+                             "`consult.py fire --workspace NAME --mention APP`.\n")
+            return 2
+        if (not _CODE_URL_RE.search(prompt) and not is_followup and "references no code" not in low
+                and _WORKSPACE_SENTINEL not in low):
             sys.stderr.write("CGC_ERROR no_code_source: prompt has no public code link — deliver "
-                             "a link first, or render a no-code question with `prep --no-code`.\n")
+                             "a link first, render a no-code question with `prep --no-code`, or name "
+                             "a local workspace with `fire --workspace NAME --mention APP`.\n")
             return 2
     return cgc_backend.enqueue_round(a, prompt, os.path.abspath(out))
 
@@ -839,7 +866,7 @@ def main() -> int:
                                     "ITS conversation (causal, unambiguous under concurrency). "
                                     "Preferred over --conversation auto.")
     e.add_argument("--model", default=os.environ.get("CGC_MODEL", "Pro"))
-    e.add_argument("--model-family", default=os.environ.get("CGC_MODEL_FAMILY", "Latest"),
+    e.add_argument("--model-family", default=os.environ.get("CGC_MODEL_FAMILY", "GPT-6"),
                    help="model family to pin, FROZEN into the round's spec here rather than read "
                         "from the daemon's environment at send time — so a queued round keeps the "
                         "family it was fired with. Part of the request-key fingerprint: the same "
@@ -883,7 +910,30 @@ def main() -> int:
 
     st = sub.add_parser("stats", help="reliability metrics: outcome rates + completion latency "
                                       "percentiles + sentinel-drift alarm")
-    st.set_defaults(fn=lambda a: __import__("cgc_backend").stats_report())
+    st.add_argument("--week", action="store_true",
+                    help="instead: the rolling-7-day view — potentially spent messages vs "
+                         "CGC_WEEKLY_BUDGET, answers awaiting a grade, backlog, expired rounds, "
+                         "grades by trigger and by mention, useful outcomes per message, and whether "
+                         "the weekly policy review was recorded")
+    st.set_defaults(fn=lambda a: __import__("cgc_backend").week_report() if a.week
+                    else __import__("cgc_backend").stats_report())
+
+    fb = sub.add_parser("feedback", help="grade a consult's answer (LOCAL only), or record the "
+                                         "weekly policy review with --policy")
+    fb.add_argument("--rid", help="the round whose answer you are grading (a retrieve round "
+                                  "resolves to the round it recovered)")
+    fb.add_argument("--grade", type=int, choices=(-1, 0, 1, 2),
+                    help="2 changed a decision or caught a defect, verified; 1 validated improvement "
+                         "or new evidence; 0 duplicate/late/refuted/unused/transport; -1 acting on it "
+                         "caused rework. 1 and 2 require --evidence.")
+    fb.add_argument("--reason", choices=("useful", "decision-changed", "defect-caught", "duplicate",
+                                         "late", "refuted", "unused", "transport", "missing-source",
+                                         "wrong"))
+    fb.add_argument("--action", help="what you did with the answer")
+    fb.add_argument("--evidence", help="a commit SHA, test, file, or concrete acceptance judgment")
+    fb.add_argument("--policy", help="record the weekly review: what rule/template/test changed and "
+                                     "why (stamped with the current policy_rev; takes no other flag)")
+    fb.set_defaults(fn=lambda a: __import__("cgc_backend").record_feedback(a))
 
     rc = sub.add_parser("reconcile", help="operator-driven durable reconcile of a stuck round "
                                           "(today: recording a verified not-sent proof)")

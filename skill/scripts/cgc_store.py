@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import hashlib
+import json
 import os
 import sqlite3
 import sys
@@ -368,6 +369,200 @@ def _new_id() -> str:
     return uuid.uuid4().hex
 
 
+def spent_messages(db) -> list:
+    """Every outgoing paid message that may have been spent, as (rid, kind, at). `db` is any sqlite3
+    connection onto the store, including a read-only one — the SessionStart snapshot has no Store.
+
+    One round can send more than once: its base send, and the single automatic "continue" a
+    ChatGPT-failed turn gets under the SAME rid. So the unit is the message, not the round.
+      - base: the round crossed the send fence (an `attempts` row, begin_send being its only writer)
+        and carries no durable not-sent proof. The proof covers every attempt so far: it is stamped
+        on a proven not-sent requeue or terminal and cleared by the next begin_send, so a requeued
+        round that never sent is free and one that later sent is charged once. An UNCERTAIN send is
+        charged: the click may have landed. `at` is the last attempt's start.
+      - continuation: a claimed `auto_continue` whose recorded result is landed, unsure, or absent
+        (the worker died between claim and result, possibly after the click). `not_sent` is free.
+    A `retrieve` never calls begin_send and never claims a continue, so it contributes nothing."""
+    base = db.execute(
+        "SELECT r.rid, r.kind, (SELECT max(a.started_at) FROM attempts a WHERE a.rid=r.rid) "
+        "FROM rounds r WHERE EXISTS(SELECT 1 FROM attempts a WHERE a.rid=r.rid) "
+        "AND (r.send_disposition IS NULL OR r.send_disposition<>?)", (NOT_SENT_PROVEN,)).fetchall()
+    cont = db.execute(
+        "SELECT r.rid, r.kind, e.at FROM rounds r JOIN events e "
+        "ON e.rid=r.rid AND e.kind='auto_continue' "
+        "WHERE COALESCE((SELECT x.detail FROM events x WHERE x.rid=r.rid "
+        "AND x.kind='auto_continue_result' ORDER BY x.id DESC LIMIT 1), 'claimed')<>'not_sent'"
+    ).fetchall()
+    return [tuple(r) for r in (*base, *cont)]
+
+
+WEEK_S = 7 * 86400   # the rolling window every weekly figure uses; no reset day to configure
+_DONE = (COMPLETED_VERIFIED, COMPLETED_UNVERIFIED)
+
+
+def _title(prompt) -> str:
+    """The round's headline: the first `# <title>` line of the rendered prompt. The templates open with
+    the `CGC_RID:<rid>` marker line, so the title is the first heading, not the first line."""
+    for ln in (prompt or "").splitlines():
+        if ln.startswith("# "):
+            return ln[2:].strip()[:80]
+    return ""
+
+
+def _spec(raw) -> dict:
+    try:
+        v = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def week_view(db, now=None) -> dict:
+    """The rolling-7-day picture the weekly review and the SessionStart line both read. ONE
+    definition, over any sqlite3 connection onto the store (a read-only one is fine), so the two
+    surfaces cannot disagree. Pure reads: nothing here writes, migrates, or touches updated_at.
+
+    Windowed by instant, never by calendar: a message counts for 7 days after it was sent, so the
+    budget frees up continuously and there is no reset day to configure. Timestamps are all written
+    by _now() (UTC isoformat), so string comparison orders them."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    t0 = (now - datetime.timedelta(seconds=WEEK_S)).isoformat()
+    t1 = now.isoformat()
+    q = lambda sql, *args: db.execute(sql, args).fetchall()  # noqa: E731
+
+    spent = [m for m in spent_messages(db) if m[2] and m[2] >= t0]
+    ungraded = [{"rid": r[0], "title": _title(r[1]), "completed_at": r[2]} for r in q(
+        "SELECT r.rid, r.rendered_prompt, r.updated_at FROM rounds r "
+        "WHERE r.state IN (?,?) AND r.kind<>'retrieve' AND r.updated_at>=? "
+        "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.rid=r.rid AND e.kind='consult_outcome') "
+        "ORDER BY r.updated_at", *_DONE, t0)]
+    # A scheduled round waits with a future not_before and no gate retries; a gate-backoff requeue
+    # (gate_retry_count>0) also has a future not_before but is a transient retry, not backlog.
+    backlog = [{"rid": r[0], "title": _title(r[1]), "not_before": r[2],
+                "use_by": _spec(r[3]).get("consult_meta", {}).get("use_by")} for r in q(
+        "SELECT rid, rendered_prompt, not_before, spec_json FROM rounds "
+        "WHERE state=? AND not_before>? AND gate_retry_count=0 ORDER BY not_before", QUEUED, t1)]
+    expired = [{"rid": r[0], "title": _title(r[1]), "error": r[2]} for r in q(
+        "SELECT rid, rendered_prompt, error_code FROM rounds "
+        "WHERE state=? AND error_code LIKE 'expired: use-by%' AND updated_at>=? ORDER BY updated_at",
+        FAILED, t0)]
+
+    by_trigger, by_mention, useful = {}, {}, 0
+    for rid, detail, spec in q(
+            "SELECT e.rid, e.detail, r.spec_json FROM events e JOIN rounds r ON r.rid=e.rid "
+            "WHERE e.kind='consult_outcome' AND e.at>=? AND e.id=(SELECT max(x.id) FROM events x "
+            "WHERE x.rid=e.rid AND x.kind='consult_outcome')", t0):
+        sp = _spec(spec)
+        g = str(_spec(detail).get("grade"))
+        trig = (sp.get("consult_meta") or {}).get("trigger") or "none"
+        ment = "with_mention" if sp.get("mentions") else "without_mention"
+        for tally, k in ((by_trigger, trig), (by_mention, ment)):
+            tally.setdefault(k, {})[g] = tally.setdefault(k, {}).get(g, 0) + 1
+        useful += g in ("1", "2")
+
+    pol = q("SELECT detail, at FROM events WHERE kind='policy_update' AND at>=? "
+            "ORDER BY id DESC LIMIT 1", t0)
+    durs = []
+    for c, u in q("SELECT created_at, updated_at FROM rounds WHERE state IN (?,?)", *_DONE):
+        try:
+            d = (datetime.datetime.fromisoformat(u) - datetime.datetime.fromisoformat(c)).total_seconds()
+        except (TypeError, ValueError):
+            continue
+        if d > 0:
+            durs.append(d)
+    durs.sort()
+    try:
+        budget = int(os.environ.get("CGC_WEEKLY_BUDGET", "").strip())
+    except ValueError:
+        budget = None
+    return {
+        "window": {"from": t0, "to": t1, "days": 7},
+        "budget": {"weekly": budget, "spent": len(spent),
+                   "available": max(0, budget - len(spent)) if budget is not None else None,
+                   **({} if budget is not None else {"note": "budget unset (set CGC_WEEKLY_BUDGET)"})},
+        "ungraded": ungraded, "backlog": backlog, "expired": expired,
+        "grades": {"by_trigger": by_trigger, "by_mention": by_mention},
+        "useful": {"outcomes": useful,
+                   "per_spent_message": round(useful / len(spent), 3) if spent else None},
+        "policy_update": ({"happened": True, "at": pol[0][1], **_spec(pol[0][0])} if pol
+                          else {"happened": False}),
+        "latency_p50_s": durs[len(durs) // 2] if durs else None,
+    }
+
+
+# ---- the UI contract: what a send needs from ChatGPT's page ---------------------------------
+# ChatGPT's web UI is an unversioned contract the driver reads by structure, and it moved four times
+# in three weeks. Each move was found one paid round at a time. A capability is one part of that
+# contract, recorded in `meta` under `ui.<name>` as JSON {ok, epoch, phase, cause,
+# rid_or_conversation, checked_at, driver_rev}. ABSENT means never established, which never gates:
+# only a recorded failure does. `epoch` grows on every write; a probe reads it before it starts, and
+# its pass may clear a failure only if no write happened since (Store.mark_passed).
+CAPABILITIES = ("composer", "model", "mention", "reader")
+
+
+# ---- use-by: `fire --use-by T` — a round whose answer is useless after T never sends after it --------
+def past(instant) -> bool:
+    """True iff the ISO-8601 `instant` has passed. None or unparseable -> False: a deadline is
+    validated at fire time, and a malformed one must never silently eat a paid round. The one
+    definition: the claim sweep, the worker's pre-send checks and the driver's click-time check."""
+    try:
+        t = datetime.datetime.fromisoformat(instant)
+    except (TypeError, ValueError):
+        return False
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return t <= datetime.datetime.now(datetime.timezone.utc)
+
+
+def use_by_of(spec) -> str | None:
+    """A round's use-by from its spec (a dict, or spec_json text)."""
+    spec = spec if isinstance(spec, dict) else _spec(spec)
+    return (spec.get("consult_meta") or {}).get("use_by")
+
+
+def _expired_fields(use_by: str) -> dict:
+    """An expired round's terminal fields: pre-send by construction (every caller runs before
+    begin_send), so not-sent-proven — never charged, and its request-key releases."""
+    return {"state": FAILED, "send_disposition": NOT_SENT_PROVEN,
+            "error_code": f"expired: use-by {use_by} passed before send"}
+
+
+MODEL_REF = "model:"   # a `model` verdict's ref: "model:<tier>@<family>", the pair it checked
+
+
+def model_ref(tier: str, family: str) -> str:
+    return f"{MODEL_REF}{tier}@{family}"
+
+
+def round_needs(kind: str, spec_json) -> tuple:
+    """The capabilities a round's send depends on. A retrieve sends nothing, so it needs none and is
+    never gated. Every send needs the composer (paste, read it back) and the reader (prove the turn
+    landed, read the answer). A round that selects a model needs `model:<tier>@<family>` for the pair
+    its spec froze — matched against the pair a verdict recorded, never against today's environment,
+    so a config change can neither gate an unrelated round nor release the one that failed. Only a
+    `skip` tier needs no model: a `skip` family still selects the tier. A round with an @mention also needs the mention picker."""
+    if kind == "retrieve":
+        return ()
+    spec = _spec(spec_json)
+    tier, family = spec.get("model") or "Pro", spec.get("model_family") or "GPT-6"
+    # `family='skip'` still selects the tier (cdp_consult._select_model skips only the family check),
+    # so only `tier='skip'` drops the model dependency.
+    model = () if tier.lower() == "skip" else (model_ref(tier, family),)
+    return ("composer", "reader") + model + (("mention",) if spec.get("mentions") else ())
+
+
+def _gate_keys(broken: dict) -> set:
+    """What each broken capability blocks, in round_needs' terms: a `model` break blocks only the
+    pair its record names; a legacy `model` record without one blocks nothing it cannot name."""
+    keys = set()
+    for name, rec in broken.items():
+        if name != "model":
+            keys.add(name)
+        elif str(rec.get("rid_or_conversation") or "").startswith(MODEL_REF):
+            keys.add(rec["rid_or_conversation"])
+    return keys
+
+
 def new_daemon_instance_id() -> str:
     """A fresh identity per daemon process — recorded on attempts so ownership is the daemon
     INSTANCE, not a reusable OS pid."""
@@ -488,12 +683,13 @@ class Store:
                      source_mode: str | None = None, out_path: str | None = None,
                      spec_json: str | None = None, prompt: str | None = None,
                      request_key: str | None = None, parent_rid: str | None = None,
-                     state: str = QUEUED) -> None:
+                     state: str = QUEUED, not_before: str | None = None) -> None:
         """Insert a new round. `prompt` (the exact rendered bytes to send) is stored on the round at
         enqueue, so the CLI receipt is just the rid and there is no prompt PATHNAME whose contents
         could drift before the gate reads them — the store row is the one copy. `request_key` is the
         caller's logical-request identity (unique where set — the idempotency anchor); `parent_rid`
-        records which consult a follow-up causally continues."""
+        records which consult a follow-up causally continues. `not_before` (UTC ISO-8601) schedules the
+        round: claim_ready will not pick it before that instant."""
         if state not in _LEGAL:
             raise ValueError(f"unknown initial state {state!r}")
         now = _now()
@@ -511,9 +707,9 @@ class Store:
             self.db.execute(
                 "INSERT INTO rounds(rid,thread_id,kind,source_mode,spec_json,rendered_prompt,"
                 "prompt_sha256,out_path,request_key,parent_rid,state,created_at,updated_at,"
-                "schema_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "schema_version,not_before) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rid, thread_id, kind, source_mode, spec_json, prompt, psha, out_path,
-                 request_key, parent_rid, state, now, now, SCHEMA_VERSION))
+                 request_key, parent_rid, state, now, now, SCHEMA_VERSION, not_before))
             self._event("created", rid=rid, detail=f"kind={kind} state={state}")
 
     def round_by_request_key(self, key: str) -> dict | None:
@@ -565,7 +761,7 @@ class Store:
                              thread_id: str | None = None, out_path: str | None = None,
                              spec_json: str | None = None, prompt: str | None = None,
                              request_key: str, parent_rid: str | None = None,
-                             state: str = QUEUED) -> None:
+                             state: str = QUEUED, not_before: str | None = None) -> None:
         """Atomically MOVE a request-key from a terminally-failed `old_rid` to a fresh successor
         round, in ONE transaction: clear the old row's key and INSERT the new row already holding it,
         so the UNIQUE key is never momentarily free for a concurrent retry to seize (the separate
@@ -596,9 +792,9 @@ class Store:
             self.db.execute(
                 "INSERT INTO rounds(rid,thread_id,kind,source_mode,spec_json,rendered_prompt,"
                 "prompt_sha256,out_path,request_key,parent_rid,state,created_at,updated_at,"
-                "schema_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "schema_version,not_before) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rid, thread_id, kind, None, spec_json, prompt, psha, out_path,
-                 request_key, parent_rid, state, now, now, SCHEMA_VERSION))
+                 request_key, parent_rid, state, now, now, SCHEMA_VERSION, not_before))
             self._event("created", rid=rid,
                         detail=f"kind={kind} state={state} (request-key transfer from {old_rid})")
 
@@ -663,7 +859,7 @@ class Store:
         self.db.execute(f"UPDATE rounds SET {assigns} WHERE rid=?", (*cols.values(), rid))
 
     # ---- claiming ------------------------------------------------------------
-    def claim_ready(self, daemon_instance_id: str) -> dict | None:
+    def claim_ready(self, daemon_instance_id: str, retrieve_only: bool = False) -> dict | None:
         """Atomically pick ONE queued round and move it to `ready`, returning it — the store-native
         replacement for the pending→processing rename. IMMEDIATE transaction + single-writer means
         two daemons cannot both claim the same round (and phase 5 enforces one daemon anyway).
@@ -682,17 +878,42 @@ class Store:
 
         `not_before`: a round requeued with a backoff (cgc_backend._gate_requeue_or_block) is not
         eligible until that instant — this is the ONE place that fence has to be enforced, since it
-        is claiming, not requeuing, that makes a round hot-spinnable again."""
+        is claiming, not requeuing, that makes a round hot-spinnable again.
+
+        THE UI-CONTRACT GATE, for the same reason: a round that needs a capability recorded broken
+        is skipped, not failed. It stays QUEUED and intact, and is claimed once a probe clears it.
+        Read inside this transaction, so a capability recorded broken before the claim is seen.
+        `retrieve_only` (a UI probe is running): only read-only retrieves are claimed; sends wait.
+
+        USE-BY, swept here first: a queued round past its use-by fails in this transaction, whether or
+        not the gate holds it. A gated round never reaches the worker's own use-by check, so without
+        this it would sit queued past its deadline — refire refusing it, a same-key retry getting it
+        back. (A claimed round is re-checked by the worker before begin_send and by the driver at the
+        click.)"""
         now = _now()
         with self._tx():
-            row = self.db.execute(
-                "SELECT rid FROM rounds r WHERE r.state=? AND (r.not_before IS NULL OR r.not_before<=?) "
+            for q in self.db.execute("SELECT rid,spec_json FROM rounds WHERE state=? "
+                                     "AND spec_json LIKE '%\"use_by\"%'", (QUEUED,)).fetchall():
+                use_by = use_by_of(q["spec_json"])
+                if use_by and past(use_by):
+                    self._apply_round_fields(q["rid"], **_expired_fields(use_by))
+                    self._event("state", rid=q["rid"], detail=f"{QUEUED} -> {FAILED} (use-by passed)")
+            broken = _gate_keys(self.broken_capabilities())
+            # Nothing broken (the common case): the first eligible row, as before. Otherwise walk the
+            # cursor in order and stop at the first round that needs nothing broken.
+            cur = self.db.execute(
+                "SELECT rid,kind,spec_json FROM rounds r WHERE r.state=? "
+                + ("AND r.kind='retrieve' " if retrieve_only else "") +
+                "AND (r.not_before IS NULL OR r.not_before<=?) "
                 "AND ("
                 "  r.kind!='followup' OR r.thread_id IS NULL OR NOT EXISTS ("
                 "    SELECT 1 FROM rounds o WHERE o.thread_id=r.thread_id AND o.rid!=r.rid"
                 f"     AND o.state IN (?,?,?)))"
-                " ORDER BY r.created_at LIMIT 1", (QUEUED, now, SENDING, ACCEPTED, WAITING)
-            ).fetchone()
+                " ORDER BY r.created_at" + ("" if broken else " LIMIT 1"),
+                (QUEUED, now, SENDING, ACCEPTED, WAITING))
+            row = next((c for c in cur
+                        if not broken & set(round_needs(c["kind"], c["spec_json"]))), None)
+            cur.close()
             if row is None:
                 return None
             rid = row["rid"]
@@ -722,6 +943,9 @@ class Store:
                 (attempt_id, rid, daemon_instance_id, browser_epoch, SENDING, now, now))
             self._apply_round_fields(rid, state=SENDING, rendered_prompt=rendered_prompt,
                                      prompt_sha256=prompt_sha256, current_attempt_id=attempt_id)
+            # A not-sent proof covers the attempts before this one (a proven not-sent requeue);
+            # this attempt may click, so the round no longer carries it.
+            self.db.execute("UPDATE rounds SET send_disposition=NULL WHERE rid=?", (rid,))
             self._event("begin_send", rid=rid, attempt_id=attempt_id,
                         detail=f"epoch={browser_epoch} sha256={prompt_sha256[:16]}")
         return attempt_id
@@ -748,7 +972,8 @@ class Store:
             if r["state"] not in (SENDING, POSSIBLY_ACCEPTED):
                 raise IllegalTransition(f"{rid}: mark_accepted from {r['state']!r}")
             self.db.execute(
-                "UPDATE attempts SET phase=?,last_progress_at=?,remote_evidence_json=? WHERE attempt_id=?",
+                "UPDATE attempts SET phase=?,last_progress_at=?,"
+                "remote_evidence_json=COALESCE(?,remote_evidence_json) WHERE attempt_id=?",
                 (ACCEPTED, now, evidence_json, attempt_id))
             if conversation_id:
                 # A fresh submit has no thread until its conversation is first known (here). Create
@@ -1094,6 +1319,94 @@ class Store:
                detail: str | None = None) -> None:
         self.db.execute("INSERT INTO events(rid,attempt_id,kind,detail,at) VALUES(?,?,?,?,?)",
                         (rid, attempt_id, kind, detail, _now()))
+
+    def record_outcome(self, rid: str, outcome: dict) -> None:
+        """A local grade of one round's answer. An event, never a column: grading must not move
+        rounds.updated_at (completion-latency stats read it), needs no migration, and the LATEST
+        consult_outcome event per rid is the grade that stands."""
+        with self._tx():
+            self._event("consult_outcome", rid=rid, detail=json.dumps(outcome, sort_keys=True))
+
+    def record_policy_update(self, policy_rev: str, text: str) -> None:
+        """The record that the weekly review happened and what it changed."""
+        with self._tx():
+            self._event("policy_update",
+                        detail=json.dumps({"policy_rev": policy_rev, "text": text}, sort_keys=True))
+
+    # ---- the UI contract (see CAPABILITIES) ------------------------------------
+    def capabilities(self) -> dict:
+        """{name: record} for every capability ever recorded; a never-probed one is absent."""
+        return {r["key"][3:]: _spec(r["value"]) for r in self.db.execute(
+            "SELECT key,value FROM meta WHERE key LIKE 'ui.%'") if r["key"][3:] in CAPABILITIES}
+
+    def broken_capabilities(self) -> dict:
+        return {k: v for k, v in self.capabilities().items() if v.get("ok") is False}
+
+    def capability_epoch(self) -> int:
+        """The counter every capability write advances. A probe reads it BEFORE it starts."""
+        row = self.db.execute("SELECT value FROM meta WHERE key='ui.epoch'").fetchone()
+        return int(row["value"]) if row else 0
+
+    def _write_capability(self, name: str, ok: bool, *, phase: str, cause: str | None,
+                          ref: str | None, driver_rev: str | None) -> dict:
+        if name not in CAPABILITIES:
+            raise ValueError(f"unknown capability {name!r}")
+        epoch = self.capability_epoch() + 1
+        rec = {"ok": ok, "epoch": epoch, "phase": phase, "cause": (cause or "")[:400] or None,
+               "rid_or_conversation": ref, "checked_at": _now(), "driver_rev": driver_rev}
+        self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('ui.epoch',?)", (str(epoch),))
+        self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                        ("ui." + name, json.dumps(rec, sort_keys=True)))
+        self._event("ui_" + ("pass" if ok else "broken"),
+                    detail=json.dumps({name: rec}, sort_keys=True))
+        return rec
+
+    def mark_broken(self, name: str, *, phase: str, cause: str, ref: str | None = None,
+                    driver_rev: str | None = None) -> dict:
+        """Record that `name` no longer matches ChatGPT's page. Always written: a failure is never
+        refused, whatever happened before it."""
+        with self._tx():
+            return self._write_capability(name, False, phase=phase, cause=cause, ref=ref,
+                                          driver_rev=driver_rev)
+
+    def mark_passed(self, name: str, *, started_epoch: int, phase: str, cause: str | None = None,
+                    ref: str | None = None, driver_rev: str | None = None) -> bool:
+        """Record a probe's pass, unless `name` was written after the probe started (its record's
+        epoch is past `started_epoch`): a real round's failure seen mid-probe is newer evidence than
+        a pass that began before it, so the stale pass is dropped. Read and write are one
+        transaction, so no failure can land between the comparison and the write. False when
+        dropped."""
+        with self._tx():
+            cur = self.capabilities().get(name)
+            if cur is not None and int(cur.get("epoch") or 0) > started_epoch:
+                return False
+            self._write_capability(name, True, phase=phase, cause=cause, ref=ref,
+                                   driver_rev=driver_rev)
+        return True
+
+    def gated_by(self, r: dict) -> dict:
+        """The broken capabilities this round's send needs ({} = not gated)."""
+        need = set(round_needs(r.get("kind") or "", r.get("spec_json")))
+        return {k: v for k, v in self.broken_capabilities().items()
+                if (v.get("rid_or_conversation") if k == "model" else k) in need}
+
+    def record_event(self, kind: str, *, rid: str | None = None, detail: str | None = None) -> None:
+        """A diagnostic event, in its own transaction; moves no round."""
+        with self._tx():
+            self._event(kind, rid=rid, detail=detail)
+
+    def record_attempt_evidence(self, attempt_id: str, evidence_json: str) -> None:
+        """The driver's typed outcome for one send attempt (cgc_backend._project_send)."""
+        with self._tx():
+            self.db.execute("UPDATE attempts SET remote_evidence_json=? WHERE attempt_id=?",
+                            (evidence_json, attempt_id))
+
+    def send_evidence(self, rid: str) -> dict | None:
+        """The current attempt's recorded driver outcome, or None (no attempt, or none recorded)."""
+        row = self.db.execute(
+            "SELECT a.remote_evidence_json v FROM rounds r JOIN attempts a "
+            "ON a.attempt_id=r.current_attempt_id WHERE r.rid=?", (rid,)).fetchone()
+        return (_spec(row["v"]) or None) if row and row["v"] else None
 
     def events(self, rid: str) -> list[dict]:
         return [dict(r) for r in self.db.execute(

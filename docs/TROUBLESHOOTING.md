@@ -68,8 +68,12 @@ Every job the daemon runs writes a full transcript of its send + wait to
 `await` names that path on any failure. It streams **live**, so you can watch a
 consult while it runs — the waiter's per-poll heartbeat is the line to read:
 
-    CGC_WAIT alive: gen=… len=… done=… begin=… end=… ac=…
+    CGC_WAIT alive: gen=… node=… len=… done=… begin=… end=… ac=…
 
+- `node=source_unrendered` — the round's own user turn is not in the tab's DOM right now, so
+  there is no interval to read (`len=0` here means "not looking", never "no answer"). The waiter
+  re-finds the turn by its rid on every poll, so this clears when the turn renders again.
+- `node=none` — the turn is there but has no assistant reply yet.
 - `ac=0` for the whole run — ChatGPT never produced an assistant turn at all. The
   prompt was inserted but the send didn't take, or the session was rejected. Look
   at the debug Chrome window.
@@ -99,7 +103,8 @@ raise this error — read the sentence after the colon to see which one failed.
 **The GPT-6 picker (2026-09-03 onward).** Opening the composer's switcher shows
 one menu carrying both dimensions: a power slider for the reasoning tier
 (`Instant / Medium / High / Extra High / Pro`) and, beside it, radio items for the
-model itself (`Latest` / `GPT-5.6 Sol` / `GPT-5.5`). The switcher button no longer
+model itself (`GPT-6` / `GPT-5.6 Sol` / `GPT-5.5`; the first was labelled `Latest` until
+2026-10). The switcher button no longer
 reads a tier at all — it shows the model badge (`6`). Older accounts still get the
 pre-GPT-6 forms (slider alone, an `Effort` submenu, or a flat menu), all of which
 are still driven; a build with no model radios has the family check skipped rather
@@ -116,7 +121,7 @@ changed`. None of the picker forms carried the target tier:
   one call, without changing your env config.
 
 **Family miss** — `model family '<name>' is not offered in this picker (offered:
-Latest, GPT-5.6 Sol, GPT-5.5)`. The radios are there and none of them is the model
+GPT-6, GPT-5.6 Sol, GPT-5.5)`. The radios are there and none of them is the model
 you pinned — usually a rename on OpenAI's side, a spelling that doesn't match the
 radio's own label exactly, or a plan that no longer lists that model. The error
 always names what the account actually offers, so copy one of those verbatim:
