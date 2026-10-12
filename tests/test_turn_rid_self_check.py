@@ -240,3 +240,16 @@ def test_the_automatic_continue_prompt_reaches_the_browser(driver):
     import cgc_backend
     with pytest.raises(_Reached):
         _followup(driver, R2, cgc_backend._continue_prompt(R2), mention=["WebCodex Demo"])
+
+
+def test_a_mention_holding_the_marker_in_any_case_is_refused():
+    """The picker matches app labels case-insensitively, so a requested `cgc_rid:R1` can attach a
+    `CGC_RID:R1` chip that the case-sensitive reader would then read ahead of this round's marker."""
+    import importlib, sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "skill", "scripts"))
+    cdp = importlib.import_module("cdp_consult")
+    rid = "REQ-20261011-120000-abcdef"
+    prompt = f"CGC_RID:{rid}\n\n# T\n\nBEGIN_RESPONSE:{rid}\nx\nEND_RESPONSE:{rid}"
+    for name in ("cgc_rid:REQ-20261011-110000-111111", "Cgc_Rid tools", "CGC_RID"):
+        assert cdp._refuse_ambiguous_rid(rid, prompt, [name], "submit"), name
+    assert cdp._refuse_ambiguous_rid(rid, prompt, ["WebCodex Demo"], "submit") is None
