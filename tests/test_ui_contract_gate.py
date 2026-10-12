@@ -225,10 +225,18 @@ def _collapsed_page(rid, *, answered=True, head_marker=True, extra=""):
             + _MAIN + "var document=ROOT;document.body=ROOT;var location={pathname:'/c/x'};")
 
 
-def _fast(monkeypatch, cdp):
+def _fast(monkeypatch, cdp, settled=True):
     monkeypatch.setattr(cdp.time, "sleep", lambda s: None)
     monkeypatch.setattr(cdp, "STALE_RELOAD_SETTLE_S", 0)
     monkeypatch.setattr(cdp, "_await_thread_rendered", lambda c, seconds=0: True)
+    # The waiter's settle signal (the switcher labels): settled, or never settling (bound reached).
+    if settled:
+        monkeypatch.setattr(cdp, "_settled_labels", lambda c, hold=4.0, bound=20.0: ["Pro"])
+    else:
+        def never(c, hold=4.0, bound=20.0):
+            cdp.time.sleep(bound)
+            return ["Pro"]
+        monkeypatch.setattr(cdp, "_settled_labels", never)
 
 
 def test_the_reader_probe_reads_a_collapsed_marker_turn(env, monkeypatch):
@@ -344,7 +352,8 @@ def test_transient_errors_leave_state_unchanged(env, monkeypatch):
     monkeypatch.setattr(cdp, "CDP", dead)
     monkeypatch.setenv("CGC_APPS", "")
     rep = probe.run_probe()
-    assert {v["verdict"] for v in rep.values()} <= {"transient", "unestablished"}
+    assert rep["composer"]["verdict"] == "transient"
+    assert rep["reader"]["verdict"] == "unprovable", "no fixture in this store (a no-op: reader is not broken)"
     assert s.capabilities() == before, "an inconclusive probe writes nothing"
     assert len(opened) == 2, "retried once, then reported inconclusive"
 
@@ -359,9 +368,10 @@ def test_a_confirmed_break_is_recorded_after_its_retry(env, monkeypatch):
                         or tabs[-1])
     monkeypatch.setenv("CGC_APPS", "")
     rep = probe.run_probe("composer")
-    assert rep["composer"]["verdict"] == "broken" and len(tabs) == 2
-    cap = env.s.capabilities()["composer"]
-    assert cap["ok"] is False and cap["phase"] == "probe:model" and "GPT-6" in cap["cause"]
+    assert rep["model"]["verdict"] == "broken" and len(tabs) == 2
+    assert rep["composer"]["verdict"] == "pass", "the paste is its own capability"
+    cap = env.s.capabilities()["model"]
+    assert cap["ok"] is False and cap["phase"] == "probe:done" and "GPT-6" in cap["cause"]
     assert [t.closed for t in tabs] == [1, 1], "each attempt closed its own tab"
 
 
@@ -379,7 +389,7 @@ def test_a_challenge_or_login_page_leaves_every_record_untouched(env, monkeypatc
     monkeypatch.setattr(cdp, "CDP", lambda port, match=None, create_url=None: _Composer(blocker=blocker))
     monkeypatch.setenv("CGC_APPS", "")
     rep = probe.run_probe("composer")
-    assert rep["composer"]["verdict"] == "transient" and rep["composer"]["phase"] == "human:" + blocker
+    assert rep["model"]["verdict"] == "transient" and rep["model"]["phase"] == "human:" + blocker
     assert s.capabilities() == before
     assert probe.print_states(rep) == 3       # reader is still broken; nothing new was written
 
@@ -615,6 +625,8 @@ def test_a_selector_drift_on_a_blocked_page_marks_nothing(env):
 
 def test_an_uncertain_send_never_auto_resends_and_keeps_its_typed_outcome(env, monkeypatch, capsys):
     backend, s, store_mod = env.backend, env.s, env.store_mod
+    fixture = "REQ-20261011-120000-0000f1"           # a finished round a probe could re-prove on
+    _completed(env, fixture, "CGC_RID:%s\n\nask" % fixture, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
     r = _ready(env, RID)
     calls = []
     contract = {"families": [{"adapter": "search-unit-v1", "ridLanded": True, "users": 1,
@@ -726,3 +738,210 @@ def test_finding8_once_ends_when_only_gated_rounds_remain(env):
     env.s.mark_broken("mention", phase="probe", cause="x")
     assert not d._claimable(), "a gated round is not claimable work: --once may exit"
     assert env.s.get_round(RID)["state"] == env.store_mod.QUEUED
+
+
+# ---- pre-release review: the ledger, the reader self-lock, use-by --------------------------------
+
+_MARKER_ERR = "CGC_ERROR model_not_selectable: wanted 'Pro', switcher shows 'Medium' — NOT submitting.\n"
+
+
+def _spent(e):
+    return [m[0] for m in e.store_mod.spent_messages(e.s.db)]
+
+
+def _preclick_requeue(e, rid):
+    r = _ready(e, rid)
+    res = {"code": 3, "conversation": "", "stderr": _MARKER_ERR,
+           "outcome": {"submitted": False, "reason": "model_not_selectable", "phase": "model"}}
+    assert e.backend.process_round(e.s, r, lambda kind, **kw: res, daemon_instance_id="d",
+                                   validate=lambda p: (True, "ok")) == e.store_mod.QUEUED
+
+
+def test_ledger_a_preclick_requeue_then_cancel_spends_nothing(env, capsys):
+    _preclick_requeue(env, RID)
+    assert _spent(env) == [], "the requeued attempt provably never clicked"
+    assert env.backend.cancel_round(RID) == 0
+    assert _spent(env) == []
+    assert env.backend._release_eligible(env.s, env.s.get_round(RID)), "its request-key is free"
+
+
+def test_ledger_a_preclick_requeue_then_a_real_send_spends_one(env):
+    _preclick_requeue(env, RID)
+    env.s.set_state(RID, env.store_mod.READY)
+    aid = env.s.begin_send(RID, "p", env.store_mod.sha256("p"), daemon_instance_id="d")
+    assert env.s.get_round(RID)["send_disposition"] is None, "this attempt may click: the proof is gone"
+    env.s.mark_accepted(aid, CONV)
+    assert _spent(env) == [RID]
+
+
+def test_ledger_an_uncertain_send_spends_one(env):
+    r = _ready(env, RID)
+    res = {"code": 1, "conversation": "", "stderr": "CGC_ERROR unknown_send: clicked send\n",
+           "outcome": {"submitted": None, "reason": "unknown_send", "phase": "contract"}}
+    assert env.backend.process_round(env.s, r, lambda kind, **kw: res, daemon_instance_id="d",
+                                     validate=lambda p: (True, "ok")) == env.store_mod.POSSIBLY_ACCEPTED
+    assert _spent(env) == [RID]
+
+
+def _drift(e, rid):
+    r = _ready(e, rid)
+    res = {"code": 1, "conversation": CONV, "stderr": "CGC_ERROR selector_drift: the prompt WAS sent\n",
+           "outcome": {"submitted": True, "reason": "selector_drift", "phase": "contract",
+                       "drift": "reader", "conversation_id": CONV}}
+    e.backend.process_round(e.s, r, lambda kind, **kw: res, daemon_instance_id="d",
+                            validate=lambda p: (True, "ok"))
+
+
+def test_reader_drift_with_no_fixture_is_recorded_not_gated(env):
+    _drift(env, RID)
+    assert env.s.capabilities() == {}, "nothing could re-prove it, so it must not gate"
+    assert any(e["kind"] == "ui_drift_ungated" for e in env.s.events(RID))
+    _queue(env, RID2)
+    assert env.s.claim_ready("d1")["rid"] == RID2, "sends keep flowing"
+
+
+def test_a_reader_break_whose_fixture_is_gone_is_cleared_as_unprovable(env, monkeypatch):
+    fixture = "REQ-20261011-120000-0000f2"
+    _completed(env, fixture, "CGC_RID:%s\n\nask" % fixture, "ffffffff-ffff-4fff-8fff-ffffffffffff")
+    _drift(env, RID)
+    assert env.s.capabilities()["reader"]["ok"] is False, "a fixture existed: the drift gates"
+    _queue(env, RID2)
+    assert env.s.claim_ready("d1") is None
+    # The fixture's thread then takes a new send, so it no longer serves.
+    env.s.create_round("REQ-20261011-120000-0000f3", "followup",
+                       thread_id="ffffffff-ffff-4fff-8fff-ffffffffffff", prompt="p")
+    env.s.set_state("REQ-20261011-120000-0000f3", env.store_mod.READY)
+    env.s.begin_send("REQ-20261011-120000-0000f3", "p", env.store_mod.sha256("p"), daemon_instance_id="d")
+    assert env.probe.pick_reader_round(env.s) is None
+    monkeypatch.setattr(env.cdp, "CDP", lambda *a, **k: pytest.fail("no tab: nothing to read"))
+    rep = env.probe.run_probe("reader")
+    assert rep["reader"]["verdict"] == "unprovable" and rep["reader"]["recorded"]
+    cap = env.s.capabilities()["reader"]
+    assert cap["ok"] is True and cap["phase"] == "unprovable" and "re-proven" in cap["cause"]
+    assert env.s.claim_ready("d1")["rid"] == RID2, "no deadlock: sends resume"
+
+
+def _use_by_round(e, rid, use_by, mentions=(), key=None):
+    e.s.create_round(rid, "submit", prompt="p", request_key=key,
+                     spec_json=json.dumps({"model": "Pro", "mentions": list(mentions),
+                                           "consult_meta": {"use_by": use_by}}))
+
+
+def test_a_gated_round_past_use_by_is_expired_by_the_next_claim(env):
+    _use_by_round(env, RID, "2020-01-01T00:00:00+00:00", mentions=["WebCodex Demo"], key="k-exp")
+    env.s.mark_broken("mention", phase="probe", cause="popup never opened")
+    assert env.s.claim_ready("d1") is None
+    r = env.s.get_round(RID)
+    assert r["state"] == env.store_mod.FAILED and r["error_code"].startswith("expired: use-by 2020")
+    assert r["send_disposition"] == env.store_mod.NOT_SENT_PROVEN
+    assert env.backend._release_eligible(env.s, r), "its request-key is released"
+
+
+def test_a_future_use_by_is_left_alone(env):
+    _use_by_round(env, RID, "2999-01-01T00:00:00+00:00")
+    assert env.s.claim_ready("d1")["rid"] == RID
+
+
+@pytest.mark.parametrize("cmd", ["submit", "followup"])
+def test_use_by_is_rechecked_at_the_click(env, monkeypatch, cmd):
+    """Model selection and the paste run after the worker's own use-by check; the driver re-checks
+    immediately before the click and, past it, clicks nothing (exit 6, provably not sent)."""
+    import types
+    cdp = env.cdp
+    clicked = []
+    monkeypatch.setattr(cdp, "_send_click_js", lambda: clicked.append(1) or "CLICK")
+    monkeypatch.setattr(cdp, "_egress_gate", lambda p: (True, "ok"))
+    monkeypatch.setattr(cdp, "_has_sendable_source", lambda p: True)
+    monkeypatch.setattr(cdp, "_await_composer", lambda *a, **k: (True, {}))
+    monkeypatch.setattr(cdp, "_paste_prompt", lambda *a, **k: None)
+    monkeypatch.setattr(cdp, "_await_thread_rendered", lambda c, seconds=0: True)
+    monkeypatch.setattr(cdp, "_last_user_text_js", lambda: "LAST")
+    monkeypatch.setattr(cdp.time, "sleep", lambda s: None)
+
+    class Tab:
+        def eval(self, js, timeout=None):
+            return 1 if "length" in js else ("x" if js == "LAST" else None)
+
+        def conversation_id(self):
+            return CONV
+
+        def call(self, *a, **k):
+            return {}
+
+        def close_tab(self):
+            pass
+
+        def close(self):
+            pass
+    monkeypatch.setattr(cdp, "CDP", lambda *a, **k: Tab())
+    pf = env.tmp / "p.md"
+    pf.write_text("CGC_RID:%s\n\nask\nBEGIN_RESPONSE:%s\n<a>\nEND_RESPONSE:%s\n" % (RID, RID, RID))
+    ns = types.SimpleNamespace(rid=RID, prompt_file=str(pf), project_url="https://chatgpt.com/",
+                               model="skip", model_family="skip", allow_model_mismatch=False,
+                               reuse_tab=False, no_gate=True, port=9333, mention=[], watch=False,
+                               out=None, conversation=CONV, task=None,
+                               not_after="2020-01-01T00:00:00+00:00")
+    fn = cdp.cmd_submit if cmd == "submit" else cdp.cmd_followup
+    assert fn(ns) == cdp.EXIT_NOT_SENT_PRECLICK
+    assert clicked == [], "past use-by, the send button is never evaluated"
+
+
+def test_a_completed_rounds_envelope_carries_its_typed_send(env, monkeypatch, capsys):
+    r = _ready(env, RID)
+    landed = {"ok": True, "submitted": True, "reason": "landed", "phase": "contract",
+              "conversation_id": CONV, "adapter": "search-unit-v1"}
+
+    def cdp(kind, **kw):
+        if kind == "submit":
+            return {"code": 0, "conversation": CONV, "stderr": "", "outcome": landed}
+        with open(kw["out"], "w") as f:
+            f.write("the verdict")
+        return {"code": 0, "out": kw["out"], "stderr": ""}
+    final = env.backend.process_round(env.s, r, cdp, daemon_instance_id="d",
+                                      validate=lambda p: (True, "ok"))
+    assert final == env.store_mod.COMPLETED_VERIFIED
+    monkeypatch.setattr(env.spool, "daemon_alive", lambda: True)
+    assert env.backend.await_round(argparse.Namespace(rid=RID, out=str(env.tmp / "a.txt"), poll=0.01,
+                                                      timeout=2)) == 0
+    env_json = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert env_json["state"] == "completed_verified"
+    assert env_json["send"]["submitted"] is True and env_json["send"]["reason"] == "landed"
+    assert env_json["send"]["conversation_id"] == CONV
+
+
+def test_a_broken_model_picker_holds_only_rounds_that_select_that_model(env, monkeypatch):
+    monkeypatch.setenv("CGC_MODEL_FAMILY", "GPT-6")
+    s = env.s
+    s.create_round(RID, "submit", prompt="p", spec_json=json.dumps({"model": "skip", "model_family": "skip"}))
+    s.create_round(RID2, "submit", prompt="p", spec_json=json.dumps({"model": "Pro", "model_family": "GPT-6"}))
+    s.create_round("REQ-20261011-120000-0000d3", "submit", prompt="p",
+                   spec_json=json.dumps({"model": "Pro", "model_family": "GPT-5.5"}))
+    s.mark_broken("model", phase="probe:done", cause="'GPT-6' is not offered")
+    got = [s.claim_ready("d1")["rid"], s.claim_ready("d1")["rid"]]
+    assert got == [RID, "REQ-20261011-120000-0000d3"], "a skip round and another family still claim"
+    assert s.claim_ready("d1") is None and s.get_round(RID2)["state"] == env.store_mod.QUEUED
+
+
+def test_once_does_not_wait_for_a_future_not_before(env):
+    sys.modules["cgc_spool"] = env.spool
+    d = _load("cgc_daemon")
+    tomorrow = (__import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+                + __import__("datetime").timedelta(days=1)).isoformat()
+    env.s.create_round(RID, "submit", prompt="p", not_before=tomorrow)
+    assert not d._claimable(), "--once exits now; the round runs on schedule later"
+    assert env.s.get_round(RID)["state"] == env.store_mod.QUEUED
+
+
+def test_the_reader_never_breaks_on_a_page_that_did_not_settle(env, monkeypatch):
+    """A miss with the rid on the page, but switcher labels that never stopped changing: the page
+    was still hydrating, so the probe reports inconclusive, not a break."""
+    _fast(monkeypatch, env.cdp, settled=False)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(env.probe.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(env.probe.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    monkeypatch.setattr(env.cdp.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    page = ("var ROOT=E('MAIN',{},[E('DIV',{'data-new-turn':'user'},[P('CGC_RID:%s'),P('ask')])]);"
+            % RID + _MAIN + "var document=ROOT;document.body=ROOT;var location={pathname:'/c/x'};")
+    with pytest.raises(env.probe.Transient) as e:
+        env.probe.probe_reader(env.probe._NoSend(_NodeTab(page)), RID, settle=0)
+    assert not isinstance(e.value, (env.probe.Drift, env.probe.Blocked)) and "never settled" in str(e.value)

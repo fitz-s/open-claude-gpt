@@ -145,11 +145,18 @@ def probe_composer(t, *, model, family, app):
             raise _confirm(t, Drift("composer", "composer",
                                     f"the app rendered but no composer editor (path {st.get('path')!r})"))
         raise Transient(f"{out['reason']} (path {st.get('path')!r}, form={bool(out.get('form'))})")
+    if st.get("blocker"):                   # a page showing a human condition proves nothing either way
+        raise Blocked(st["blocker"])
+    res = {}
     if model and model.lower() != "skip":
+        # Its own capability: only rounds that select this tier on this family need it (round_needs).
         pick = cdp._select_model(t, model, family)
-        if not pick.confirmed:
-            raise _confirm(t, Drift("composer", "model", pick.error or
-                                    f"wanted {model!r} on {family!r}; the picker shows {pick.shown!r}"))
+        if pick.confirmed:
+            res["model"] = ("pass", f"{model!r} on {family!r} selected")
+        else:
+            why = pick.error or f"wanted {model!r} on {family!r}; the picker shows {pick.shown!r}"
+            b = cdp._blocker(t)
+            res["model"] = ("transient", "human:" + b, f"ChatGPT shows {b}") if b else ("broken", why)
     try:
         cdp._paste_prompt(t, DUMMY)
     except cdp._PreClickFailure as e:
@@ -157,7 +164,7 @@ def probe_composer(t, *, model, family, app):
             raise Transient(str(e)) from None
         raise _confirm(t, Drift("composer", "paste", str(e))) from None
     _cleared(t)
-    res = {"composer": ("pass", f"{len(DUMMY)}-char draft pasted, read back whole, cleared")}
+    res["composer"] = ("pass", f"{len(DUMMY)}-char draft pasted, read back whole, cleared")
     if app:
         try:
             cdp._insert_mention(t, app)
@@ -257,6 +264,10 @@ def probe_reader(t, rid, marker=True, settle=None):
     settle = HYDRATE_S if settle is None else settle
     start = time.time()
     reloaded, miss = False, ("turns", "a loaded conversation shows no user turn")
+    # The settle signal a re-opened thread's follow-up waits on (_settled_labels): the composer's
+    # switchers render last, so labels that stopped changing mean the page finished hydrating.
+    # Labels that never settle make any miss below inconclusive, never a break.
+    settled = _hydrated(t)
     while True:
         if cdp._await_thread_rendered(t, seconds=min(RENDER_S, settle)):
             ans, miss = _read(t, rid)
@@ -274,11 +285,23 @@ def probe_reader(t, rid, marker=True, settle=None):
     b = cdp._blocker(t)
     if b:
         raise Blocked(b)
-    # Hydrated = the rid's text is rendered in <main>. Without that the page never showed the
-    # conversation, which is inconclusive whatever the cause.
+    # A break needs a page that finished hydrating (settled, re-checked now after the reload) and
+    # shows the rid in <main>; anything less is inconclusive.
+    if not (settled or _hydrated(t)):
+        raise Transient(f"{rid} not read ({phase}: {cause}); the page never settled")
     if (marker or phase != "rid") and cdp._rid_in_main(t, rid):
         raise Drift("reader", phase, cause)
     raise Transient(f"{rid} not read ({phase}: {cause})")
+
+
+def _hydrated(t) -> bool:
+    """Did the re-opened conversation finish hydrating? The driver's own settle signal for that
+    (cdp._settled_labels, what a follow-up waits on before acting on a re-opened thread), read as
+    a verdict: labels present and unchanged for its hold. Bounded at its own 20 s."""
+    hold, bound = 4.0, 20.0
+    start = time.time()
+    labels = cdp._settled_labels(t, hold=hold, bound=bound)
+    return bool(labels) and time.time() - start < bound
 
 
 _APP_REF = "app:"
@@ -301,6 +324,13 @@ def probe_app(s, override=None):
 
 
 # ---- one run ------------------------------------------------------------------------------------
+def _composer_caps(model, app):
+    """What the composer probe reports on: composer, plus model unless auto-model is off, plus mention
+    when there is an app to insert."""
+    return (("composer",) + (("model",) if model and model.lower() != "skip" else ())
+            + (("mention",) if app else ()))
+
+
 def _attempt(composer, reader, pick, *, model, family, app):
     """{cap: (verdict, phase, detail)} for one pass of the composer (+ mention when `app`) and/or the
     reader probe; verdict: pass, broken, unestablished or transient."""
@@ -308,8 +338,8 @@ def _attempt(composer, reader, pick, *, model, family, app):
 
     def run(caps, fn):
         try:
-            for cap, (verdict, detail) in fn().items():
-                out[cap] = (verdict, "done", detail)
+            for cap, v in fn().items():     # (verdict, detail) or (verdict, phase, detail)
+                out[cap] = (v[0], "done", v[1]) if len(v) == 2 else v
         except Drift as d:
             out[d.cap] = ("broken", d.phase, d.cause)
             for cap in caps:
@@ -333,11 +363,11 @@ def _attempt(composer, reader, pick, *, model, family, app):
                 return probe_composer(t, model=model, family=family, app=app)
             finally:
                 _close(raw)
-        run(("composer", "mention") if app else ("composer",), composer_probe)
+        run(_composer_caps(model, app), composer_probe)
     if reader:
         if pick is None:
-            out["reader"] = ("unestablished", "pick", "no completed_verified round whose rid the "
-                                                      "reader can prove")
+            out["reader"] = ("unprovable", "pick", "no completed_verified round whose rid the "
+                                                   "reader can prove")
             return out
 
         def reader():
@@ -380,7 +410,7 @@ def run_probe(only=None, mention=None) -> dict:
                   "detail": "no app to insert: set CGC_APPS, or run `cgc probe --mention \"<app>\"`"}
     lease = spool.acquire_browser_lease(shared=True)
     if lease is None:
-        caps = (("composer", "mention") if app else ("composer",)) * composer + ("reader",) * reader
+        caps = _composer_caps(model, app) * composer + ("reader",) * reader
         return {c: {"verdict": "transient", "phase": "browser", "recorded": False,
                     "detail": "browser under exclusive maintenance"} for c in caps}
     try:
@@ -406,6 +436,13 @@ def run_probe(only=None, mention=None) -> dict:
             elif verdict == "broken":
                 s.mark_broken(cap, phase=f"probe:{phase}", cause=detail, ref=ref, driver_rev=rev)
                 rec = True
+            elif verdict == "unprovable" and (s.capabilities().get(cap) or {}).get("ok") is False:
+                # A break no probe can re-check would hold every send forever. Clear it, saying so;
+                # the next round that lands proves the reader or breaks it again. The epoch guard
+                # still keeps a break recorded after this run started.
+                rec = s.mark_passed(cap, started_epoch=started, phase="unprovable", driver_rev=rev,
+                                    cause="the reader could not be re-proven (no finished round to "
+                                          "read); gate cleared so sends are not locked")
             report[cap] = {"verdict": verdict, "phase": phase, "detail": detail, "recorded": rec}
     if no_app:
         report.setdefault("mention", no_app)
@@ -419,6 +456,7 @@ def print_states(report=None) -> int:
         caps = s.capabilities()
     print(json.dumps({"probe": report, "capabilities": caps}, sort_keys=True))
     words = {"pass": "ok", "broken": "BROKEN", "unestablished": "not established",
+             "unprovable": "cannot be re-proven (a break is cleared, not kept)",
              "transient": "probe inconclusive (state unchanged)"}
     for cap, v in (report or {}).items():
         stale = v["verdict"] == "pass" and not v["recorded"]

@@ -376,8 +376,10 @@ def spent_messages(db) -> list:
     One round can send more than once: its base send, and the single automatic "continue" a
     ChatGPT-failed turn gets under the SAME rid. So the unit is the message, not the round.
       - base: the round crossed the send fence (an `attempts` row, begin_send being its only writer)
-        and carries no durable not-sent proof. An UNCERTAIN send is charged: the click may have
-        landed. `at` is the last attempt's start — the one that actually sent.
+        and carries no durable not-sent proof. The proof covers every attempt so far: it is stamped
+        on a proven not-sent requeue or terminal and cleared by the next begin_send, so a requeued
+        round that never sent is free and one that later sent is charged once. An UNCERTAIN send is
+        charged: the click may have landed. `at` is the last attempt's start.
       - continuation: a claimed `auto_continue` whose recorded result is landed, unsure, or absent
         (the worker died between claim and result, possibly after the click). `not_sent` is free.
     A `retrieve` never calls begin_send and never claims a continue, so it contributes nothing."""
@@ -495,16 +497,52 @@ def week_view(db, now=None) -> dict:
 # rid_or_conversation, checked_at, driver_rev}. ABSENT means never established, which never gates:
 # only a recorded failure does. `epoch` grows on every write; a probe reads it before it starts, and
 # its pass may clear a failure only if no write happened since (Store.mark_passed).
-CAPABILITIES = ("composer", "mention", "reader")
+CAPABILITIES = ("composer", "model", "mention", "reader")
+
+
+# ---- use-by: `fire --use-by T` — a round whose answer is useless after T never sends after it --------
+def past(instant) -> bool:
+    """True iff the ISO-8601 `instant` has passed. None or unparseable -> False: a deadline is
+    validated at fire time, and a malformed one must never silently eat a paid round. The one
+    definition: the claim sweep, the worker's pre-send checks and the driver's click-time check."""
+    try:
+        t = datetime.datetime.fromisoformat(instant)
+    except (TypeError, ValueError):
+        return False
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return t <= datetime.datetime.now(datetime.timezone.utc)
+
+
+def use_by_of(spec) -> str | None:
+    """A round's use-by from its spec (a dict, or spec_json text)."""
+    spec = spec if isinstance(spec, dict) else _spec(spec)
+    return (spec.get("consult_meta") or {}).get("use_by")
+
+
+def _expired_fields(use_by: str) -> dict:
+    """An expired round's terminal fields: pre-send by construction (every caller runs before
+    begin_send), so not-sent-proven — never charged, and its request-key releases."""
+    return {"state": FAILED, "send_disposition": NOT_SENT_PROVEN,
+            "error_code": f"expired: use-by {use_by} passed before send"}
 
 
 def round_needs(kind: str, spec_json) -> tuple:
     """The capabilities a round's send depends on. A retrieve sends nothing, so it needs none and is
-    never gated. Every send needs the composer (select the model, paste, read it back) and the reader
-    (prove the turn landed, read the answer); a round with an @mention also needs the mention picker."""
+    never gated. Every send needs the composer (paste, read it back) and the reader (prove the turn
+    landed, read the answer). `model` is what the probe checks: selecting the configured tier on the
+    configured family, so only a round that selects that same pair needs it; a `skip` round, or one
+    pinned to another family, does not. A round with an @mention also needs the mention picker."""
     if kind == "retrieve":
         return ()
-    return ("composer", "reader") + (("mention",) if _spec(spec_json).get("mentions") else ())
+    spec = _spec(spec_json)
+    auto = os.environ.get("CGC_AUTO_MODEL", "1").strip().lower() not in ("0", "false", "no", "off", "")
+    configured = ((os.environ.get("CGC_MODEL", "Pro"), os.environ.get("CGC_MODEL_FAMILY", "GPT-6"))
+                  if auto else ("skip", "skip"))
+    picks = (spec.get("model") or "Pro", spec.get("model_family") or "GPT-6")
+    model = picks[0].lower() != "skip" and picks == configured
+    return (("composer", "reader") + (("model",) if model else ())
+            + (("mention",) if spec.get("mentions") else ()))
 
 
 def new_daemon_instance_id() -> str:
@@ -827,9 +865,21 @@ class Store:
         THE UI-CONTRACT GATE, for the same reason: a round that needs a capability recorded broken
         is skipped, not failed. It stays QUEUED and intact, and is claimed once a probe clears it.
         Read inside this transaction, so a capability recorded broken before the claim is seen.
-        `retrieve_only` (a UI probe is running): only read-only retrieves are claimed; sends wait."""
+        `retrieve_only` (a UI probe is running): only read-only retrieves are claimed; sends wait.
+
+        USE-BY, swept here first: a queued round past its use-by fails in this transaction, whether or
+        not the gate holds it. A gated round never reaches the worker's own use-by check, so without
+        this it would sit queued past its deadline — refire refusing it, a same-key retry getting it
+        back. (A claimed round is re-checked by the worker before begin_send and by the driver at the
+        click.)"""
         now = _now()
         with self._tx():
+            for q in self.db.execute("SELECT rid,spec_json FROM rounds WHERE state=? "
+                                     "AND spec_json LIKE '%\"use_by\"%'", (QUEUED,)).fetchall():
+                use_by = use_by_of(q["spec_json"])
+                if use_by and past(use_by):
+                    self._apply_round_fields(q["rid"], **_expired_fields(use_by))
+                    self._event("state", rid=q["rid"], detail=f"{QUEUED} -> {FAILED} (use-by passed)")
             broken = self.broken_capabilities().keys()
             # Nothing broken (the common case): the first eligible row, as before. Otherwise walk the
             # cursor in order and stop at the first round that needs nothing broken.
@@ -875,6 +925,9 @@ class Store:
                 (attempt_id, rid, daemon_instance_id, browser_epoch, SENDING, now, now))
             self._apply_round_fields(rid, state=SENDING, rendered_prompt=rendered_prompt,
                                      prompt_sha256=prompt_sha256, current_attempt_id=attempt_id)
+            # A not-sent proof covers the attempts before this one (a proven not-sent requeue);
+            # this attempt may click, so the round no longer carries it.
+            self.db.execute("UPDATE rounds SET send_disposition=NULL WHERE rid=?", (rid,))
             self._event("begin_send", rid=rid, attempt_id=attempt_id,
                         detail=f"epoch={browser_epoch} sha256={prompt_sha256[:16]}")
         return attempt_id
@@ -1317,6 +1370,11 @@ class Store:
         """The broken capabilities this round's send needs ({} = not gated)."""
         need = set(round_needs(r.get("kind") or "", r.get("spec_json")))
         return {k: v for k, v in self.broken_capabilities().items() if k in need}
+
+    def record_event(self, kind: str, *, rid: str | None = None, detail: str | None = None) -> None:
+        """A diagnostic event, in its own transaction; moves no round."""
+        with self._tx():
+            self._event(kind, rid=rid, detail=detail)
 
     def record_attempt_evidence(self, attempt_id: str, evidence_json: str) -> None:
         """The driver's typed outcome for one send attempt (cgc_backend._project_send)."""

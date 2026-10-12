@@ -24,7 +24,7 @@ spent, and the round then waited up to 90 minutes before ending uncertain.
   source turn and wrapped answer through the waiter's own reads. Every check opens its own
   background tab and closes only that tab. A handle that refuses the send button, Enter and
   `Input.*` events is the only way the probe reaches its tab.
-- **Capability state** is stored in `meta` (`ui.composer`, `ui.mention`, `ui.reader`). A failing
+- **Capability state** is stored in `meta` (`ui.composer`, `ui.model`, `ui.mention`, `ui.reader`). A failing
   probe marks a capability broken, after one retry. A real round marks only `reader`, on
   `selector_drift`, which is the break that spends messages. A pre-click failure costs nothing, and
   from one round it can be a deleted project or an unconnected app, so it never gates. A login,
@@ -37,6 +37,22 @@ spent, and the round then waited up to 90 minutes before ending uncertain.
   are never paused. `await` says `ChatGPT UI changed (<capability>: <cause>) — sends paused; driver
   needs a fix; queued rounds are intact`. The daemon probes at start, before queued work once the
   last probe is 6 h old, and every 30 min while something is broken.
+- **The model picker is its own capability (`model`).** A probe that cannot select the configured
+  family and tier pauses only the rounds that select that pair. A `--model skip` round, or one
+  pinned to another family, still sends. The reader probe judges a page only after its switcher
+  labels settle, the follow-up's own hydration signal. A page that never settles is
+  inconclusive. `--once` no longer waits for a round scheduled later with `--not-before`.
+- **Only what can be re-proven gates.** A real round's `selector_drift` pauses sends only when a
+  finished round exists for the probe to re-read. Otherwise it is logged (`ui_drift_ungated`) and
+  sends go on. A `reader` break the probe can no longer re-check (its finished round is gone) is
+  cleared as `unprovable`, so a break can never lock sends for good.
+- **`--use-by` holds at the click.** The claim pass expires a queued round past its use-by even
+  while a paused capability holds it. The driver re-checks `--not-after` immediately before the
+  click, after model selection and the paste.
+- **The message ledger no longer charges a proven pre-click retry.** A `model_not_selectable` (or
+  any other pre-click) requeue is stamped not-sent-proven, and the next `begin_send` clears the
+  stamp. A requeued round that is then cancelled is free, and one that later sends is charged once.
+  (This predates the gate; it was in 0.4.0.)
 - **The driver's typed outcome is kept.** Its failure line (`submitted`, `reason`, `phase`, the
   contract it observed) is stored on the attempt and returned by `await` as `send`. An uncertain
   send's error now says, for example, `selector_drift: submitted=true`. It still keeps its

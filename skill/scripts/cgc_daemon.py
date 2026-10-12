@@ -121,6 +121,8 @@ def _make_run_cdp():
             # budget protects became unrecoverable in the first place.
             for m in kw.get("mentions") or ():
                 cmd += ["--mention", m]
+            if kw.get("not_after"):
+                cmd += ["--not-after", kw["not_after"]]   # use-by, re-checked at the click
             code, so, se = _run(cmd, 300, kw["rid"], stdin_text=kw["prompt"], pass_fds=fds)
             rec = _last_json(so)
             # outcome: the driver's whole typed line (submitted / reason / phase / drift / contract),
@@ -140,6 +142,8 @@ def _make_run_cdp():
                    "--model", kw["model"], "--model-family", kw["model_family"]]
             for m in kw.get("mentions") or ():
                 cmd += ["--mention", m]
+            if kw.get("not_after"):
+                cmd += ["--not-after", kw["not_after"]]
             code, so, se = _run(cmd, 240, kw["rid"], stdin_text=kw["prompt"], pass_fds=fds)
             rec = _last_json(so)
             return {"code": code, "model_badge": rec.get("modelBadge"), "stderr": se, "outcome": rec}
@@ -732,13 +736,16 @@ def _probe_due(now: float, last_start, broken: bool, queued_paid: bool) -> bool:
 
 
 def _claimable() -> bool:
-    """Is there work the dispatcher could still pick up? A ready round (a ready-orphan), or a queued
-    one the UI-contract gate admits. A round the gate holds is not: `--once` ends with it still
-    queued, rather than polling until a capability clears."""
+    """Is there work the dispatcher could pick up NOW? A ready round (a ready-orphan), or a queued one
+    whose not_before has come and that the UI-contract gate admits. A round the gate holds, or one
+    scheduled for later, is not: `--once` ends with it still queued, rather than polling until a
+    capability clears or the schedule arrives."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     with store_mod.Store() as s:
         broken = s.broken_capabilities().keys()
-        rows = s.db.execute("SELECT state,kind,spec_json FROM rounds WHERE state IN (?,?)",
-                            (store_mod.QUEUED, store_mod.READY)).fetchall()
+        rows = s.db.execute("SELECT state,kind,spec_json FROM rounds WHERE state=? OR (state=? "
+                            "AND (not_before IS NULL OR not_before<=?))",
+                            (store_mod.READY, store_mod.QUEUED, now)).fetchall()
     return any(r["state"] == store_mod.READY
                or not broken & set(store_mod.round_needs(r["kind"], r["spec_json"])) for r in rows)
 

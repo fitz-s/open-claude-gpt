@@ -171,7 +171,7 @@ message plus up to 90 minutes of waiting. Three pieces now catch the next move o
   marks anything. A probe pass clears a failure only if no capability write happened after the probe
   started; the epoch is compared in the same transaction as the write.
 - **The gate** is in `claim_ready`. A queued round that needs a broken capability is skipped, not
-  failed: every send needs `composer` and `reader`, and a round with `--mention` also needs
+  failed: every send needs `composer` and `reader`, one that selects the configured model also `model`, and a round with `--mention` also needs
   `mention`. A retrieve sends nothing and is never gated. `await` reports the pause as
   `human_action` once it has outlasted one probe run.
 

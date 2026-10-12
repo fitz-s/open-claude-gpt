@@ -91,7 +91,13 @@ def _requeue_or_block(store, rid: str, marker: str) -> str:
                                     "automatic retries; nothing was ever sent, but this needs a "
                                     "human (check the ChatGPT window: model tier, login, the tab)"))
         return store_mod.BLOCKED
-    store.set_state(rid, store_mod.QUEUED, expect=store_mod.SENDING, error_code=marker)
+    # The requeue is stamped too: this is the ONLY sending -> queued edge, and it is only ever taken on
+    # a proven not-sent, while an attempt that may have clicked can never return to queued. So a
+    # queued round's every attempt so far is proven unsent, which is exactly what the stamp says;
+    # begin_send clears it the moment a new attempt may click. Without it the ledger charged a round
+    # that never sent, and a cancel after the requeue held its request-key forever.
+    store.set_state(rid, store_mod.QUEUED, expect=store_mod.SENDING, error_code=marker,
+                    send_disposition=store_mod.NOT_SENT_PROVEN)
     return store_mod.QUEUED
 
 
@@ -1029,8 +1035,18 @@ def _project_send_unchecked(store, attempt, rid, res):
     cap = ev.get("drift")
     if cap != "reader":
         return None
-    store.mark_broken(cap, phase=f"send:{ev.get('phase') or '?'}",
-                      cause=ev.get("error") or ev.get("reason") or "driver reported drift",
+    cause = ev.get("error") or ev.get("reason") or "driver reported drift"
+    # Only gate what a probe can re-prove. With no finished round to read, no probe could ever clear
+    # this, and every later send would wait behind it forever — so the drift is recorded for diagnosis
+    # and the gate is left open; the next round that lands either proves the reader or breaks it.
+    import cgc_probe
+    if cgc_probe.pick_reader_round(store) is None:
+        store.record_event("ui_drift_ungated", rid=rid,
+                           detail=json.dumps({cap: cause, "why": "no reader fixture"}))
+        sys.stderr.write(f"CGC_UI_DRIFT {cap}: {cause} (round {rid}) — NOT gated: no finished round "
+                         "exists for a probe to re-prove the reader on.\n")
+        return None
+    store.mark_broken(cap, phase=f"send:{ev.get('phase') or '?'}", cause=cause,
                       ref=rid, driver_rev=driver_rev())
     sys.stderr.write(f"CGC_UI_BROKEN {cap}: {ev.get('error') or ev.get('reason')} (round {rid}) — "
                      "rounds that need it stay queued until a probe passes.\n")
@@ -1380,25 +1396,12 @@ def _publish_answer(store, rid: str, text: str) -> None:
 
 
 # ---- the worker --------------------------------------------------------------
-def _expired(use_by: str) -> bool:
-    """True iff the ISO-8601 instant `use_by` has passed. An unparseable value is not expiry: the
-    deadline was validated at fire time, and a malformed one must never silently eat a paid round."""
-    try:
-        t = datetime.datetime.fromisoformat(use_by)
-    except (TypeError, ValueError):
-        return False
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=datetime.timezone.utc)
-    return t <= datetime.datetime.now(datetime.timezone.utc)
-
-
-def _use_by(spec: dict):
-    return (spec.get("consult_meta") or {}).get("use_by")
+_expired = store_mod.past
+_use_by = store_mod.use_by_of
 
 
 def _use_by_passed(spec: dict) -> bool:
-    use_by = _use_by(spec)
-    return bool(use_by) and _expired(use_by)
+    return store_mod.past(_use_by(spec))
 
 
 def _expire_if_due(store, rid: str, spec: dict) -> bool:
@@ -1411,9 +1414,8 @@ def _expire_if_due(store, rid: str, spec: dict) -> bool:
     use_by = _use_by(spec)
     if not (use_by and _expired(use_by)):
         return False
-    store.set_state(rid, store_mod.FAILED, expect=store_mod.READY,
-                    send_disposition=store_mod.NOT_SENT_PROVEN,
-                    error_code=f"expired: use-by {use_by} passed before send")
+    fields = store_mod._expired_fields(use_by)
+    store.set_state(rid, fields.pop("state"), expect=store_mod.READY, **fields)
     return True
 
 
@@ -1501,7 +1503,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             send = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
                            model=spec.get("model") or "Pro",
                            model_family=spec.get("model_family") or "GPT-6",
-                           mentions=spec.get("mentions") or [])
+                           mentions=spec.get("mentions") or [], not_after=_use_by(spec))
         finally:
             if hasattr(conv_lease, "close"):
                 conv_lease.close()  # mutating region done — the read-only wait below needs no lease
@@ -1509,6 +1511,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             # same thread, confirmed — with the composer reading it selected before this send
             store.mark_accepted(attempt, conv, model_badge=send.get("model_badge"))
             store.mark_waiting(rid)
+            _project_send(store, attempt, rid, send)    # after the state + address; fail-soft
             return _wait_phase(store, rid, conv, spec, run_cdp)
         # Every other outcome: its durable state FIRST, then the driver's typed outcome (the
         # `finally`, after whichever branch ran). _project_send is diagnostics and fail-soft, so it
@@ -1558,12 +1561,13 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
                   project_url=spec.get("project_url") or "https://chatgpt.com/",
                   model=spec.get("model") or "Pro",
                   model_family=spec.get("model_family") or "GPT-6",
-                  mentions=spec.get("mentions") or [])
+                  mentions=spec.get("mentions") or [], not_after=_use_by(spec))
     conv = sub.get("conversation")
 
     if conv and sub.get("code") == 0:
         store.mark_accepted(attempt, conv, model_badge=sub.get("model_badge"))
         store.mark_waiting(rid)
+        _project_send(store, attempt, rid, sub)        # after the state + address; fail-soft
         return _wait_phase(store, rid, conv, spec, run_cdp)
 
     # Every other outcome: its durable state and address FIRST, then the driver's typed outcome (the
@@ -1811,7 +1815,7 @@ def _send_continue(store, rid, conv, spec, run_cdp, prompt) -> str:
             sent = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
                            model=spec.get("model") or "Pro",
                            model_family=spec.get("model_family") or "GPT-6",
-                           mentions=spec.get("mentions") or [])
+                           mentions=spec.get("mentions") or [], not_after=_use_by(spec))
         except Exception as e:                        # noqa: BLE001 — a crash may follow the click
             sys.stderr.write(f"CGC_WARN {rid}: auto-continue crashed ({type(e).__name__}: {e}).\n")
             return "unsure"

@@ -2527,6 +2527,19 @@ def _composer_failure(st):
                "The page did not load in time; re-enqueue and it will retry.")
 
 
+_NOT_AFTER_HELP = ("the round's use-by (ISO-8601): re-checked immediately before the click; past it "
+                   "nothing is clicked (exit 6, provably not sent)")
+
+
+def _past(instant):
+    """Has the round's use-by passed? cgc_store.past, the one definition (lazy import, like
+    _is_canonical's, so the driver stays standalone-runnable; no --not-after means no deadline)."""
+    if not instant:
+        return False
+    import cgc_store
+    return cgc_store.past(instant)
+
+
 def _composer_outcome(st):
     """The typed line for a composer that never appeared (always pre-click: nothing was sent)."""
     reason = ("login_needed" if st.get("loginWall") else "captcha" if st.get("captcha")
@@ -3094,6 +3107,12 @@ def cmd_submit(a) -> int:
             before_conv = c.conversation_id()
         except Exception:
             before_conv = "?unknown"
+        # `fire --use-by`: the last instant a send may happen, re-checked here because model selection
+        # and the paste above can take a minute past the daemon's own check. Past it, nothing clicks.
+        if _past(getattr(a, "not_after", None)):
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: expired: use-by {getattr(a, "not_after", None)} passed before "
+                             "send — NOT submitted.\n")
+            return EXIT_NOT_SENT_PRECLICK
         # Submit. Prefer the send button; fall back to Enter. (POST-click from here: a failure past
         # this point is uncertain, never provably-not-sent.)
         pre_click = False        # the eval below may click: from here a failure is uncertain
@@ -3186,8 +3205,9 @@ def cmd_submit(a) -> int:
                 "the tab's URL shows a /c/<id>.\n")
             return 2
         _write_state(conversation=conv, rid=a.rid)  # so `followup`/`wait` can auto-resolve
-        print(json.dumps({"ok": True, "userMsgs": n, "model": model_now, "adapter": adapter,
-                          "modelBadge": model_badge,
+        print(json.dumps({"ok": True, "submitted": True, "reason": "landed", "phase": "contract",
+                          "userMsgs": n, "model": model_now, "adapter": adapter,
+                          "modelBadge": model_badge, "contract": contract,
                           "modelConfirmed": model_confirmed, "conversation_id": conv}))
         out = os.path.join(CGC_STATE_DIR, f"answer_{a.rid}.txt")
         # Hand the agent the exact waiter to run (run_in_background:true). It holds the whole
@@ -3439,6 +3459,10 @@ def cmd_followup(a) -> int:
                              "same --request-key.\n")
             return EXIT_NOT_SENT_PRECLICK
         time.sleep(0.3)
+        if _past(getattr(a, "not_after", None)):    # `fire --use-by`, at the click (see cmd_submit)
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: expired: use-by {getattr(a, "not_after", None)} passed before "
+                             "send — NOT sent.\n")
+            return EXIT_NOT_SENT_PRECLICK
         click_attempted = True    # from here on a failure is post-click: uncertain, tab kept as evidence
         may_send, press_enter, why = _send_verdict(c.eval(_send_click_js()))
         if not may_send:
@@ -3528,8 +3552,9 @@ def cmd_followup(a) -> int:
         # modelBadge here is the same PRE-SEND selection evidence submit reports (SHARED CONTRACT
         # #4): a follow-up re-asserts the tier/family on the thread, so it has its own selection
         # evidence and its own round row to carry it. It is NOT attribution — `wait`'s modelSlug is.
-        print(json.dumps({"ok": True, "userMsgs": n, "conversation_id": conv, "rid": rid,
-                          "followup": True, "modelBadge": model_badge,
+        print(json.dumps({"ok": True, "submitted": True, "reason": "landed", "phase": "echo",
+                          "userMsgs": n, "conversation_id": conv, "rid": rid,
+                          "followup": True, "modelBadge": model_badge, "echoedRid": echoed,
                           "wait_out": default_out, "watching": bool(a.watch)}))
     finally:
         # A tab THIS command re-opened, left by any exit before the send click (a return or an
@@ -4071,6 +4096,7 @@ def main() -> int:
     su.add_argument("--reuse-tab", action="store_true",
                     help="navigate the existing single tab instead of opening a dedicated one "
                          "(default: own tab per consult, for safe concurrency)")
+    su.add_argument("--not-after", metavar="ISO", help=_NOT_AFTER_HELP)
     su.add_argument("--allow-model-mismatch", action="store_true",
                     help="send even if the target model could not be selected (default: fail-closed, "
                          "do not submit on the wrong model)")
@@ -4112,6 +4138,7 @@ def main() -> int:
     # --watch: send AND wait in ONE process, so a follow-up is a single backgrounded command
     # (run_in_background:true) whose exit wakes the agent — no separate `wait` step to forget
     # or mis-arm. This is the recommended way to run a follow-up.
+    fu.add_argument("--not-after", metavar="ISO", help=_NOT_AFTER_HELP)
     fu.add_argument("--watch", action="store_true",
                     help="after sending, wait inline for the answer and write it to --out, then exit "
                          "(one-shot send+wait; the exit is the wake). REQUIRES --out.")
