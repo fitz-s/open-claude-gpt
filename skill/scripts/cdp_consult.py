@@ -3110,7 +3110,7 @@ def cmd_submit(a) -> int:
         # `fire --use-by`: the last instant a send may happen, re-checked here because model selection
         # and the paste above can take a minute past the daemon's own check. Past it, nothing clicks.
         if _past(getattr(a, "not_after", None)):
-            sys.stderr.write(f"CGC_ERROR not_sent_preclick: expired: use-by {getattr(a, "not_after", None)} passed before "
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: expired: use-by {getattr(a, 'not_after', None)} passed before "
                              "send — NOT submitted.\n")
             return EXIT_NOT_SENT_PRECLICK
         # Submit. Prefer the send button; fall back to Enter. (POST-click from here: a failure past
@@ -3460,7 +3460,7 @@ def cmd_followup(a) -> int:
             return EXIT_NOT_SENT_PRECLICK
         time.sleep(0.3)
         if _past(getattr(a, "not_after", None)):    # `fire --use-by`, at the click (see cmd_submit)
-            sys.stderr.write(f"CGC_ERROR not_sent_preclick: expired: use-by {getattr(a, "not_after", None)} passed before "
+            sys.stderr.write(f"CGC_ERROR not_sent_preclick: expired: use-by {getattr(a, 'not_after', None)} passed before "
                              "send — NOT sent.\n")
             return EXIT_NOT_SENT_PRECLICK
         click_attempted = True    # from here on a failure is post-click: uncertain, tab kept as evidence
