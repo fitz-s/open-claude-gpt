@@ -742,7 +742,7 @@ def _claimable() -> bool:
     capability clears or the schedule arrives."""
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     with store_mod.Store() as s:
-        broken = s.broken_capabilities().keys()
+        broken = store_mod._gate_keys(s.broken_capabilities())
         rows = s.db.execute("SELECT state,kind,spec_json FROM rounds WHERE state=? OR (state=? "
                             "AND (not_before IS NULL OR not_before<=?))",
                             (store_mod.READY, store_mod.QUEUED, now)).fetchall()

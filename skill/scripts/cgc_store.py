@@ -527,22 +527,38 @@ def _expired_fields(use_by: str) -> dict:
             "error_code": f"expired: use-by {use_by} passed before send"}
 
 
+MODEL_REF = "model:"   # a `model` verdict's ref: "model:<tier>@<family>", the pair it checked
+
+
+def model_ref(tier: str, family: str) -> str:
+    return f"{MODEL_REF}{tier}@{family}"
+
+
 def round_needs(kind: str, spec_json) -> tuple:
     """The capabilities a round's send depends on. A retrieve sends nothing, so it needs none and is
     never gated. Every send needs the composer (paste, read it back) and the reader (prove the turn
-    landed, read the answer). `model` is what the probe checks: selecting the configured tier on the
-    configured family, so only a round that selects that same pair needs it; a `skip` round, or one
-    pinned to another family, does not. A round with an @mention also needs the mention picker."""
+    landed, read the answer). A round that selects a model needs `model:<tier>@<family>` for the pair
+    its spec froze — matched against the pair a verdict recorded, never against today's environment,
+    so a config change can neither gate an unrelated round nor release the one that failed. A `skip`
+    round needs no model. A round with an @mention also needs the mention picker."""
     if kind == "retrieve":
         return ()
     spec = _spec(spec_json)
-    auto = os.environ.get("CGC_AUTO_MODEL", "1").strip().lower() not in ("0", "false", "no", "off", "")
-    configured = ((os.environ.get("CGC_MODEL", "Pro"), os.environ.get("CGC_MODEL_FAMILY", "GPT-6"))
-                  if auto else ("skip", "skip"))
-    picks = (spec.get("model") or "Pro", spec.get("model_family") or "GPT-6")
-    model = picks[0].lower() != "skip" and picks == configured
-    return (("composer", "reader") + (("model",) if model else ())
-            + (("mention",) if spec.get("mentions") else ()))
+    tier, family = spec.get("model") or "Pro", spec.get("model_family") or "GPT-6"
+    model = () if tier.lower() == "skip" or family.lower() == "skip" else (model_ref(tier, family),)
+    return ("composer", "reader") + model + (("mention",) if spec.get("mentions") else ())
+
+
+def _gate_keys(broken: dict) -> set:
+    """What each broken capability blocks, in round_needs' terms: a `model` break blocks only the
+    pair its record names; a legacy `model` record without one blocks nothing it cannot name."""
+    keys = set()
+    for name, rec in broken.items():
+        if name != "model":
+            keys.add(name)
+        elif str(rec.get("rid_or_conversation") or "").startswith(MODEL_REF):
+            keys.add(rec["rid_or_conversation"])
+    return keys
 
 
 def new_daemon_instance_id() -> str:
@@ -880,7 +896,7 @@ class Store:
                 if use_by and past(use_by):
                     self._apply_round_fields(q["rid"], **_expired_fields(use_by))
                     self._event("state", rid=q["rid"], detail=f"{QUEUED} -> {FAILED} (use-by passed)")
-            broken = self.broken_capabilities().keys()
+            broken = _gate_keys(self.broken_capabilities())
             # Nothing broken (the common case): the first eligible row, as before. Otherwise walk the
             # cursor in order and stop at the first round that needs nothing broken.
             cur = self.db.execute(
@@ -1369,7 +1385,8 @@ class Store:
     def gated_by(self, r: dict) -> dict:
         """The broken capabilities this round's send needs ({} = not gated)."""
         need = set(round_needs(r.get("kind") or "", r.get("spec_json")))
-        return {k: v for k, v in self.broken_capabilities().items() if k in need}
+        return {k: v for k, v in self.broken_capabilities().items()
+                if (v.get("rid_or_conversation") if k == "model" else k) in need}
 
     def record_event(self, kind: str, *, rid: str | None = None, detail: str | None = None) -> None:
         """A diagnostic event, in its own transaction; moves no round."""

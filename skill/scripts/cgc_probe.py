@@ -428,7 +428,8 @@ def run_probe(only=None, mention=None) -> dict:
     with store_mod.Store() as s:
         for cap, (verdict, phase, detail) in res.items():
             ref = (f"{pick['rid']}@{pick['conversation']}" if cap == "reader" and pick
-                   else _APP_REF + app if cap == "mention" and app else None)
+                   else _APP_REF + app if cap == "mention" and app
+                   else store_mod.model_ref(model, family) if cap == "model" else None)
             rec = False
             if verdict == "pass":
                 rec = s.mark_passed(cap, started_epoch=started, phase="probe", cause=detail, ref=ref,

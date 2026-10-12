@@ -916,10 +916,32 @@ def test_a_broken_model_picker_holds_only_rounds_that_select_that_model(env, mon
     s.create_round(RID2, "submit", prompt="p", spec_json=json.dumps({"model": "Pro", "model_family": "GPT-6"}))
     s.create_round("REQ-20261011-120000-0000d3", "submit", prompt="p",
                    spec_json=json.dumps({"model": "Pro", "model_family": "GPT-5.5"}))
-    s.mark_broken("model", phase="probe:done", cause="'GPT-6' is not offered")
+    s.mark_broken("model", phase="probe:done", cause="'GPT-6' is not offered",
+                  ref=env.store_mod.model_ref("Pro", "GPT-6"))
     got = [s.claim_ready("d1")["rid"], s.claim_ready("d1")["rid"]]
     assert got == [RID, "REQ-20261011-120000-0000d3"], "a skip round and another family still claim"
     assert s.claim_ready("d1") is None and s.get_round(RID2)["state"] == env.store_mod.QUEUED
+
+
+def test_a_model_break_binds_the_pair_it_checked_not_todays_config(env, monkeypatch):
+    """GPT-6/Pro recorded broken, then the config moves to GPT-5.5: the verdict still names GPT-6, so
+    a GPT-5.5 round claims and the frozen GPT-6 round stays held — today's env decides neither."""
+    s = env.s
+    s.create_round(RID, "submit", prompt="p", spec_json=json.dumps({"model": "Pro", "model_family": "GPT-6"}))
+    s.create_round(RID2, "submit", prompt="p", spec_json=json.dumps({"model": "Pro", "model_family": "GPT-5.5"}))
+    s.mark_broken("model", phase="probe:done", cause="'GPT-6' is not offered",
+                  ref=env.store_mod.model_ref("Pro", "GPT-6"))
+    monkeypatch.setenv("CGC_MODEL_FAMILY", "GPT-5.5")
+    assert s.claim_ready("d1")["rid"] == RID2
+    assert s.claim_ready("d1") is None and s.get_round(RID)["state"] == env.store_mod.QUEUED
+    assert set(s.gated_by(s.get_round(RID))) == {"model"} and not s.gated_by(s.get_round(RID2))
+
+
+def test_a_legacy_model_break_without_a_pair_gates_nothing(env):
+    s = env.s
+    s.create_round(RID, "submit", prompt="p", spec_json=json.dumps({"model": "Pro", "model_family": "GPT-6"}))
+    s.mark_broken("model", phase="probe:done", cause="old record")
+    assert s.claim_ready("d1")["rid"] == RID
 
 
 def test_once_does_not_wait_for_a_future_not_before(env):
