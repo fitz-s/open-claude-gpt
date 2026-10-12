@@ -593,25 +593,36 @@ _TEXT_FN = ("function __cgcText(el){if(!el)return '';"
             "return out.replace(/[ \\t]+\\n/g,'\\n').replace(/\\n{3,}/g,'\\n\\n');}")
 
 # The rid regex shape (REQ-YYYYMMDD-HHMMSS-hhhhhh) shared by every rid-reading regex in this file.
-_RID_RE_SRC = r"REQ-\d{8}-\d{6}-[0-9a-f]{6}"
+# ASCII digits spelled out: \d is Unicode-aware in Python and ASCII-only in JS.
+_RID_RE_SRC = r"REQ-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}"
 
-# The page-side mirror of _turn_canonical_rid (SHARED CONTRACT #3): a user turn's OWN rid is the rid on
-# its first non-blank line when that line is exactly CGC_RID:<rid> (the head marker, the one part of a
-# long prompt ChatGPT never collapses), else the rid of the LAST complete, in-order
-# BEGIN_RESPONSE:<rid>/END_RESPONSE:<rid> pair of bare lines in its block-aware text. A marker and a
-# pair that name DIFFERENT rids read as no rid at all (fail closed). tests/test_wait_virtualized_thread.py
-# holds the two to the same answers on every ASCII rendering. They part only outside it: Python's
-# str.strip() and \d also take \x1c-\x1f, \x85 and non-ASCII digits, and JS's trim() and \d take the BOM
-# instead; each difference makes one side see no marker or pair, so a disagreement reads as "turn not
-# found" (fail closed), never as another rid's turn.
-_RID_FN = ("function __cgcRid(t){var re=/^(BEGIN|END)_RESPONSE:(" + _RID_RE_SRC + ")$/,"
-           "mk=/^CGC_RID:(" + _RID_RE_SRC + ")$/,ob={},rid=null,M=null,first=true,"
-           "ls=(t||'').replace(/\\r\\n/g,'\\n').split('\\n');"
-           "for(var i=0;i<ls.length;i++){var l=ls[i].trim();"
-           "if(first&&l){first=false;var q=l.match(mk);if(q){M=q[1];continue;}}"
-           "var m=l.match(re);if(!m)continue;"
-           "if(m[1]==='BEGIN')ob[m[2]]=1;else if(ob[m[2]])rid=m[2];}"
-           "return M===null?rid:(rid===null||rid===M?M:null);}")
+# THE ONE whitespace set of the user-turn identity rule, as the source of a regex character class that
+# Python's re and JS's RegExp read identically: ASCII space, \t \n \v \f \r, U+0085, U+00A0, U+1680,
+# U+2000-200A, U+2028, U+2029, U+202F, U+205F, U+3000 and the BOM U+FEFF. Python's str.strip() and JS's
+# trim() disagree about it (strip() takes \x1c-\x1f and U+0085 and not the BOM; trim() the reverse), so
+# neither is used on a rid path; both sides trim a line with this class and nothing else.
+_WS_SRC = r"\t\n\x0b\x0c\r \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+
+# The head marker token: needs a character that is not [A-Za-z0-9_] (or the text's start) before it and
+# one after the rid, so a glued "xCGC_RID:..." or a longer rid is not ours. Written once for both sides.
+_MARKER_RE_SRC = r"(?<![A-Za-z0-9_])CGC_RID:(" + _RID_RE_SRC + r")(?![A-Za-z0-9_])"
+
+# The page-side mirror of _turn_canonical_rid (SHARED CONTRACT #3): a user turn's OWN rid is the rid of
+# the FIRST CGC_RID:<rid> token anywhere in its text (the head marker: the template puts it before
+# everything else, so only an @mention label can precede it, and ChatGPT never collapses the head), else
+# the rid of the LAST complete, in-order BEGIN_RESPONSE:<rid>/END_RESPONSE:<rid> pair of bare lines in its
+# block-aware text. A marker is authoritative: in a collapsed turn the last VISIBLE pair can be a quote.
+# The two sides share the whitespace set (_WS_SRC), the digit class and the marker regex (_MARKER_RE_SRC)
+# by construction, and split lines on "\n" alone after folding "\r\n", so they return the same rid on
+# every input; tests/test_wait_virtualized_thread.py pins that on a corpus that includes the BOM, U+0085,
+# U+00A0, \x1c-\x1f and non-ASCII digits. A rid in a shape one side cannot read reads as no rid (the turn
+# is "not found", fail closed) on BOTH.
+_RID_FN = ("function __cgcRid(t){t=t||'';"
+           "var q=t.match(/" + _MARKER_RE_SRC + "/);if(q)return q[1];"
+           "var re=/^(BEGIN|END)_RESPONSE:(" + _RID_RE_SRC + ")$/,tr=/^[" + _WS_SRC + "]+|[" + _WS_SRC + "]+$/g,"
+           "ob={},rid=null,ls=t.replace(/\\r\\n/g,'\\n').split('\\n');"
+           "for(var i=0;i<ls.length;i++){var m=ls[i].replace(tr,'').match(re);if(!m)continue;"
+           "if(m[1]==='BEGIN')ob[m[2]]=1;else if(ob[m[2]])rid=m[2];}return rid;}")
 
 _NODE_FN = (
     _ROLE_FN + _TEXT_FN + _RID_FN +
@@ -832,7 +843,8 @@ def _detect_js(rid: str, *, scoped=False) -> str:
 # Mirrored page-side by _RID_FN, which the scoped answer reads anchor on.
 _TURN_BEGIN_LINE_RE = re.compile(rf"^BEGIN_RESPONSE:({_RID_RE_SRC})$")
 _TURN_END_LINE_RE = re.compile(rf"^END_RESPONSE:({_RID_RE_SRC})$")
-_TURN_MARKER_LINE_RE = re.compile(rf"^CGC_RID:({_RID_RE_SRC})$")
+_TURN_MARKER_RE = re.compile(_MARKER_RE_SRC)
+_WS_TRIM_RE = re.compile(rf"^[{_WS_SRC}]+|[{_WS_SRC}]+$")
 
 
 def _turn_canonical_rid(turn_text):
@@ -857,25 +869,25 @@ def _turn_canonical_rid(turn_text):
     fence-awareness is unnecessary here because picking the LAST pair already defeats an earlier
     fenced/prose quote regardless of whether it's inside a fence).
 
-    THE HEAD MARKER. Both templates now open with a plain `CGC_RID:<rid>` line. ChatGPT collapses a
-    long user message to its head plus "Show more", and the pair above is the LAST thing in the
-    render, so a collapsed turn's DOM holds the marker and never the pair. The turn's first non-blank
-    line, trimmed, being exactly that marker names the turn's rid. A marker and a complete pair that
-    disagree give None (fail closed): the head and the tail of one prompt cannot name two requests.
-    A prompt without a marker (a legacy round, the automatic continue) is read by the pair alone, so a
-    collapsed legacy turn stays unproven exactly as before. The turn's React state is NOT consulted:
-    which fiber or ancestor is current cannot be known from a DOM node.
+    THE HEAD MARKER. Both templates open with a plain `CGC_RID:<rid>` token. ChatGPT collapses a long
+    user message to its head plus "Show more", and the pair above is the LAST thing in the render, so a
+    collapsed turn's DOM holds the marker and never its own pair. The turn's rid is the rid of the FIRST
+    such token anywhere in the text (a non-word character or the text's start before it, a non-word
+    character after the rid): the template puts it ahead of everything, so only an @mention label can
+    precede it, and a body that quotes another marker comes later. A marker is AUTHORITATIVE, with no
+    cross-check against a tail pair: in a collapsed turn the last VISIBLE complete pair can be a quote
+    (a follow-up quoting its parent), and a refire rewrites the rid everywhere, so our own tail always
+    equals our marker. With no marker anywhere (a legacy round, the automatic continue) the pair rule
+    above applies unchanged, so a collapsed legacy turn stays unproven. The turn's React state is NOT
+    consulted: which fiber or ancestor is current cannot be known from a DOM node.
     """
-    canonical, marker, first = None, None, True
+    marker = _TURN_MARKER_RE.search(turn_text or "")
+    if marker:
+        return marker.group(1)
+    canonical = None
     open_begin = set()
     for line in (turn_text or "").replace("\r\n", "\n").split("\n"):
-        s = line.strip()
-        if first and s:
-            first = False
-            mm = _TURN_MARKER_LINE_RE.match(s)
-            if mm:
-                marker = mm.group(1)
-                continue
+        s = _WS_TRIM_RE.sub("", line)        # NOT str.strip(): the two sides share _WS_SRC
         mb = _TURN_BEGIN_LINE_RE.match(s)
         if mb:
             open_begin.add(mb.group(1))
@@ -883,9 +895,7 @@ def _turn_canonical_rid(turn_text):
         me = _TURN_END_LINE_RE.match(s)
         if me and me.group(1) in open_begin:
             canonical = me.group(1)  # scanning in order: the last completed pair wins
-    if marker is None:
-        return canonical
-    return marker if canonical in (None, marker) else None
+    return canonical
 
 
 def _last_user_text_js() -> str:
@@ -2874,6 +2884,50 @@ def _paste_prompt(c, prompt: str, mentions=()) -> None:
                 f"the requested {wanted!r} — refusing to send the prompt with the wrong apps")
 
 
+def _turn_rid_conflicts(rid, prompt, mentions=()):
+    """The distinct rids (None = "no rid") the user turn we are about to send would PARSE as, other
+    than `rid`; empty means it parses as `rid` however the page lays it out.
+
+    The reader names a turn by the first CGC_RID token in its text, and _paste_prompt types each
+    @mention label BEFORE the prompt, so the text a turn shows is "<labels><prompt>". Any foreign
+    CGC_RID token ahead of ours — an app named `CGC_RID:<other>`, or a legacy prompt-file body that
+    discusses one while its footer is `rid` — would make the sent turn read as another request, and
+    the OTHER rid's waiter or retrieve could then take this round's answer as its own. So the
+    invariant is enforced on the write side, with the reader's own rule, before the click. The labels
+    are laid out both inline (a space) and on their own line, since the sent bubble's layout is not
+    something to depend on. A prompt with no marker whose tail pair is `rid` parses as `rid`: that is
+    the legacy path, and only a collapsed turn would be unprovable there."""
+    names = [m for m in (mentions or ()) if m]
+    texts = [prompt] if not names else [sep.join(names) + sep + prompt for sep in (" ", "\n")]
+    return sorted({got for got in (_turn_canonical_rid(t) for t in texts) if got != rid},
+                  key=lambda g: g or "")
+
+
+_AMBIGUOUS_RID_TAIL = {"submit": "NOT submitting.", "follow-up": "NOT sending the follow-up.",
+                       "enqueue": "NOT enqueuing."}
+
+
+def _refuse_ambiguous_rid(rid, prompt, mentions, what):
+    """The refusal shared by submit, followup and the enqueue that precedes them: a message when the
+    turn would not parse as `rid`, else None. what: "submit", "follow-up" or "enqueue". At the driver
+    it exits EXIT_NOT_SENT_PRECLICK: nothing was clicked, so the round is provably unsent."""
+    # The picker matches app labels case-insensitively, so a requested `cgc_rid:<x>` can attach a
+    # `CGC_RID:<x>` chip the case-sensitive reader then reads first. No app name carries the token.
+    named = [m for m in (mentions or ()) if m and "cgc_rid" in m.lower()]
+    if named:
+        return (f"CGC_ERROR rid_ambiguous: the @mention name {named[0]!r} holds the CGC_RID token, which "
+                f"names a turn; no app name may carry it. {_AMBIGUOUS_RID_TAIL[what]}")
+    bad = _turn_rid_conflicts(rid, prompt, mentions)
+    if not bad:
+        return None
+    shown = ", ".join(b or "no rid" for b in bad)
+    return (f"CGC_ERROR rid_ambiguous: the turn this {what} would send reads as {shown}, not {rid} — "
+            "a CGC_RID token ahead of this round's own (in an @mention name or the prompt body), or no "
+            "rid the reader can find. Another request's waiter could take this answer as its own. "
+            f"{_AMBIGUOUS_RID_TAIL[what]} Render the prompt with consult.py prep (its first line is this "
+            "round's CGC_RID) and drop the token from the body or the mention name.")
+
+
 def cmd_submit(a) -> int:
     prompt = _read_prompt(a.prompt_file)
     # Backstop (prep already hard-blocks at render; the spool gate re-checks): refuse to send a
@@ -2902,6 +2956,10 @@ def cmd_submit(a) -> int:
     if not _ok:
         sys.stderr.write(f"CGC_ERROR gate_refused: {_reason} — NOT submitting.\n")
         return 2
+    _why = _refuse_ambiguous_rid(a.rid, prompt, getattr(a, "mention", None), "submit")
+    if _why:
+        sys.stderr.write(_why + "\n")
+        return EXIT_NOT_SENT_PRECLICK
     if not a.no_gate:
         _ensure_chrome(a.port)  # automated Step 0: start debug Chrome if down + check login
     # Tab policy: each consult gets its OWN dedicated tab by default, so multiple
@@ -3205,6 +3263,10 @@ def cmd_followup(a) -> int:
     if not _ok:
         sys.stderr.write(f"CGC_ERROR gate_refused: {_reason} — NOT sending the follow-up.\n")
         return 2
+    _why = _refuse_ambiguous_rid(rid, prompt, getattr(a, "mention", None), "follow-up")
+    if _why:
+        sys.stderr.write(_why + "\n")
+        return EXIT_NOT_SENT_PRECLICK
     # A consult is a THREAD: the conversation persists server-side at /c/<id> even after
     # its tab is closed (default), so follow-up must NOT depend on round-1 having kept the
     # tab. Attach to a live tab if one exists; otherwise RE-OPEN the conversation by URL.

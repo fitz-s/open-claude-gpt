@@ -115,11 +115,13 @@ BEGIN_RESPONSE:{rid}
 END_RESPONSE:{rid}"""
 
 
-# The rid marker: the FIRST line of every rendered prompt, plain text so a markdown-rendered bubble
+# The rid marker: the FIRST thing in every rendered prompt, plain text so a markdown-rendered bubble
 # keeps it verbatim. ChatGPT collapses a long user message to its head plus "Show more" and the sentinel
 # pair is the LAST thing in the render, so a collapsed turn's DOM never carries the pair; the head is the
-# one part that is never collapsed. cdp_consult._turn_canonical_rid reads the turn's own rid from it
-# (SHARED CONTRACT #3). `{rid}` is substituted like the sentinels' — logical_sha renders "<RID>" here too.
+# one part that is never collapsed. cdp_consult._turn_canonical_rid reads the turn's own rid from the first
+# such token in the turn (SHARED CONTRACT #3); an @mention label may be pasted ahead of the prompt, which is
+# why it is a token and not "the first line". `{rid}` is substituted like the sentinels' — logical_sha
+# renders "<RID>" here too.
 RID_MARKER = "CGC_RID:{rid}\n\n"
 
 PROMPT_TEMPLATE = RID_MARKER + """# {title}
@@ -1054,12 +1056,19 @@ def cmd_fire(a: argparse.Namespace) -> int:
 
 DEFAULT_APPS = "WebCodex Demo"
 
+# An @mention label is pasted into the composer AHEAD of the prompt, so the turn's text opens with it.
+# A name carrying the rid marker token would put a foreign `CGC_RID:` first and the turn would read as
+# another request (cdp_consult._turn_canonical_rid takes the FIRST token). Refused at input, in any case.
+_MARKER_NAME_RE = re.compile(r"cgc_rid", re.IGNORECASE)
+_MARKER_NAME_WHY = ("an app name may not contain 'CGC_RID': the label is pasted ahead of the prompt and "
+                    "would put a foreign rid marker first, so the turn would read as another request")
+
 
 def known_apps() -> list:
     """The ChatGPT apps this user has told us about (CGC_APPS, comma-separated) — the list an agent
     reads with `consult.py apps` instead of reasoning about what exists."""
     raw = os.environ.get("CGC_APPS", DEFAULT_APPS)
-    return [x for x in (" ".join(p.split()).lstrip("@").strip() for p in raw.split(",")) if x]
+    return [x for x in (" ".join(p.split()).lstrip("@").strip() for p in raw.split(",")) if x and not _MARKER_NAME_RE.search(x)]
 
 
 def _mention_name(v: str) -> str:
@@ -1069,6 +1078,8 @@ def _mention_name(v: str) -> str:
     v = " ".join((v or "").split()).lstrip("@").strip()
     if not v or len(v) > 80:
         raise argparse.ArgumentTypeError("a --mention is the app's name as ChatGPT shows it, 1-80 chars")
+    if _MARKER_NAME_RE.search(v):
+        raise argparse.ArgumentTypeError(_MARKER_NAME_WHY)
     apps, low = known_apps(), v.lower()
     exact = [x for x in apps if x.lower() == low]
     pref = [x for x in apps if x.lower().startswith(low)]

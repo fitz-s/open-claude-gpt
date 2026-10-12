@@ -102,42 +102,100 @@ def test_a_source_turn_that_is_not_rendered_is_named_not_read_as_an_empty_answer
     assert pending["node"] == "none", "an unscoped read with no assistant node yet"
 
 
-def test_the_js_turn_rid_parser_matches_the_python_one():
-    """__cgcRid is the page-side mirror of _turn_canonical_rid (SHARED CONTRACT #3): the waiter now
-    anchors its interval with it, so the two must agree on every shape the Python tests pin."""
+def _rid_cases():
+    """(text, expected rid) for the user-turn identity rule. Both __cgcRid and _turn_canonical_rid must
+    return `expected` on EVERY row: agreement alone would let a bug both sides share pass."""
     a, b = R[1], R[2]
-    corpus = [
-        f"review\nBEGIN_RESPONSE:{a}\nthe answer\nEND_RESPONSE:{a}\n",
-        f"Earlier you wrote BEGIN_RESPONSE:{a} inline.\nBEGIN_RESPONSE:{b}\nask\nEND_RESPONSE:{b}\n",
-        f"```\nBEGIN_RESPONSE:{a}\n```\nBEGIN_RESPONSE:{b}\nask\nEND_RESPONSE:{b}\n",
-        f"BEGIN_RESPONSE:{a}\nold\nEND_RESPONSE:{a}\nnow:\nBEGIN_RESPONSE:{b}\nask\nEND_RESPONSE:{b}\n",
-        f"BEGIN_RESPONSE:{b}\nask\nEND_RESPONSE:{b}\nquoted after:\nBEGIN_RESPONSE:{a}\nEND_RESPONSE:{a}",
-        f"just discussing BEGIN_RESPONSE:{a} with no end\n",
-        f"BEGIN_RESPONSE:{a}\nx\nEND_RESPONSE:{b}\n",
-        f"END_RESPONSE:{a}\nBEGIN_RESPONSE:{a}\n",
-        f"  BEGIN_RESPONSE:{a}  \r\nx\r\n\tEND_RESPONSE:{a}\t\r\n",
-        f"BEGIN_RESPONSE:{a}x\nEND_RESPONSE:{a}x\n",
-        "plain question, no sentinels\n",
-        "",
-        # the head marker (the one part of a long prompt ChatGPT never collapses)
-        f"CGC_RID:{a}\n# t\nBEGIN_RESPONSE:{a}\nx\nEND_RESPONSE:{a}\n",
-        f"CGC_RID:{a}\n# a collapsed turn: no tail pair in the DOM\n",
-        f"\n  CGC_RID:{a}  \r\n# t\n",
-        f"CGC_RID:{a}\n# t\nBEGIN_RESPONSE:{b}\nx\nEND_RESPONSE:{b}\n",
-        f"CGC_RID:{a}\n# t\nquotes BEGIN_RESPONSE:{b} with no end\nBEGIN_RESPONSE:{a}\nEND_RESPONSE:{a}\n",
-        f"# t\nCGC_RID:{a}\nBEGIN_RESPONSE:{b}\nx\nEND_RESPONSE:{b}\n",
-        f"# t\nCGC_RID:{a}\n",
-        f"CGC_RID:{a}x\n# t\n",
-        f"cgc_rid:{a}\n# t\n",
-        f"CGC_RID:{a} \nCGC_RID:{b}\n# t\n",
-        f"CGC_RID:not-a-rid\nBEGIN_RESPONSE:{a}\nx\nEND_RESPONSE:{a}\n",
+    pair = lambda r: f"BEGIN_RESPONSE:{r}\nx\nEND_RESPONSE:{r}\n"
+    label = "WebCodex Demo"
+    rows = [
+        # ---- the legacy tail pair (no marker anywhere)
+        (f"review\nBEGIN_RESPONSE:{a}\nthe answer\nEND_RESPONSE:{a}\n", a),
+        (f"Earlier you wrote BEGIN_RESPONSE:{a} inline.\nBEGIN_RESPONSE:{b}\nask\nEND_RESPONSE:{b}\n", b),
+        (f"```\nBEGIN_RESPONSE:{a}\n```\nBEGIN_RESPONSE:{b}\nask\nEND_RESPONSE:{b}\n", b),
+        (f"BEGIN_RESPONSE:{a}\nold\nEND_RESPONSE:{a}\nnow:\nBEGIN_RESPONSE:{b}\nask\nEND_RESPONSE:{b}\n", b),
+        (f"BEGIN_RESPONSE:{b}\nask\nEND_RESPONSE:{b}\nquoted after:\nBEGIN_RESPONSE:{a}\nEND_RESPONSE:{a}", a),
+        (f"just discussing BEGIN_RESPONSE:{a} with no end\n", None),
+        (f"BEGIN_RESPONSE:{a}\nx\nEND_RESPONSE:{b}\n", None),
+        (f"END_RESPONSE:{a}\nBEGIN_RESPONSE:{a}\n", None),
+        (f"  BEGIN_RESPONSE:{a}  \r\nx\r\n\tEND_RESPONSE:{a}\t\r\n", a),
+        (f"BEGIN_RESPONSE:{a}x\nEND_RESPONSE:{a}x\n", None),
+        ("plain question, no sentinels\n", None),
+        ("", None),
+        # ---- the head marker: the FIRST CGC_RID token, authoritative over any tail pair
+        (f"CGC_RID:{a}\n# t\n" + pair(a), a),
+        (f"CGC_RID:{a}\n# a collapsed turn: no tail pair in the DOM\n", a),
+        (f"CGC_RID:{a}\n# t\n" + pair(b), a),
+        (f"CGC_RID:{a}\r\n# t\r\nBEGIN_RESPONSE:{b}\r\nx\r\nEND_RESPONSE:{b}\r\n", a),
+        (f"CGC_RID:{a}\n# t\nquotes BEGIN_RESPONSE:{b} with no end\nBEGIN_RESPONSE:{a}\nEND_RESPONSE:{a}\n", a),
+        (f"# t\nCGC_RID:{a}\n" + pair(b), a),
+        (f"(CGC_RID:{a}) # t\n", a),
+        (f"-CGC_RID:{a}.\n# t\n", a),
+        # ---- an @mention label ahead of the marker: inline, on its own line, with a quoted R1 pair
+        (f"{label} CGC_RID:{a}\n# t\n", a),
+        (f"{label}\nCGC_RID:{a}\n# t\n", a),
+        (f"@{label}  CGC_RID:{a}\n# t\n" + pair(a), a),
+        (f"{label} CGC_RID:{b}\n# t\nyou wrote:\n" + pair(a), b),
+        (f"﻿{label} CGC_RID:{b}\n# t\nyou wrote:\n" + pair(a), b),
+        # ---- the FIRST token wins; a later quoted marker does not
+        (f"CGC_RID:{a}\n# t\nthe old prompt began CGC_RID:{b}\n", a),
+        (f"CGC_RID:{a}\nCGC_RID:{b}\n# t\n", a),
+        # ---- boundary: glued to a word, a longer rid, another case or a malformed rid is not a marker
+        (f"xCGC_RID:{a}\n# t\n", None),
+        (f"_CGC_RID:{a}\n# t\n", None),
+        (f"CGC_RID:{a}x\n# t\n", None),
+        (f"CGC_RID:{a}0\n# t\n", None),
+        (f"cgc_rid:{a}\n# t\n", None),
+        (f"xCGC_RID:{a}\nCGC_RID:{b}\n# t\n", b),
+        (f"xCGC_RID:{a}\n" + pair(b), b),
+        ("CGC_RID:not-a-rid\n" + pair(a), a),
+        # ---- the whitespace set both sides share: BOM, U+0085, U+00A0, U+2003, U+3000 are space ...
+        (f"﻿CGC_RID:{a}\n# t\n", a),
+        (f"\x85CGC_RID:{a}\x85\n# t\n", a),
+        (f"\xa0CGC_RID:{a}\xa0\n# t\n", a),
+        (f" CGC_RID:{a}　\n# t\n", a),
+        (f"﻿BEGIN_RESPONSE:{a}\nx\nEND_RESPONSE:{a}﻿\n", a),
+        (f"\x85BEGIN_RESPONSE:{a}\x85\nx\n\x85END_RESPONSE:{a}\x85\n", a),
+        (f"\xa0BEGIN_RESPONSE:{a}\xa0\nx\nEND_RESPONSE:{a}\xa0\n", a),
+        (f" BEGIN_RESPONSE:{a}　\nx\nEND_RESPONSE:{a}\n", a),
+        # ... the reviewer's pair: marker R2 + a visible quoted R1 pair + tail hidden, under a BOM or U+0085
+        (f"﻿CGC_RID:{b}\n# t\nyou wrote:\n" + pair(a), b),
+        (f"\x85CGC_RID:{b}\n# t\nyou wrote:\n" + pair(a), b),
+        (f"{label}﻿\nCGC_RID:{b}\n# t\n﻿BEGIN_RESPONSE:{a}\nx\nEND_RESPONSE:{a}\n", b),
+        # ... \x1c-\x1f are NOT space (str.strip() takes them, trim() does not): a pair line wearing one is no pair
+        *[(f"{c}BEGIN_RESPONSE:{a}\nx\nEND_RESPONSE:{a}\n", None) for c in "\x1c\x1d\x1e\x1f"],
+        *[(f"BEGIN_RESPONSE:{a}\nx\nEND_RESPONSE:{a}{c}\n", None) for c in "\x1c\x1d\x1e\x1f"],
+        *[(f"{c}CGC_RID:{a}\n# t\n", a) for c in "\x1c\x1d\x1e\x1f"],       # a non-word char before: still a marker
+        *[(f"CGC_RID:{b}\n{c}BEGIN_RESPONSE:{a}\nx\nEND_RESPONSE:{a}\n", b) for c in "\x1c\x1f"],
+        # ... non-ASCII digits (Python's \d takes them, JS's does not): a rid in them is not a rid
+        (f"CGC_RID:{a.replace('2099', chr(0x0662) + chr(0x0660) + chr(0x0669) + chr(0x0669))}\n# t\n", None),
+        (f"CGC_RID:REQ-{chr(0xff12) * 8}-010000-00000{chr(0x0661)}\n# t\n", None),
+        (f"BEGIN_RESPONSE:REQ-{chr(0xff12) * 8}-010000-000001\nx\nEND_RESPONSE:REQ-{chr(0xff12) * 8}-010000-000001\n", None),
+        (f"CGC_RID:REQ-{chr(0xff12) * 8}-010000-000001\n" + pair(a), a),
+        # ---- other line endings: \r alone and U+2028 are not line breaks for either side
+        (f"BEGIN_RESPONSE:{a}\rx\rEND_RESPONSE:{a}\r", None),
+        (f"BEGIN_RESPONSE:{a} x END_RESPONSE:{a}\n", None),
     ]
+    assert all(a.startswith("REQ-2099") for a in R), "the non-ASCII-digit row rewrites the rid's year"
+    return rows
+
+
+def test_the_js_turn_rid_parser_matches_the_python_one():
+    """__cgcRid is the page-side mirror of _turn_canonical_rid (SHARED CONTRACT #3): the waiter anchors
+    its interval with it, so the two must return the SAME rid on every input, and the right one. They
+    share one whitespace set (_WS_SRC), the [0-9] digit class and the marker regex by construction;
+    str.strip() and trim() disagree (\\x1c-\\x1f and U+0085 vs the BOM), so neither is used."""
+    rows = _rid_cases()
+    corpus = [t for t, _ in rows]
     if not shutil.which("node"):
         pytest.skip("node not installed")
     js = CDP._RID_FN + "console.log(JSON.stringify(" + json.dumps(corpus) + ".map(__cgcRid)));"
     got = json.loads(subprocess.run(["node", "-e", js], capture_output=True, text=True,
                                     check=True).stdout)
-    assert got == [CDP._turn_canonical_rid(t) for t in corpus]
+    py = [CDP._turn_canonical_rid(t) for t in corpus]
+    bad = [(repr(t[:60]), e, j, p) for (t, e), j, p in zip(rows, got, py) if not (e == j == p)]
+    assert not bad, "text, expected, js, python:\n" + "\n".join(map(str, bad))
+
 
 
 def test_every_rendered_prompt_template_parses_to_its_rid_in_both_parsers():
