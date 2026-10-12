@@ -539,13 +539,15 @@ def round_needs(kind: str, spec_json) -> tuple:
     never gated. Every send needs the composer (paste, read it back) and the reader (prove the turn
     landed, read the answer). A round that selects a model needs `model:<tier>@<family>` for the pair
     its spec froze — matched against the pair a verdict recorded, never against today's environment,
-    so a config change can neither gate an unrelated round nor release the one that failed. A `skip`
-    round needs no model. A round with an @mention also needs the mention picker."""
+    so a config change can neither gate an unrelated round nor release the one that failed. Only a
+    `skip` tier needs no model: a `skip` family still selects the tier. A round with an @mention also needs the mention picker."""
     if kind == "retrieve":
         return ()
     spec = _spec(spec_json)
     tier, family = spec.get("model") or "Pro", spec.get("model_family") or "GPT-6"
-    model = () if tier.lower() == "skip" or family.lower() == "skip" else (model_ref(tier, family),)
+    # `family='skip'` still selects the tier (cdp_consult._select_model skips only the family check),
+    # so only `tier='skip'` drops the model dependency.
+    model = () if tier.lower() == "skip" else (model_ref(tier, family),)
     return ("composer", "reader") + model + (("mention",) if spec.get("mentions") else ())
 
 

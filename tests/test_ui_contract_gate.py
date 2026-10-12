@@ -967,3 +967,15 @@ def test_the_reader_never_breaks_on_a_page_that_did_not_settle(env, monkeypatch)
     with pytest.raises(env.probe.Transient) as e:
         env.probe.probe_reader(env.probe._NoSend(_NodeTab(page)), RID, settle=0)
     assert not isinstance(e.value, (env.probe.Drift, env.probe.Blocked)) and "never settled" in str(e.value)
+
+
+def test_a_skip_family_still_needs_its_tier(env):
+    """`family='skip'` only skips the family check; the tier is still selected, so a broken
+    `model:Pro@skip` holds that round. Only `tier='skip'` sends without touching the picker."""
+    s = env.s
+    s.create_round(RID, "submit", prompt="p", spec_json=json.dumps({"model": "Pro", "model_family": "skip"}))
+    s.create_round(RID2, "submit", prompt="p", spec_json=json.dumps({"model": "skip", "model_family": "skip"}))
+    s.mark_broken("model", phase="probe:done", cause="tier not selectable",
+                  ref=env.store_mod.model_ref("Pro", "skip"))
+    assert s.claim_ready("d1")["rid"] == RID2
+    assert s.claim_ready("d1") is None and s.get_round(RID)["state"] == env.store_mod.QUEUED
