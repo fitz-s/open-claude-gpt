@@ -753,6 +753,8 @@ function match(x,sel){return sel.split(',').some(function(p){p=p.trim();
   if(p==='button[data-testid="send-button"]')return x.tagName==='BUTTON'&&x._a['data-testid']==='send-button';
   if(p==='button[aria-label*="Send" i]')return x.tagName==='BUTTON'&&/send/i.test(x._a['aria-label']||'');
   if(p==='button[aria-label*="\u53d1\u9001"]')return x.tagName==='BUTTON'&&/\u53d1\u9001/.test(x._a['aria-label']||'');
+  if(p==='form')return x.tagName==='FORM';
+  if(p==='[role="alert"]'||p==='[id*="challenge"]')return false;   // no rate-limit alert, no challenge
   throw new Error('unsupported selector: '+p);});}
 function ed(o){o=o||{};o.a=Object.assign({role:'textbox',contenteditable:'true'},o.a||{});var n=el('div',o);
   Object.defineProperty(n,'innerText',{get:function(){return n._text}});return n;}

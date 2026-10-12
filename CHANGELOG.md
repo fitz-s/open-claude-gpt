@@ -6,6 +6,42 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Added — a no-send UI-contract probe, and sends pause instead of failing when ChatGPT's page moves
+
+ChatGPT's page changed four times in three weeks:
+
+- `Latest` became `GPT-6`;
+- the @-mention popup changed;
+- long user turns now collapse;
+- re-opened threads render late.
+
+Each change was found one round at a time. A reader break was the worst case: the message was
+spent, and the round then waited up to 90 minutes before ending uncertain.
+
+- **`cgc probe`** checks the contract without sending anything. It selects the configured model on
+  a fresh project tab, pastes and reads back a 17 KB draft, inserts the first `CGC_APPS` app's
+  mention, and clears the composer. It also opens a finished conversation read-only and reads its
+  source turn and wrapped answer through the waiter's own reads. Every check opens its own
+  background tab and closes only that tab. A handle that refuses the send button, Enter and
+  `Input.*` events is the only way the probe reaches its tab.
+- **Capability state** is stored in `meta` (`ui.composer`, `ui.mention`, `ui.reader`). A failing
+  probe marks a capability broken, after one retry. A real round marks only `reader`, on
+  `selector_drift`, which is the break that spends messages. A pre-click failure costs nothing, and
+  from one round it can be a deleted project or an unconnected app, so it never gates. A login,
+  challenge or rate-limit page never marks anything, and the probe reports it (`CGC_PROBE_BLOCKER`).
+  An inconclusive probe changes nothing. That covers a thread still hydrating after 60 s, and a page
+  that never showed the conversation. A pass clears a failure only if the probe started after that
+  failure was recorded.
+- **Sends pause, rounds stay queued.** The daemon claims no round that needs a broken capability:
+  every send needs `composer` and `reader`, and a `--mention` round also needs `mention`. Retrieves
+  are never paused. `await` says `ChatGPT UI changed (<capability>: <cause>) — sends paused; driver
+  needs a fix; queued rounds are intact`. The daemon probes at start, before queued work once the
+  last probe is 6 h old, and every 30 min while something is broken.
+- **The driver's typed outcome is kept.** Its failure line (`submitted`, `reason`, `phase`, the
+  contract it observed) is stored on the attempt and returned by `await` as `send`. An uncertain
+  send's error now says, for example, `selector_drift: submitted=true`. It still keeps its
+  conversation id and is still never resent.
+
 ### Added — a usage feedback loop: intent, backlog, grading, a weekly view, and a budget line at session start
 
 Agents almost never fired on their own (1 of 13 consult sessions in 30 days), nothing measured whether

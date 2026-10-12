@@ -15,6 +15,7 @@ uses a dedicated Chrome profile, CDP, sentinels, and a detached waiter.
 | `skill/scripts/cgc_spool.py` | **Egress gate + CLI.** The validating gate (public repos, existing refs, secret scan), daemon heartbeat/singleton, per-round logs, and the agent-facing enqueue/await/status/cancel/stats CLI. |
 | `skill/scripts/cgc_daemon.py` | **The egress daemon.** User-owned (launchd); claims rounds, runs the gate, drives CDP subprocesses, maintains the browser (sweep/repair). |
 | `skill/scripts/cdp_consult.py` | **Browser adapter.** External CDP client: submit, followup, wait. Opens tabs, selects model, types + sends, polls to completion. |
+| `skill/scripts/cgc_probe.py` | **UI-contract probe.** `cgc probe`: checks, without sending, that ChatGPT's page still reads the way the driver reads it (composer, @mention, reader), and records a verdict per capability. |
 | `skill/scripts/cdp_launch.sh` | **Setup plane.** Starts the dedicated debug Chrome, probes login, exit-code gate for self-healing. |
 | `skill/scripts/cgc_doctor.py` | Health check / preflight. |
 | `skill/scripts/retrieval_window.js` | Answer-windowing helper for the MCP fallback backend. |
@@ -147,6 +148,59 @@ touch only lease-free rounds. Complementing that, every store file carries a
 schema_version, db_path, store_uuid, instance id), and enqueue fails closed on a
 live daemon whose identity does not match the store the CLI opened — the runtime
 fence against a stale daemon serving a relocated-away or older-schema DB.
+
+### The UI contract: probe it without sending, gate sends on it
+ChatGPT's page is an unversioned contract that the driver reads by structure. It moved four times
+in three weeks: the model label, the @-mention popup, long user turns collapsing, and re-opened
+threads rendering late. Each change was found one round at a time, and a reader break cost a sent
+message plus up to 90 minutes of waiting. Three pieces now catch the next move once, cheaply:
+
+- **Typed send outcomes.** The driver's failure lines carry `submitted` (true / false / null =
+  unknown), `reason`, `phase`, and `drift` when the failure deterministically proves part of the
+  contract broken. The worker stores the line on the attempt (`attempts.remote_evidence_json`), and
+  `await` returns it as `send`. An uncertain send stays `possibly_accepted` with its conversation id,
+  and is never auto-resent.
+- **Capability state** lives in `meta`, one key per capability (`ui.composer`, `ui.mention`,
+  `ui.reader`), each holding `{ok, epoch, phase, cause, rid_or_conversation, checked_at,
+  driver_rev}`. A failing probe marks any of them broken. A real round marks only `reader`, and
+  only on `selector_drift`: the rid landed but no reply is readable, on a page with no blocker. That
+  is the failure that costs a message. A real round's pre-click failure costs nothing, and one round
+  cannot tell a UI change from its own deleted project, stale frozen family or unconnected app, so
+  composer and mention are recorded by the probe only. The probe checks the configured project,
+  model and app. A login, challenge or rate-limit page (one shared detector, `_BLOCKER_FN`) never
+  marks anything. A probe pass clears a failure only if no capability write happened after the probe
+  started; the epoch is compared in the same transaction as the write.
+- **The gate** is in `claim_ready`. A queued round that needs a broken capability is skipped, not
+  failed: every send needs `composer` and `reader`, and a round with `--mention` also needs
+  `mention`. A retrieve sends nothing and is never gated. `await` reports the pause as
+  `human_action` once it has outlasted one probe run.
+
+The probe (`cgc_probe.py`) uses the driver's own helpers and has no selector of its own. Each check
+opens its own background tab and closes only that tab:
+
+- **composer:** model selection, a 17 KB paste read back whole, then a clear. A missing editor
+  counts as drift only when the app's own form rendered.
+- **mention:** an app picked from the @ popup, and its chip confirmed. The app is `--mention`, or
+  the app a recorded mention failure names, or else the first `CGC_APPS` app.
+- **reader:** a finished conversation's source turn found by its rid with the waiter's reads, the
+  send contract's landed check, and the wrapped answer extracted. The reads are polled for 60 s,
+  with the waiter's one reload, before anything is judged. A miss is drift only if the rid is
+  rendered in `<main>`. The fixture is a `completed_verified` round in a thread whose later rounds
+  never crossed the send fence (a queued round, gated or not, does not count) and where nothing is
+  active. It prefers a long round with the `CGC_RID` head marker; when none exists it uses a short
+  legacy round, whose tail pair proves its rid.
+
+It cannot send. Every step goes through a handle that refuses the send button's JS, Enter, and
+`Input.*` events, and a test runs the probe with the send helpers rigged to fail. A failure that
+says nothing about the page (Chrome, attach, a timeout, a page that never hydrated, a login,
+challenge or rate-limit page) is retried once and then reported inconclusive, with the state left
+as it was. A login, challenge or rate limit is also printed as `CGC_PROBE_BLOCKER`.
+
+The daemon runs the probe at start, again before queued paid work once the last run is 6 h old,
+and after any capability is recorded broken (at most once per 30 min). While a probe runs it claims
+only retrieves. The probe is the daemon's child: shutdown sends it SIGTERM, which closes its own
+tab, and reaps it. `--once` ends when no claimable work remains; rounds held by the gate stay queued.
+The typed send evidence is written after the round's state and conversation, and fail-soft.
 
 ### The auto-mode egress path: why a user-owned daemon, not a bypass
 Claude Code's `auto` permission mode runs a data-exfiltration classifier **above**
