@@ -305,7 +305,8 @@ validating egress gate the daemon runs before every send.
 ### When ChatGPT's page changes: `cgc probe`
 
 The daemon checks, without sending anything, that ChatGPT's page still works the way the driver
-reads it. It checks three capabilities: the composer (model picker, paste), the @mention picker,
+reads it. It checks four capabilities: the composer (paste and read back), the model picker (for
+the configured tier@family; a break holds only rounds frozen to that pair), the @mention picker,
 and the reader (finding a finished turn and its answer). It runs these checks at start, before
 queued work once the last check is 6 h old, and again (at most every 30 min) after one breaks.
 
