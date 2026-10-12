@@ -6,6 +6,8 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-12
+
 ### Added — a no-send UI-contract probe, and sends pause instead of failing when ChatGPT's page moves
 
 ChatGPT's page changed four times in three weeks:
