@@ -648,25 +648,23 @@ _NODE_FN = (
     "var nx=document.querySelectorAll(" + _JS_ANY + ");"
     "var scoped=!!RID,lo=-1,hi=nx.length;"
     "if(scoped){lo=__cgcSrc(nx,RID);if(lo<0)return null;"
-    # The interval ends at the next user turn that belongs to ANOTHER round (carries another rid) — not
-    # at the next user turn. A rid-less user turn is a human typing into the thread, and while the
-    # round is still reasoning ChatGPT folds it in: the one reply lands AFTER it (live 2026-10-13,
-    # REQ-20261013-091624-b74d3b: a waiter stopping at such a note read node=none beside the finished
-    # answer for 50 minutes). Position cannot tell "mid-reasoning" from "after the reply": an empty
-    # assistant placeholder is in the DOM while the model thinks. Identity can: the reply must still
-    # carry THIS rid's sentinel to be done (step 1). A resend under this rid (the auto-continue) is lo
-    # itself (__cgcSrc takes the last); salvage stays refused once any turn follows (_salvage_allowed).
-    "for(var j=lo+1;j<nx.length;j++){if(__cgcRole(nx[j])==='user'&&__cgcRid(__cgcText(nx[j]))){hi=j;break;}}}"
+    # Where the interval ends: at the next user turn that carries ANOTHER rid (another round), or at
+    # any user turn once a reply (a non-blank assistant node) has appeared since lo. Between those, a
+    # rid-less user turn is a STEER typed while the model was still reasoning, and ChatGPT's one reply
+    # lands after it (live 2026-10-13, REQ-20261013-091624-b74d3b: the heartbeat read ac=0 for the whole
+    # 45 minutes of reasoning — no assistant node exists before the reply — and a waiter stopping at
+    # the note read node=none beside the finished answer). A note typed AFTER a reply starts a new
+    # exchange, even when the model reuses this rid's wrapper in answering it. Where the DOM cannot
+    # tell the two apart, the rule errs toward ending the interval: a missed answer is retrieved, a
+    # wrong one is not caught. A resend under this rid is lo itself (__cgcSrc takes the last).
+    "var rep=false;for(var j=lo+1;j<nx.length;j++){var rj=__cgcRole(nx[j]);"
+    "if(rj==='assistant'){rep=rep||/\\S/.test(nx[j].textContent||'');continue;}"
+    "if(rj==='user'&&(rep||__cgcRid(__cgcText(nx[j])))){hi=j;break;}}}"
     # 1) exact: any assistant node containing our (unique) BEGIN sentinel, newest-first. Scoped ->
     #    within [lo,hi) only. Unscoped -> the whole document (lo=-1,hi=nx.length), matching the
     #    original global search.
     #    Narrowed to the message BODY: the search-unit build puts attachment cards ("x.py Code Open
     #    file") after the markdown in the same unit, which would make END no longer the last line.
-    #    Scoped, a COMPLETE reply (the canonical parser's done) is taken oldest-first: a rid-less note typed after
-    #    this round's reply finished stays inside the interval (see above), and a reply to it that
-    #    echoes the wrapper must never replace the round's own. No complete one yet -> newest with BEGIN.
-    "if(scoped){for(var i=lo+1;i<hi;i++){if(__cgcRole(nx[i])!=='assistant')continue;"
-    "var bd=__cgcBody(nx[i],BG);if(__cgcDone(__cgcText(bd),RID))return bd;}}"
     "for(var i=hi-1;i>lo;i--){if(__cgcRole(nx[i])==='assistant'&&(nx[i].textContent||'').indexOf(BG)>=0)"
     "return __cgcBody(nx[i],BG);}"
     # 2) fallback (no sentinel yet): the LARGEST assistant node in the interval. Scoped -> the same
@@ -760,14 +758,15 @@ def _sentinel_parse(text: str, rid: str):
     return True, body
 
 
-def _sentinel_js(rid: str, text_expr: str, *, tokens_js=None) -> str:
+def _sentinel_js(rid: str, text_expr: str) -> str:
     """JS mirror of _sentinel_parse (v2, fence-aware), operating on the LINE-STRUCTURED text produced
     by `text_expr` (a JS expression evaluating to a string — pass __cgcText(node) output, not raw
     .textContent, so block-element boundaries survive as line breaks and bare-line matching is
     meaningful). Returns {done, body} as a JS object literal — embed via `(function(){...return
     X;})()`. This is the ONE canonical fence-aware JS implementation; detect, extract, status and the
     timeout-rescue path all call it instead of re-deriving the rule."""
-    begin, end = tokens_js or (json.dumps(f"BEGIN_RESPONSE:{rid}"), json.dumps(f"END_RESPONSE:{rid}"))
+    begin = json.dumps(f"BEGIN_RESPONSE:{rid}")
+    end = json.dumps(f"END_RESPONSE:{rid}")
     return (
         "(function(){"
         "var __t=((" + text_expr + ")||'').replace(/\\r\\n/g,'\\n');"
@@ -792,13 +791,6 @@ def _sentinel_js(rid: str, text_expr: str, *, tokens_js=None) -> str:
         "if(!__body)return {done:false,body:''};"
         "return {done:true,body:__body};})()"
     )
-
-
-# __cgcDone(t, RID): the canonical wrapper verdict (SHARED CONTRACT #1) for a rid known only at run
-# time — the scoped answer read picks a round's FIRST complete reply by it, never by substring.
-_NODE_FN += ("function __cgcDone(t,RID){return " +
-             _sentinel_js(None, "t", tokens_js=("'BEGIN_RESPONSE:'+RID", "'END_RESPONSE:'+RID")) +
-             ".done;}")
 
 
 # The page conditions only a human can clear: a login wall, a captcha or challenge, a rate-limit
@@ -1097,6 +1089,36 @@ def _read_attribution(c, rid, *, scoped=False):
         return (c.eval(_model_slug_js(rid, scoped=scoped)) or "").strip() or None
     except Exception:
         return None
+
+
+def _crossed_js(rid: str) -> str:
+    """True when rid's answer node sits after a rid-less user turn inside its interval. That shape is
+    a steer typed mid-reasoning (the answer is this round's) OR a note typed after a reply that has
+    since been virtualized out (the answer is the note's, in this rid's wrapper) — the DOM cannot
+    tell them apart, so such an answer is delivered but never graded verified."""
+    return ("(function(){" + _NODE_FN + "var n=" + _node_call(rid, True) + ";if(!n)return false;"
+            "var nx=document.querySelectorAll(" + _JS_ANY + "),lo=__cgcSrc(nx," + json.dumps(rid) + ");"
+            "var BG=" + json.dumps(f"BEGIN_RESPONSE:{rid}") + ",u=false;"
+            "for(var j=lo+1;j<nx.length;j++){var r=__cgcRole(nx[j]);if(r==='user')u=true;"
+            "else if(r==='assistant'&&(nx[j]===n||__cgcBody(nx[j],BG)===n))return u;}return true;})()")
+
+
+def _write_answer(c, rid, out, ans, scoped):
+    """Write a wrapped answer: verified, unless it crossed a rid-less user turn (_crossed_js) — then
+    the answer is delivered with a `.raw` sidecar, which grades the round unverified (review)."""
+    crossed = False
+    if scoped:
+        try:
+            crossed = bool(c.eval(_crossed_js(rid)))
+        except Exception:
+            crossed = True                 # unproven is not verified
+    if not crossed:
+        _write_verified(out, ans)
+        return
+    _write_private(out, ans)
+    _write_private(out + ".raw", ans)
+    sys.stderr.write(f"CGC_WAIT crossed: {rid}'s wrapped answer follows a user turn without a rid — "
+                     "a steer mid-reasoning or a later note; delivered UNVERIFIED for review.\n")
 
 
 def _write_verified(out, ans):
@@ -3858,7 +3880,7 @@ def cmd_wait(a) -> int:
                 return 4
             if st.get("done"):
                 ans = c.eval(_extract_js(rid, scoped=strict)) or ""
-                _write_verified(a.out, ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
+                _write_answer(c, rid, a.out, ans, strict)  # answer file stays PURE — the follow-up recipe goes to stderr only
                 # Attribution is read from the SAME scoped node that produced `ans`, and BEFORE the
                 # tab is closed below — afterwards the node is gone and the fact is unrecoverable.
                 _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
@@ -3910,7 +3932,7 @@ def cmd_wait(a) -> int:
                     # salvaged as unwrapped.
                     ans = ans or _sentinel_parse(raw, rid)[1]
                     if ans:
-                        _write_verified(a.out, ans)
+                        _write_answer(c, rid, a.out, ans, strict)
                         _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
                         sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out} (recovered at settle)\n")
                         if not a.keep_tab:
@@ -3987,7 +4009,7 @@ def cmd_wait(a) -> int:
         raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
         rescue = rescue or _sentinel_parse(raw, rid)[1]   # wrapped text is never salvaged as unwrapped
         if rescue:
-            _write_verified(a.out, rescue)
+            _write_answer(c, rid, a.out, rescue, strict)
             _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
             sys.stderr.write(f"CGC_DONE wrote {len(rescue)} chars to {a.out} (rescued at timeout)\n")
             if not a.keep_tab:

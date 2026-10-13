@@ -114,14 +114,6 @@ def test_a_human_note_typed_mid_reasoning_does_not_cut_the_rounds_interval():
     assert _node(CDP._extract_js(R[1], scoped=True), page).strip() == BODY[0].strip()
 
 
-def test_a_note_after_the_thinking_placeholder_still_does_not_cut_it():
-    """An empty assistant placeholder is in the DOM while the model thinks, so 'a reply already
-    began' is not observable; a note after it is still mid-reasoning."""
-    page = _page(_turn(1, R[1], ["…"]), _human(1, "correction: use the 0.1.0 tag"),
-                 _reply(1, _wrapped(R[1])))
-    assert json.loads(_node(CDP._detect_js(R[1], scoped=True), page))["done"] is True
-
-
 def test_another_rounds_turn_still_closes_the_interval():
     """A turn under another rid is another round: a reply after it is never R1's, even when it
     reproduces R1's wrapper and R1 has no answer of its own."""
@@ -140,23 +132,28 @@ def test_a_round_overtaken_by_another_rid_before_any_reply_reads_superseded():
     assert json.loads(_node(CDP._detect_js(R[1], scoped=True), replied))["superseded"] is False
 
 
-def test_a_reply_to_a_later_note_never_replaces_the_rounds_own_finished_reply():
-    """Sol's repro: R1's reply finished, then a rid-less note, then a reply to it that reproduces
-    R1's wrapper. The note stays inside R1's interval, so the round's OWN (first complete) reply wins."""
-    page = _page(_turn(1, R[1], _wrapped(R[1], ["ORIGINAL"])), _human(1, "Reformat with same format"),
-                 _reply(1, _wrapped(R[1], ["LATER"])))
-    assert _node(CDP._extract_js(R[1], scoped=True), page).strip() == "ORIGINAL"
+def test_an_answer_across_a_ridless_turn_is_never_graded_verified():
+    """Sol P1: the live steer and a note after a virtualized-out reply are the same DOM. Both are
+    flagged crossed (delivered unverified); a plain answer is not."""
+    steer = _page(_turn(1, R[1]), _human(1, "note"), _reply(1, _wrapped(R[1])))
+    assert _node(CDP._crossed_js(R[1]), steer) is True
+    assert _node(CDP._crossed_js(R[1]), _page(_turn(1, R[1], _wrapped(R[1])))) is False
 
 
-def test_a_fenced_example_of_the_wrapper_is_not_the_rounds_complete_reply():
-    """Sol: a first reply that only SHOWS the wrapper inside a code fence, a note asking to finish,
-    then the real wrapped reply. Substring BEGIN..END picked the example forever."""
-    example = ["here is the format:", "```", "BEGIN_RESPONSE:" + R[1], "x", "END_RESPONSE:" + R[1], "```",
-               "thinking…"]
-    page = _page(_turn(1, R[1], example), _human(1, "finish the actual answer"),
-                 _reply(1, _wrapped(R[1], ["REAL"])))
-    assert json.loads(_node(CDP._detect_js(R[1], scoped=True), page))["done"] is True
-    assert _node(CDP._extract_js(R[1], scoped=True), page).strip() == "REAL"
+def test_a_note_after_the_rounds_reply_starts_a_new_exchange():
+    """Sol: R1's reply (wrapped, or a substantial UNWRAPPED one), then a rid-less note asking for
+    something else, answered in R1's wrapper. That reply is never R1's verified answer."""
+    for first in (_wrapped(R[1], ["ORIGINAL"]), BODY):
+        page = _page(_turn(1, R[1], first), _human(1, "now a different task"),
+                     _reply(1, _wrapped(R[1], ["LATER"])))
+        got = _node(CDP._extract_js(R[1], scoped=True), page).strip()
+        assert got == ("ORIGINAL" if first is not BODY else "")
+
+
+def test_a_fenced_example_of_the_wrapper_never_completes_the_round():
+    example = ["here is the format:", "```", "BEGIN_RESPONSE:" + R[1], "x", "END_RESPONSE:" + R[1], "```"]
+    page = _page(_turn(1, R[1], example))
+    assert json.loads(_node(CDP._detect_js(R[1], scoped=True), page))["done"] is False
 
 
 def test_a_thinking_placeholder_does_not_hide_that_another_round_overtook():
