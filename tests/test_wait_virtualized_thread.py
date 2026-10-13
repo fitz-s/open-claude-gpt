@@ -100,18 +100,76 @@ def _human(i, text):
         json.dumps("h%d" % i), json.dumps("h%d:0:user" % i), json.dumps(text))
 
 
-def test_a_human_note_typed_mid_round_does_not_cut_the_rounds_interval():
-    """Live 2026-10-13: the user typed a rid-less note after the prompt; the wrapped answer landed
-    after it, and the scoped read stopped at the note and saw node=none for 50 minutes."""
-    page = _page(_turn(1, R[1]), _human(1, "additional focus on speed"),
-                 "E('DIV',{'data-turn-key':'a1'},[unit('a1:2:assistant',[md(%s)])])"
-                 % json.dumps(_wrapped(R[1])))
+def _reply(i, lines):
+    return "E('DIV',{'data-turn-key':%s},[unit(%s,[md(%s)])])" % (
+        json.dumps("a%d" % i), json.dumps("a%d:2:assistant" % i), json.dumps(lines))
+
+
+def test_a_human_note_typed_mid_reasoning_does_not_cut_the_rounds_interval():
+    """Live 2026-10-13: a rid-less note typed while the model was reasoning; the wrapped answer landed
+    after it, and a scoped read stopping at the note saw node=none for 50 minutes."""
+    page = _page(_turn(1, R[1]), _human(1, "additional focus on speed"), _reply(1, _wrapped(R[1])))
     st = json.loads(_node(CDP._detect_js(R[1], scoped=True), page))
     assert st["done"] is True and st["node"] == "found"
     assert _node(CDP._extract_js(R[1], scoped=True), page).strip() == BODY[0].strip()
-    # A later ROUND (it carries a rid) still closes the interval: its answer is never R1's.
+
+
+def test_a_note_after_the_thinking_placeholder_still_does_not_cut_it():
+    """An empty assistant placeholder is in the DOM while the model thinks, so 'a reply already
+    began' is not observable; a note after it is still mid-reasoning."""
+    page = _page(_turn(1, R[1], ["…"]), _human(1, "correction: use the 0.1.0 tag"),
+                 _reply(1, _wrapped(R[1])))
+    assert json.loads(_node(CDP._detect_js(R[1], scoped=True), page))["done"] is True
+
+
+def test_another_rounds_turn_still_closes_the_interval():
+    """A turn under another rid is another round: a reply after it is never R1's, even when it
+    reproduces R1's wrapper and R1 has no answer of its own."""
     later = _page(_turn(1, R[1]), _human(1, "note"), _turn(2, R[2], _wrapped(R[1], ["echo"])))
     assert json.loads(_node(CDP._detect_js(R[1], scoped=True), later))["done"] is False
+
+
+def test_a_round_overtaken_by_another_rid_before_any_reply_reads_superseded():
+    """A correction sent under a NEW rid while R1 was still reasoning: the reply after it is R2's."""
+    page = _page(_turn(1, R[1]), _turn(2, R[2], _wrapped(R[2])))
+    st = json.loads(_node(CDP._detect_js(R[1], scoped=True), page))
+    assert st["superseded"] is True and st["done"] is False
+    note = _page(_turn(1, R[1]), _human(1, "note"))
+    assert json.loads(_node(CDP._detect_js(R[1], scoped=True), note))["superseded"] is False
+    replied = _page(_turn(1, R[1], _wrapped(R[1])), _turn(2, R[2]))
+    assert json.loads(_node(CDP._detect_js(R[1], scoped=True), replied))["superseded"] is False
+
+
+def test_a_reply_to_a_later_note_never_replaces_the_rounds_own_finished_reply():
+    """Sol's repro: R1's reply finished, then a rid-less note, then a reply to it that reproduces
+    R1's wrapper. The note stays inside R1's interval, so the round's OWN (first complete) reply wins."""
+    page = _page(_turn(1, R[1], _wrapped(R[1], ["ORIGINAL"])), _human(1, "Reformat with same format"),
+                 _reply(1, _wrapped(R[1], ["LATER"])))
+    assert _node(CDP._extract_js(R[1], scoped=True), page).strip() == "ORIGINAL"
+
+
+def test_a_fenced_example_of_the_wrapper_is_not_the_rounds_complete_reply():
+    """Sol: a first reply that only SHOWS the wrapper inside a code fence, a note asking to finish,
+    then the real wrapped reply. Substring BEGIN..END picked the example forever."""
+    example = ["here is the format:", "```", "BEGIN_RESPONSE:" + R[1], "x", "END_RESPONSE:" + R[1], "```",
+               "thinking…"]
+    page = _page(_turn(1, R[1], example), _human(1, "finish the actual answer"),
+                 _reply(1, _wrapped(R[1], ["REAL"])))
+    assert json.loads(_node(CDP._detect_js(R[1], scoped=True), page))["done"] is True
+    assert _node(CDP._extract_js(R[1], scoped=True), page).strip() == "REAL"
+
+
+def test_a_thinking_placeholder_does_not_hide_that_another_round_overtook():
+    page = _page(_turn(1, R[1], ["…"]), _turn(2, R[2], _wrapped(R[2])))
+    st = json.loads(_node(CDP._detect_js(R[1], scoped=True), page))
+    assert st["superseded"] is True and st["done"] is False
+
+
+def test_a_correction_resent_under_the_running_rid_owns_the_reply():
+    """A mid-reasoning correction that carries the running round's own rid (the auto-continue shape)
+    becomes the source turn; the reply after it is the round's."""
+    page = _page(_turn(1, R[1]), _turn(2, R[1], _wrapped(R[1])))
+    assert json.loads(_node(CDP._detect_js(R[1], scoped=True), page))["done"] is True
 
 
 def test_a_source_turn_that_is_not_rendered_is_named_not_read_as_an_empty_answer():

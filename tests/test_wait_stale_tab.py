@@ -399,3 +399,44 @@ def test_a_live_round_without_idle_exit_is_not_cut_short(wait_env):
     tab._answer_visible = lambda: False
     code, _ = wait_env(tab, timeout=1000, poll=20, settle_seconds=300)
     assert code == 4 and wait_env.clock.t - 1_000_000 >= 1000
+
+
+# ---------------------------------------------------------------------------------------------
+# A correction sent under a NEW rid while this round was still reasoning: ChatGPT's one reply comes
+# after the later turn and is that round's. The waiter must say so after one settle window, not
+# watch out the whole 5400s budget.
+# ---------------------------------------------------------------------------------------------
+
+class SupersededTab(FakeTab):
+    def eval(self, expr, timeout=None):
+        if "generating:stop,done:done" in expr:
+            return _json.dumps({"generating": False, "done": False, "blocker": None, "failed": None,
+                                "node": "none", "superseded": True, "len": 0,
+                                "begin": False, "end": False, "ac": 1})
+        if "Array.prototype.map.call(u" in expr:
+            return [_user_turn(RID), _user_turn("REQ-20260906-030000-bbbbbb")]
+        return super().eval(expr, timeout)
+
+
+def test_a_round_overtaken_mid_reasoning_ends_superseded_after_one_settle(wait_env, capsys):
+    tab = SupersededTab(turns_before_reload=[RID], turns_after_reload=[RID])
+    code, _ = wait_env(tab, **PROD)
+    assert code == 5
+    assert wait_env.clock.t - 1_000_000.0 < 900, "two settle windows around one reload, not 5400s"
+    assert tab.reloads == 1, "a stale tab gets its one reload before the verdict"
+    err = capsys.readouterr().err
+    assert "rid_superseded" in err and "observed_rid=REQ-20260906-030000-bbbbbb" in err
+    assert tab.sends == []
+
+
+def test_a_same_rid_resend_that_lands_keeps_the_wait_alive(wait_env, capsys):
+    """The turns re-read before the verdict: if rid is the conversation's last turn again (a resend
+    under this rid landed), it is not superseded, and the wait goes on."""
+    class Resent(SupersededTab):
+        def eval(self, expr, timeout=None):
+            if "Array.prototype.map.call(u" in expr:
+                return [_user_turn(RID), _user_turn("REQ-20260906-030000-bbbbbb"), _user_turn(RID)]
+            return super().eval(expr, timeout)
+    code, _ = wait_env(Resent(turns_before_reload=[RID], turns_after_reload=[RID]), **PROD)
+    assert code != 5
+    assert "rid_superseded" not in capsys.readouterr().err
