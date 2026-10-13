@@ -136,8 +136,10 @@ def test_an_answer_across_a_ridless_turn_is_never_graded_verified():
     """Sol P1: the live steer and a note after a virtualized-out reply are the same DOM. Both are
     flagged crossed (delivered unverified); a plain answer is not."""
     steer = _page(_turn(1, R[1]), _human(1, "note"), _reply(1, _wrapped(R[1])))
-    assert _node(CDP._crossed_js(R[1]), steer) is True
-    assert _node(CDP._crossed_js(R[1]), _page(_turn(1, R[1], _wrapped(R[1])))) is False
+    assert _node(CDP._clean_js(R[1]), steer) == ""
+    assert _node(CDP._clean_js(R[1]), _page(_turn(1, R[1], _wrapped(R[1])))).strip() == BODY[0].strip()
+    # Sol: the answer node unmounted between the extract and this read proves nothing.
+    assert _node(CDP._clean_js(R[1]), _page(_turn(1, R[1]), _human(1, "note"))) == ""
 
 
 def test_a_note_after_the_rounds_reply_starts_a_new_exchange():
@@ -509,7 +511,9 @@ def test_the_timeout_salvage_grades_text_it_finds_wrapped_as_verified(wait, tmp_
     tab = NodeTab([(None, _page(_turn(4, src)))])
     answered = _page(_turn(4, src, _wrapped(src)))
     orig = tab.eval
-    tab.eval = lambda e, timeout=None: (_node(e, answered) if "return __cgcText(__cgcNode(" in e
+    # The answer stays rendered after that read, so the verified-grade proof (_clean_js) sees it too.
+    tab.eval = lambda e, timeout=None: (_node(e, answered) if ("return __cgcText(__cgcNode(" in e
+                                                               or "if(u||!hit)" in e)
                                         else orig(e, timeout))
     state, code, env, _ = _wait_then_await(wait, tab, src, tmp_path, monkeypatch, capsys,
                                            timeout=120)

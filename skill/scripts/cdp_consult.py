@@ -1091,34 +1091,39 @@ def _read_attribution(c, rid, *, scoped=False):
         return None
 
 
-def _crossed_js(rid: str) -> str:
-    """True when rid's answer node sits after a rid-less user turn inside its interval. That shape is
-    a steer typed mid-reasoning (the answer is this round's) OR a note typed after a reply that has
-    since been virtualized out (the answer is the note's, in this rid's wrapper) — the DOM cannot
-    tell them apart, so such an answer is delivered but never graded verified."""
-    return ("(function(){" + _NODE_FN + "var n=" + _node_call(rid, True) + ";if(!n)return false;"
+def _clean_js(rid: str) -> str:
+    """The wrapped body of rid's answer node when that node does NOT sit after a rid-less user turn in
+    its interval, else ''. A rid-less turn before it is a steer mid-reasoning or a note whose own
+    reply reused this wrapper after the original was virtualized out; the DOM cannot tell them
+    apart, so such an answer is never graded verified. Body and verdict come from ONE eval, so a
+    node swapped between two reads cannot pass."""
+    return ("(function(){" + _NODE_FN + "var n=" + _node_call(rid, True) + ";if(!n)return '';"
             "var nx=document.querySelectorAll(" + _JS_ANY + "),lo=__cgcSrc(nx," + json.dumps(rid) + ");"
-            "var BG=" + json.dumps(f"BEGIN_RESPONSE:{rid}") + ",u=false;"
+            "var BG=" + json.dumps(f"BEGIN_RESPONSE:{rid}") + ",u=false,hit=false;"
             "for(var j=lo+1;j<nx.length;j++){var r=__cgcRole(nx[j]);if(r==='user')u=true;"
-            "else if(r==='assistant'&&(nx[j]===n||__cgcBody(nx[j],BG)===n))return u;}return true;})()")
+            "else if(r==='assistant'&&(nx[j]===n||__cgcBody(nx[j],BG)===n)){hit=true;break;}}"
+            "if(u||!hit)return '';"
+            "var res=" + _sentinel_js(rid, "__cgcText(n)") + ";return res.done?res.body:'';})()")
 
 
 def _write_answer(c, rid, out, ans, scoped):
-    """Write a wrapped answer: verified, unless it crossed a rid-less user turn (_crossed_js) — then
-    the answer is delivered with a `.raw` sidecar, which grades the round unverified (review)."""
-    crossed = False
+    """Write a wrapped answer: verified only when a single read proves the same body sits in rid's
+    interval with no rid-less user turn before it (_clean_js); otherwise delivered with a `.raw`
+    sidecar, which grades the round unverified (review)."""
+    clean = not scoped
     if scoped:
         try:
-            crossed = bool(c.eval(_crossed_js(rid)))
+            clean = (c.eval(_clean_js(rid)) or "").strip() == (ans or "").strip() != ""
         except Exception:
-            crossed = True                 # unproven is not verified
-    if not crossed:
+            clean = False                  # unproven is not verified
+    if clean:
         _write_verified(out, ans)
         return
     _write_private(out, ans)
     _write_private(out + ".raw", ans)
-    sys.stderr.write(f"CGC_WAIT crossed: {rid}'s wrapped answer follows a user turn without a rid — "
-                     "a steer mid-reasoning or a later note; delivered UNVERIFIED for review.\n")
+    sys.stderr.write(f"CGC_WAIT crossed: {rid}'s wrapped answer could not be proven to precede every "
+                     "rid-less user turn — a steer mid-reasoning or a later note; delivered UNVERIFIED "
+                     "for review.\n")
 
 
 def _write_verified(out, ans):
