@@ -364,19 +364,28 @@ class CDP:
         base = f"http://127.0.0.1:{port}"
         target = None
         if create_url:
-            ver = json.load(urllib.request.urlopen(f"{base}/json/version", timeout=5))
-            bw = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=timeout)
             # background:true — create the consult tab WITHOUT activating it, so a consult never
             # yanks Chrome (or the whole desktop) to the foreground and interrupts the user's work.
             # The waiter drives and reads the tab over CDP, which does not need it focused.
-            bw.send(json.dumps({"id": 1, "method": "Target.createTarget",
-                                "params": {"url": create_url, "background": True}}))
+            # A tab that is still being created holds no composer, so any failure here is proven
+            # unsent and must say so (live 2026-10-13, REQ-20261013-171359-975fcc: a browser socket
+            # timeout escaped as a traceback and the round was filed possibly_accepted).
             tid = None
-            for _ in range(50):
-                m = json.loads(bw.recv())
-                if m.get("id") == 1:
-                    tid = m.get("result", {}).get("targetId"); break
-            bw.close()
+            try:
+                ver = json.load(urllib.request.urlopen(f"{base}/json/version", timeout=5))
+                bw = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=timeout)
+                try:
+                    bw.send(json.dumps({"id": 1, "method": "Target.createTarget",
+                                        "params": {"url": create_url, "background": True}}))
+                    for _ in range(50):
+                        m = json.loads(bw.recv())
+                        if m.get("id") == 1:
+                            tid = m.get("result", {}).get("targetId"); break
+                finally:
+                    bw.close()
+            except Exception as e:
+                raise SystemExit(f"CGC_ERROR new_tab_failed: the browser did not create the consult "
+                                 f"tab ({type(e).__name__}: {e}) — nothing was sent.")
             if not tid:
                 raise SystemExit("CGC_ERROR new_tab_failed")
             for _ in range(20):
