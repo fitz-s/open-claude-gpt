@@ -648,7 +648,12 @@ _NODE_FN = (
     "var nx=document.querySelectorAll(" + _JS_ANY + ");"
     "var scoped=!!RID,lo=-1,hi=nx.length;"
     "if(scoped){lo=__cgcSrc(nx,RID);if(lo<0)return null;"
-    "for(var j=lo+1;j<nx.length;j++){if(__cgcRole(nx[j])==='user'){hi=j;break;}}}"
+    # The interval ends at the next user turn that is ANOTHER round (carries a rid). A rid-less user
+    # turn is a human typing into the thread mid-round (live 2026-10-13, REQ-20261013-091624-b74d3b:
+    # "additional focus on speed" sent before the answer; the wrapped answer landed after it and the
+    # waiter read node=none beside it for 50 minutes). The answer still answers this round, and its
+    # BEGIN token still names it; salvage stays refused there (_salvage_allowed: not the last turn).
+    "for(var j=lo+1;j<nx.length;j++){if(__cgcRole(nx[j])==='user'&&__cgcRid(__cgcText(nx[j]))){hi=j;break;}}}"
     # 1) exact: any assistant node containing our (unique) BEGIN sentinel, newest-first. Scoped ->
     #    within [lo,hi) only. Unscoped -> the whole document (lo=-1,hi=nx.length), matching the
     #    original global search.

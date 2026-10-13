@@ -94,6 +94,26 @@ def test_a_resent_rid_reads_the_later_turn_and_its_marker_not_the_failed_one():
     assert json.loads(_node(CDP._detect_js(rid, scoped=True), answered))["done"] is True
 
 
+def _human(i, text):
+    """A user turn the human typed into the thread mid-round: no rid, no wrapper."""
+    return "E('DIV',{'data-turn-key':%s},[unit(%s,[P(%s)])])" % (
+        json.dumps("h%d" % i), json.dumps("h%d:0:user" % i), json.dumps(text))
+
+
+def test_a_human_note_typed_mid_round_does_not_cut_the_rounds_interval():
+    """Live 2026-10-13: the user typed a rid-less note after the prompt; the wrapped answer landed
+    after it, and the scoped read stopped at the note and saw node=none for 50 minutes."""
+    page = _page(_turn(1, R[1]), _human(1, "additional focus on speed"),
+                 "E('DIV',{'data-turn-key':'a1'},[unit('a1:2:assistant',[md(%s)])])"
+                 % json.dumps(_wrapped(R[1])))
+    st = json.loads(_node(CDP._detect_js(R[1], scoped=True), page))
+    assert st["done"] is True and st["node"] == "found"
+    assert _node(CDP._extract_js(R[1], scoped=True), page).strip() == BODY[0].strip()
+    # A later ROUND (it carries a rid) still closes the interval: its answer is never R1's.
+    later = _page(_turn(1, R[1]), _human(1, "note"), _turn(2, R[2], _wrapped(R[1], ["echo"])))
+    assert json.loads(_node(CDP._detect_js(R[1], scoped=True), later))["done"] is False
+
+
 def test_a_source_turn_that_is_not_rendered_is_named_not_read_as_an_empty_answer():
     page = _page(_turn(2, R[2], _wrapped(R[2])))
     st = json.loads(_node(CDP._detect_js(R[4], scoped=True), page))
