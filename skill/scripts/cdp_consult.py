@@ -648,7 +648,18 @@ _NODE_FN = (
     "var nx=document.querySelectorAll(" + _JS_ANY + ");"
     "var scoped=!!RID,lo=-1,hi=nx.length;"
     "if(scoped){lo=__cgcSrc(nx,RID);if(lo<0)return null;"
-    "for(var j=lo+1;j<nx.length;j++){if(__cgcRole(nx[j])==='user'){hi=j;break;}}}"
+    # Where the interval ends: at the next user turn that carries ANOTHER rid (another round), or at
+    # any user turn once a reply (a non-blank assistant node) has appeared since lo. Between those, a
+    # rid-less user turn is a STEER typed while the model was still reasoning, and ChatGPT's one reply
+    # lands after it (live 2026-10-13, REQ-20261013-091624-b74d3b: the heartbeat read ac=0 for the whole
+    # 45 minutes of reasoning — no assistant node exists before the reply — and a waiter stopping at
+    # the note read node=none beside the finished answer). A note typed AFTER a reply starts a new
+    # exchange, even when the model reuses this rid's wrapper in answering it. Where the DOM cannot
+    # tell the two apart, the rule errs toward ending the interval: a missed answer is retrieved, a
+    # wrong one is not caught. A resend under this rid is lo itself (__cgcSrc takes the last).
+    "var rep=false;for(var j=lo+1;j<nx.length;j++){var rj=__cgcRole(nx[j]);"
+    "if(rj==='assistant'){rep=rep||/\\S/.test(nx[j].textContent||'');continue;}"
+    "if(rj==='user'&&(rep||__cgcRid(__cgcText(nx[j])))){hi=j;break;}}}"
     # 1) exact: any assistant node containing our (unique) BEGIN sentinel, newest-first. Scoped ->
     #    within [lo,hi) only. Unscoped -> the whole document (lo=-1,hi=nx.length), matching the
     #    original global search.
@@ -829,6 +840,13 @@ def _detect_js(rid: str, *, scoped=False) -> str:
         "var node=" + _node_call(rid, scoped) + ";"
         "var nx=document.querySelectorAll(" + _JS_ANY + "),src=RID?__cgcSrc(nx,RID):-1;"
         "var where=node?'found':(RID&&src<0)?'source_unrendered':'none';"
+        # superseded: another round's turn (another rid) follows rid's own turn and nothing between them
+        # carries rid's BEGIN. A correction sent under a NEW rid while this round was still reasoning
+        # lands here: ChatGPT's one reply comes after it and is that round's. An empty "thinking"
+        # placeholder between them is not a reply, which is why the test is the BEGIN token.
+        "var sup=false;if(RID&&src>=0){for(var j=src+1;j<nx.length;j++){var rj=__cgcRole(nx[j]);"
+        "if(rj==='assistant'&&(nx[j].textContent||'').indexOf(BG)>=0)break;"
+        "if(rj==='user'&&__cgcRid(__cgcText(nx[j]))){sup=true;break;}}}"
         # ChatGPT's own "this turn will never answer" marker, read from the SOURCE turn's container:
         # rid's own turn for a scoped wait (a later prompt can quote the BEGIN token, so a substring
         # match could read another turn's marker); the last user node carrying BG only for an
@@ -853,7 +871,7 @@ def _detect_js(rid: str, *, scoped=False) -> str:
         "var stop=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"],button[aria-label*=\"\\u505c\\u6b62\"]');"
         + _BLOCKER_FN + "var blocker=__cgcBlocker();"
         "var done=(res.done&&a.length>0);"
-        "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,node:where,"
+        "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,node:where,superseded:sup,"
         "len:rawT.length,begin:hasB,end:hasE,ac:a.length});})()"
     )
 
@@ -1071,6 +1089,41 @@ def _read_attribution(c, rid, *, scoped=False):
         return (c.eval(_model_slug_js(rid, scoped=scoped)) or "").strip() or None
     except Exception:
         return None
+
+
+def _clean_js(rid: str) -> str:
+    """The wrapped body of rid's answer node when that node does NOT sit after a rid-less user turn in
+    its interval, else ''. A rid-less turn before it is a steer mid-reasoning or a note whose own
+    reply reused this wrapper after the original was virtualized out; the DOM cannot tell them
+    apart, so such an answer is never graded verified. Body and verdict come from ONE eval, so a
+    node swapped between two reads cannot pass."""
+    return ("(function(){" + _NODE_FN + "var n=" + _node_call(rid, True) + ";if(!n)return '';"
+            "var nx=document.querySelectorAll(" + _JS_ANY + "),lo=__cgcSrc(nx," + json.dumps(rid) + ");"
+            "var BG=" + json.dumps(f"BEGIN_RESPONSE:{rid}") + ",u=false,hit=false;"
+            "for(var j=lo+1;j<nx.length;j++){var r=__cgcRole(nx[j]);if(r==='user')u=true;"
+            "else if(r==='assistant'&&(nx[j]===n||__cgcBody(nx[j],BG)===n)){hit=true;break;}}"
+            "if(u||!hit)return '';"
+            "var res=" + _sentinel_js(rid, "__cgcText(n)") + ";return res.done?res.body:'';})()")
+
+
+def _write_answer(c, rid, out, ans, scoped):
+    """Write a wrapped answer: verified only when a single read proves the same body sits in rid's
+    interval with no rid-less user turn before it (_clean_js); otherwise delivered with a `.raw`
+    sidecar, which grades the round unverified (review)."""
+    clean = not scoped
+    if scoped:
+        try:
+            clean = (c.eval(_clean_js(rid)) or "").strip() == (ans or "").strip() != ""
+        except Exception:
+            clean = False                  # unproven is not verified
+    if clean:
+        _write_verified(out, ans)
+        return
+    _write_private(out, ans)
+    _write_private(out + ".raw", ans)
+    sys.stderr.write(f"CGC_WAIT crossed: {rid}'s wrapped answer could not be proven to precede every "
+                     "rid-less user turn — a steer mid-reasoning or a later note; delivered UNVERIFIED "
+                     "for review.\n")
 
 
 def _write_verified(out, ans):
@@ -3740,6 +3793,7 @@ def cmd_wait(a) -> int:
         ticks = 0
         approvals = 0
         idle_since, idle_len = time.time(), None
+        sup_since = None
         idle_exit = getattr(a, "idle_exit", 0) or 0   # followup --watch reuses this waiter
         while time.time() < deadline:
             try:
@@ -3751,6 +3805,7 @@ def cmd_wait(a) -> int:
             except Exception as e:
                 # transient CDP/eval hiccup — log and keep waiting, don't die
                 sys.stderr.write(f"CGC_WAIT eval-retry: {e}\n")
+                sup_since = None
                 time.sleep(a.poll)
                 continue
             ticks += 1
@@ -3770,6 +3825,7 @@ def cmd_wait(a) -> int:
                     return 3
                 sys.stderr.write(f"CGC_APPROVED {app!r}: {text[:120]!r}\n")
                 settle_start, last_len = None, -1   # a paused stretch is not a settled answer
+                sup_since = None
                 time.sleep(2)
                 continue
             if st.get("blocker"):
@@ -3782,6 +3838,32 @@ def cmd_wait(a) -> int:
                 if not a.keep_tab:
                     c.close_tab()
                 return 4
+            # Another round's turn followed this one before any reply (a correction sent under a new rid
+            # mid-reasoning): the reply after it is that round's. Once the page has stopped generating
+            # for a settle window, none is coming for this rid — say so now instead of at the timeout.
+            if st.get("superseded") and not st.get("generating"):
+                sup_since = sup_since or time.time()
+                if time.time() - sup_since >= a.settle_seconds:
+                    # "No reply rendered" is not "never answered": the round's own reply may be
+                    # virtualized out of a stale tab. Spend the wait's one reload first, and re-read
+                    # the turns — a same-rid resend that just landed makes rid the last turn again.
+                    sup_since = None
+                    if not reloaded:
+                        reloaded = True
+                        _reload_stale_tab(c, f"{rid} reads superseded with no reply rendered")
+                        continue
+                    allowed, observed_rid, _p = _salvage_allowed(c, rid)
+                    if allowed:
+                        continue
+                    sys.stderr.write(
+                        f"CGC_ERROR rid_superseded: source_rid={rid} got no reply before a later round's "
+                        f"turn observed_rid={observed_rid or 'none'} — the reply that followed belongs to "
+                        "that round. Nothing is coming for this rid; read the later round instead.\n")
+                    if not a.keep_tab:
+                        c.close_tab()
+                    return 5
+            else:
+                sup_since = None
             # Idleness must be CONTINUOUS: any generation or byte movement restarts the clock, so the
             # gap between a thinking phase and the written answer can never end a live round.
             if st.get("generating") or st.get("len", 0) != idle_len:
@@ -3803,7 +3885,7 @@ def cmd_wait(a) -> int:
                 return 4
             if st.get("done"):
                 ans = c.eval(_extract_js(rid, scoped=strict)) or ""
-                _write_verified(a.out, ans)  # answer file stays PURE — the follow-up recipe goes to stderr only
+                _write_answer(c, rid, a.out, ans, strict)  # answer file stays PURE — the follow-up recipe goes to stderr only
                 # Attribution is read from the SAME scoped node that produced `ans`, and BEFORE the
                 # tab is closed below — afterwards the node is gone and the fact is unrecoverable.
                 _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
@@ -3855,7 +3937,7 @@ def cmd_wait(a) -> int:
                     # salvaged as unwrapped.
                     ans = ans or _sentinel_parse(raw, rid)[1]
                     if ans:
-                        _write_verified(a.out, ans)
+                        _write_answer(c, rid, a.out, ans, strict)
                         _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
                         sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out} (recovered at settle)\n")
                         if not a.keep_tab:
@@ -3932,7 +4014,7 @@ def cmd_wait(a) -> int:
         raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
         rescue = rescue or _sentinel_parse(raw, rid)[1]   # wrapped text is never salvaged as unwrapped
         if rescue:
-            _write_verified(a.out, rescue)
+            _write_answer(c, rid, a.out, rescue, strict)
             _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
             sys.stderr.write(f"CGC_DONE wrote {len(rescue)} chars to {a.out} (rescued at timeout)\n")
             if not a.keep_tab:
