@@ -6,6 +6,15 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — a note typed into a thread mid-round no longer hides the answer
+
+A human note typed while the model was still reasoning ended the round's answer interval, so the
+waiter watched an empty interval beside the finished answer until the 90-minute timeout. The
+interval now ends at another round's turn, or at any user turn once a reply exists. An answer
+found past a rid-less user turn is delivered `completed_unverified`: the DOM cannot tell a steer
+mid-reasoning from a later note whose reply reused the wrapper. A round overtaken by another
+rid's turn before any reply ends `rid_superseded` after one settle window and one reload.
+
 ## [0.5.0] — 2026-10-12
 
 ### Added — a no-send UI-contract probe, and sends pause instead of failing when ChatGPT's page moves
