@@ -18,7 +18,6 @@ uses a dedicated Chrome profile, CDP, sentinels, and a detached waiter.
 | `skill/scripts/cgc_probe.py` | **UI-contract probe.** `cgc probe`: checks, without sending, that ChatGPT's page still reads the way the driver reads it (composer, @mention, reader), and records a verdict per capability. |
 | `skill/scripts/cdp_launch.sh` | **Setup plane.** Starts the dedicated debug Chrome, probes login, exit-code gate for self-healing. |
 | `skill/scripts/cgc_doctor.py` | Health check / preflight. |
-| `skill/scripts/retrieval_window.js` | Answer-windowing helper for the MCP fallback backend. |
 | `bin/cgc` | Human CLI dispatcher over the above. |
 
 ## The flow

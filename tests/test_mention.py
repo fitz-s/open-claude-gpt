@@ -115,10 +115,10 @@ def test_fire_freezes_mentions_into_the_request(tmp_path, monkeypatch):
     monkeypatch.setattr(spool, "cmd_enqueue", lambda a: seen.update(vars(a)) or 0)
     ns = argparse.Namespace(
         repo_dir=ROOT, repo=None, pr=None, ref=None, compare=None, pulls=False, blobs=False,
-        files=None, issues=None, base=None, verify=False, allow_nonpublic=False, backend="cdp",
-        window_template=None, task="probe", title="t", role=None, followup=False, no_code=True,
+        files=None, issues=None, base=None, verify=False, allow_nonpublic=False,
+        task="probe", title="t", role=None, followup=False, no_code=True,
         context_file=None, refs_file=None, output_file=None, output_replace=False,
-        target_chars=32000, hard_chars=40000, expect_minutes=25, model="Pro", out=None,
+        model="Pro", out=None,
         project_url="https://chatgpt.com/", conversation=None, mention=["WebCodex Demo"])
     assert isinstance(consult.cmd_fire(ns), dict)
     assert seen["mentions"] == ["WebCodex Demo"]

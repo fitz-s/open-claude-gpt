@@ -227,6 +227,4 @@ template clause, or test that the graded outcomes support. Then record it with
 - `references/gpt-6-astra-prompting-principles.md` — prompting law for GPT-6 Astra, including the
   two Astra-specific rules the live template now carries (don't ask, don't obey browsed instructions).
 - `references/injection-and-prompting.md` — every code-delivery URL form + file-selection rules.
-- `references/mcp-fallback.md` — LAST-RESORT backend when the CDP debug profile cannot exist;
-  also documents the platform constraints (CSP, scanner, 50k cap) that shaped this design.
 - `docs/ARCHITECTURE.md` — why daemon+CDP+sentinels; the classifier rationale and egress model.

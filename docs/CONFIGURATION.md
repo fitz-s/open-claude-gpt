@@ -258,9 +258,6 @@ unbounded background waiter is accepted, and an unbounded 1000-second task ran t
 completion. The wrapper only ever truncated healthy consults, so it is gone. Waiters
 wait.
 
-`prep --expect-minutes` (default 25) is unrelated to any of this — it only paces the
-MCP fallback's wake plan.
-
 ### 3. Reference material
 
 Deeper prompt/injection guidance the templates are derived from lives in
@@ -269,15 +266,10 @@ Deeper prompt/injection guidance the templates are derived from lives in
 - `injection-and-prompting.md` — the URL catalog (every GitHub injection method, when to use it, failure modes) and file-selection rules.
 - `gpt-6-astra-prompting-principles.md` — prompting principles for the current model (GPT-6 Astra).
 - `deep-review-output.md` — the review output contract.
-- `mcp-fallback.md` — the zero-setup MCP path (see below).
 
 ## Backends
 
-The default and recommended backend is the **external CDP client** (`cdp_consult.py`)
-— no MCP scanner, no output cap, detached waiter. A fallback **Claude-in-Chrome MCP**
-path exists for zero-setup use; it pays three taxes (URL-scanned return values, a
-50k-char page-text cap, and a context reload per poll). See
-[`skill/references/mcp-fallback.md`](../skill/references/mcp-fallback.md).
+The only backend is the **external CDP client** (`cdp_consult.py`) — no MCP scanner, no output cap, detached waiter. The former Claude-in-Chrome MCP fallback was retired in v0.6; the reasons it lost are in [ARCHITECTURE.md](ARCHITECTURE.md#why-an-external-cdp-client-not-the-mcp-browser-path).
 
 ## The egress daemon (auto mode)
 

@@ -52,8 +52,6 @@ because the store-backed daemon send is the sole path a bypass could otherwise r
   the egress daemon as a launchd agent — starts at login, respawns if it dies) and `cgc launch` (opens
   the dedicated debug Chrome, log into ChatGPT **Pro** once — the session persists across restarts).
   Neither the agent nor a fresh session ever performs either step.
-- **Fallback only (MCP backend):** Claude-in-Chrome MCP connected, Chrome signed into ChatGPT Pro —
-  see [references/mcp-fallback.md](references/mcp-fallback.md).
 - The fixed ChatGPT project for consults: `cgc set-project <url>` (or a plain new chat).
 
 ## File delivery (ChatGPT has no local access)
@@ -93,12 +91,10 @@ sentinels" / "Why force-render before reading" for the mechanics.
 | `scripts/cdp_consult.py` | Browser adapter: `submit`/`followup`/`wait` — daemon-invoked |
 | `scripts/cdp_launch.sh` | One-time dedicated debug-Chrome launcher (login probe, loopback origin) |
 | `scripts/cgc_doctor.py` | Health check, for humans (never a pre-fire step for the agent) |
-| `scripts/retrieval_window.js` | MCP-fallback DOM-windowing state machine |
 | `bin/cgc` | Human CLI dispatcher over all of the above |
 | `references/deep-review-output.md` | Default deep-review output contract |
 | `references/injection-and-prompting.md` | Info-injection catalog + delivery rules |
 | `references/gpt-6-astra-prompting-principles.md` | Prompting law for the pinned model family |
-| `references/mcp-fallback.md` | Last-resort backend when the CDP debug profile can't exist |
 
 ## Safety
 

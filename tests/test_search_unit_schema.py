@@ -90,35 +90,6 @@ def test_the_no_sentinel_salvage_read_skips_the_attachment_cards():
     assert raw.strip() == "an unwrapped answer" and "Open file" not in raw
 
 
-def test_the_mcp_fallback_readers_see_the_new_schema():
-    """poll_js (consult.py) and extractAnswer (retrieval_window.js) are the MCP backend's copies of
-    the reader; run the REAL code of each (pulled out exactly as test_parity does) on this DOM."""
-    import importlib.util as ilu
-    ps = ilu.spec_from_file_location("test_parity", os.path.join(ROOT, "tests", "test_parity.py"))
-    par = ilu.module_from_spec(ps)
-    ps.loader.exec_module(par)
-    poll_js, rid = par._poll_js_parse_source()
-    page = _page().replace(R1, rid)
-    got = json.loads(_eval(poll_js, page))
-    assert got["assistantCount"] == 1 and got["done"] is True
-
-    src = open(par.RETRIEVAL_WINDOW_JS, encoding="utf-8").read()
-    fns = []
-    for name in ("isFenceToggle", "cgcText", "extractAnswer"):
-        m = __import__("re").search(r"function " + name + r"\(", src)
-        depth, j = 0, src.index("{", m.start())
-        for k in range(j, len(src)):
-            depth += {"{": 1, "}": -1}.get(src[k], 0)
-            if depth == 0:
-                fns.append(src[m.start():k + 1])
-                break
-    tags = __import__("re").search(r"var BLOCK_TAGS = [^;]+;", src).group(0)
-    setup = (page + tags + "var BEGIN=" + json.dumps("BEGIN_RESPONSE:" + rid) + ",END="
-             + json.dumps("END_RESPONSE:" + rid) + ";" + "\n".join(fns))
-    assert _eval("extractAnswer()", setup).strip() == "the verdict"
-
-
-
 def _turned(extra_r2=""):
     """Wrap each turn's units in a [data-turn-key] container, as the live page does, so the failure
     probe can read the turn's own text. extra_r2 is appended to R2's turn (e.g. ChatGPT's marker)."""

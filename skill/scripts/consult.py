@@ -4,8 +4,7 @@
 # Authority basis: open-claude-gpt skill v2 — prep renders the GPT-6 Astra outcome-first
 #   PROMPT_TEMPLATE (title + steerable role + end-to-end depth mandate) and, with
 #   --followup, the FOLLOWUP_TEMPLATE for a continuing thread; deliver builds
-#   purpose-grouped GitHub refs. Used by both the CDP backend (primary) and the MCP
-#   fallback. 2026-07-01: deliver hardened fail-closed on public-source provenance —
+#   purpose-grouped GitHub refs. Used by the CDP backend. 2026-07-01: deliver hardened fail-closed on public-source provenance —
 #   PUBLIC stamp requires gh-confirmed visibility=="public"; private/unknown visibility
 #   refuses to emit refs unless --allow-nonpublic is passed; refs must always contain
 #   >=1 real browsable URL (github.com/gist.github.com/raw.githubusercontent.com).
@@ -17,17 +16,11 @@
 """
 Prep helper for the open-claude-gpt skill.
 
-Generates a per-consult REQUEST_ID, renders the prompt file (sentinel contract +
-"keep raw reference URLs inline"), and renders retrieval_window.js with the
-request id + chunk sizes baked in. Prints a JSON state blob to stdout.
-
-There is no local server / loopback in this design: the visible ChatGPT page
-cannot open a connection to localhost (chatgpt.com serves a CSP that blocks
-page->127.0.0.1), so completion is detected by agent-side scheduled polling and
-the answer is read only through get_page_text + in-page DOM windowing.
+Generates a per-consult REQUEST_ID and renders the prompt file (sentinel contract +
+"keep raw reference URLs inline"). Prints a JSON state blob to stdout.
 
 Subcommands:
-  prep   render prompt + retrieval window for one consult; print state JSON
+  prep   render the prompt for one consult; print state JSON
 """
 from __future__ import annotations
 
@@ -657,24 +650,8 @@ def _when(v: str) -> datetime.datetime:
 
 
 def cmd_prep(a: argparse.Namespace) -> int:
-    if a.target_chars < 2000 or a.hard_chars < a.target_chars:
-        raise SystemExit("CGC_ERROR bad_chunk_sizes: need target-chars>=2000 and hard-chars>=target-chars")
-    if a.expect_minutes < 1 or a.expect_minutes > 60:
-        raise SystemExit("CGC_ERROR bad_expect_minutes: need 1<=expect-minutes<=60")
     import cgc_spool as spool
     rid = spool.new_rid()
-
-    # Wake plan. Each wake = one full main-context reload (ScheduleWakeup sleep
-    # >5 min always misses the prompt cache), so token cost ~= wake_count *
-    # context_size. The poll_js round-trip itself is trivial. Being LATE is free
-    # (idle wall-time, no tokens); waking EARLY on an unfinished answer burns a
-    # whole reload for nothing. So bias LONG: first wake lands at ~85% of the
-    # expected latency, then back off in coarse 6-min steps. Target <=4 wakes.
-    first_wake = max(120, int(a.expect_minutes * 60 * 0.85))
-    repoll = 360
-    # Cover ~expect+18 min before giving up; clamp wake count to [3, 8].
-    span = a.expect_minutes * 60 + 18 * 60 - first_wake
-    max_polls = int(min(8, max(3, 2 + (span // repoll))))
 
     # Per-consult scratch lives in $CGC_STATE_DIR (default /tmp/cgc) so it is easy to
     # clean (`rm -rf`) and does not flat-litter /tmp. Answers go wherever `wait --out` points.
@@ -686,20 +663,6 @@ def cmd_prep(a: argparse.Namespace) -> int:
         scratch.chmod(0o700)
     except OSError:
         pass
-
-    # The DOM-windowing script is ONLY used by the MCP fallback (Backend B). On the
-    # default CDP backend it is dead weight — skip it (was creating a junk file/consult).
-    window_js_file = ""
-    if a.backend == "mcp":
-        if not a.window_template:
-            raise SystemExit("CGC_ERROR need_window_template: --backend mcp requires --window-template")
-        window_template = pathlib.Path(a.window_template).read_text(encoding="utf-8")
-        cfg = {"requestId": rid, "targetChars": a.target_chars, "hardChars": a.hard_chars}
-        rendered = window_template.replace("__CGC_CONFIG__", json.dumps(cfg, ensure_ascii=False))
-        if "__CGC_CONFIG__" in rendered:
-            raise SystemExit("CGC_ERROR window_render_failed")
-        window_js_file = str(scratch / f"window_{rid}.js")
-        pathlib.Path(window_js_file).write_text(rendered, encoding="utf-8")
 
     prompt_file = ""
     # The rid-independent prompt identity: the SAME render with a literal <RID> placeholder. It
@@ -826,114 +789,12 @@ def cmd_prep(a: argparse.Namespace) -> int:
         prompt_file = str(scratch / f"prompt_{rid}.md")
         pathlib.Path(prompt_file).write_text(prompt, encoding="utf-8")
 
-    end = f"END_RESPONSE:{rid}"
-    # Ready-to-paste JS snippets with the request id baked in (no manual <id> fill-in).
-    # Both return METADATA ONLY (booleans / counts) — never page content or URLs.
-    begin = f"BEGIN_RESPONSE:{rid}"
-    # done is line-ANCHORED and FENCE-AWARE (SHARED CONTRACT #1, v2 — mirrors
-    # _sentinel_parse / _sentinel_js in cdp_consult.py exactly): scan lines tracking
-    # in_fence (a trimmed line starting with ``` or ~~~ toggles fence state and is
-    # itself never a sentinel); bi = first non-fenced line === BEGIN_RESPONSE:<rid>;
-    # ei = first non-fenced line AFTER bi === END_RESPONSE:<rid>. A bare sentinel line
-    # ECHOED INSIDE a fenced code block is ignored — only bare sentinel lines outside
-    # any fence satisfy completion. Reads textContent (not innerText, which can be
-    # stale/empty on a backgrounded tab — see cdp_consult.py's textContent-vs-innerText
-    # note) and scans assistant nodes NEWEST-to-OLDEST, returning the first node whose
-    # parse is a complete non-empty wrapped answer — not just the last DOM node, since
-    # the sentinel-bearing turn need not be the last node in every layout. `done` does
-    # NOT depend on the stop button being gone (parity with the canonical _detect_js:
-    # the model writes END_RESPONSE only as its final line, so its presence alone means
-    # complete+extractable); `generating` still reports stop-button presence as
-    # telemetry only, never as a completion gate.
-    poll_js = (
-        "(function(){"
-        "var BG=" + json.dumps(begin) + ",EN=" + json.dumps(end) + ";"
-        # Single-return by design (a body-parity probe patches this one return). bi = first bare
-        # unfenced BEGIN. END must be the LAST non-blank line, bare and unfenced (anti-injection: an
-        # early bare END is ignored while real answer text still follows). Mirrors _sentinel_parse.
-        "function parse(t){"
-        "t=(t||'').replace(/\\r\\n/g,'\\n');var L=t.split('\\n');"
-        "var inFence=false,bi=-1;"
-        "for(var i=0;i<L.length;i++){"
-        "var ln=L[i].trim();"
-        "if(ln.slice(0,3)==='```'||ln.slice(0,3)==='~~~'){inFence=!inFence;continue;}"
-        "if(!inFence&&ln===BG){bi=i;break;}"
-        "}"
-        "var last=-1;"
-        "if(bi>=0){for(var c=L.length-1;c>bi;c--){if(L[c].trim()!==''){last=c;break;}}}"
-        "var endok=false;"
-        "if(bi>=0&&last>bi&&L[last].trim()===EN){"
-        "var f2=false;"
-        "for(var b=bi+1;b<last;b++){var lb=L[b].trim();"
-        "if(lb.slice(0,3)==='```'||lb.slice(0,3)==='~~~')f2=!f2;}"
-        "endok=!f2;}"
-        "var body=endok?L.slice(bi+1,last).join('\\n').trim():'';"
-        "return {done:(endok&&body.length>0),len:t.length};"
-        "}"
-        # Either turn markup: older ChatGPT builds tag the message node
-        # data-message-author-role="assistant", the current build tags the turn
-        # data-turn="assistant". Matching only the old one selected nothing, so `done` could
-        # never fire. Mirrors _SEL_A in cdp_consult.py — the parsers must agree.
-        "var a=document.querySelectorAll('[data-message-author-role=\"assistant\"],"
-        "[data-turn=\"assistant\"],[data-chatgpt-search-unit-key$=\":assistant\"]');"
-        # The search-unit build appends attachment cards after the markdown in the same unit;
-        # read the last markdown body when there is one (mirrors __cgcBody in cdp_consult.py).
-        "function body(n){var m=n.querySelectorAll?n.querySelectorAll("
-        "'[data-markdown-text-style=\"assistant-message\"]'):[];return m.length?m[m.length-1]:n;}"
-        # Line structure from block boundaries, as cgcText/__cgcText do: in this build each line is
-        # its own <p> with no newline characters, so raw textContent never has a bare sentinel line.
-        "function txt(el){var B=/^(P|DIV|LI|UL|OL|H1|H2|H3|H4|H5|H6|PRE|BLOCKQUOTE|TABLE|TR|THEAD|TBODY|SECTION|ARTICLE|HR)$/,"
-        "o='';(function w(n){var c=n.childNodes||[];for(var i=0;i<c.length;i++){var x=c[i];"
-        "if(x.nodeType===3){o+=x.nodeValue;}else if(x.nodeType===1){if(x.tagName==='BR'){o+='\\n';continue;}"
-        "var b=B.test(x.tagName);if(b)o+='\\n';w(x);if(b)o+='\\n';}}})(el);"
-        "return el.childNodes?o:(el.textContent||'');}"
-        "var res={done:false,len:0};"
-        "for(var k=a.length-1;k>=0;k--){"
-        "var r=parse(txt(body(a[k])));"
-        "if(r.done){res=r;break;}"
-        "if(k===a.length-1)res=r;"
-        "}"
-        "var stop=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"],button[aria-label*=\"停止\"]');"
-        "var blocker=null;"
-        "if(document.querySelector('input[type=\"password\"]')||/\\/auth|login/i.test(location.pathname))blocker='login';"
-        "else if(document.querySelector('iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]'))blocker='captcha';"
-        "else if(/rate limit|too many requests|usage limit/i.test((document.body.innerText||'').slice(0,4000)))blocker='rate_limit';"
-        "var done=(res.done&&a.length>0);"
-        "return JSON.stringify({generating:stop,done:done,blocker:blocker,assistantCount:a.length,len:res.len});})()"
-    )
-    preflight_js = (
-        "(function(){"
-        "var composer=!!document.querySelector('#prompt-textarea,[contenteditable=\"true\"],textarea');"
-        "var loginLike=!!document.querySelector('input[type=\"password\"]')||/log[- ]?in|auth/i.test(location.pathname);"
-        "var captchaLike=!!document.querySelector('iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]');"
-        "var isChatGPT=/(^|\\.)chatgpt\\.com$/.test(location.hostname);"
-        "return JSON.stringify({isChatGPT:isChatGPT,composer:composer,loginLike:loginLike,captchaLike:captchaLike});})()"
-    )
     state = {
         "request_id": rid,
         "prompt_file": prompt_file,
         "logical_sha": logical_sha,
     }
-    # poll_js / preflight_js / the window script / the ScheduleWakeup wake plan exist ONLY for the
-    # MCP fallback (Backend B), which pastes them into javascript_tool and paces its own wakes. On
-    # the default CDP+daemon path nothing reads them — cdp_consult.py rebuilds the sentinels from
-    # the rid — so printing them dumped ~2.5k chars of dead JS straight into the agent's context on
-    # every single consult. The caller that needs them asks for them.
-    if a.backend == "mcp":
-        state.update({
-            "window_js_file": window_js_file,
-            "target_chars": a.target_chars,
-            "hard_chars": a.hard_chars,
-            "sentinel_begin": f"BEGIN_RESPONSE:{rid}",
-            "sentinel_end": end,
-            "poll_js": poll_js,
-            "preflight_js": preflight_js,
-            "expect_minutes": a.expect_minutes,
-            "first_wake_seconds": first_wake,
-            "repoll_seconds": repoll,
-            "max_polls": max_polls,
-        })
-    if a.backend != "mcp" and prompt_file:
+    if prompt_file:
         spool_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgc_spool.py")
         argv = ["python3", spool_py, "enqueue", "--rid", rid, "--prompt-file", prompt_file]
         sys.stderr.write(
@@ -1117,10 +978,6 @@ def cmd_apps(a) -> int:
 
 
 def _add_prep_args(pp):
-    pp.add_argument("--backend", choices=["cdp", "mcp"], default="cdp",
-                    help="cdp (default): skip the DOM-window script (unused on CDP). "
-                         "mcp: also render retrieval_window.js for the MCP fallback.")
-    pp.add_argument("--window-template", help="path to retrieval_window.js (only needed for --backend mcp)")
     pp.add_argument("--task", required=True, help="the question / what ChatGPT should plan or review")
     pp.add_argument("--title", help="headline shown ABOVE the role (frames the consult; a sharp, "
                                     "specific one primes depth). Default 'Engineering consult'.")
@@ -1161,12 +1018,6 @@ def _add_prep_args(pp):
                     help="with --output-file: REPLACE the default findings contract with your spec entirely "
                          "(use when your spec defines its own findings shape/severity scale, so the two "
                          "don't conflict). Keeps only a short universal close. No effect without --output-file.")
-    pp.add_argument("--target-chars", type=int, default=32000)
-    pp.add_argument("--hard-chars", type=int, default=40000)
-    pp.add_argument("--expect-minutes", type=int, default=25,
-                    help="expected Pro latency; first wake lands at ~85%% of it. Default 25 — a "
-                         "GPT-6 Astra Pro consult reasons for a long time (multi-angle, proof-style). "
-                         "Raise it further (40+) for a genuinely huge review to cut wake count.")
     return pp
 
 

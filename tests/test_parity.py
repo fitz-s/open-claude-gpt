@@ -2,14 +2,12 @@
 # Created: 2026-07-01
 # Last audited: 2026-07-01
 # Authority basis: open-claude-gpt skill v2 — SHARED CONTRACT #1 (fence-aware, line-anchored
-#   sentinel parser) MUST stay behaviorally identical across its four parallel implementations:
+#   sentinel parser) MUST stay behaviorally identical across its two parallel implementations:
 #     1. _sentinel_parse   (Python, canonical)               skill/scripts/cdp_consult.py
 #     2. _sentinel_js      (JS source string)                skill/scripts/cdp_consult.py
-#     3. extractAnswer     (standalone JS file)               skill/scripts/retrieval_window.js
-#     4. poll_js's parse() (JS source string built in cmd_prep) skill/scripts/consult.py
 #   If one drifts from the canonical Python parser, a real consult can silently break (declared
 #   complete when it isn't, or vice versa, or a differently-sliced body). This file runs the SAME
-#   fixture corpus through all four and asserts agreement. JS implementations are extracted from
+#   fixture corpus through both and asserts agreement. JS implementations are extracted from
 #   the .py source AT TEST RUNTIME (never hardcoded) and executed under Node via subprocess.
 """
 Cross-implementation parity tests for the fence-aware sentinel parser (SHARED CONTRACT #1).
@@ -34,8 +32,6 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "skill", "scripts")
 CDP_CONSULT_PY = os.path.join(SCRIPTS, "cdp_consult.py")
-CONSULT_PY = os.path.join(SCRIPTS, "consult.py")
-RETRIEVAL_WINDOW_JS = os.path.join(SCRIPTS, "retrieval_window.js")
 
 NODE = shutil.which("node")
 
@@ -281,34 +277,6 @@ def _sentinel_js_source(rid, text_expr="__INPUT_TEXT__"):
     return m._sentinel_js(rid, text_expr)
 
 
-def _poll_js_parse_source():
-    """Extract the inner parse(t) function body from poll_js, built inside cmd_prep in
-    consult.py, by actually invoking cmd_prep's JS-building logic — not a hand copy. We call
-    consult.py's `prep` subcommand as a subprocess (its real code path) with a throwaway
-    refs file, and pull `poll_js` back out of the printed state JSON. This guarantees the
-    harness runs the EXACT string the production code builds, not a paraphrase."""
-    import tempfile
-    with tempfile.TemporaryDirectory() as td:
-        refs_file = os.path.join(td, "refs.md")
-        with open(refs_file, "w", encoding="utf-8") as f:
-            f.write("https://github.com/acme/widgets/tree/deadbeef\n")
-        state_dir = os.path.join(td, "state")
-        env = {**os.environ, "CGC_STATE_DIR": state_dir}
-        # --backend mcp: poll_js is an MCP-fallback artifact, and only that backend prints it
-        # (the CDP path never reads it, so emitting it there was dead weight in the agent's
-        # context). The STRING is built by the same cmd_prep code path either way, which is
-        # what this parity harness needs.
-        window_template = os.path.join(os.path.dirname(CONSULT_PY), "retrieval_window.js")
-        r = subprocess.run(
-            [sys.executable, CONSULT_PY, "prep", "--title", "x", "--task", "y",
-             "--refs-file", refs_file, "--backend", "mcp",
-             "--window-template", window_template],
-            capture_output=True, text=True, env=env, timeout=30)
-        assert r.returncode == 0, f"consult.py prep failed: {r.stderr}"
-        state = json.loads(r.stdout)
-        return state["poll_js"], state["request_id"]
-
-
 def _run_node(script):
     """Run `script` under `node -e`, return parsed JSON stdout. Raises on non-zero exit."""
     r = subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=30)
@@ -324,147 +292,6 @@ def _sentinel_js_result(text, rid):
         "var INPUT = " + json.dumps(text) + ";\n"
         "var res = " + js_expr + ";\n"
         "process.stdout.write(JSON.stringify(res));\n"
-    )
-    return _run_node(script)
-
-
-def _extract_answer_result(text, rid):
-    """Run the standalone extractAnswer() from retrieval_window.js under Node, fed a stubbed
-    `document` exposing a single assistant node whose text — read via the file's own cgcText()
-    DOM walk (a single text-node child holds `text`) — is `text`. extractAnswer() scans nodes
-    newest-to-oldest and returns body string or null — normalize to {done, body}."""
-    src = open(RETRIEVAL_WINDOW_JS, encoding="utf-8").read()
-    # extractAnswer() is a free function defined inside the IIFE in retrieval_window.js; the
-    # file as a whole is a self-invoking config-driven installer (needs __CGC_CONFIG__ and a
-    # DOM to install into), so we don't eval the whole file. Instead pull out the function
-    # source verbatim via a regex anchored on its declaration, matching brace depth — this
-    # extracts the REAL function body from the file at runtime, not a paraphrase.
-    m = re.search(r"function extractAnswer\(\) \{", src)
-    assert m, "extractAnswer() not found in retrieval_window.js"
-    start = m.start()
-    # brace-match from the function's opening brace to find its end
-    depth = 0
-    i = src.index("{", start)
-    j = i
-    for j in range(i, len(src)):
-        if src[j] == "{":
-            depth += 1
-        elif src[j] == "}":
-            depth -= 1
-            if depth == 0:
-                break
-    fn_src = src[start:j + 1]
-    # also need isFenceToggle(), which extractAnswer() calls
-    m2 = re.search(r"function isFenceToggle\(trimmed\) \{", src)
-    assert m2, "isFenceToggle() not found in retrieval_window.js"
-    start2 = m2.start()
-    i2 = src.index("{", start2)
-    depth = 0
-    j2 = i2
-    for j2 in range(i2, len(src)):
-        if src[j2] == "{":
-            depth += 1
-        elif src[j2] == "}":
-            depth -= 1
-            if depth == 0:
-                break
-    fence_fn_src = src[start2:j2 + 1]
-
-    # extractAnswer() now reads each node via cgcText() (a block-newline-preserving textContent
-    # walk, layout-independent) instead of .innerText — pull that helper + its BLOCK_TAGS regex
-    # from the file too, so the harness runs the REAL read path, not a stub that dodges it.
-    mb = re.search(r"var BLOCK_TAGS = /[^\n]*/;", src)
-    assert mb, "BLOCK_TAGS regex not found in retrieval_window.js"
-    block_tags_src = mb.group(0)
-    m3 = re.search(r"function cgcText\(el\) \{", src)
-    assert m3, "cgcText() not found in retrieval_window.js"
-    start3 = m3.start()
-    i3 = src.index("{", start3)
-    depth = 0
-    j3 = i3
-    for j3 in range(i3, len(src)):
-        if src[j3] == "{":
-            depth += 1
-        elif src[j3] == "}":
-            depth -= 1
-            if depth == 0:
-                break
-    cgctext_src = src[start3:j3 + 1]
-
-    script = (
-        "var BEGIN = " + json.dumps(f"BEGIN_RESPONSE:{rid}") + ";\n"
-        "var END = " + json.dumps(f"END_RESPONSE:{rid}") + ";\n"
-        + block_tags_src + "\n"
-        + cgctext_src + "\n"
-        + fence_fn_src + "\n"
-        + fn_src + "\n"
-        "var NODE_TEXT = " + json.dumps(text) + ";\n"
-        # feed the fixture as a single text-node child so cgcText()'s DOM walk yields NODE_TEXT
-        "var node = { childNodes: [ { nodeType: 3, nodeValue: NODE_TEXT } ] };\n"
-        "var document = { querySelectorAll: function(sel) { return [node]; } };\n"
-        "var body = extractAnswer();\n"
-        "process.stdout.write(JSON.stringify({done: body !== null, body: body === null ? '' : body}));\n"
-    )
-    return _run_node(script)
-
-
-def _poll_js_parse_result(text, poll_js_source, rid):
-    """Feed `text` as the single assistant node's textContent to poll_js's DOM scan (built
-    inside cmd_prep in consult.py) via a stubbed document, and return {done, body}. poll_js's
-    parse(t) only returns {done, len} (no body) — it is a completion-signal poller, extraction
-    happens via extractAnswer()/_extract_js elsewhere. For parity we compare `done`, and
-    separately assert poll_js's parse() slices the SAME body internally by calling parse(t)
-    directly (re-derived below) so a body mismatch would still be caught."""
-    script = (
-        "var node = { textContent: " + json.dumps(text) + " };\n"
-        "var document = { querySelectorAll: function(sel) { return [node]; }, "
-        "body: { innerText: '' }, "
-        "querySelector: function(sel) { return null; } };\n"
-        "var location = { pathname: '/' };\n"
-        "var res = " + poll_js_source + ";\n"
-        "var parsed = JSON.parse(res);\n"
-        "process.stdout.write(JSON.stringify(parsed));\n"
-    )
-    return _run_node(script)
-
-
-def _poll_js_parse_body(text, poll_js_source, rid):
-    """poll_js's inner parse(t) is not directly exposed (it's a closure), so to compare BODY
-    (not just done), re-invoke poll_js but monkey-patch it to expose parse's body slice: we
-    call the same source with a wrapper that intercepts by re-declaring `parse` identically is
-    unnecessary — instead extract the exact body poll_js's own slicing would produce by adding
-    a one-line instrumented copy of the IIFE that returns body too. This still uses the REAL
-    poll_js_source (unmodified) for `done`; this helper independently derives body from the
-    same rid/text using the identical L.slice(bi+1,ei) logic, but that would risk re-deriving
-    (drift). Instead we directly patch the return statement of THIS EXACT poll_js_source to
-    also emit body, so drift is impossible — any change to poll_js's real parse() logic flows
-    through unchanged into this call."""
-    patched = poll_js_source.replace(
-        "return {done:(endok&&body.length>0),len:t.length};",
-        "return {done:(endok&&body.length>0),len:t.length,body:body};",
-        1,
-    )
-    assert patched != poll_js_source, "poll_js source shape changed — inner parse() patch point not found"
-    # The inner parse()'s extra `body` field lands in the closure-local `res` variable, but the
-    # OUTER return builds a fresh object via JSON.stringify({...}) that doesn't forward it —
-    # patch that too so `res.body` actually reaches the caller. Still uses the untouched `done`
-    # computation; only ADDS a field, so `done` parity is unaffected by this probe.
-    patched2 = patched.replace(
-        "return JSON.stringify({generating:stop,done:done,blocker:blocker,assistantCount:a.length,len:res.len});",
-        "return JSON.stringify({generating:stop,done:done,blocker:blocker,assistantCount:a.length,len:res.len,body:res.body});",
-        1,
-    )
-    assert patched2 != patched, "poll_js source shape changed — outer return patch point not found"
-    patched = patched2
-    script = (
-        "var node = { textContent: " + json.dumps(text) + " };\n"
-        "var document = { querySelectorAll: function(sel) { return [node]; }, "
-        "body: { innerText: '' }, "
-        "querySelector: function(sel) { return null; } };\n"
-        "var location = { pathname: '/' };\n"
-        "var res = " + patched + ";\n"
-        "var parsed = JSON.parse(res);\n"
-        "process.stdout.write(JSON.stringify(parsed));\n"
     )
     return _run_node(script)
 
@@ -499,47 +326,9 @@ def test_sentinel_js_parity_with_python(name, text, rid, expected_done, expected
         f"`body` — python={py} js(_sentinel_js)={js}")
 
 
-@pytest.mark.parametrize("name,text,rid,expected_done,expected_body", FIXTURES, ids=[f[0] for f in FIXTURES])
-def test_extract_answer_parity_with_python(name, text, rid, expected_done, expected_body):
-    _require_node()
-    py = _python_result(text, rid)
-    js = _extract_answer_result(text, rid)
-    assert js["done"] == py["done"], (
-        f"[{name}] PARITY FAILURE: extractAnswer (retrieval_window.js) diverges from canonical "
-        f"_sentinel_parse on completion — python={py} js(extractAnswer)={js}")
-    assert js["body"] == py["body"], (
-        f"[{name}] PARITY FAILURE: extractAnswer (retrieval_window.js) diverges from canonical "
-        f"_sentinel_parse on body — python={py} js(extractAnswer)={js}")
-
-
-@pytest.mark.parametrize("name,text,rid,expected_done,expected_body", FIXTURES, ids=[f[0] for f in FIXTURES])
-def test_poll_js_parse_parity_with_python(name, text, rid, expected_done, expected_body):
-    _require_node()
-    # poll_js is rid-specific (built with its own freshly-minted rid by cmd_prep), so we cannot
-    # feed it OUR fixture rid directly. Instead rewrite the fixture text/expectation onto the
-    # rid poll_js was actually built for, preserving the exact same fixture shape/semantics.
-    src, built_rid = _poll_js_parse_source()
-    retext = text.replace(rid, built_rid)
-    reexpected_body = expected_body.replace(rid, built_rid)
-    py = _python_result(retext, built_rid)
-    assert py["done"] == expected_done, f"[{name}] rid-rewrite broke fixture semantics: {py}"
-    assert py["body"] == reexpected_body, f"[{name}] rid-rewrite broke fixture semantics: {py}"
-
-    js_done = _poll_js_parse_result(retext, src, built_rid)
-    assert js_done["done"] == py["done"], (
-        f"[{name}] PARITY FAILURE: poll_js diverges from canonical _sentinel_parse on `done` — "
-        f"python={py} js(poll_js)={js_done}")
-
-    js_body = _poll_js_parse_body(retext, src, built_rid)
-    assert js_body["body"] == py["body"], (
-        f"[{name}] PARITY FAILURE: poll_js's internal body slice diverges from canonical "
-        f"_sentinel_parse — python={py} js(poll_js body-probe)={js_body}")
-
-
 def test_parity_matrix_size():
-    """Documents the coverage: N fixtures x 4 implementations (1 python canonical + 3 JS)."""
+    """Documents the coverage: N fixtures x 2 implementations (python canonical + _sentinel_js)."""
     assert len(FIXTURES) == 19
-    # 4 implementations: python canonical (reference), _sentinel_js, extractAnswer, poll_js.
 
 
 # ============================================================================
