@@ -933,6 +933,14 @@ def refire_round(old_rid: str) -> int:
                 f"(`cgc_spool.py reconcile --rid {old_rid} --not-sent --evidence \"...\"`), then "
                 "refire again.\n")
             return 2
+        succ = _refired_to(s, old_rid)
+        if succ:
+            # One refire per proven-unsent round: a second would send the same request twice.
+            sys.stderr.write(f"CGC_ALREADY {old_rid} was refired as {succ}; await that round.\n")
+            envelope(rid=succ, state=None, code="ok",
+                     next_command=_cmd("cgc_spool.py", "await", "--rid", succ),
+                     detail=f"{old_rid} already refired")
+            return 0
         old_prompt = prior.get("rendered_prompt") or ""
         if not old_prompt:
             sys.stderr.write(f"CGC_ERROR refire_no_prompt: {old_rid} has no stored prompt to replay "
@@ -967,7 +975,16 @@ def refire_round(old_rid: str) -> int:
     out = os.path.abspath(_spool.default_out(new_rid))
     sys.stderr.write(f"CGC_REFIRE {old_rid} -> {new_rid}: replaying its stored prompt as a fresh "
                      f"{prior['kind']} round.\n")
-    return enqueue_round(a, new_prompt, out)
+    rc = enqueue_round(a, new_prompt, out)
+    if rc == 0:
+        with store_mod.Store() as s:
+            s.record_event("refired", rid=old_rid, detail=new_rid)
+    return rc
+
+
+def _refired_to(s, rid):
+    """The rid this round was refired as, or None."""
+    return s.refired_to(rid) if hasattr(s, "refired_to") else None
 
 
 # ---- the agent envelope: one JSON line, one decision ------------------------------------------
@@ -1338,6 +1355,11 @@ def decide(s, r: dict, *, daemon_up: bool = True, out: str | None = None) -> dic
             d.update(next_command=_cmd("cdp_consult.py", "find-conversation", "--rid", src),
                      human_action="the source turn was not confirmed; check the ChatGPT window, "
                                   "never re-send")
+        return d
+    succ = _refired_to(s, rid)
+    if succ:
+        d.update(code="ok", next_command=_cmd("cgc_spool.py", "await", "--rid", succ),
+                 human_action=f"refired as {succ}; await that round")
         return d
     if _release_eligible(s, r):
         if d["code"] == "policy_denied" or not r.get("rendered_prompt"):

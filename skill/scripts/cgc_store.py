@@ -1525,6 +1525,12 @@ class Store:
         return {k: v for k, v in self.broken_capabilities().items()
                 if (v.get("rid_or_conversation") if k == "model" else k) in need}
 
+    def refired_to(self, rid: str) -> str | None:
+        """The rid this round was refired as (cgc_backend.refire_round's `refired` event), or None."""
+        row = self.db.execute("SELECT detail FROM events WHERE rid=? AND kind='refired' "
+                              "ORDER BY id DESC LIMIT 1", (rid,)).fetchone()
+        return row["detail"] if row else None
+
     def record_event(self, kind: str, *, rid: str | None = None, detail: str | None = None) -> None:
         """A diagnostic event, in its own transaction; moves no round."""
         with self._tx():
