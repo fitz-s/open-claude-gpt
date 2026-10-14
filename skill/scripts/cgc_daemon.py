@@ -155,7 +155,7 @@ def _make_run_cdp():
                    "--out", kw["out"], "--poll", poll, "--timeout", str(timeout)]
             if kw.get("idle_exit"):
                 cmd += ["--idle-exit", str(int(kw["idle_exit"]))]
-            if not kw.get("approve", True):
+            if not kw.get("approve"):          # granting access is opt-in: an unstated caller never may
                 cmd += ["--no-approve"]
             code, so, se = _run(cmd, timeout + 40, kw["rid"], pass_fds=fds)
             # `wait`'s stdout receipt carries the producer attribution read off the very node it

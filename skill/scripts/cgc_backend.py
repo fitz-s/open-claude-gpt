@@ -2397,7 +2397,7 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
             if left <= 0:
                 return _deadline_passed(store, rid)
             res = run_cdp("wait", rid=rid, conversation=conv, out=out_tmp,
-                          poll=spec.get("poll"), timeout=left)
+                          poll=spec.get("poll"), timeout=left, approve=may_continue)
             code = res.get("code")
             turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
     answer_path = res.get("out") or out_tmp

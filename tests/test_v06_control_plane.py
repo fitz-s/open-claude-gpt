@@ -562,3 +562,28 @@ def test_only_the_send_worker_may_answer_an_approval_card(sent):
     worker = _cdp({"answer": f"BEGIN_RESPONSE:{RID}\nok\nEND_RESPONSE:{RID}"})
     backend._wait_phase(s, RID, CONV, {"model": "Pro", "timeout": 5400}, worker, may_continue=True)
     assert [kw["approve"] for k, kw in worker.calls if k == "wait"] == [True]
+
+
+def test_a_recovery_re_wait_after_a_landed_continue_never_approves(sent):
+    """Sol 2026-10-14: a worker recorded the continue as landed and died; the resume's first wait sees
+    turn_failed, adopts the recorded outcome and re-waits — that second wait must not approve either."""
+    sm, backend, s = sent
+    s.claim_auto_continue(RID, sm.sha256("c"))
+    s.record_auto_continue(RID, "landed")
+    rec = _cdp(FAILED_WAIT, {"answer": f"BEGIN_RESPONSE:{RID}\nok\nEND_RESPONSE:{RID}"})
+    backend.resume_round(s, s.get_round(RID), rec)
+    assert [kw.get("approve") for k, kw in rec.calls if k == "wait"] == [False, False]
+
+
+def test_the_driver_never_approves_unless_told(monkeypatch, tmp_path):
+    """An unstated approve is no: the daemon adds --no-approve unless the caller passed approve=True."""
+    daemon = _load("cgc_daemon")
+    seen = []
+    monkeypatch.setattr(daemon, "_run", lambda cmd, *a, **k: (seen.append(cmd) or (0, "", "")))
+    run = daemon._make_run_cdp() if callable(getattr(daemon, "_make_run_cdp", None)) else None
+    if run is None:
+        pytest.skip("driver factory not found")
+    out = str(tmp_path / "o.txt")
+    for kw in ({}, {"approve": False}, {"approve": True}):
+        run("wait", rid=RID, conversation=CONV, out=out, poll=1, timeout=5, **kw)
+    assert ["--no-approve" in c for c in seen] == [True, True, False]
