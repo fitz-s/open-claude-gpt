@@ -85,7 +85,7 @@ class Drift(Exception):
         self.cap, self.phase, self.cause = cap, phase, cause
 
 
-def _confirm(t, drift, diagnose=False):
+def _confirm(t, drift, diagnose=False, **kw):
     """Every broken verdict passes here: the send path's own blocker rule (cdp._blocker) runs on the
     page first, and a login wall, a challenge or a rate limit turns the verdict into Blocked. On the
     confirming pass (`diagnose`) the drift-repair bundle is written from the page, and its path
@@ -93,13 +93,14 @@ def _confirm(t, drift, diagnose=False):
     b = cdp._blocker(t)
     if b:
         return Blocked(b)
-    drift.cause = _bundled(t, drift.cap, drift.cause, diagnose)
+    drift.cause = _bundled(t, drift.cap, drift.cause, diagnose, **kw)
     return drift
 
 
-def _bundled(t, cap, cause, diagnose, rid=None):
+def _bundled(t, cap, cause, diagnose, rid=None, snap=None, inputs=None):
     """`cause`, led by the drift bundle's path when one was written for `cap` on `t`."""
-    path = cdp._diagnose(t, cap, "UI_CONTRACT_BROKEN", cause, rid) if diagnose else None
+    path = (cdp._diagnose(t, cap, "UI_CONTRACT_BROKEN", cause, rid, snap=snap, inputs=inputs)
+            if diagnose else None)
     return f"diagnosis {path}/diagnosis.json; {cause}" if path else cause
 
 
@@ -179,7 +180,8 @@ def probe_composer(t, *, model, family, app, diagnose=False):
             why = pick.error or f"wanted {model!r} on {family!r}; the picker shows {pick.shown!r}"
             b = cdp._blocker(t)
             res["model"] = (("transient", "human:" + b, f"ChatGPT shows {b}") if b
-                            else ("broken", _bundled(t, "model", why, diagnose)))
+                            else ("broken", _bundled(t, "model", why, diagnose,
+                                                     inputs={"model": model, "family": family})))
     try:
         cdp._paste_prompt(t, DUMMY)
     except cdp._PreClickFailure as e:
@@ -193,7 +195,8 @@ def probe_composer(t, *, model, family, app, diagnose=False):
             cdp._insert_mention(t, app)
         except cdp._MentionFailure as e:
             if getattr(e, "drift", False):
-                raise _confirm(t, Drift("mention", "mention", str(e)), diagnose) from None
+                raise _confirm(t, Drift("mention", "mention", str(e)), diagnose, snap=e.snap,
+                               inputs={"app": app}) from None
             res["mention"] = ("unestablished", str(e))   # this account's apps, not the page's markup
         except cdp._PreClickFailure as e:
             raise Transient(str(e)) from None
@@ -508,6 +511,7 @@ def print_states(report=None) -> int:
 def _driver(contract):
     """A fresh cdp_consult module reading `contract` (the one under test), never the running one."""
     import importlib.util
+    prev = os.environ.get("CGC_CONTRACT")
     os.environ["CGC_CONTRACT"] = os.path.abspath(contract)
     try:
         spec = importlib.util.spec_from_file_location("_cgc_replay_driver", cdp.__file__)
@@ -515,15 +519,52 @@ def _driver(contract):
         spec.loader.exec_module(mod)
         return mod
     finally:
-        os.environ.pop("CGC_CONTRACT", None)
+        if prev is None:
+            os.environ.pop("CGC_CONTRACT", None)
+        else:
+            os.environ["CGC_CONTRACT"] = prev
+
+
+def _replay_check(drv, cap, tab, diag):
+    """(ok, detail): the capability's own decision on the fixture, through the driver `drv`."""
+    inp = diag.get("inputs") or {}
+    if cap == "reader":
+        if not diag.get("rid"):
+            return False, "the bundle names no rid to read"
+        ans, miss = _read(tab, diag["rid"], drv)
+        return (True, f"{len(ans)}-char answer read for {diag['rid']}") if not miss else \
+            (False, f"{miss[0]}: {miss[1]}")
+    if cap == "composer":
+        ok = tab.eval("(function(){" + drv._COMPOSER_RESOLVE_JS + "return !!__cg();})()")
+        return bool(ok), "the composer resolves" if ok else "no visible composer editor inside a form"
+    if cap == "model":
+        st = tab.eval(drv._PICKER_STATE_JS)
+        obs = drv._family_obs(st)
+        fam = inp.get("family")
+        if fam and str(fam).lower() != "skip":
+            hit = [lab for lab, _chk in obs.entries if drv._is_family(lab, fam)]
+            if obs.status != "family" or not hit:
+                return False, (f"family {fam!r} not offered (picker {obs.status}: "
+                               f"{[lab for lab, _ in obs.entries]}{'; ' + obs.detail if obs.detail else ''})")
+        if not isinstance(st, dict) or st.get("now") is None:
+            return False, "the picker shows no tier slider"
+        return True, f"the picker offers {fam or 'its family'} and a tier slider (the tier walk is live-only)"
+    if cap == "mention":
+        if not inp.get("app"):
+            return False, "the bundle names no app to find"
+        r = tab.eval(drv._mention_pick_js(inp["app"], "cgc-replay")) or {}
+        return bool(r.get("hit")), (f"the popup offers {inp['app']!r} as a connected app" if r.get("hit")
+                                    else f"no app row for {inp['app']!r} (popup open={r.get('open')})")
+    return False, f"no replay for {cap!r}"
 
 
 def replay(incident, contract=None) -> dict:
-    """Run the failed capability's own reads against the incident's fixture under `contract`
+    """Run the failed capability's own check against the incident's fixture under `contract`
     (default: the installed chatgpt_contract.json, i.e. the copy an agent just edited). Offline: the
     page is the saved fixture in node, nothing reaches Chrome or the network. {ok, capability,
-    contradicted, matches, detail}; ok means every selector fact the capability reads matches the
-    fixture and, for the reader, the incident rid's answer is read through the send contract."""
+    contradicted, matches, detail}; ok means the needed contract selectors match the fixture AND
+    the capability's own decision passes (the reader reads the rid's answer through the send
+    contract, the composer resolves, the picker offers the family, the popup offers the app)."""
     import cgc_drift
     diag, fixture = cgc_drift.load(incident)
     drv = _driver(contract or cdp.CONTRACT_PATH)
@@ -531,11 +572,10 @@ def replay(incident, contract=None) -> dict:
     tab = cgc_drift.FixtureTab(fixture, (diag.get("observed") or {}).get("path") or "/")
     counts = tab.eval(cgc_drift.counts_js(drv.UI, cap))
     bad = cgc_drift.contradicted(drv.UI, cap, counts)
-    detail = f"unmatched contract ids: {bad}" if bad else "every contract selector matches the fixture"
-    if not bad and cap == "reader" and diag.get("rid"):
-        ans, miss = _read(tab, diag["rid"], drv)
-        bad = [] if not miss else ["reader:" + miss[0]]
-        detail = f"{len(ans)}-char answer read for {diag['rid']}" if not miss else f"{miss[0]}: {miss[1]}"
+    detail = f"unmatched contract ids: {bad}"
+    if not bad:
+        ok, detail = _replay_check(drv, cap, tab, diag)
+        bad = [] if ok else [cap]
     return {"ok": not bad, "capability": cap, "contradicted": bad, "detail": detail,
             "matches": [{"id": c[0], "matches": c[2]} for c in counts]}
 

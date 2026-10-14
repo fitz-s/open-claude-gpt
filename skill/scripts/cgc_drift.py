@@ -34,14 +34,25 @@ FIXTURE_NODES = 2500
 KEEP_INCIDENTS = 20
 SANITIZER_REV = 1
 
-# The contract ids each capability reads, and the attribute shapes a generic search looks for near
-# them: `name` matches attribute names, `value` attribute values (both case-insensitive).
+# Per capability: `need`, the selector facts the page must match for the capability to work (a tuple
+# is a set of alternatives: one matching is enough, as the picker owner's testid OR a menu holding a
+# slider), and `reads`, every contract id the capability's code reads (optional facts and labels
+# included) — what the bundle names to edit when every needed selector matches.
 CAPS = {
-    "reader": ("turn_schemas", "assistant_body", "turn_container", "conversation_root"),
-    "composer": ("composer",),
-    "mention": ("mention_popup_attr", "mention_option_attr", "mention_chip_attr",
-                "mention_row_content_attr"),
-    "model": ("picker_owner", "picker_menu", "picker_slider", "picker_family_radio", "family_aliases"),
+    "reader": {"need": ("turn_schemas", "conversation_root"),
+               "reads": ("turn_schemas", "conversation_root", "assistant_body", "turn_container",
+                         "failure_markers")},
+    "composer": {"need": ("composer",),
+                 "reads": ("composer", "composer_exclude_ancestor", "trailing_break_class")},
+    "mention": {"need": ("mention_popup_attr", "mention_option_attr"),
+                "reads": ("mention_popup_attr", "mention_option_attr", "mention_row_content_attr",
+                          "mention_app_icon_class", "mention_description_class", "mention_section_header",
+                          "mention_loading", "mention_chip_attr", "mention_chip_label_attr")},
+    "model": {"need": (("picker_owner", "picker_menu"), "picker_slider"),
+              "reads": ("picker_owner", "picker_menu", "picker_slider", "picker_menuitem",
+                        "picker_family_radio", "picker_radio_scaffold", "picker_flat_items",
+                        "picker_submenu_trigger", "picker_open_trigger", "family_aliases",
+                        "switcher_labels", "switcher_not_labels")},
 }
 _SEARCH = {
     "reader": (r"author|turn|message|markdown|unit", r"(^|[:_ -])(user|assistant)$|assistant-message"),
@@ -61,7 +72,7 @@ def incidents_dir() -> str:
 def selectors(ui, cap):
     """[(id, selector)] the capability's facts are read through; facts that are labels have none."""
     out = []
-    for i in CAPS[cap]:
+    for i in CAPS[cap]["reads"]:
         v = ui[i]
         if i == "turn_schemas":
             for s in v:
@@ -73,9 +84,22 @@ def selectors(ui, cap):
             out.append((i, f'[{v["attr"]}="{v["value"]}"]'))
         elif i.endswith("_attr"):
             out.append((i, f"[{v}]"))
-        elif isinstance(v, str):
+        elif i.endswith("_class"):
+            out.append((i, "." + v))
+        elif i == "turn_container" or (isinstance(v, str) and i != "mention_section_header"):
             out.append((i, v))
     return out
+
+
+def _vocab(ui):
+    """Every string the contract holds: attribute values equal to one are structure, never content."""
+    def walk(v):
+        if isinstance(v, str):
+            yield v
+        elif isinstance(v, (list, dict)):
+            for x in (v.values() if isinstance(v, dict) else v):
+                yield from walk(x)
+    return sorted({s for v in ui.values() for s in walk(v) if len(s) <= 60})
 
 
 _COUNTS_FN = (
@@ -91,17 +115,29 @@ def counts_js(ui, cap) -> str:
 
 # One read-only pass over the live page: match counts, candidates, and the sanitized tree (walked
 # last child first, so when the node budget runs out it is the oldest content that is dropped).
+# Page text and every attribute value that is not structure share ONE 200-character budget. Structure,
+# kept whole: a value the contract itself names (V), a turn-role value ("t1:2:assistant"), a short
+# lowercase identifier in an attribute developers author (role, type, data-testid, id, the aria
+# states, class tokens). A value holding / \ @ or :// (a URL, a path, an address) is replaced, never
+# kept. The rid marker tokens are kept and the text around them is cut to the budget, so a fixture
+# still reads as the same turn.
 _CAPTURE = _COUNTS_FN + r"""
-var BUD=200,NODES=LIM,TOK=/(?:CGC_RID|BEGIN_RESPONSE|END_RESPONSE):REQ-[0-9]{8}-[0-9]{6}-[0-9a-f]{6}/g;
-function take(s,cap){s=(s||'').replace(/\s+/g,' ');var k=Math.min(s.length,cap,BUD);BUD-=k;
+var BUD=200,NODES=LIM,TOK=/((?:CGC_RID|BEGIN_RESPONSE|END_RESPONSE):REQ-[0-9]{8}-[0-9]{6}-[0-9a-f]{6})/;
+var VS={};V.forEach(function(v){VS[v]=1;});
+function take(s,cap){s=(s||'').replace(/[ \t\r\f\v]+/g,' ');var k=Math.min(s.length,cap,BUD);BUD-=k;
  return k<s.length?s.slice(0,k)+'…':s;}
-function txt(s){var t=(s||'').match(TOK);if(t)return t.join('\n');if(!/\S/.test(s||''))return null;
- return take(s,40)||'…';}
+function lines(s){return s.split('\n').map(function(l){return /\S/.test(l)?(take(l,40)||'…'):l;}).join('\n');}
+function txt(s){s=s||'';if(!/\S/.test(s))return null;
+ return s.split(TOK).map(function(p,i){return i%2?p:lines(p);}).join('');}
 var KEEP=/^(role|aria-(label|checked|expanded|haspopup|valuenow|valuemin|valuemax|describedby|selected|disabled|hidden)|data-[\w-]+|app-[\w-]+|[\w-]*mention[\w-]*|type|contenteditable|id|class|disabled|hidden)$/;
+var DEV=/^(role|type|contenteditable|data-testid|id|aria-(checked|expanded|haspopup|valuenow|valuemin|valuemax|describedby|selected|disabled|hidden))$/;
 var SKIP={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,LINK:1,META:1,NAV:1,IFRAME:1,OBJECT:1,EMBED:1,CANVAS:1,VIDEO:1,AUDIO:1};
+function val(n,v){if(VS[v]||v===''||/^[\w-]*(:[\w-]+)*:(user|assistant)$/.test(v))return v;
+ if(n==='class')return v.split(/\s+/).filter(function(t){return VS[t]||/^[a-z0-9-]{1,40}$/.test(t);}).join(' ');
+ if(DEV.test(n)&&/^[A-Za-z0-9_ -]{1,60}$/.test(v)&&!/\s\S+\s/.test(v))return v;
+ if(/[\/\\@]/.test(v))return '…';return take(v,40)||'…';}
 function attrs(e){var o={};for(var j=0;j<e.attributes.length;j++){var a=e.attributes[j],n=a.name;
- if(!KEEP.test(n)||/^data-cgc/.test(n))continue;var v=a.value||'';
- o[n]=n==='aria-label'?take(v,40):v.slice(0,n==='class'?160:80);}return o;}
+ if(!KEEP.test(n)||/^data-cgc/.test(n))continue;o[n]=val(n,a.value||'');}return o;}
 function walk(e){NODES--;var kids=[];if(!/^svg$/i.test(e.tagName)){
  for(var i=e.childNodes.length-1;i>=0&&NODES>0;i--){var c=e.childNodes[i],k=null;
   if(c.nodeType===3)k=txt(c.nodeValue);else if(c.nodeType===1&&!SKIP[c.tagName.toUpperCase()])k=walk(c);
@@ -126,29 +162,33 @@ return {counts:counts,candidates:cands,path:'/'+(p.length?p[0]+(p.length>1?'/x':
 
 
 def capture_js(ui, cap, nodes=FIXTURE_NODES) -> str:
-    return ("(function(S,SR,LIM){" + _CAPTURE + "})(" + json.dumps(selectors(ui, cap)) + ","
-            + json.dumps(_SEARCH[cap]) + "," + str(int(nodes)) + ")")
+    return ("(function(S,SR,LIM,V){" + _CAPTURE + "})(" + json.dumps(selectors(ui, cap)) + ","
+            + json.dumps(_SEARCH[cap]) + "," + str(int(nodes)) + "," + json.dumps(_vocab(ui)) + ")")
 
 
 def contradicted(ui, cap, counts) -> list:
-    """The contract ids the page contradicts: a selector fact with no match. The turn schemas are
-    one fact, matched when some schema sees both roles."""
+    """The needed contract ids the page contradicts: a selector fact with no match, or a set of
+    alternatives none of which matches (all of them named). The turn schemas are one fact, matched
+    when some schema sees both roles."""
     hit = {c[0]: c[2] for c in counts}
-    ids = []
-    for i in CAPS[cap]:
+
+    def ok(i):
         if i == "turn_schemas":
-            if not any(hit.get(f"{i}/{s['adapter']}/user", 0) > 0 and
-                       hit.get(f"{i}/{s['adapter']}/assistant", 0) > 0 for s in ui[i]):
-                ids.append(i)
-        elif i in hit and hit[i] <= 0:
-            ids.append(i)
+            return any(hit.get(f"{i}/{s['adapter']}/user", 0) > 0 and
+                       hit.get(f"{i}/{s['adapter']}/assistant", 0) > 0 for s in ui[i])
+        return hit.get(i, 0) > 0
+    ids = []
+    for need in CAPS[cap]["need"]:
+        alts = need if isinstance(need, tuple) else (need,)
+        if not any(ok(i) for i in alts):
+            ids.extend(alts)
     return ids
 
 
 def involved(ui, cap, counts) -> list:
-    """What the bundle tells the agent to edit: the contradicted ids, or, when every selector
+    """What the bundle tells the agent to edit: the contradicted ids, or, when every needed selector
     matches, every id the capability reads (the fault is then in a label or a structure)."""
-    return contradicted(ui, cap, counts) or list(CAPS[cap])
+    return contradicted(ui, cap, counts) or list(CAPS[cap]["reads"])
 
 
 # ---- the fixture as HTML ---------------------------------------------------------------------------
@@ -245,7 +285,7 @@ def _sha(b: bytes) -> str:
     return "sha256:" + hashlib.sha256(b).hexdigest()
 
 
-def bundle(ui, snap, *, cap, code, detail, contract_path, rid=None, scope=None, incident=None):
+def bundle(ui, snap, *, cap, code, detail, contract_path, rid=None, inputs=None, incident=None):
     """(diagnosis dict, fixture html) from one capture_js result. Pure."""
     incident = incident or f"I-{_now():%Y%m%d-%H%M%S}-{cap}-{secrets.token_hex(3)}"
     counts = snap.get("counts") or []
@@ -268,7 +308,7 @@ def bundle(ui, snap, *, cap, code, detail, contract_path, rid=None, scope=None, 
         "code": code,
         "detail": (detail or "")[:300],
         "rid": rid,
-        "scope": scope or {},
+        "inputs": {k: v for k, v in (inputs or {}).items() if v},
         "contract": {"file": contract_path, "sha256": contract_sha},
         "expected": [{"id": i, "selector": s, "matches": ">=1"} for i, s in selectors(ui, cap)],
         "observed": {"path": snap.get("path"),
@@ -313,15 +353,25 @@ def write(d, fixture) -> str:
     return path
 
 
-def record(tab, ui, *, cap, code, detail, contract_path, rid=None, scope=None):
-    """Capture the page `tab` shows and write its bundle: the incident dir, or None. Never raises —
-    a diagnosis that fails must not change what the failure it describes does."""
+def snapshot(tab, ui, cap):
+    """One read-only capture of the page `tab` shows, or None. Taken BEFORE the failing step cleans
+    up (a menu closed, a composer cleared), so the fixture holds the page as it failed. Never raises."""
     try:
         snap = tab.eval(capture_js(ui, cap), timeout=30)
-        if not isinstance(snap, dict):
-            raise ValueError(f"capture returned {type(snap).__name__}")
+        return snap if isinstance(snap, dict) else None
+    except Exception as e:
+        sys.stderr.write(f"CGC_WARN drift capture for {cap} failed ({type(e).__name__}: {e})\n")
+        return None
+
+
+def record(snap, ui, *, cap, code, detail, contract_path, rid=None, inputs=None):
+    """Write the bundle for a snapshot: the incident dir, or None. Never raises — a diagnosis that
+    fails must not change what the failure it describes does."""
+    if not snap:
+        return None
+    try:
         return write(*bundle(ui, snap, cap=cap, code=code, detail=detail, contract_path=contract_path,
-                             rid=rid, scope=scope))
+                             rid=rid, inputs=inputs))
     except Exception as e:
         sys.stderr.write(f"CGC_WARN drift bundle for {cap} not written ({type(e).__name__}: {e})\n")
         return None

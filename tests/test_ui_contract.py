@@ -69,19 +69,49 @@ _OWNED = ("data-message-author-role", "data-chatgpt-search-unit-key", "data-turn
           "composer-intelligence-picker-content", "composer-plus-btn", "menuitemradio", 'role="slider"',
           'role=\\"slider', "radiogroup", "aria-haspopup=\\\"menu", 'aria-expanded=\\"true',
           "data-message-model-slug", "Thinking failed", "Message stream error", "captcha\\\" i",
-          'type=\\"password', "too many requests", "allow once", "u5141", "u505c", "u53d1",
-          "querySelector('main')", "'plugins'")
+          'type="password', "too many requests", "allow once", "允许", "停止", "发送", "拒绝",
+          "querySelector('main')", "'plugins'", "Extra High", "upgrade|")
+
+
+def _code_strings(name):
+    """Every string constant in the file's code: docstrings (the first statement of a module, class
+    or function) are prose about the page and are left out; every other string, triple-quoted JS
+    included, is checked."""
+    import ast
+    tree = ast.parse(_src(name))
+    docs = set()
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body \
+                and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant):
+            docs.add(id(n.body[0].value))
+    return [n.value for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docs]
 
 
 @pytest.mark.parametrize("name", ["cdp_consult.py", "cgc_probe.py"])
 def test_no_contract_owned_literal_is_written_twice(name):
-    # Only code is checked: comments and docstrings may describe the page.
-    import io
-    import tokenize
-    code = [t.string for t in tokenize.generate_tokens(io.StringIO(_src(name)).readline)
-            if t.type == tokenize.STRING and not t.string.startswith(('"""', "'''", 'r"""', 'f"""'))]
+    code = _code_strings(name)
     hits = sorted({lit for lit in _OWNED for s in code if lit in s})
+    # Every selector, attribute and label the contract holds, too: none may be spelled in code
+    # (values short enough to be ordinary words are covered by the list above instead).
+    vals = []
+    for v in _facts().values():
+        stack = [v["value"]]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, str):
+                vals.append(x)
+            elif isinstance(x, (list, dict)):
+                stack.extend(x.values() if isinstance(x, dict) else x)
+    hits += sorted({x for x in vals if len(x) >= 12 and any(x in s for s in code)})
     assert hits == [], f"{name} re-spells contract facts: {hits}"
+
+
+def test_the_literal_check_sees_triple_quoted_js():
+    import ast
+    src = 'X = """var b=document.querySelector(\'[data-testid="send-button"]\')"""\n'
+    strings = [n.value for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Constant)]
+    assert any("send-button" in s for s in strings)
 
 
 def test_the_probe_imports_the_drivers_reads_and_defines_no_selector():
@@ -251,6 +281,106 @@ def test_the_capture_sanitizes_on_the_page(mods):
     assert "secret()" not in page and "steal()" not in page and "hunter2" not in page
     assert '"data-turn": "user"' in page and '"type": "password"' in page
     assert page.count("A") <= 201 and snap["path"] == "/c/x"
+
+
+def _capture(drift, cdp, tree, cap="reader"):
+    t = drift.FixtureTab("", "/c/abc")
+    t.tree = [tree]
+    return t.eval(drift.capture_js(cdp.UI, cap))
+
+
+def test_sol_attribute_values_share_the_text_budget_and_lose_urls_and_paths(mods):
+    cdp, _probe, drift = mods
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    tree = ["html", {}, [["body", {}, [["main", {}, [
+        ["div", {"data-turn": "user", "data-preview": "private " * 100,
+                 "data-href": "https://private.example/secret", "app-src": "/" + "Users/private/file",
+                 "data-testid": "conversation-turn-3", "aria-label": "Edit message"}, ["hi"]]]]]]]]
+    page = json.dumps(_capture(drift, cdp, tree)["tree"])
+    assert page.count("private") <= 10, "an attribute's prose is cut to the shared budget"
+    assert "private.example" not in page and "/Users/" not in page
+    assert '"data-turn": "user"' in page and '"data-testid": "conversation-turn-3"' in page
+
+
+def test_sol_a_one_node_wrapper_still_reads_after_capture(mods, monkeypatch):
+    """BEGIN, body and END in ONE text node: the fixture keeps the markers and a stand-in body."""
+    cdp, probe, drift = mods
+    _fast(monkeypatch, cdp)
+    tree = _page()
+    md = tree[2][0][2][1][2][0][2][1][2][0]                       # the markdown body
+    md[2] = [["p", {}, ["BEGIN_RESPONSE:%s\nthe verdict\nEND_RESPONSE:%s" % (RID, RID)]]]
+    snap = _capture(drift, cdp, tree)
+    tab = _Tab(drift, ["html", {}, [snap["tree"]]])
+    ans, miss = probe._read(probe._NoSend(tab), RID)
+    assert miss is None and ans.strip()
+
+
+def _picker_tree(families):
+    radios = [["div", {"role": "menuitemradio", "aria-checked": "true" if i == 0 else "false"}, [f]]
+              for i, f in enumerate(families)]
+    slider = ["div", {"role": "menuitem", "aria-label": "Power"},
+              [["span", {"role": "slider", "aria-valuenow": "4", "aria-valuemin": "0",
+                         "aria-valuemax": "4"}, []]]]
+    owner = ["div", {"data-testid": "composer-intelligence-picker-content"}, radios + [slider]]
+    return ["html", {}, [["body", {}, [["div", {"role": "menu"}, [owner]]]]]]
+
+
+def _bundle_of(drift, cdp, cap, tree, inputs, tmp_path):
+    t = drift.FixtureTab("", "/g/x")
+    t.tree = [tree]
+    snap = t.eval(drift.capture_js(cdp.UI, cap))
+    return drift.record(snap, cdp.UI, cap=cap, code="x", detail="y", contract_path=cdp.CONTRACT_PATH,
+                        inputs=inputs)
+
+
+def test_sol_model_replay_runs_the_family_decision(mods, tmp_path):
+    cdp, probe, drift = mods
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    inc = _bundle_of(drift, cdp, "model", _picker_tree(["Alien", "Other"]),
+                     {"model": "Pro", "family": "GPT-6"}, tmp_path)
+    r = probe.replay(inc)
+    assert r["ok"] is False and "GPT-6" in r["detail"], r
+    inc = _bundle_of(drift, cdp, "model", _picker_tree(["Latest", "GPT-5.5"]),
+                     {"model": "Pro", "family": "GPT-6"}, tmp_path)
+    assert probe.replay(inc)["ok"] is True, "a demonstrated relabel is the family"
+
+
+def test_sol_composer_replay_runs_the_resolver(mods, tmp_path):
+    cdp, probe, drift = mods
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    ed = ["div", {"role": "textbox", "contenteditable": "true"}, []]
+    in_article = ["html", {}, [["body", {}, [["form", {}, [["article", {}, [ed]]]]]]]]
+    assert probe.replay(_bundle_of(drift, cdp, "composer", in_article, {}, tmp_path))["ok"] is False
+    in_form = ["html", {}, [["body", {}, [["form", {}, [ed]]]]]]
+    assert probe.replay(_bundle_of(drift, cdp, "composer", in_form, {}, tmp_path))["ok"] is True
+
+
+def test_sol_family_names_compare_alike_on_both_sides(mods):
+    cdp = mods[0]
+    assert cdp._is_family("Latest", "Latest") and cdp._is_family("latest", "GPT-6")
+    assert cdp._is_family("GPT-6", "latest")
+
+
+def test_sol_contract_values_splice_as_js(mods, tmp_path):
+    cdp = mods[0]
+    assert cdp._js_str("停止") == "'\\u505c\\u6b62'"
+    for bad in ("x\ny", "\U0001f600"):
+        facts = _facts()
+        facts["composer"]["value"] = bad
+        p = tmp_path / "c.json"
+        p.write_text(json.dumps({"facts": facts}))
+        with pytest.raises(SystemExit, match="contract_invalid"):
+            cdp._load_contract(str(p))
+
+
+def test_sol_replay_leaves_cgc_contract_as_it_found_it(mods, monkeypatch):
+    _cdp, probe, _drift = mods
+    monkeypatch.setenv("CGC_CONTRACT", CONTRACT)
+    probe._driver(CONTRACT)
+    assert os.environ["CGC_CONTRACT"] == CONTRACT
 
 
 def test_a_send_refusal_carries_its_bundle_into_the_attempt_and_the_daemon_log(mods, capsys):

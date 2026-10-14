@@ -130,6 +130,14 @@
       "value": "[role=\"menu\"][data-state=\"open\"],[role=\"menu\"]:not([data-state])",
       "why": "Menus an Escape is dispatched at; Radix keeps closed ones mounted (2026-09-06)."
     },
+    "switcher_labels": {
+      "value": ["Instant", "Medium", "High", "Extra High", "Pro", "Auto", "Thinking", "GPT", "ChatGPT"],
+      "why": "Leading text of a composer model/tier switcher button (case-sensitive prefix; version-shaped labels like '5.5' and 'o3' are matched by code). Tiers 2026-08-18, GPT badge 2026-09-06."
+    },
+    "switcher_not_labels": {
+      "value": ["project", "share", "copy", "send", "search", "attach", "new chat", "cancel", "stop", "upgrade", "get ", "settings", "log in", "login", "sign", "account"],
+      "why": "Case-insensitive leading text of buttons that are never a model switcher ('Upgrade to Pro' must not confirm Pro) (2026-07)."
+    },
     "family_aliases": {
       "value": {"Latest": "GPT-6"},
       "why": "Observed family radio label -> the family it is. 'Latest' was relabelled 'GPT-6' in 2026-10, same model, same slot."

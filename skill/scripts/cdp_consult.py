@@ -136,24 +136,30 @@ def _load_contract(path):
         elif isinstance(v, (list, dict)):
             for x in (v.values() if isinstance(v, dict) else v):
                 yield from strings(x)
-    bad = [k for k, v in ui.items() for s in strings(v) if "'" in s or "\\" in s]
+    bad = [k for k, v in ui.items() for s in strings(v)
+           if "'" in s or "\\" in s or any(ord(ch) < 0x20 or ord(ch) > 0xFFFF for ch in s)]
     if bad:
-        raise SystemExit(f"CGC_ERROR contract_invalid: {path}: {bad} hold a ' or a backslash")
+        raise SystemExit(f"CGC_ERROR contract_invalid: {path}: {bad} hold a ' , a backslash, a "
+                         "control character or a character outside the BMP")
     return ui
 
 
 UI = _load_contract(CONTRACT_PATH)
 
 
+def _u(s):
+    """Non-ASCII as JS \\uXXXX escapes (the loader admits only BMP characters, so one per char)."""
+    return "".join(ch if ord(ch) < 0x80 else "\\u%04x" % ord(ch) for ch in s)
+
+
 def _js_str(s):
-    """A contract value as a single-quoted JS string literal, non-ASCII as \\u escapes."""
-    return "'" + s.encode("ascii", "backslashreplace").decode() + "'"
+    """A contract value as a single-quoted JS string literal."""
+    return "'" + _u(s) + "'"
 
 
 def _js_alt(words):
     """Plain contract labels as one JS regex alternation (each label matched literally)."""
-    return "|".join(re.sub(r"([\\^$.|?*+()\[\]{}/])", r"\\\1", w).encode("ascii", "backslashreplace")
-                    .decode() for w in words)
+    return "|".join(_u(re.sub(r"([\\^$.|?*+()\[\]{}/])", r"\\\1", w)) for w in words)
 
 
 CGC_PORT = int(os.environ.get("CGC_PORT", "9333"))
@@ -866,15 +872,29 @@ _BLOCKER_FN = (
     "return null;}")
 
 
-def _diagnose(c, cap, code, detail, rid=None):
+def _diagnose(c, cap, code, detail, rid=None, snap=None, inputs=None):
     """Write the drift-repair bundle (cgc_drift) for the page `c` shows: its incident dir, or None.
-    Read-only and fail-soft; skipped when the page shows a human condition, which says nothing
-    about the contract."""
-    if _blocker(c):
-        return None
+    Pre-click only, after a refusal, and fail-soft; skipped when the page shows a human condition,
+    which says nothing about the contract. `snap`: a capture the failing step took before its own
+    cleanup (a mention). A model refusal has already closed its menu, so the picker is reopened —
+    the same open the selection walk performs, nothing selected — captured, and closed again.
+    `inputs`: what replay needs to re-run the capability's own check (the family, the app)."""
     import cgc_drift
-    path = cgc_drift.record(c, UI, cap=cap, code=code, detail=detail, contract_path=CONTRACT_PATH,
-                            rid=rid)
+    try:
+        if _blocker(c):
+            return None
+        if snap is None and cap == "model":
+            opened = _reopen_picker(c, "") is not None
+            snap = cgc_drift.snapshot(c, UI, cap)
+            if opened:
+                _close_menus(c)
+        elif snap is None:
+            snap = cgc_drift.snapshot(c, UI, cap)
+    except Exception as e:                  # a diagnosis never changes the refusal it describes
+        sys.stderr.write(f"CGC_WARN drift capture for {cap} failed ({type(e).__name__}: {e})\n")
+        return None
+    path = cgc_drift.record(snap, UI, cap=cap, code=code, detail=detail, contract_path=CONTRACT_PATH,
+                            rid=rid, inputs=inputs)
     if path:
         sys.stderr.write(f"CGC_DRIFT_BUNDLE {cap}: {path}/diagnosis.json — edit the contract ids it "
                          f"names, then `python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cgc_probe.py')} --replay {path}`\n")
@@ -1338,11 +1358,11 @@ def cmd_status(a) -> int:
 # (aria-haspopup) or is aria-labelled as a model picker; and is NOT an action/nav button.
 _CAND_JS = ("[].slice.call(document.querySelectorAll('button')).filter(function(b){"
             "var t=(b.innerText||'').trim().split('\\n')[0];"
-            "if(!t||t.length>28||/^(projects?|share|copy|send|search|attach|new chat|cancel|stop|upgrade|get |settings|log ?in|sign|account)/i.test(t))return false;"
+            "if(!t||t.length>28||/^(" + _js_alt(UI["switcher_not_labels"]) + ")/i.test(t))return false;"
             "var hp=(b.getAttribute('aria-haspopup')||'');"
             "var al=(b.getAttribute('aria-label')||'');"
             "var menuish=/menu|listbox|dialog|true/i.test(hp)||/model/i.test(al);"
-            "var labelish=/^(Instant|Medium|High|Extra High|Pro|Auto|Thinking|GPT|ChatGPT|o[0-9]|[0-9]\\.[0-9])/.test(t);"
+            "var labelish=/^(" + _js_alt(UI["switcher_labels"]) + "|o[0-9]|[0-9]\\.[0-9])/.test(t);"
             "return menuish||labelish;})")
 
 # The composer's OWN switcher, scoped to its <form>: on the build live-repro'd 2026-08-28 this
@@ -1940,8 +1960,13 @@ def _is_family(label, family):
     """Does the radio labelled `label` select `family`? Exact and case-insensitive, after the
     contract's demonstrated relabels (family_aliases: 'Latest' is 'GPT-6'); any other label is
     only itself, never an assumed equivalent."""
-    lab = (label or "").strip()
-    return UI["family_aliases"].get(lab, lab).lower() == (family or "").strip().lower()
+    return _family_name(label) == _family_name(family)
+
+
+def _family_name(s):
+    """A family label in its one comparable form: case-folded, a demonstrated relabel resolved."""
+    k = (s or "").strip().lower()
+    return {a.lower(): b.lower() for a, b in UI["family_aliases"].items()}.get(k, k)
 """`touched` means a gesture was DISPATCHED at the radio group — whether or not it was confirmed.
 Anything touched must be restored on a later failure, because a click whose confirmation could not
 be read is not a click that provably did nothing."""
@@ -2881,9 +2906,16 @@ class _MentionFailure(_PreClickFailure):
     `drift` is True only when the failure proves the picker's markup moved (the popup never opened,
     or an app-shaped row took no app mention node); every other cause is this account's apps."""
 
-    def __init__(self, msg, drift=False):
+    def __init__(self, msg, drift=False, snap=None):
         super().__init__(msg)
         self.drift = drift
+        self.snap = snap        # a drift capture of the page as it failed, before the cleanup
+
+
+def _mention_snap(c):
+    """The drift capture of the page as the mention failed, taken before the composer is cleared."""
+    import cgc_drift
+    return cgc_drift.snapshot(c, UI, "mention")
 
 
 def _norm_label(s):
@@ -3029,6 +3061,14 @@ def _clear_after_mention_failure(c):
 
 
 def _insert_mention(c, name):
+    try:
+        _insert_mention_unnamed(c, name)
+    except _MentionFailure as e:
+        e.app = name            # which app a drift bundle's replay must find again
+        raise
+
+
+def _insert_mention_unnamed(c, name):
     token = os.urandom(4).hex()
     want = _norm_label(name)
     have = list(c.eval(_composer_mentions_js(), timeout=45) or [])
@@ -3063,6 +3103,7 @@ def _insert_mention(c, name):
                 return
             # Not the requested app: nothing appeared (the row was not an app), or something else did.
             # Either way the prompt would go out without the app that was asked for.
+            snap = None if appeared else _mention_snap(c)
             residue = _clear_after_mention_failure(c)
             if appeared:
                 raise _MentionFailure(
@@ -3071,12 +3112,13 @@ def _insert_mention(c, name):
             raise _MentionFailure(
                 f"mention_not_found: the popup row {r['hit'][:40]!r} for '@{name}' is not an app — the "
                 f"composer took no app mention from it{residue}. Enable the app '{name}' in ChatGPT "
-                "or fix the name", drift=True)
+                "or fix the name", drift=True, snap=snap)
+    snap = None if popup_open else _mention_snap(c)
     residue = _clear_after_mention_failure(c)
     raise _MentionFailure(
         f"mention_not_found: the composer offered no app named '{name}' for '@{name}' within "
         f"{_MENTION_WAIT_S:.0f}s{residue}. {_mention_offer(popup_open, seen, unconnected, loading, unverified, ambiguous, name)}",
-        drift=not popup_open)
+        drift=not popup_open, snap=snap)
 
 
 def _paste_prompt(c, prompt: str, mentions=()) -> None:
@@ -3274,7 +3316,8 @@ def cmd_submit(a) -> int:
                 sys.stderr.write(
                     f"CGC_ERROR model_not_selectable: {why} — NOT submitting. Fix: {fix}, or "
                     f"pass --allow-model-mismatch.\n")
-                _diagnose(c, "model", "model_not_selectable", why, a.rid)
+                _diagnose(c, "model", "model_not_selectable", why, a.rid,
+                          inputs={"model": target, "family": a.model_family})
                 return 3
             if not model_confirmed:
                 sys.stderr.write(f"CGC_WARN proceeding on '{model_now}' not '{target}' "
@@ -3292,7 +3335,8 @@ def cmd_submit(a) -> int:
                               "phase": "mention"}))
             sys.stderr.write(f"CGC_ERROR {e} — NOT submitted.\n")
             if e.drift:
-                _diagnose(c, "mention", "mention_not_found", str(e), a.rid)
+                _diagnose(c, "mention", "mention_not_found", str(e), a.rid, snap=e.snap,
+                          inputs={"app": getattr(e, "app", None)})
             return 3
         except _PreClickFailure as e:
             sys.stderr.write(f"CGC_ERROR not_sent_preclick: {e} — NOT submitted; safe to retry with "
@@ -3623,7 +3667,8 @@ def cmd_followup(a) -> int:
                     f"CGC_ERROR model_not_selectable: {why} — NOT sending this follow-up (it "
                     f"would answer on a DEGRADED model, the Instant-stall failure). Fix: {fix}, "
                     f"or pass --allow-model-mismatch to override.\n")
-                _diagnose(c, "model", "model_not_selectable", why, rid)
+                _diagnose(c, "model", "model_not_selectable", why, rid,
+                          inputs={"model": target, "family": a.model_family})
                 return 2
         # Count user messages BEFORE sending so we can confirm a NEW one landed (the
         # thread already has >=1 user message, so an absolute >0 check would false-pass).
@@ -3667,7 +3712,8 @@ def cmd_followup(a) -> int:
                               "phase": "mention"}))
             sys.stderr.write(f"CGC_ERROR {e} — NOT sent.\n")
             if e.drift:
-                _diagnose(c, "mention", "mention_not_found", str(e), rid)
+                _diagnose(c, "mention", "mention_not_found", str(e), rid, snap=e.snap,
+                          inputs={"app": getattr(e, "app", None)})
             return 3
         except _PreClickFailure as e:
             sys.stderr.write(f"CGC_ERROR not_sent_preclick: {e} — NOT sent; safe to retry with the "
