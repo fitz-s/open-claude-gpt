@@ -40,8 +40,13 @@ import cgc_backend  # noqa: E402
 import cgc_spool as spool  # noqa: E402
 import cgc_store as store_mod  # noqa: E402
 
-DUMMY = "".join(f"cgc no-send composer probe, line {i:03d}: this draft is cleared and never sent.\n"
-                for i in range(220))       # ~17 KB, past the length at which long pastes broke
+# The shapes every real prompt carries, so a pass proves the editor hands back the exact payload the
+# send path binds (blank lines, indentation inside a fence, list, heading and quote markers) — the
+# pre-click equality check refuses a send on any editor rewrite of them.
+_SHAPES = ("# cgc probe heading\n\n- list item one\n- list item two\n\n> a quoted line\n\n"
+           "```python\ndef f(x):\n    if x:\n        return \"\"\"a\n\nb\"\"\"\n    return None\n```\n\n")
+DUMMY = _SHAPES + "".join(f"cgc no-send composer probe, line {i:03d}: this draft is cleared and never sent.\n"
+                          for i in range(220))   # ~17 KB, past the length at which long pastes broke
 LONG_PROMPT = 12_000      # a marker round at least this long exercises the collapsed-turn read
 LEGACY_MAX = 6_000        # a legacy (no marker) turn this short is not collapsed (20.7 KB kept 10 KB)
 RENDER_S = 30             # how long a loaded conversation may take to render its first user turn

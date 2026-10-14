@@ -39,13 +39,19 @@ class _FakeComposer:
         self.html = ""
         self.text = ""
         self.mentions = []
+        self.chips = []          # labels in self.text that a chip node renders, not typed text
 
     def eval(self, js, timeout=None):
+        if "__cgcPlain" in js:                      # the typed-text read: chip nodes are not text
+            out = self.text
+            for chip in self.chips:
+                out = out.replace(chip, "", 1)
+            return out
         if "readyState" in js:
             return True
         if "selectAll" in js:
             self.html = self.text = ""
-            self.mentions = []
+            self.mentions, self.chips = [], []
             return 0
         if "app-mention-name" in js:
             if self._pending:                       # a click landed: the node shows after late_by reads
@@ -60,6 +66,7 @@ class _FakeComposer:
                 if not self.non_app:  # a row that is not an app leaves the composer without a mention
                     self.html = self.html.replace("@" + want, "") + f'<span data-mention>{want}</span>'
                     self.text = self.text.lower().replace("@" + want, want)
+                    self.chips.append(want)
                     self._pending.append(self.yields or want)
                 return {"hit": want, "open": True, "seen": [], "unconnected": [], "unverified": []}
             return {"hit": None, "open": self.popup_open, "loading": self.loading, "seen": self.offers,
@@ -71,8 +78,6 @@ class _FakeComposer:
             self.text += chunk
             self.html += chunk.lower()
             return True if "return true" in js else len(self.text)
-        if "return d?(d.innerText" in js:
-            return self.text
         raise AssertionError("unexpected js: " + js[:80])
 
 
@@ -733,9 +738,10 @@ def test_blocked_round_keeps_the_offered_app_names():
 # editor is never a fallback; the send button is the one INSIDE that composer's own form.
 
 _NODE_FORMS = r"""
-function el(t,o){o=o||{};var n={tagName:t.toUpperCase(),_a:o.a||{},children:[],parent:null,hidden:!!o.hidden,
+function el(t,o){o=o||{};var n={nodeType:1,tagName:t.toUpperCase(),_a:o.a||{},children:[],parent:null,hidden:!!o.hidden,
   disabled:!!o.disabled,clicked:0,
   getAttribute:function(k){return k in this._a?this._a[k]:null},
+  hasAttribute:function(k){return k in this._a},
   getBoundingClientRect:function(){return this.hidden||(this.parent&&this.parent.hiddenDeep())?{width:0,height:0}:{width:500,height:40}},
   hiddenDeep:function(){return this.hidden||(this.parent&&this.parent.hiddenDeep())},
   closest:function(sel){var ok=sel.split(',').map(function(x){return x.trim()});var n=this;
@@ -757,7 +763,9 @@ function match(x,sel){return sel.split(',').some(function(p){p=p.trim();
   if(p==='[role="alert"]'||p==='[id*="challenge"]')return false;   // no rate-limit alert, no challenge
   throw new Error('unsupported selector: '+p);});}
 function ed(o){o=o||{};o.a=Object.assign({role:'textbox',contenteditable:'true'},o.a||{});var n=el('div',o);
-  Object.defineProperty(n,'innerText',{get:function(){return n._text}});return n;}
+  Object.defineProperty(n,'innerText',{get:function(){return n._text}});
+  // what was typed is one text node, as in the browser: the composer text read walks childNodes
+  Object.defineProperty(n,'childNodes',{get:function(){return [{nodeType:3,nodeValue:n._text}]}});return n;}
 function send(o){o=o||{};o.a=Object.assign({'aria-label':'Send'},o.a||{});return el('button',o);}
 var ACTIVE=null;
 var document={activeElement:null,readyState:'complete',
@@ -872,11 +880,35 @@ def test_send_with_no_button_yet_needs_focus_inside_the_composer_before_enter_is
 
 
 def test_send_verdict_lets_only_clicked_and_no_send_go_on_and_enter_only_for_no_send():
-    assert CDP._send_verdict("clicked") == (True, False, "")
-    assert CDP._send_verdict("no-send") == (True, True, "")
-    for bad in ("no-composer", "ambiguous", "disabled", "no-focus", None, "", "weird", 0, False):
-        may, enter, why = CDP._send_verdict(bad)
-        assert may is False and enter is False and "send target" in why, bad
+    assert CDP._send_verdict("clicked") == ("clicked", "")
+    assert CDP._send_verdict("no-send") == ("enter", "")
+    for neg in ("no-composer", "ambiguous", "disabled", "no-focus", "error-preclick:TypeError x"):
+        verdict, why = CDP._send_verdict(neg)
+        assert verdict == "not-sent" and "send target" in why, neg
+    # No reply, or one nobody listed, is not evidence of anything: it may have come after click().
+    for unknown in (None, "", "weird", 0, False, "error-postclick", "Clicked"):
+        assert CDP._send_verdict(unknown)[0] == "unknown", unknown
+
+
+def test_the_send_eval_returns_an_explicit_negative_for_a_throw_before_the_click():
+    # f.querySelectorAll throws on a form that cannot be searched: caught before the gesture, so it is
+    # an explicit pre-click negative, and no button is clicked.
+    tree = "el('body',{c:[el('form',{c:[ed(),send({a:{id:'S'}})]})]})"
+    expr = ("(function(){ALL.filter(function(x){return x.tagName==='FORM'})[0].querySelectorAll="
+            "function(){throw new Error('boom')};var v=" + CDP._send_click_js() +
+            ";return [v,ALL.filter(function(x){return x.clicked}).length];})()")
+    v, clicked = _run_forms(tree, expr)
+    assert v == "error-preclick:boom" and clicked == 0
+    assert CDP._send_verdict(v)[0] == "not-sent"
+
+
+def test_a_throw_from_the_click_itself_is_not_a_pre_click_negative():
+    # click() is outside the try: if it throws the eval yields no value, which reads as unknown.
+    tree = "el('body',{c:[el('form',{c:[ed(),send({a:{id:'S'}})]})]})"
+    expr = ("(function(){ALL.filter(function(x){return x._a.id==='S'})[0].click="
+            "function(){throw new Error('mid-click')};try{return " + CDP._send_click_js() +
+            "}catch(e){return 'escaped:'+e.message;}})()")
+    assert _run_forms(tree, expr) == "escaped:mid-click"
 
 
 def test_send_never_reaches_a_send_button_outside_the_composers_form():
