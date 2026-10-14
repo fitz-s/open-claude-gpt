@@ -350,7 +350,7 @@ def run(deep: bool, secure: bool = False) -> Report:
         r.fail("scratch dir", f"{STATE_DIR} not writable ({e})", "set CGC_STATE_DIR to a writable path")
 
     # 8. Skill files present
-    need = ["consult.py", "cdp_consult.py", "cdp_launch.sh", "retrieval_window.js"]
+    need = ["consult.py", "cdp_consult.py", "cdp_launch.sh"]
     missing = [f for f in need if not os.path.exists(os.path.join(HERE, f))]
     skill_md = os.path.exists(os.path.join(HERE, "..", "SKILL.md"))
     if not missing and skill_md:

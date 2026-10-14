@@ -46,6 +46,17 @@ releases until it stabilizes.
 - Answer files are written through a unique temp file, and a parallel first open of an
   un-migrated DB re-reads the schema version under the write lock instead of running a migration
   twice.
+### Removed — the MCP fallback backend
+
+The Claude-in-Chrome MCP path is retired. Nothing on the CDP + daemon path read its artifacts
+(`poll_js`, `preflight_js`, the window script, the wake plan), and it needed a second copy of every
+DOM selector and of the sentinel parser. Gone: `consult.py prep --backend/--window-template/
+--target-chars/--hard-chars/--expect-minutes`, `skill/scripts/retrieval_window.js`,
+`skill/references/mcp-fallback.md`, and doctor's `retrieval_window.js` file requirement (doctor is
+ready without it). The sentinel-parser parity corpus is kept in full and now runs Python against
+`_sentinel_js`; only the two MCP implementations were dropped from it. Kept on purpose: `cgc_migrate.py`
+and `Store.import_round` (offline-only, off the runtime path) and `consult.py prep`/`deliver` (the
+follow-up path of `cdp_consult.py` shells out to `prep`; `bin/cgc deliver` runs `deliver --verify`).
 
 ### Fixed — a note typed into a thread mid-round no longer hides the answer
 

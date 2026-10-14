@@ -27,11 +27,9 @@ def _ns(mod, tmp, **over):
     ns = argparse.Namespace(
         repo_dir=ROOT, repo="acme/widgets", pr=None, ref="a" * 40, compare=None,
         pulls=False, blobs=False, files=None, issues=None, base=None,
-        verify=False, allow_nonpublic=False,
-        backend="cdp", window_template=None, task="probe", title="t", role=None,
+        verify=False, allow_nonpublic=False, task="probe", title="t", role=None,
         followup=False, no_code=False, context_file=None, refs_file=None,
-        output_file=None, output_replace=False, target_chars=32000, hard_chars=40000,
-        expect_minutes=25, model="Pro", out=None,
+        output_file=None, output_replace=False, model="Pro", out=None,
         project_url="https://chatgpt.com/", conversation=None)
     for k, v in over.items():
         setattr(ns, k, v)

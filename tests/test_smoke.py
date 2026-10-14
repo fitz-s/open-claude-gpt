@@ -291,3 +291,16 @@ def test_no_undefined_names_anywhere_in_the_scripts():
     r = subprocess.run([ruff, "check", "--select", "F821", "--output-format", "concise", scripts],
                        capture_output=True, text=True)
     assert r.returncode == 0, f"undefined names in the scripts:\n{r.stdout}{r.stderr}"
+
+
+def test_minimal_install_without_mcp_is_ready():
+    """The MCP fallback is retired: the skill-files check passes with no retrieval_window.js on disk."""
+    import importlib.util
+    here = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skill", "scripts")
+    assert not os.path.exists(os.path.join(here, "retrieval_window.js"))
+    spec = importlib.util.spec_from_file_location("cgc_doctor_t", os.path.join(here, "cgc_doctor.py"))
+    doc = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, here)
+    spec.loader.exec_module(doc)
+    row = [r for r in doc.run(deep=False).rows if r[1] == "skill files"][0]
+    assert row[0] == "pass", row
