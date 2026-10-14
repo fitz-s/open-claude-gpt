@@ -1034,7 +1034,7 @@ _ERRORS = {
         "submit_failed_before followup_failed_before reconciled_not_sent"),
     "human_required": "login_needed captcha rate_limit approval_needed mention_not_found "
                       "request_key_locked attribution_mismatch",
-    "ui_contract_broken": "selector_drift composer_not_ready model_not_selectable wrong_page "
+    "ui_contract_broken": "contract_invalid selector_drift composer_not_ready model_not_selectable wrong_page "
                           "ui_contract",
     "send_uncertain": (
         "unknown_send wait_produced_no submit_did_not followup_send_failed daemon_died "
