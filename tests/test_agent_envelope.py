@@ -143,7 +143,7 @@ def _diag(env, full=True):
     rc, out = _run(env, "cgc_spool.py", "diagnose", "--rid", RID)
     raw = subprocess.run([sys.executable, os.path.join(SCRIPTS, "cgc_spool.py"), "diagnose", "--rid",
                           RID], capture_output=True, text=True, env=env).stdout
-    assert len(raw.strip().encode()) <= backend.DIAGNOSE_MAX, len(raw)
+    assert out.get("truncated") or len(raw.strip().encode()) <= backend.DIAGNOSE_MAX, len(raw)
     for k in ("phases", "attempts", "conversation", "answer_on_disk", "last_marker", "ui", "bundle") if full else ():
         assert k in out
     return out
@@ -255,12 +255,128 @@ def test_fire_crash_after_commit_keeps_the_rid(env, monkeypatch, capsys):
         assert s.get_round(out["rid"])["state"] == "queued"
 
 
-def test_diagnose_bound_holds_for_a_wide_unicode_path(env, tmp_path):
-    deep = tmp_path / ("界" * 60) / ("界" * 60) / ("界" * 60)
+def test_diagnose_wide_unicode_path_is_never_abbreviated(env, tmp_path):
+    """Machine fields are exact or absent, never a fabricated head…tail. Only when they alone
+    outgrow the bound is the line longer, and then it says so (`truncated`)."""
+    deep = tmp_path / ("界" * 70) / ("界" * 70) / ("界" * 70)
     deep.mkdir(parents=True)
     _round(store_mod.COMPLETED_VERIFIED, result="x", out=deep / "answer.txt")
     out = _diag(env, full=False)
-    assert out["code"] == "ok" and out["answer_path"]
+    assert out["code"] == "ok" and out["answer_path"] == str(deep / "answer.txt")
+    assert os.path.exists(out["answer_path"]) and out.get("truncated") is True
+
+
+def test_fit_keeps_a_long_command_whole():
+    cmd = "python3 /opt/" + "界" * 260 + "/cgc_spool.py await --rid " + RID
+    env = {"schema": 1, "rid": RID, "state": "queued", "code": "ok", "next_command": cmd,
+           "human_action": "x" * 900, "answer_path": None, "detail": "y" * 200}
+    fitted = backend._fit(env, backend.DIAGNOSE_MAX)
+    assert fitted["next_command"] == cmd and fitted["truncated"] is True
+
+
+def test_fire_fallback_needs_no_store(capsys, monkeypatch):
+    """Post-commit failure where the store itself keeps failing: the rid alone is the receipt."""
+    def broken(*a, **kw):
+        raise OSError("simulated persistent store failure")
+
+    def action():
+        backend._committed(RID)
+        monkeypatch.setattr(store_mod, "Store", broken)
+        raise OSError("post-commit failure")
+    assert backend.agent_cli(action) == 1
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith('{"schema"')]
+    out = json.loads(lines[-1])
+    assert len(lines) == 1 and out["rid"] == RID and out["code"] == "ok"
+    assert f"await --rid {RID}" in out["next_command"]
+
+
+def test_sigint_during_serialization_still_emits_one_line(capsys, monkeypatch):
+    import signal
+    real = backend._line
+    state = {"once": True}
+
+    def interrupting(env):
+        if state["once"]:
+            state["once"] = False
+            os.kill(os.getpid(), signal.SIGINT)
+        return real(env)
+    monkeypatch.setattr(backend, "_line", interrupting)
+    rc = backend.agent_cli(lambda: 2)
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith('{"schema"')]
+    assert len(lines) == 1 and rc in (2, 130)
+
+
+def test_undecodable_answer_file_is_rebuilt(env, tmp_path):
+    a = tmp_path / "a.txt"
+    a.write_bytes(b"\xff\xfe")
+    _round(store_mod.COMPLETED_VERIFIED, result="authoritative answer", out=a)
+    for verb in ("diagnose", "status", "await"):
+        _, out = _run(env, "cgc_spool.py", verb, "--rid", RID,
+                      *(["--timeout", "2"] if verb == "await" else []))
+        assert out["code"] == "ok" and out["answer_path"] == str(a), (verb, out)
+    assert a.read_text() == "authoritative answer"
+
+
+@pytest.mark.parametrize("error,cont,new_key", [
+    ("turn_failed: provider marked", None, True),
+    ("CGC_ERROR turn_failed: provider marked", "landed", True),
+    ("CGC_ERROR turn_failed: provider marked", "not_sent", True),
+    ("CGC_ERROR turn_failed: provider marked", "claimed", False),
+    ("CGC_ERROR turn_failed: provider marked", "unsure", False),
+    ("CGC_ERROR turn_failed: provider marked", "something_new", False),
+    ("turn_failed_to_attach: no provider failure", None, False),
+    ("CGC_ERROR turn_failedness: unknown error", None, False),
+])
+def test_new_key_advice_needs_an_exact_final_turn_failed(error, cont, new_key):
+    class S:
+        def has_send_attempt(self, rid): return True
+        def gated_by(self, r): return {}
+        def conversation_of(self, rid): return CONV
+        def auto_continue_state(self, rid): return cont
+    r = {"rid": RID, "state": store_mod.FAILED, "error_code": error, "send_disposition": None,
+         "rendered_prompt": "p", "kind": "submit", "parent_rid": None, "spec_json": "{}"}
+    d = backend.decide(S(), r)
+    assert ("NEW --request-key" in (d["human_action"] or "")) is new_key, d
+    if not new_key:
+        assert "retrieve" in d["next_command"]
+
+
+def test_no_round_that_may_have_sent_is_ever_resent():
+    """Exhaustive over states × errors × attempt × disposition × conversation × kind × continue."""
+    import itertools
+    errs = [None, "transport_error", "unknown_send", "captcha", "selector_drift",
+            "timeout_no_answer", "rid_absent", "cancelled by caller before send", "refused: private",
+            "unverified: gate", "turn_failed: provider marked", "CGC_ERROR turn_failed: x",
+            "turn_failed_to_attach: x", "CGC_ERROR turn_failedness: x"]
+
+    class S:
+        def __init__(self, attempt, conv, cont):
+            self.attempt, self.conv, self.cont = attempt, conv, cont
+        def has_send_attempt(self, rid): return self.attempt
+        def gated_by(self, r): return {}
+        def conversation_of(self, rid): return self.conv
+        def auto_continue_state(self, rid): return self.cont
+    real = backend._answer_file
+    backend._answer_file = lambda r, out: None
+    try:
+        for state, err, attempt, disp, conv, kind, cont in itertools.product(
+                store_mod._LEGAL, errs, (False, True), (None, store_mod.NOT_SENT_PROVEN),
+                (None, CONV), ("submit", "followup", "retrieve"),
+                (None, "claimed", "unsure", "landed", "not_sent")):
+            r = {"rid": RID, "state": state, "error_code": err, "send_disposition": disp,
+                 "rendered_prompt": "p", "kind": kind, "parent_rid": "REQ-x", "spec_json": "{}"}
+            d = backend.decide(S(attempt, conv, cont), r)
+            if not attempt or disp == store_mod.NOT_SENT_PROVEN or kind == "retrieve" \
+                    or state == store_mod.GATE_REJECTED:
+                continue
+            resend = (" refire " in (d["next_command"] or "")
+                      or "NEW --request-key" in (d["human_action"] or "")
+                      or "then fire again" in (d["human_action"] or ""))
+            explicit = (state == store_mod.FAILED and backend._PROVIDER_FINAL.match(err or "")
+                        and cont in backend._CONTINUE_FINAL)
+            assert not resend or explicit, (state, err, attempt, disp, conv, kind, cont, d)
+    finally:
+        backend._answer_file = real
 
 
 def test_completed_retrieve_with_missing_file_is_rematerialized(env, tmp_path):

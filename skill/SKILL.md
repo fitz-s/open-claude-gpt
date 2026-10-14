@@ -118,8 +118,9 @@ re-send) · `source_unresolved` · `remote_failed` · `observation_deadline` · 
   the cause in `detail`, then run `next_command` (`refire`: fresh rid, same prompt; nothing can
   duplicate). `send_uncertain` or a post-send blocker → the send may have landed: NEVER re-fire;
   `next_command` retrieves by conversation.
-- Stuck or unclear → run `cgc_spool.py diagnose --rid <rid>`: one line of 1.5 KB at most, with phases,
-  the driver's last verdict, the UI verdicts and the next command. Never read the log or the driver.
+- Stuck or unclear → run `cgc_spool.py diagnose --rid <rid>`: one line of ≤1.5 KB (paths are never
+  cut; `truncated:true` if they alone exceed it) with phases, the driver's last verdict, the UI
+  verdicts and the next command. Never read the log or the driver.
 - ChatGPT failing a turn ("Thinking failed") is handled for you: the daemon sends ONE "continue" in
   the same thread and the same rid keeps waiting. If that continue also fails, the round ends `failed`
   with `turn_failed` — re-fire with a NEW `--request-key` only if you still need the answer. If the

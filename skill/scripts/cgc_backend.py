@@ -1065,8 +1065,8 @@ def envelope(**fields) -> dict:
     env.update(fields)
     if env["detail"] is not None:
         env["detail"] = str(env["detail"])[:200]
-    line = _line(env) + "\n"
-    with _no_sigint():
+    with _no_sigint():   # mask → build → mark → write: an interrupt is delivered after the line
+        line = _line(env) + "\n"
         _EMITTED = True
         sys.stdout.write(line)
         sys.stdout.flush()
@@ -1152,10 +1152,15 @@ def agent_cli(call, rid_of=lambda: None) -> int:
         if _EMITTED:
             return rc
         rid = _COMMITTED or rid_of()
-        try:
-            _synthesize(rid, rc, tap, crashed, interrupted)
-        except KeyboardInterrupt:   # delivered once the guarded write is done: the line is out
-            rc = 130
+        for _ in range(3):
+            try:
+                if not _EMITTED:
+                    _synthesize(rid, rc, tap, crashed, interrupted)
+                break
+            except KeyboardInterrupt:   # after the guarded write, or before it: emit if still owed
+                interrupted, rc = True, 130
+            except Exception as e:      # the envelope itself must not depend on anything failing
+                tap.err, crashed = f"{type(e).__name__}: {e}", True
         return rc
     finally:
         _EMITTED = outer
@@ -1165,9 +1170,8 @@ def _synthesize(rid, rc, tap, crashed, interrupted):
     """The envelope for a verb that printed none."""
     if rid and rid == _COMMITTED:
         # The round is durably in the store: whatever failed came after, so the rid is the receipt.
-        with store_mod.Store() as s:
-            r = s.get_round(rid)
-        envelope(rid=rid, state=r["state"] if r else None, code="ok",
+        # Built from the rid alone — the failure may be the store itself.
+        envelope(rid=rid, state=None, code="ok",
                  next_command=_cmd("cgc_spool.py", "await", "--rid", rid),
                  detail="the round is queued; this command failed after committing it: "
                         + str(tap.err or tap.last or "interrupted"))
@@ -1218,7 +1222,7 @@ def _answer_file(r: dict, out: str | None = None) -> str | None:
         with open(out, encoding="utf-8") as f:
             if f.read() == text:
                 return out
-    except OSError:
+    except (OSError, ValueError):   # missing, unreadable, or not UTF-8: rebuild it
         pass
     try:
         _materialize(out, text)
@@ -1228,7 +1232,9 @@ def _answer_file(r: dict, out: str | None = None) -> str | None:
 
 
 _DONE_STATES = (store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED)
-_PROVIDER_FINAL = ("turn_failed", "CGC_ERROR turn_failed")
+_PROVIDER_FINAL = re.compile(r"^(?:CGC_ERROR )?turn_failed(?![A-Za-z0-9_])")
+# auto_continue_state values after which a failed turn is final: never claimed, or an outcome known.
+_CONTINUE_FINAL = (None, "landed", "not_sent")
 
 
 def decide(s, r: dict, *, daemon_up: bool = True, out: str | None = None) -> dict:
@@ -1305,8 +1311,8 @@ def decide(s, r: dict, *, daemon_up: bool = True, out: str | None = None) -> dic
         d.update(next_command=_cmd("cgc_spool.py", "refire", "--rid", rid), retryable=True,
                  human_action=f"nothing was sent: {why}, then run next_command")
         return d
-    if (state == store_mod.FAILED and str(err or "").startswith(_PROVIDER_FINAL)
-            and s.auto_continue_state(rid) not in ("claimed", "unsure")):
+    if (state == store_mod.FAILED and _PROVIDER_FINAL.match(str(err or ""))
+            and s.auto_continue_state(rid) in _CONTINUE_FINAL):
         d.update(code="remote_failed",
                  human_action="ChatGPT failed the turn: re-fire with a NEW --request-key if still "
                               "needed")
@@ -1361,17 +1367,11 @@ def _incident_bundle(rid: str, since) -> str | None:
     return best[1] if best else None
 
 
-def _short_path(p, keep: int = 120):
-    """A path cut in the middle (`head…tail`) — still names the file, bounded in bytes."""
-    if not p or len(p) <= keep:
-        return p
-    return p[:keep // 2 - 1] + "…" + p[-(keep // 2):]
-
-
 def _fit(env: dict, limit: int) -> dict:
-    """Shrink `env` until its printed line is ≤ limit bytes: free text shortens, optional
-    diagnostics drop, then paths are cut in the middle (the full `answer_path` stays only while it
-    fits). Measured exactly as envelope() prints it."""
+    """Shrink `env` until its printed line is ≤ limit bytes: prose shortens, optional diagnostics
+    drop. Machine fields (rid, code, next_command, answer_path, ...) are never altered — a cut path
+    names no file. If they alone outgrow the limit (paths of ~600+ characters), the line is printed
+    anyway with `truncated: true`: the bound covers everything except the decision itself."""
     size = lambda: len(_line(env).encode())   # noqa: E731
     for key, cap in (("last_marker", 160), ("human_action", 160), ("detail", 120),
                      ("last_marker", 60), ("detail", 60)):
@@ -1385,14 +1385,11 @@ def _fit(env: dict, limit: int) -> dict:
         if size() <= limit:
             return env
         env.pop(key, None)
-    for key in ("answer_path", "next_command", "human_action", "detail"):
-        if size() <= limit:
-            return env
-        if env.get(key):
-            env[key] = _short_path(env[key], 160)
     for key in ("detail", "human_action"):
         if size() > limit and env.get(key):
             env[key] = env[key][:max(0, len(env[key]) - (size() - limit))] or None
+    if size() > limit:
+        env["truncated"] = True
     return env
 
 
