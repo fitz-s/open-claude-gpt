@@ -548,3 +548,69 @@ def test_every_cgc_error_name_has_a_code():
 ])
 def test_stored_error_texts_map_to_their_class(error, code):
     assert backend.code_of(store_mod.FAILED, error) == code
+
+
+# ---- the emit primitive: _EMITTED means "written" ------------------------------------------------
+
+_FAULT = """
+import os, sys, json
+sys.path.insert(0, {scripts!r})
+import cgc_backend as b
+mode = sys.argv[1]
+real = os.write
+if mode == "before_any_byte":
+    calls = {{"n": 0}}
+    def flaky(fd, data):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("EIO before any byte")
+        return real(fd, data)
+    os.write = flaky
+    rc = b.agent_cli(lambda: b.envelope(rid="R", code="ok") and 0)
+elif mode == "partial":
+    def half(fd, data):
+        n = real(fd, data[:5])
+        os.write = lambda fd, d: (_ for _ in ()).throw(OSError("EIO after 5 bytes"))
+        return n
+    os.write = half
+    rc = b.agent_cli(lambda: 2)
+else:   # after_write: the verb wrote its success line, then failed
+    def verb():
+        b.envelope(rid="R", code="ok", answer_path="/a")
+        raise OSError("late failure after the answer was reported")
+    rc = b.agent_cli(verb)
+sys.exit(rc)
+"""
+
+
+@pytest.mark.parametrize("mode,lines,code,rc", [
+    ("before_any_byte", 1, "ok", None),   # nothing written → the retry writes the one line
+    ("partial", 0, None, None),            # 5 bytes out → never a second line
+    ("after_write", 1, "ok", 0),           # success already out → not re-reported as a failure
+])
+def test_emit_primitive_under_stdout_faults(mode, lines, code, rc):
+    r = subprocess.run([sys.executable, "-c", _FAULT.format(scripts=SCRIPTS), mode],
+                       capture_output=True, text=True, timeout=30)
+    full = [ln for ln in r.stdout.splitlines() if ln.startswith('{"schema"')]
+    assert len(full) == lines, r.stdout
+    if mode == "partial":
+        assert r.stdout == '{"sch', "a partial line is never followed by another"
+    if code:
+        assert json.loads(full[0])["code"] == code
+    if rc is not None:
+        assert r.returncode == rc, r.stderr[-400:]
+
+
+def test_await_late_failure_never_rereports_a_written_answer(env, tmp_path, monkeypatch, capsys):
+    import types
+    a = tmp_path / "a.txt"
+    _round(store_mod.COMPLETED_VERIFIED, result="the answer", out=a)
+    real = backend._emit
+
+    def emit_then_fail(*args, **kw):
+        real(*args, **kw)
+        raise OSError("failure after the answer line was written")
+    monkeypatch.setattr(backend, "_emit", emit_then_fail)
+    rc = backend.await_round(types.SimpleNamespace(rid=RID, out=None, poll=0.01, timeout=2))
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith('{"schema"')]
+    assert len(lines) == 1 and json.loads(lines[0])["code"] == "ok" and rc == 0

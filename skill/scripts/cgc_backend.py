@@ -1052,25 +1052,58 @@ def code_of(state, error=None) -> str:
 
 
 _EMITTED = False
+_LAST = None        # the envelope this invocation wrote — or, while _EMITTED is False, tried to
+_IN_CLI = False     # inside agent_cli: one line per invocation is enforced
 _COMMITTED = None   # the rid a create/transfer/idempotent match just made durable, this invocation
 
 
 def envelope(**fields) -> dict:
     """Print THE agent envelope line: ENVELOPE_KEYS first (defaults filled, detail ≤200 chars), then
-    any verb-specific extras. ASCII-escaped, so no stdout encoding can make the one line fail. Marks
-    the current agent_cli invocation as having emitted, so it adds no second line."""
-    global _EMITTED
+    any verb-specific extras. ASCII-escaped, so no stdout encoding can make the one line fail. A
+    no-op once this invocation's line is out: there is never a second one."""
+    global _LAST
     env = {"schema": 1, "rid": None, "state": None, "code": "ok", "next_command": None,
            "human_action": None, "answer_path": None, "detail": None}
     env.update(fields)
     if env["detail"] is not None:
         env["detail"] = str(env["detail"])[:200]
-    with _no_sigint():   # mask → build → mark → write: an interrupt is delivered after the line
-        line = _line(env) + "\n"
-        _EMITTED = True
-        sys.stdout.write(line)
-        sys.stdout.flush()
+    if _EMITTED and _IN_CLI:
+        return env
+    _LAST = env   # kept even if the write fails, so the fallback re-sends THIS verdict
+    with _no_sigint():   # an interrupt is delivered after the write, never inside it
+        _write_line(_line(env) + "\n")
     return env
+
+
+def _write_line(line: str) -> None:
+    """THE emit primitive. `_EMITTED` means the line was written, not that a write was tried:
+    it is set only once every byte is out, or as soon as any byte is (a partial line is never
+    followed by a second one). A failure before the first byte leaves it unset, so a caller may
+    retry. Writes straight to stdout's fd, in a loop for partial writes, after flushing what the
+    text layer buffered; a stdout without an fd (a test capture) gets one text write."""
+    global _EMITTED
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        fd = sys.stdout.fileno()
+    except Exception:
+        fd = None
+    if fd is None:
+        sys.stdout.write(line)   # raises before anything is stored, or stores it whole
+        _EMITTED = True
+        with contextlib.suppress(Exception):
+            sys.stdout.flush()
+        return
+    data, done = line.encode(), 0
+    try:
+        while done < len(data):
+            done += os.write(fd, data[done:])
+    except BaseException:
+        if not done:
+            raise
+    _EMITTED = True
 
 
 def _line(env: dict) -> str:
@@ -1127,9 +1160,9 @@ def agent_cli(call, rid_of=lambda: None) -> int:
     SystemExit message, a crash or an interrupt gets one synthesized (from its last CGC_ERROR line
     when there is one). The emitted flag is scoped to this invocation."""
     import traceback
-    global _EMITTED
-    global _COMMITTED
-    outer, _EMITTED, _COMMITTED = _EMITTED, False, None
+    global _EMITTED, _COMMITTED, _LAST, _IN_CLI
+    outer, _EMITTED, _COMMITTED, _LAST = _EMITTED, False, None, None
+    outer_cli, _IN_CLI = _IN_CLI, True
     tap = sys.stderr = _StderrTap(sys.stderr)
     crashed = interrupted = False
     try:
@@ -1149,12 +1182,18 @@ def agent_cli(call, rid_of=lambda: None) -> int:
     finally:
         sys.stderr = tap.inner
     try:
-        if _EMITTED:
-            return rc
+        if _EMITTED:   # the line is out: a later failure never adds a second one or flips success
+            return 0 if crashed and (_LAST or {}).get("code") == "ok" else rc
         rid = _COMMITTED or rid_of()
         for _ in range(3):
             try:
-                if not _EMITTED:
+                if _EMITTED:
+                    pass
+                elif _LAST is not None:   # the verb's own verdict, whose write failed: send it
+                    envelope(**_LAST)
+                    if crashed:   # the verdict stands; only the write had failed
+                        rc = 0 if _LAST.get("code") == "ok" else 1
+                else:
                     _synthesize(rid, rc, tap, crashed, interrupted)
                 break
             except KeyboardInterrupt:   # after the guarded write, or before it: emit if still owed
@@ -1163,7 +1202,7 @@ def agent_cli(call, rid_of=lambda: None) -> int:
                 tap.err, crashed = f"{type(e).__name__}: {e}", True
         return rc
     finally:
-        _EMITTED = outer
+        _EMITTED, _IN_CLI = outer, outer_cli
 
 
 def _synthesize(rid, rc, tap, crashed, interrupted):
@@ -1611,21 +1650,29 @@ def await_round(a) -> int:
     (SchemaTooNew, a corrupt file) or an answer that cannot materialize (disk full) — emits exactly
     one JSON envelope on stdout; the traceback goes to stderr. 'Every await exit has an envelope'
     is a contract, not a happy-path property."""
+    global _EMITTED
+    before, _EMITTED = _EMITTED, False
     try:
         return _await_round(a)
     except Exception as e:
         import traceback
         traceback.print_exc()
+        if _EMITTED:   # the outcome is already out; a late failure never re-reports it
+            return 0 if (_LAST or {}).get("code") == "ok" else 1
         try:
             _emit(a.rid, "error", retryable=False,
                   human_action="await itself failed before reaching a round outcome — read the "
                                "traceback on stderr",
                   error=f"{type(e).__name__}: {e}")
         except Exception:
+            if _EMITTED:   # _emit got its line out before failing
+                return 1
             envelope(rid=getattr(a, "rid", None), state="error", code="service_unavailable",
                      human_action="read the traceback on stderr", detail=f"{type(e).__name__}: {e}",
                      retryable=False, error=f"{type(e).__name__}: {e}")
         return 1
+    finally:
+        _EMITTED = _EMITTED or before
 
 
 def _await_round(a) -> int:
