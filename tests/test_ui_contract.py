@@ -414,6 +414,21 @@ def test_sol_backticked_paths_and_unstructured_data_attrs_are_budgeted(mods):
     assert '"data-message-author-role": "user"' in out
 
 
+def test_sol_candidate_selectors_carry_no_page_prose(mods):
+    cdp, _probe, drift = mods
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    nodes = [["div", {"data-model-label": f"private-model-description-{i}abcdefghi"}, []]
+             for i in range(8)]
+    nodes.append(["div", {"data-message-unit": "t1:2:assistant"}, []])
+    snap = _capture(drift, cdp, ["html", {}, [["body", {}, [["main", {}, nodes]]]]], cap="model")
+    sels = [c["selector"] for c in snap["candidates"]]
+    assert not any("private-model-description" in s for s in sels), sels
+    assert "[data-model-label]" in sels
+    snap = _capture(drift, cdp, ["html", {}, [["body", {}, [["main", {}, nodes]]]]])
+    assert '[data-message-unit$=":assistant"]' in [c["selector"] for c in snap["candidates"]]
+
+
 def test_sol_composer_replay_runs_the_resolver(mods, tmp_path):
     cdp, probe, drift = mods
     if not shutil.which("node"):

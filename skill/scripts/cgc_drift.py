@@ -155,7 +155,9 @@ var all=document.body?document.body.querySelectorAll('*'):[];
 for(var i=0;i<all.length&&cands.length<40;i++){var e=all[i];if(e.closest('nav'))continue;
  for(var j=0;j<e.attributes.length;j++){var a=e.attributes[j],n=a.name,v=a.value||'',sel=null;
   if(/^data-cgc|^(class|style|id)$/.test(n))continue;
-  if(v.length<=40&&VR.test(v)&&/^[A-Za-z0-9_: -]+$/.test(v))sel=/:/.test(v)?'['+n+'$=":'+v.split(':').pop()+'"]':'['+n+'="'+v+'"]';
+  var rk=/:(user|assistant)$/.exec(v);
+  if(rk&&/^[\w:-]+$/.test(v))sel='['+n+'$=":'+rk[1]+'"]';
+  else if(VR.test(v)&&(VS.has(v)||((SATTR.test(n)||SNAMES.has(n))&&ident(v)!==null)))sel='['+n+'="'+v+'"]';
   else if(n!=='role'&&NR.test(n))sel='['+n+']';
   if(!sel||seen.has(sel))continue;seen.add(sel);var m;try{m=[].slice.call(document.querySelectorAll(sel));}catch(x){continue;}
   var leaf=!e.children.length?(e.textContent||''):'';
