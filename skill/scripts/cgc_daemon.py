@@ -149,7 +149,8 @@ def _make_run_cdp():
             return {"code": code, "model_badge": rec.get("modelBadge"), "stderr": se, "outcome": rec}
         if kind == "wait":
             poll = str(kw.get("poll") or spool.POLL_S)
-            timeout = int(kw.get("timeout") or spool.STUCK_AFTER_S)
+            # None means "no budget given"; 0 is a budget that is spent, never a reason for a fresh one.
+            timeout = spool.STUCK_AFTER_S if kw.get("timeout") is None else int(kw["timeout"])
             cmd = [sys.executable, _CDP, "wait", "--rid", kw["rid"], "--conversation", kw["conversation"],
                    "--out", kw["out"], "--poll", poll, "--timeout", str(timeout)]
             if kw.get("idle_exit"):

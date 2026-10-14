@@ -31,6 +31,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import uuid
@@ -563,6 +564,16 @@ def _gate_keys(broken: dict) -> set:
     return keys
 
 
+# A canonical ChatGPT conversation id (cgc_spool._CONV_ID_RE, which imports this module — so the
+# shape is restated here rather than imported), as a regex and as the GLOB SQL can match on.
+_CONV_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_CONV_GLOB = "-".join("[0-9a-f]" * n for n in (8, 4, 4, 4, 12))
+
+
+def _is_conv_id(value) -> bool:
+    return bool(_CONV_RE.fullmatch(value or ""))
+
+
 def new_daemon_instance_id() -> str:
     """A fresh identity per daemon process — recorded on attempts so ownership is the daemon
     INSTANCE, not a reusable OS pid."""
@@ -595,6 +606,30 @@ class Store:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
         self._migrate()
+        self._backfill_thread_addresses()
+
+    def _backfill_thread_addresses(self) -> None:
+        """Give a legacy thread row (created before create_round stamped conversation_id) the address it
+        already implies: its thread_id when that is a canonical conversation id — thread_id IS the
+        conversation id at every call site — else the canonical `conversation` a round's spec in it
+        carries. Without this, conversation_of() is None, an uncertain round there is never offered
+        its one read-only retrieve, and its answer is stranded. Idempotent; writes only when a NULL
+        row has a recoverable address."""
+        rows = self.db.execute(
+            "SELECT t.thread_id, (SELECT json_extract(r.spec_json,'$.conversation') FROM rounds r "
+            "  WHERE r.thread_id=t.thread_id AND json_valid(r.spec_json) "
+            "  AND json_extract(r.spec_json,'$.conversation') GLOB ? LIMIT 1) spec_conv "
+            "FROM threads t WHERE t.conversation_id IS NULL", (_CONV_GLOB,)).fetchall()
+        fixes = [(r["thread_id"] if _is_conv_id(r["thread_id"]) else r["spec_conv"], r["thread_id"])
+                 for r in rows]
+        fixes = [f for f in fixes if f[0]]
+        if not fixes:
+            return
+        with self._tx():
+            for conv, tid in fixes:
+                self.db.execute("UPDATE threads SET conversation_id=?,updated_at=? "
+                                "WHERE thread_id=? AND conversation_id IS NULL", (conv, _now(), tid))
+                self._event("thread_backfill", detail=f"{tid} -> {conv}")
 
     # ---- schema / migration --------------------------------------------------
     def _migrate(self) -> None:
@@ -628,13 +663,40 @@ class Store:
                         (_new_id(),))
         if have == SCHEMA_VERSION:
             return
-        self._backup(f".v{have}.bak")
+        # ONE migrator. Two openers (the daemon and a CLI after an upgrade) both read v<n> above; the
+        # loser must not back up the DB the winner has already migrated, which overwrote the original
+        # control.db.v<n>.bak with a v<n+1> copy. So the version check, the backup and the steps run
+        # under one exclusive flock, and the version is re-read once it is held.
+        lock = self._migration_lock()
+        try:
+            have = int(self.db.execute(
+                "SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"])
+            if have >= SCHEMA_VERSION:
+                return
+            self._backup(f".v{have}.bak")
+            self._apply_migrations()
+        finally:
+            if lock is not None:
+                os.close(lock)
+
+    def _migration_lock(self) -> int | None:
+        """Exclusive flock on a lock file beside the DB (None for :memory:, which no peer can open).
+        The file is never unlinked, for the reason _relocate_legacy_db gives."""
+        if self.path == ":memory:":
+            return None
+        import fcntl
+        fd = os.open(self.path + ".migrate.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def _apply_migrations(self) -> None:
+        have = int(self.db.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"])
         for target in range(have + 1, SCHEMA_VERSION + 1):
             with self._tx():
-                # `have` was read outside any lock, so a concurrent open (the daemon and a CLI
-                # starting together after an upgrade) may have applied this step since. Re-read it
-                # under the write lock: a step already applied is skipped, never re-run — a second
-                # ALTER TABLE ADD COLUMN fails, and the loser's open would die on a migrated DB.
+                # Re-read under the write lock too: an opener that does not take the migration
+                # flock (an older install's code) may have applied this step since. A step already
+                # applied is skipped, never re-run — a second ALTER TABLE ADD COLUMN fails.
                 at = int(self.db.execute(
                     "SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"])
                 if at >= target:
@@ -644,10 +706,13 @@ class Store:
                 self.db.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(target),))
 
     def _backup(self, suffix: str) -> None:
-        """Consistent point-in-time copy of the DB file (skipped for :memory:)."""
+        """Consistent point-in-time copy of the DB file (skipped for :memory:). WRITE-ONCE: an existing
+        backup is the original pre-migration copy, and nothing may replace it with a later state."""
         if self.path == ":memory:":
             return
         dst_path = self.path + suffix
+        if os.path.exists(dst_path):
+            return
         dst = sqlite3.connect(dst_path)
         try:
             with dst:
@@ -887,10 +952,12 @@ class Store:
         "Live" starts at READY, not SENDING: two queued follow-ups claimed back to back are both
         READY, and the composer lease serializes only their clicks — B would send the moment A's
         landed, while A is being answered. And an uncertain send (`possibly_accepted`) may be
-        generating in that thread right now, so it holds the thread too — but only until its one-shot
-        auto-retrieve has run. That retrieve is automatic and bounded, and it either resolves the round
-        or leaves it for a human; an unreconciled round past that point would otherwise embargo its
-        thread forever, since possibly_accepted has no automatic exit.
+        generating in that thread right now, so it holds the thread too — but only while its one-shot
+        auto-retrieve is still pending: the thread has an address (recover() schedules that retrieve
+        only then) and the retrieve has not run. That retrieve is automatic and bounded, and it either
+        resolves the round or leaves it for a human; past it — or with no address, where it can never
+        be scheduled — an unreconciled round would embargo its thread forever, since possibly_accepted
+        has no automatic exit.
 
         `not_before`: a round requeued with a backoff (cgc_backend._gate_requeue_or_block) is not
         eligible until that instant — this is the ONE place that fence has to be enforced, since it
@@ -924,7 +991,9 @@ class Store:
                 "AND ("
                 "  r.kind!='followup' OR r.thread_id IS NULL OR NOT EXISTS ("
                 "    SELECT 1 FROM rounds o WHERE o.thread_id=r.thread_id AND o.rid!=r.rid"
-                "     AND (o.state IN (?,?,?,?) OR (o.state=? AND NOT EXISTS ("
+                "     AND (o.state IN (?,?,?,?) OR (o.state=? AND EXISTS ("
+                "       SELECT 1 FROM threads t WHERE t.thread_id=o.thread_id"
+                "       AND t.conversation_id IS NOT NULL) AND NOT EXISTS ("
                 "       SELECT 1 FROM events e WHERE e.rid=o.rid AND e.kind='auto_retrieve')))))"
                 " ORDER BY r.created_at" + ("" if broken else " LIMIT 1"),
                 (QUEUED, now, READY, SENDING, ACCEPTED, WAITING, POSSIBLY_ACCEPTED))

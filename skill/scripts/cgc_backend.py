@@ -1769,7 +1769,29 @@ def _newer_send(store, rid, conv):
         (conv, rid, rid)).fetchone()
 
 
-def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
+def _past_deadline(rid, deadline, where) -> bool:
+    """A continue whose answer nobody has time left to watch is a message paid for nothing."""
+    if time.time() < deadline:
+        return False
+    sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — the observation deadline passed {where}.\n")
+    return True
+
+
+def _click_not_after(spec, deadline) -> str:
+    """The instant the continue's click must not pass: the earlier of the round's use-by and its
+    observation deadline. The driver re-checks it at the click, so a slow attach/paste that crosses
+    the deadline ends provably not sent (its pre-click exit) instead of sending unwatched."""
+    obs = datetime.datetime.fromtimestamp(deadline, datetime.timezone.utc)
+    try:
+        use_by = datetime.datetime.fromisoformat(_use_by(spec))
+        if use_by.tzinfo is None:
+            use_by = use_by.replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return obs.isoformat()
+    return min(use_by, obs).isoformat()
+
+
+def _auto_continue(store, rid, conv, spec, run_cdp, deadline) -> str:
     """Send the one automatic continue for a round whose turn ChatGPT marked failed. Returns (and,
     once claimed, durably records) the outcome:
       "landed"   the continue provably landed — re-wait on the same rid;
@@ -1777,6 +1799,8 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
       "unsure"   the click may have happened (timeout, crash, unconfirmed echo)."""
     import cgc_spool as _spool
     prompt = _continue_prompt(rid)
+    if _past_deadline(rid, deadline, "before it was considered"):
+        return "not_sent"
     if _use_by_passed(spec):
         # The answer is worthless past use-by, and a continue is a second paid message for it.
         # Declined BEFORE the claim, so no auto_continue event exists and nothing is charged; the
@@ -1797,25 +1821,29 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
         sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — {newer['rid']} was sent into "
                          f"{conv} after it, so 'answer that same request' would be ambiguous.\n")
         return "not_sent"
+    if _past_deadline(rid, deadline, "while the continue was validated"):
+        return "not_sent"                             # before the claim: nothing spent
     if not store.claim_auto_continue(rid, store_mod.sha256(prompt)):
         return "not_sent"                             # already spent — at most one per round
-    outcome = _send_continue(store, rid, conv, spec, run_cdp, prompt)
+    outcome = _send_continue(store, rid, conv, spec, run_cdp, prompt, deadline)
     store.record_auto_continue(rid, outcome)
     return outcome
 
 
-def _send_continue(store, rid, conv, spec, run_cdp, prompt) -> str:
+def _send_continue(store, rid, conv, spec, run_cdp, prompt, deadline) -> str:
     import cgc_spool as _spool
-    lease, end = None, time.time() + CONTINUE_LEASE_WAIT_S
+    lease, end = None, min(time.time() + CONTINUE_LEASE_WAIT_S, deadline)
     while lease is None and time.time() < end:
         lease = _spool.acquire_conversation_lease(conv)
         if lease is None:
             time.sleep(2)
     if lease is None:
         sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — another send held conversation "
-                         f"{conv} for {CONTINUE_LEASE_WAIT_S}s.\n")
+                         f"{conv} until the lease wait or the observation deadline ran out.\n")
         return "not_sent"
     try:
+        if _past_deadline(rid, deadline, "while waiting for the conversation"):
+            return "not_sent"
         if _use_by_passed(spec):                 # the lease wait (up to 60 s) may have crossed it
             sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — use-by {_use_by(spec)} "
                              "passed while waiting for the conversation.\n")
@@ -1829,7 +1857,8 @@ def _send_continue(store, rid, conv, spec, run_cdp, prompt) -> str:
             sent = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
                            model=spec.get("model") or "Pro",
                            model_family=spec.get("model_family") or "GPT-6",
-                           mentions=spec.get("mentions") or [], not_after=_use_by(spec))
+                           mentions=spec.get("mentions") or [],
+                           not_after=_click_not_after(spec, deadline))
         except Exception as e:                        # noqa: BLE001 — a crash may follow the click
             sys.stderr.write(f"CGC_WARN {rid}: auto-continue crashed ({type(e).__name__}: {e}).\n")
             return "unsure"
@@ -1878,14 +1907,14 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
     deadline = (None if is_retrieve else store.observation_deadline(rid, budget)) \
         or time.time() + budget
 
-    def left() -> int:
-        return int(deadline - time.time())
-
-    last_look = final_look and left() < RETRIEVE_IDLE_EXIT_S
-    if left() <= 0 and not last_look:
+    # The remainder is read ONCE per wait: the value checked is the value passed. Reading the clock
+    # twice let a 1 s check become a 0 s argv, which the driver used to read as "no budget".
+    left = int(deadline - time.time())
+    last_look = final_look and left < RETRIEVE_IDLE_EXIT_S
+    if left <= 0 and not last_look:
         return _deadline_passed(store, rid)
     res = run_cdp("wait", rid=wait_rid or rid, conversation=conv, out=out_tmp,
-                  poll=spec.get("poll"), timeout=RETRIEVE_IDLE_EXIT_S if last_look else left(),
+                  poll=spec.get("poll"), timeout=RETRIEVE_IDLE_EXIT_S if last_look else left,
                   idle_exit=RETRIEVE_IDLE_EXIT_S if is_retrieve or last_look else None)
     code = res.get("code")
     turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
@@ -1897,11 +1926,8 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
             sys.stderr.write(f"CGC_WARN {rid}: turn failed, seen by a recovery wait — no continue "
                              "is sent from recovery.\n")
             outcome = "not_sent"
-        elif prior is None and left() <= 0:
-            # A continue nobody has time left to watch would be a message paid for nothing.
-            outcome = "not_sent"
         elif prior is None:
-            outcome = _auto_continue(store, rid, conv, spec, run_cdp)
+            outcome = _auto_continue(store, rid, conv, spec, run_cdp, deadline)
         elif prior in ("claimed", "unsure"):
             # An earlier continue may have landed (a worker died after its click, or it went
             # unconfirmed), yet this rid's latest turn is still the failed one. The one-shot read-only
@@ -1927,10 +1953,11 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
                     os.remove(_p)
                 except OSError:
                     pass
-            if left() <= 0:
+            left = int(deadline - time.time())
+            if left <= 0:
                 return _deadline_passed(store, rid)
             res = run_cdp("wait", rid=rid, conversation=conv, out=out_tmp,
-                          poll=spec.get("poll"), timeout=left())
+                          poll=spec.get("poll"), timeout=left)
             code = res.get("code")
             turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
     answer_path = res.get("out") or out_tmp

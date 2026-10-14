@@ -76,8 +76,9 @@ def test_an_uncertain_send_holds_its_thread_until_its_auto_retrieve_has_run(stor
 
 def test_parallel_open_runs_each_migration_once(tmp_path):
     """The daemon and a CLI opening an un-migrated DB together: both read the old version outside any
-    lock. The loser must re-read it under the write lock and skip, not re-run an ALTER TABLE that then
-    fails with 'duplicate column'."""
+    lock. The loser must re-read it under the migration lock and skip — not re-run an ALTER TABLE that
+    then fails with 'duplicate column', and not back up the DB the winner already migrated over the
+    original control.db.v4.bak (the backup is write-once and must hold the v4 state)."""
     m = _load("cgc_store")
     p = str(tmp_path / "legacy.db")
     # The v4 shape: today's DDL minus the three columns migration 5 adds.
@@ -103,7 +104,18 @@ def test_parallel_open_runs_each_migration_once(tmp_path):
         finally:
             self.db.set_trace_callback(None)
 
+    # The worst order for the backup: a second _backup runs only after the first opener has finished
+    # migrating (bounded, so a fix that never reaches a second _backup does not stall the test).
+    real_backup, backups, first_done = m.Store._backup, [], threading.Event()
+
+    def backup(self, suffix):
+        backups.append(suffix)
+        if len(backups) > 1:
+            first_done.wait(10)
+        real_backup(self, suffix)
+
     m.Store._migrate = racing
+    m.Store._backup = backup
     errors = []
 
     def open_one():
@@ -111,6 +123,8 @@ def test_parallel_open_runs_each_migration_once(tmp_path):
             m.Store(p).close()
         except Exception as e:      # noqa: BLE001 — the assertion reports it
             errors.append(e)
+        finally:
+            first_done.set()
 
     try:
         ts = [threading.Thread(target=open_one) for _ in range(2)]
@@ -120,10 +134,25 @@ def test_parallel_open_runs_each_migration_once(tmp_path):
             t.join(30)
     finally:
         m.Store._migrate = real
+        m.Store._backup = real_backup
     assert errors == [], errors
     s = m.Store(p)
     assert s.db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == str(m.SCHEMA_VERSION)
     s.close()
+    bak = sqlite3.connect(p + ".v4.bak")
+    assert bak.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "4", \
+        "the pre-migration backup was overwritten with a migrated copy"
+    bak.close()
+
+
+def test_a_backup_is_write_once(store, tmp_path):
+    sm, s = store
+    s._backup(".v4.bak")
+    s.db.execute("UPDATE meta SET value='changed' WHERE key='store_uuid'")
+    s._backup(".v4.bak")
+    bak = sqlite3.connect(str(tmp_path / "control.db.v4.bak"))
+    assert bak.execute("SELECT value FROM meta WHERE key='store_uuid'").fetchone()[0] != "changed"
+    bak.close()
 
 
 # ---- 2. a READY orphan passes the same admission a fresh claim does ------------
@@ -365,3 +394,113 @@ def test_no_continue_is_sent_once_the_budget_is_spent(sent, monkeypatch):
     assert backend._wait_phase(s, RID, CONV, {"model": "Pro", "timeout": 5400}, cdp,
                                may_continue=True) == sm.FAILED
     assert cdp.calls == ["wait"]
+
+
+# ---- review round 2 -------------------------------------------------------------
+
+def test_the_driver_never_turns_a_spent_budget_into_a_fresh_one(daemon, monkeypatch):
+    """The real _make_run_cdp argv: timeout=0 is a spent budget and must reach the waiter as 0, not as
+    the 5400 s default `0 or STUCK_AFTER_S` made of it. Only a missing timeout gets the default."""
+    argvs = []
+    monkeypatch.setattr(daemon, "_run", lambda cmd, *a, **k: argvs.append(cmd) or (0, "{}", ""))
+    run = daemon._make_run_cdp()
+    for t in (0, 1, None):
+        run("wait", rid=RID, conversation=CONV, out="/x", timeout=t)
+    got = [cmd[cmd.index("--timeout") + 1] for cmd in argvs]
+    assert got == ["0", "1", str(daemon.spool.STUCK_AFTER_S)]
+
+
+def test_the_remainder_checked_is_the_remainder_passed(sent, monkeypatch):
+    """One clock read per wait. With the clock advancing between two reads, a 1 s check used to pass
+    a 0 s argv (which the driver then read as 'no budget')."""
+    sm, backend, s = sent
+    base = backend.time.time()
+    s.db.execute("UPDATE attempts SET started_at=? WHERE attempt_id=?",
+                 (__import__("datetime").datetime.fromtimestamp(
+                     base - 5400 + 1.5, __import__("datetime").timezone.utc).isoformat(), s.aid))
+    ticks = iter([base, base + 1, base + 2, base + 3])
+    monkeypatch.setattr(backend.time, "time", lambda: next(ticks))
+    cdp = _cdp({"answer": "a"})
+    backend._wait_phase(s, RID, CONV, {"model": "Pro", "timeout": 5400}, cdp, may_continue=True)
+    assert cdp.calls[0][1]["timeout"] == 1
+
+
+def test_a_legacy_thread_without_an_address_is_backfilled_and_retrievable(tmp_path):
+    """Threads created before create_round stamped conversation_id have it NULL. An uncertain round in
+    one had no address, so its one retrieve was never scheduled — and the thread fence held forever.
+    Opening the store backfills the address it already implies (thread_id IS the conversation id),
+    which schedules the retrieve; after it, the thread frees."""
+    sm = _load("cgc_store")
+    p = str(tmp_path / "control.db")
+    s = sm.Store(p)
+    _followup(s, sm, "REQ-20261013-000000-00e001", sm.POSSIBLY_ACCEPTED)
+    _followup(s, sm, "REQ-20261013-000000-00e002", sm.QUEUED)
+    s.db.execute("UPDATE threads SET conversation_id=NULL")          # the pre-5b363a3 shape
+    s.close()
+    s = sm.Store(p)
+    assert s.conversation_of("REQ-20261013-000000-00e001") == CONV
+    assert "REQ-20261013-000000-00e001" in s.recover()["retrievable"]
+    assert s.claim_ready("d1") is None, "held while its retrieve is pending"
+    assert s.claim_auto_retrieve("REQ-20261013-000000-00e001")
+    s.set_state("REQ-20261013-000000-00e001", sm.POSSIBLY_ACCEPTED)
+    assert s.claim_ready("d1")["rid"] == "REQ-20261013-000000-00e002"
+    s.close()
+
+
+def test_an_uncertain_round_with_no_recoverable_address_does_not_fence(store):
+    """No canonical thread id and no conversation in any spec: no retrieve can ever be scheduled, so
+    holding the thread for it would be forever. It does not hold."""
+    sm, s = store
+    tid = "legacy-thread-1"
+    s.db.execute("INSERT INTO threads(thread_id,conversation_id,created_at,updated_at) "
+                 "VALUES(?,NULL,'t','t')", (tid,))
+    for rid, st in (("REQ-20261013-000000-00e003", sm.POSSIBLY_ACCEPTED),
+                    ("REQ-20261013-000000-00e004", sm.QUEUED)):
+        s.create_round(rid, "followup", prompt="p")
+        s.db.execute("UPDATE rounds SET thread_id=? WHERE rid=?", (tid, rid))
+        if st == sm.POSSIBLY_ACCEPTED:
+            s.set_state(rid, sm.READY)
+            s.mark_possibly_accepted(s.begin_send(rid, "p", sm.sha256("p"), daemon_instance_id="t"), "x")
+    s._backfill_thread_addresses()
+    assert s.conversation_of("REQ-20261013-000000-00e003") is None
+    assert s.claim_ready("d1")["rid"] == "REQ-20261013-000000-00e004"
+
+
+@pytest.mark.parametrize("where", ["validation", "lease"])
+def test_a_continue_cannot_cross_the_observation_deadline(sent, monkeypatch, where):
+    """The continue is a paid message whose answer must be watched inside the send's budget. If the
+    egress gate or the conversation-lease wait runs past the deadline, nothing is sent."""
+    sm, backend, s = sent
+    import cgc_spool as sp
+    _backdate(s, 5370)                                 # 30 s left — less than the 60 s lease wait
+    now = [backend.time.time()]
+    start = now[0]
+    monkeypatch.setattr(backend.time, "time", lambda: now[0])
+    monkeypatch.setattr(backend.time, "sleep", lambda d: now.__setitem__(0, now[0] + d))
+    if where == "validation":
+        real = sp.validate_prompt
+
+        def slow(prompt):
+            now[0] += 200
+            return real(prompt)
+        monkeypatch.setattr(sp, "validate_prompt", slow)
+    else:
+        monkeypatch.setattr(sp, "acquire_conversation_lease", lambda conv: None)  # always held
+    cdp = _cdp(FAILED_WAIT)
+    assert backend._wait_phase(s, RID, CONV, {"model": "Pro", "timeout": 5400}, cdp,
+                               may_continue=True) == sm.FAILED
+    assert [k for k, _ in cdp.calls] == ["wait"], "nothing may be sent past the deadline"
+    if where == "lease":
+        assert now[0] - start <= 32, "the lease wait must end at the deadline, not after 60 s"
+
+
+def test_the_continue_click_is_bounded_by_the_observation_deadline(sent):
+    """The driver re-checks --not-after at the click; the continue passes the earlier of use-by and the
+    observation deadline, so a slow attach/paste cannot click after the deadline."""
+    sm, backend, s = sent
+    _backdate(s, 5300)
+    cdp = _cdp(FAILED_WAIT, {"code": 0}, {"answer": "a"})
+    backend._wait_phase(s, RID, CONV, {"model": "Pro", "timeout": 5400}, cdp, may_continue=True)
+    import datetime as dt
+    na = dt.datetime.fromisoformat(cdp.calls[1][1]["not_after"]).timestamp()
+    assert abs(na - s.observation_deadline(RID, 5400)) < 1
