@@ -98,3 +98,12 @@ def test_two_stacked_cards_never_lend_one_card_the_other_apps_name():
              "var ROOT=node('body','',[node('div','',[c1,c2])]);")
     out = _run(setup, ["WebCodex Demo"])
     assert out["clicks"][1] == 0, "Canva's Allow once must never be clicked"
+
+
+def test_no_contract_edit_can_make_an_approval_click_hit_send(tmp_path):
+    """Review 2026-10-14: allow labels in the editable contract set to ['send'] made the approval
+    click hit the composer's send button. The labels are code now, and the approval search skips
+    anything inside a form (the composer)."""
+    assert not any(k.startswith("approval_") for k in CDP.UI)
+    js = CDP._approval_js(["WebCodex Demo"])
+    assert "'send'" not in js.lower() and "closest('form')" in js

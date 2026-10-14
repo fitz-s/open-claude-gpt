@@ -145,7 +145,7 @@ _CONTRACT_SCHEMA = {
     "picker_open_trigger": "sel", "picker_open_menus": "sel", "switcher_labels": "words",
     "switcher_not_labels": "words", "family_aliases": "alias", "blocker_login": "sel",
     "blocker_login_paths": "words", "blocker_captcha": "sel", "blocker_alert": "sel",
-    "rate_limit_phrases": "words", "approval_allow_labels": "words", "approval_deny_labels": "words",
+    "rate_limit_phrases": "words",
 }
 _ATTR_RE = re.compile(r"[a-z][a-z0-9-]*\Z")
 _CLASS_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
@@ -225,6 +225,10 @@ _SEND_BUTTON_SEL = ('button[data-testid="send-button"],button[aria-label*="Send"
                     'button[aria-label*="发送"]')
 _STOP_BUTTON_SEL = ('[data-testid="stop-button"],button[aria-label*="Stop"],'
                     'button[aria-label*="停止"]')
+# An app-approval click grants a connector access, so what it may click is send authority too: code,
+# never the editable contract (a contract that named "Send" as an allow label would have clicked send).
+_APPROVAL_ALLOW = ["allow once", "允许一次"]
+_APPROVAL_DENY = ["deny", "拒绝"]
 
 
 CGC_PORT = int(os.environ.get("CGC_PORT", "9333"))
@@ -3951,19 +3955,19 @@ def _approval_js(allow):
             "function vis(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}"
             "function t(e){return (e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim();}"
             "function hasDeny(n){return Array.prototype.slice.call(n.querySelectorAll('button')).some("
-            "function(b){return vis(b)&&/^(" + _js_alt(UI["approval_deny_labels"]) + ")/i.test(t(b));});}"
+            "function(b){return vis(b)&&/^(" + _js_alt(_APPROVAL_DENY) + ")/i.test(t(b));});}"
             "function named(e){var ls=(e.innerText||'').split('\\n').map(function(l){"
             "return l.replace(/\\s+/g,' ').trim().toLowerCase();});return allow.filter(function(a){"
             "return ls.indexOf(a.toLowerCase())>=0;})[0]||null;}"
             "var ok=Array.prototype.slice.call(document.querySelectorAll('button')).filter(function(b){"
-            "return vis(b)&&/^(" + _js_alt(UI["approval_allow_labels"]) + ")/i.test(t(b));});"
+            "return vis(b)&&!(b.closest&&b.closest('form'))&&/^(" + _js_alt(_APPROVAL_ALLOW) + ")/i.test(t(b));});"
             "for(var i=0;i<ok.length;i++){var n=ok[i].parentElement,d=0;"
             "while(n&&d<6&&!hasDeny(n)){n=n.parentElement;d++;}if(!n||d>=6)continue;"
             "var txt=t(n),app=named(n);"
             # Climb only while the ancestor still holds exactly ONE visible "Allow once": a parent of
             # two stacked cards would otherwise lend the second card's app name to the first's button.
             "function ones(e){return [].slice.call(e.querySelectorAll('button')).filter(function(b){"
-            "return vis(b)&&/^(" + _js_alt(UI["approval_allow_labels"]) + ")/i.test(t(b));}).length;}"
+            "return vis(b)&&/^(" + _js_alt(_APPROVAL_ALLOW) + ")/i.test(t(b));}).length;}"
             "for(var m=n.parentElement;!app&&m&&t(m).length<=400&&ones(m)===1;m=m.parentElement){txt=t(m);app=named(m);}"
             "if(app)ok[i].click();return {app:app,text:txt.slice(0,300)};}return null;})()")
 

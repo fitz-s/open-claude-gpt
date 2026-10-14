@@ -69,7 +69,7 @@ _OWNED = ("data-message-author-role", "data-chatgpt-search-unit-key", "data-turn
           "composer-intelligence-picker-content", "composer-plus-btn", "menuitemradio", 'role="slider"',
           'role=\\"slider', "radiogroup", "aria-haspopup=\\\"menu", 'aria-expanded=\\"true',
           "data-message-model-slug", "Thinking failed", "Message stream error", "captcha\\\" i",
-          'type="password', "too many requests", "allow once", "允许", "拒绝",
+          'type="password', "too many requests",
           "querySelector('main')", "'plugins'", "Extra High", "upgrade|")
 
 
@@ -215,7 +215,8 @@ def test_law4_an_invalid_contract_blocks_the_round_as_proven_not_sent(tmp_path, 
         assert cgc_backend._release_eligible(s, r), "refire may resend it once the contract is fixed"
 
 
-_GOLDEN_JS = "ed610bb4a4f950450e98822770a7fc5587e5ab72bedbdff365b88e01bc5e9cc9"
+# Updated 2026-10-14: approval labels moved to code, approval search excludes the composer form.
+_GOLDEN_JS = "fa5ebb5b3a00141bee1ea0940fceb9ac3d2eea7a0ab64e99a620e8b922d7a398"
 
 
 def _generated_js(cdp):

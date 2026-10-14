@@ -4,14 +4,35 @@
   "facts": {
     "turn_schemas": {
       "value": [
-        {"adapter": "legacy-author-role-v1", "attr": "data-message-author-role", "level": "message", "role_from": "value", "send_rank": 1},
-        {"adapter": "data-turn-v1", "attr": "data-turn", "level": "turn", "role_from": "value", "send_rank": 0},
-        {"adapter": "search-unit-v1", "attr": "data-chatgpt-search-unit-key", "level": "message", "role_from": "last_colon_segment", "send_rank": 2}
+        {
+          "adapter": "legacy-author-role-v1",
+          "attr": "data-message-author-role",
+          "level": "message",
+          "role_from": "value",
+          "send_rank": 1
+        },
+        {
+          "adapter": "data-turn-v1",
+          "attr": "data-turn",
+          "level": "turn",
+          "role_from": "value",
+          "send_rank": 0
+        },
+        {
+          "adapter": "search-unit-v1",
+          "attr": "data-chatgpt-search-unit-key",
+          "level": "message",
+          "role_from": "last_colon_segment",
+          "send_rank": 2
+        }
       ],
       "why": "Message units, one schema per UI generation. Readers union them in list order (the first attribute present names the role); the send contract tries them one at a time by send_rank, never unioned (data-turn first: that build keeps author-role on the user node only). role_from 'value': attr=\"user|assistant\"; 'last_colon_segment': attr=\"<turn>:<n>:user|assistant\". level 'turn' tags the turn wrapper, 'message' the message itself. author-role 2026-07-01; data-turn ~2026-08; search-unit 2026-09-24."
     },
     "assistant_body": {
-      "value": {"attr": "data-markdown-text-style", "value": "assistant-message"},
+      "value": {
+        "attr": "data-markdown-text-style",
+        "value": "assistant-message"
+      },
       "why": "The answer's markdown body inside an assistant unit; attachment cards follow it in the same unit (2026-09-24)."
     },
     "turn_container": {
@@ -23,7 +44,12 @@
       "why": "The conversation region; the sidebar's thread titles are outside it (2026-07)."
     },
     "failure_markers": {
-      "value": ["Thinking failed", "Something went wrong", "Network error", "Message stream error"],
+      "value": [
+        "Thinking failed",
+        "Something went wrong",
+        "Network error",
+        "Message stream error"
+      ],
       "why": "Whole text of a leaf status element in the turn, outside any message body, when a turn will never answer (2026-09-25)."
     },
     "model_slug_attr": {
@@ -123,15 +149,44 @@
       "why": "Menus an Escape is dispatched at; Radix keeps closed ones mounted (2026-09-06)."
     },
     "switcher_labels": {
-      "value": ["Instant", "Medium", "High", "Extra High", "Pro", "Auto", "Thinking", "GPT", "ChatGPT"],
+      "value": [
+        "Instant",
+        "Medium",
+        "High",
+        "Extra High",
+        "Pro",
+        "Auto",
+        "Thinking",
+        "GPT",
+        "ChatGPT"
+      ],
       "why": "Leading text of a composer model/tier switcher button (case-sensitive prefix; version-shaped labels like '5.5' and 'o3' are matched by code). Tiers 2026-08-18, GPT badge 2026-09-06."
     },
     "switcher_not_labels": {
-      "value": ["project", "share", "copy", "send", "search", "attach", "new chat", "cancel", "stop", "upgrade", "get ", "settings", "log in", "login", "sign", "account"],
+      "value": [
+        "project",
+        "share",
+        "copy",
+        "send",
+        "search",
+        "attach",
+        "new chat",
+        "cancel",
+        "stop",
+        "upgrade",
+        "get ",
+        "settings",
+        "log in",
+        "login",
+        "sign",
+        "account"
+      ],
       "why": "Case-insensitive leading text of buttons that are never a model switcher ('Upgrade to Pro' must not confirm Pro) (2026-07)."
     },
     "family_aliases": {
-      "value": {"Latest": "GPT-6"},
+      "value": {
+        "Latest": "GPT-6"
+      },
       "why": "Observed family radio label -> the family it is. 'Latest' was relabelled 'GPT-6' in 2026-10, same model, same slot."
     },
     "blocker_login": {
@@ -139,7 +194,10 @@
       "why": "A login form on the page (2026-07-01)."
     },
     "blocker_login_paths": {
-      "value": ["auth", "login"],
+      "value": [
+        "auth",
+        "login"
+      ],
       "why": "First path segment of a login page (2026-07-01)."
     },
     "blocker_captcha": {
@@ -151,16 +209,12 @@
       "why": "Where a rate-limit notice is shown (2026-07-01)."
     },
     "rate_limit_phrases": {
-      "value": ["rate limit", "too many requests", "usage limit"],
+      "value": [
+        "rate limit",
+        "too many requests",
+        "usage limit"
+      ],
       "why": "Case-insensitive phrases in the alert that mean a rate limit (2026-07-01)."
-    },
-    "approval_allow_labels": {
-      "value": ["allow once", "允许一次"],
-      "why": "Lower-cased leading text of an app approval card's allow button (2026-09)."
-    },
-    "approval_deny_labels": {
-      "value": ["deny", "拒绝"],
-      "why": "Lower-cased leading text of the same card's deny button (2026-09)."
     }
   }
 }
