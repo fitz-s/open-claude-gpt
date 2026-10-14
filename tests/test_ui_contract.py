@@ -702,3 +702,29 @@ def test_a_send_refusal_carries_its_bundle_into_the_attempt_and_the_daemon_log(m
         "stderr": f"CGC_ERROR model_not_selectable: x\nCGC_DRIFT_BUNDLE model: {path} — edit ...\n"})
     assert ev["diagnosis"] == path
     assert f"CGC_UI_DIAGNOSIS model_not_selectable: {path}" in capsys.readouterr().err
+
+
+def test_a_free_text_attribute_name_never_rides_a_role_value(mods):
+    """Review 2026-10-14: any attribute whose value was `user`/`assistant` was kept by name, so an
+    email-shaped name reached the fixture. Only identifier-shaped names qualify."""
+    cdp, _probe, drift = mods
+    t = drift.FixtureTab("", "/c/x")
+    t.tree = [["html", {}, [["body", {}, [["main", {}, [
+        ["div", {"john.smith@gmail.com": "user", "Weird_Name": "assistant"}, ["q"]]]]]]]]]
+    snap = t.eval(drift.capture_js(cdp.UI, "reader"))
+    assert "john.smith@gmail.com" not in json.dumps(snap) and "Weird_Name" not in json.dumps(snap)
+
+
+def test_a_class_heavy_page_never_starves_the_unit_attributes(mods):
+    """Review 2026-10-14: class tokens shared the attribute budget, so a Tailwind-heavy answer
+    dropped every unit attribute and replay could read no turn."""
+    cdp, _probe, drift = mods
+    tw = "markdown prose w-full break-words dark:prose-invert"
+    kids = [["p", {"class": tw}, [["span", {"class": "hljs-keyword hljs-string"}, ["x"]]]] for _ in range(60)]
+    t = drift.FixtureTab("", "/c/x")
+    t.tree = [["html", {}, [["body", {}, [["main", {}, [
+        ["div", {"data-message-author-role": "user"}, ["q"]],
+        ["div", {"data-message-author-role": "assistant"}, kids]]]]]]]]
+    snap = t.eval(drift.capture_js(cdp.UI, "reader"))
+    units = snap["tree"][2][0][2]
+    assert [u[1].get("data-message-author-role") for u in units] == ["user", "assistant"]

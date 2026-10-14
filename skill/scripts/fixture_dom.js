@@ -49,6 +49,7 @@ class El {
     for (const c of this.childNodes) {
       if (c.nodeType === 3) { o += c.nodeValue; continue; }
       if (c.tagName === 'BR') { o += '\n'; continue; }
+      if ('data-cgc-invisible' in c._a || 'hidden' in c._a) continue;   // an unrendered box has no text
       const b = isBlock(c), t = c.innerText;
       if (b && o && !o.endsWith('\n')) o += '\n';
       o += t;

@@ -125,8 +125,9 @@ def counts_js(ui, cap) -> str:
 #   attribute VALUES: of kept names only; each scrubbed (a token holding . / \ @ = or a run of >= 24
 #     letters/digits becomes '…', end punctuation aside) and cut to 40; text-bearing aria values
 #     (label, valuetext, …) are charged to the TEXT budget, the rest to a 2 KB STRUCTURAL budget.
-#   class tokens: kept even if unknown, each <= 32 chars and scrubbed, from the structural budget
-#     (contract vocabulary and CSS layout keywords free).
+#   class tokens: kept even if unknown, each <= 32 chars and scrubbed, from the 2 KB CLASS budget
+#     (contract vocabulary and CSS layout keywords free); attribute values have their own 2 KB budget,
+#     so a Tailwind-heavy page can never starve the unit attributes a replay needs.
 #   text: every text node and every candidate name, scrubbed, from ONE 200-character budget; the
 #     rid marker tokens (CGC_RID/BEGIN_RESPONSE/END_RESPONSE:<rid>) are kept outside it.
 #   visibility: each element whose rendered box is 0x0 is marked data-cgc-invisible, which
@@ -142,13 +143,13 @@ function bad(t){var c=t.replace(/^[(\[{"'`]+|[)\]}"'`.,;:!?]+$/g,'');return /[.\
 function scrub(s){return s.split(/(\s+)/).map(function(t){return /\S/.test(t)&&bad(t)?'…':t;}).join('');}
 function take(s,cap){s=scrub((s||'').replace(/[ \t\r\f\v]+/g,' '));var k=Math.min(s.length,cap,BUD);BUD-=k;
  return k<s.length?s.slice(0,k)+'…':s;}
-function sval(v){v=scrub(v);if(v.length>40)v=v.slice(0,40)+'…';if(SBUD<v.length)return null;SBUD-=v.length;return v;}
+var ABUD=2048;function sval(v){v=scrub(v);if(v.length>40)v=v.slice(0,40)+'…';if(ABUD<v.length)return null;ABUD-=v.length;return v;}
 function lines(s){return s.split('\n').map(function(l){return /\S/.test(l)?(take(l,40)||'…'):l;}).join('\n');}
 function txt(s){s=s||'';if(!/\S/.test(s))return null;
  return s.split(TOK).map(function(p,i){return i%2?p:lines(p);}).join('');}
 function named(n){if(n.length>40||/^data-cgc/.test(n))return false;if(NAMES.has(n))return true;
  return !DENY.test(n)&&/^aria-[a-z]+$/.test(n);}
-function roleShaped(n,v){return n.length<=40&&!/^data-cgc/.test(n)&&!DENY.test(n)&&v.length<=40&&ROLEV.test(v)&&!bad(v);}
+function roleShaped(n,v){return n.length<=40&&/^[a-z][a-z0-9-]*$/.test(n)&&!bad(n)&&!/^data-cgc/.test(n)&&!DENY.test(n)&&(v.indexOf(':')>=0||n.indexOf('-')>=0)&&v.length<=40&&ROLEV.test(v)&&!bad(v);}
 var SKIP={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,LINK:1,META:1,NAV:1,IFRAME:1,OBJECT:1,EMBED:1,CANVAS:1,VIDEO:1,AUDIO:1};
 function attrs(e){var o={};for(var j=0;j<e.attributes.length;j++){var a=e.attributes[j],n=a.name,v=a.value||'';
   if(n==='class'){var ks=v.split(/\s+/).filter(function(t){if(!t||t.length>32||bad(t))return false;
