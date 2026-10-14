@@ -34,6 +34,8 @@ import os
 import re
 import sqlite3
 import sys
+import tempfile
+import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -574,6 +576,20 @@ def _is_conv_id(value) -> bool:
     return bool(_CONV_RE.fullmatch(value or ""))
 
 
+def _valid_backup(path: str, version: int) -> bool:
+    """A backup is valid iff sqlite reads it as an intact DB whose schema_version is `version`."""
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            ok = db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            row = db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            return ok and row is not None and row[0] == str(version)
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return False
+
+
 def new_daemon_instance_id() -> str:
     """A fresh identity per daemon process — recorded on attempts so ownership is the daemon
     INSTANCE, not a reusable OS pid."""
@@ -673,7 +689,7 @@ class Store:
                 "SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"])
             if have >= SCHEMA_VERSION:
                 return
-            self._backup(f".v{have}.bak")
+            self._backup(have)
             self._apply_migrations()
         finally:
             if lock is not None:
@@ -705,22 +721,42 @@ class Store:
                     self.db.execute(stmt)
                 self.db.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(target),))
 
-    def _backup(self, suffix: str) -> None:
-        """Consistent point-in-time copy of the DB file (skipped for :memory:). WRITE-ONCE: an existing
-        backup is the original pre-migration copy, and nothing may replace it with a later state."""
+    def _backup(self, version: int) -> None:
+        """The pre-migration copy control.db.v<version>.bak (skipped for :memory:), taken under the
+        migration flock. WRITE-ONCE but never trusted by existence: a valid backup of that version is
+        the original and is kept; an invalid one — a crash mid-copy leaves a 0-byte or partial file —
+        is renamed aside (.corrupt-<ts>, never deleted) and rebuilt from the still-unmigrated DB.
+        The copy goes to a unique 0600 temp in the same directory, is verified and fsynced, and only
+        then renamed into place, so the final name only ever holds a verified backup."""
         if self.path == ":memory:":
             return
-        dst_path = self.path + suffix
+        dst_path = f"{self.path}.v{version}.bak"
         if os.path.exists(dst_path):
-            return
-        dst = sqlite3.connect(dst_path)
+            if _valid_backup(dst_path, version):
+                return
+            os.replace(dst_path, f"{dst_path}.corrupt-{int(time.time())}")
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst_path) or ".",
+                                   prefix=os.path.basename(dst_path) + ".", suffix=".tmp")
+        os.close(fd)
         try:
-            with dst:
-                self.db.backup(dst)
-        finally:
-            dst.close()
-        with contextlib.suppress(OSError):
-            os.chmod(dst_path, 0o600)
+            dst = sqlite3.connect(tmp)
+            try:
+                with dst:
+                    self.db.backup(dst)
+            finally:
+                dst.close()
+            if not _valid_backup(tmp, version):
+                raise sqlite3.DatabaseError(f"backup of v{version} failed verification — not migrating")
+            fd = os.open(tmp, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, dst_path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
 
     def store_uuid(self) -> str:
         """The stable identity of THIS database file, minted once at creation/migration. The daemon

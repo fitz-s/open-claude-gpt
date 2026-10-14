@@ -108,11 +108,11 @@ def test_parallel_open_runs_each_migration_once(tmp_path):
     # migrating (bounded, so a fix that never reaches a second _backup does not stall the test).
     real_backup, backups, first_done = m.Store._backup, [], threading.Event()
 
-    def backup(self, suffix):
-        backups.append(suffix)
+    def backup(self, version):
+        backups.append(version)
         if len(backups) > 1:
             first_done.wait(10)
-        real_backup(self, suffix)
+        real_backup(self, version)
 
     m.Store._migrate = racing
     m.Store._backup = backup
@@ -147,12 +147,56 @@ def test_parallel_open_runs_each_migration_once(tmp_path):
 
 def test_a_backup_is_write_once(store, tmp_path):
     sm, s = store
-    s._backup(".v4.bak")
+    v = sm.SCHEMA_VERSION
+    s._backup(v)
     s.db.execute("UPDATE meta SET value='changed' WHERE key='store_uuid'")
-    s._backup(".v4.bak")
-    bak = sqlite3.connect(str(tmp_path / "control.db.v4.bak"))
+    s._backup(v)
+    bak = sqlite3.connect(str(tmp_path / f"control.db.v{v}.bak"))
     assert bak.execute("SELECT value FROM meta WHERE key='store_uuid'").fetchone()[0] != "changed"
     bak.close()
+
+
+def _make_v4(m, p):
+    head, tail = m._DDL.split("  -- Schema 5.", 1)
+    db = sqlite3.connect(p)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.executescript(head.rstrip().rstrip(",") + "\n);" + tail.split(");", 1)[1])
+    db.execute("INSERT INTO meta(key,value) VALUES('schema_version','4')")
+    db.commit()
+    db.close()
+
+
+@pytest.mark.parametrize("bad", [b"", b"SQLite format 3\x00" + b"\x00" * 80])
+def test_a_crash_left_backup_is_rebuilt_not_trusted(tmp_path, bad):
+    """A crash mid-copy leaves a 0-byte or partial .v4.bak. Trusting it by existence would migrate the
+    DB with its original backup lost for good. It is renamed aside and rebuilt from the v4 DB first."""
+    m = _load("cgc_store")
+    p = str(tmp_path / "legacy.db")
+    _make_v4(m, p)
+    with open(p + ".v4.bak", "wb") as f:
+        f.write(bad)
+    s = m.Store(p)
+    assert s.db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == str(m.SCHEMA_VERSION)
+    s.close()
+    assert m._valid_backup(p + ".v4.bak", 4), "a valid v4 backup must be in place"
+    aside = [n for n in os.listdir(tmp_path) if ".v4.bak.corrupt-" in n]
+    assert len(aside) == 1 and open(tmp_path / aside[0], "rb").read() == bad, "kept aside, not deleted"
+    assert not [n for n in os.listdir(tmp_path) if n.endswith(".tmp")]
+
+
+def test_a_failed_backup_refuses_to_migrate(tmp_path, monkeypatch):
+    """No verified backup, no migration: the DB stays v4 and nothing half-written takes the final name."""
+    m = _load("cgc_store")
+    p = str(tmp_path / "legacy.db")
+    _make_v4(m, p)
+    monkeypatch.setattr(m, "_valid_backup", lambda path, v: False)
+    with pytest.raises(sqlite3.DatabaseError):
+        m.Store(p)
+    assert not os.path.exists(p + ".v4.bak")
+    assert not [n for n in os.listdir(tmp_path) if n.endswith(".tmp")]
+    db = sqlite3.connect(p)
+    assert db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "4"
+    db.close()
 
 
 # ---- 2. a READY orphan passes the same admission a fresh claim does ------------
