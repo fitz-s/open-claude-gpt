@@ -163,6 +163,11 @@ function build(node, parent) {
   return n;
 }
 
+// Required as a module (tests' own mock DOMs), it lends its selector matcher and runs nothing.
+if (require.main !== module) {
+  module.exports = { matches: (el, sel) => matchList(el, parse(sel)) };
+  return;
+}
 let raw = '';
 process.stdin.on('data', d => { raw += d; });
 process.stdin.on('end', () => {

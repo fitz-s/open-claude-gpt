@@ -56,9 +56,12 @@ LEGACY_MAX = 6_000        # a legacy (no marker) turn this short is not collapse
 RENDER_S = 30             # how long a loaded conversation may take to render its first user turn
 HYDRATE_S = 60            # how long the whole thread may take to hydrate before a miss is judged
 
-# What the send path's JS looks like (its button selector, a form submit). A probe step that would
-# evaluate one is refused; Enter is a key, refused in _NoSend.key.
-_SEND_JS = re.compile(re.escape(cdp._js_str(cdp._SEND_BUTTON_SEL)) + r"|requestSubmit|\.submit\(")
+# What the send path's JS looks like: the driver's send-authority mark (cdp._SEND_MARK, which only
+# the driver's send click carries), the send button's own selector, or a form submit. A probe step that would
+# evaluate one is refused; Enter is a key, refused in _NoSend.key. Every other click the probe makes
+# is also refused page-side by the driver's own __cgcMayClick.
+_SEND_JS = re.compile(re.escape(cdp._SEND_MARK) + "|" + re.escape(cdp._js_str(cdp._SEND_BUTTON_SEL))
+                      + r"|requestSubmit|\.submit\(")
 
 
 class SendRefused(AssertionError):
@@ -145,10 +148,11 @@ def _close(raw):
         raw.close()
 
 
-def _cleared(t):
+def _cleared(t, diagnose=False):
     left = t.eval(cdp._clear_composer_js(), timeout=45)
     if left != 0:
-        raise _confirm(t, Drift("composer", "clear", f"the composer still holds {left} chars after a clear"))
+        raise _confirm(t, Drift("composer", "clear", f"the composer still holds {left} chars after a clear"),
+                       diagnose)
 
 
 # ---- composer + mention -------------------------------------------------------------------------
@@ -188,7 +192,7 @@ def probe_composer(t, *, model, family, app, diagnose=False):
         if e.__cause__ is not None:         # a CDP timeout or socket error, wrapped by the driver
             raise Transient(str(e)) from None
         raise _confirm(t, Drift("composer", "paste", str(e)), diagnose) from None
-    _cleared(t)
+    _cleared(t, diagnose)
     res["composer"] = ("pass", f"{len(DUMMY)}-char draft pasted, read back whole, cleared")
     if app:
         try:
@@ -202,7 +206,7 @@ def probe_composer(t, *, model, family, app, diagnose=False):
             raise Transient(str(e)) from None
         else:
             res["mention"] = ("pass", f"@{app} chip confirmed")
-        _cleared(t)
+        _cleared(t, diagnose)
     return res
 
 

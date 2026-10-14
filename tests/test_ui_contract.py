@@ -73,19 +73,30 @@ _OWNED = ("data-message-author-role", "data-chatgpt-search-unit-key", "data-turn
           "querySelector('main')", "'plugins'", "Extra High", "upgrade|")
 
 
+# Send authority restates what it needs (LAW 7): these code constants deliberately repeat page
+# facts — the message/turn attributes a click may never land in, the editor shape, the attach
+# button, the app-row icon, the non-switcher words — because what may be clicked is decided by code
+# that no contract edit can move. They are the ONLY place a contract-shaped literal may appear twice.
+_AUTHORITY_CONSTANTS = {"_MESSAGE_SCOPE_SEL", "_EDITOR_SHAPE_SEL", "_NOT_SWITCHER_SRC", "_PLUS_BUTTON_ID",
+                        "_MENTION_APP_SECTION", "_MENTION_APP_ICON", "_MENU_WIDGET_SEL"}
+
+
 def _code_strings(name):
     """Every string constant in the file's code: docstrings (the first statement of a module, class
-    or function) are prose about the page and are left out; every other string, triple-quoted JS
-    included, is checked."""
+    or function) are prose about the page and are left out, as are the send-authority constants
+    (_AUTHORITY_CONSTANTS); every other string, triple-quoted JS included, is checked."""
     import ast
     tree = ast.parse(_src(name))
-    docs = set()
+    skip = set()
     for n in ast.walk(tree):
         if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body \
                 and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant):
-            docs.add(id(n.body[0].value))
+            skip.add(id(n.body[0].value))
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in _AUTHORITY_CONSTANTS
+                                             for t in n.targets):
+            skip.update(id(c) for c in ast.walk(n.value))
     return [n.value for n in ast.walk(tree)
-            if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docs]
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in skip]
 
 
 # The schema's own enumeration words (role_from, level), which the loader's type check must name.
@@ -216,7 +227,7 @@ def test_law4_an_invalid_contract_blocks_the_round_as_proven_not_sent(tmp_path, 
 
 
 # Updated 2026-10-14: approval labels moved to code, approval search excludes the composer form.
-_GOLDEN_JS = "fa5ebb5b3a00141bee1ea0940fceb9ac3d2eea7a0ab64e99a620e8b922d7a398"
+_GOLDEN_JS = "bfbf3b842976be524962828e4de926d0063b74c6d02d132fbfbbe33674bc6315"
 
 
 def _generated_js(cdp):
@@ -254,9 +265,54 @@ def _generated_js(cdp):
 
 
 def test_law1_the_shipped_contract_generates_exactly_the_reviewed_js(mods):
+    """Updated once for LAW 7 (the click-authority guard): the golden hash is the guarded output;
+    test_law7_the_generated_js_is_mains_except_the_guard proves what changed against main."""
     import hashlib
     js = _generated_js(mods[0])
     assert hashlib.sha256(json.dumps(js, sort_keys=True).encode()).hexdigest() == _GOLDEN_JS
+
+
+# main (fdfaa5d)'s generated JS, dumped with _generated_js's sample arguments.
+_MAIN_JS = os.path.join(ROOT, "tests", "fixtures", "main_generated_js.json")
+# The deliberate non-guard changes since main, each reviewed: the send contract's stop selector
+# gained the waiter's Chinese label; the approval regexes write their CJK as \u escapes, and the
+# approval search skips any Allow once inside a form (46ed0bc).
+_MAIN_DELTAS = {"_contract_js": [('button[aria-label*="Stop"]\')', 'button[aria-label*="Stop"],'
+                                  'button[aria-label*="\\u505c\\u6b62"]\')')],
+                "_approval_js": [("/^(deny|拒绝)/", "/^(deny|\\u62d2\\u7edd)/"),
+                                 ("/^(allow once|允许一次)/", "/^(allow once|\\u5141\\u8bb8\\u4e00\\u6b21)/"),
+                                 # 46ed0bc: the approval search skips any Allow once inside a form
+                                 ("return vis(b)&&/^(allow once|\\u5141", "return vis(b)&&!(b.closest&&b.closest('form'))&&/^(allow once|\\u5141")]}
+
+
+def test_law7_the_generated_js_is_mains_except_the_guard(mods):
+    """Every generated JS string equals main's once the click-authority guard is taken out: the
+    _AUTHORITY_FN prelude and its call sites. Nothing else about the page JS changed."""
+    import re as _re
+    cdp = mods[0]
+    main = json.load(open(_MAIN_JS))
+    now = _generated_js(cdp)
+    assert set(main) <= set(now)
+    subs = [(cdp._AUTHORITY_FN, ""),
+            ("if(!EL||!__cgcMayClick(EL,'switcher'))return null;", "if(!EL)return null;"),
+            (".filter(function(x){return __cgcMayClick(x,'picker');});", ";"),
+            ("if(!mi||!__cgcMayClick(mi,'picker')||!__cgcMayClick(s,'picker'))return false;", "if(!mi)return false;"),
+            ("if(!EL||!__cgcMayClick(EL,'picker'))return false;", "if(!EL)return false;"),
+            ("if(!__cgcMayType(d))return -1;", "if(!d)return -1;"),
+            ("if(!__cgcMayType(d))return null;", "if(!d)return null;"),
+            ("if(!__cgcMayType(d))return 'no-composer';", "if(!d)return 'no-composer';"),
+            ("if(app&&__cgcMayClick(ok[i],'approve'))ok[i].click();else if(app)app=null;", "if(app)ok[i].click();"),
+            (cdp._SEND_MARK, "")]
+    mention = _re.compile(r"var root=document\.querySelector\([^;]*\);if\(!__cgcMayClick\(hit,'mention',root\)\)"
+                          r"return \{[^}]*\};")
+    for k, want in main.items():
+        got = now[k]
+        for a, b in subs:
+            got = got.replace(a, b)
+        got = mention.sub("", got)
+        for a, b in _MAIN_DELTAS.get(k, []):
+            want = want.replace(a, b, 1)
+        assert got == want, k
 
 
 def test_law2_the_send_button_is_not_in_the_contract(tmp_path, mods):
@@ -281,7 +337,9 @@ def test_law2_no_contract_edit_can_widen_what_the_send_click_clicks(tmp_path, mo
     drv = probe._driver(_write(tmp_path, facts))
     js = drv._send_click_js()
     # The only button query inside the composer's form is the code constant.
-    assert re.findall(r"f\.querySelectorAll\(([^)]*)\)", js) == [drv._js_str(drv._SEND_BUTTON_SEL)]
+    queries = re.findall(r"f\.querySelectorAll\(([^)]*)\)", js)
+    assert set(queries) == {drv._js_str(drv._SEND_BUTTON_SEL), drv._js_str(drv._EDITOR_SHAPE_SEL)}, \
+        "every form query is a code constant: the send button and the editor shape"
     if not shutil.which("node"):
         pytest.skip("node not installed")
     # The reviewer's case, in a real DOM: a form holding the editor and a Cancel button only.

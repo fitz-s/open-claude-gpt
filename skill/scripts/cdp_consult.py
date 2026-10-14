@@ -127,6 +127,8 @@ CONTRACT_PATH = os.environ.get("CGC_CONTRACT") or os.path.join(
 
 # Every contract id and its type. The loader accepts exactly these ids, each of exactly this type:
 #   "sel"   a CSS selector string     "attr"  an attribute name ([a-z][a-z0-9-]*)
+#   "one"   one selector, no comma list: it is joined into a descendant scope ("<menu> <slider>"),
+#           where a list would make every branch but the last document-wide
 #   "word"  a plain label string      "words" a non-empty list of labels
 #   "alias" {label: label}            "class" a class token ([A-Za-z0-9_-]+)
 #   "body"  {attr: <attr>, value: <word>}
@@ -135,15 +137,15 @@ CONTRACT_PATH = os.environ.get("CGC_CONTRACT") or os.path.join(
 _CONTRACT_SCHEMA = {
     "turn_schemas": "schemas", "assistant_body": "body", "turn_container": "sel",
     "conversation_root": "sel", "failure_markers": "words", "model_slug_attr": "attr",
-    "composer": "sel", "composer_exclude_ancestor": "sel", "composer_plus_button_id": "word",
+    "composer": "sel", "composer_exclude_ancestor": "sel",
     "trailing_break_class": "class", "mention_chip_attr": "attr", "mention_chip_label_attr": "attr",
     "mention_popup_attr": "attr", "mention_option_attr": "attr", "mention_row_content_attr": "attr",
-    "mention_app_icon_class": "class", "mention_description_class": "class", "mention_loading": "sel",
-    "mention_section_header": "word", "picker_owner": "sel", "picker_menu": "sel",
-    "picker_slider": "sel", "picker_menuitem": "sel", "picker_family_radio": "sel",
+    "mention_description_class": "class", "mention_loading": "one",
+    "picker_owner": "sel", "picker_menu": "one",
+    "picker_slider": "one", "picker_menuitem": "sel", "picker_family_radio": "sel",
     "picker_radio_scaffold": "sel", "picker_flat_items": "sel", "picker_submenu_trigger": "sel",
     "picker_open_trigger": "sel", "picker_open_menus": "sel", "switcher_labels": "words",
-    "switcher_not_labels": "words", "family_aliases": "alias", "blocker_login": "sel",
+    "family_aliases": "alias", "blocker_login": "sel",
     "blocker_login_paths": "words", "blocker_captcha": "sel", "blocker_alert": "sel",
     "rate_limit_phrases": "words",
 }
@@ -159,6 +161,8 @@ def _text(v):
 def _typed(kind, v):
     if kind in ("sel", "word"):
         return _text(v)
+    if kind == "one":
+        return _text(v) and "," not in v
     if kind == "attr":
         return isinstance(v, str) and bool(_ATTR_RE.match(v))
     if kind == "class":
@@ -225,10 +229,77 @@ _SEND_BUTTON_SEL = ('button[data-testid="send-button"],button[aria-label*="Send"
                     'button[aria-label*="发送"]')
 _STOP_BUTTON_SEL = ('[data-testid="stop-button"],button[aria-label*="Stop"],'
                     'button[aria-label*="停止"]')
+# LAW: a click is authorized by code, never located by data alone. The contract LOCATES widgets;
+# whether an element may be clicked, focused or typed into is decided here, page-side, by
+# __cgcMayClick / __cgcMayType / __cgcSendScope (below), which every action helper calls first.
+# Send authority restates what it needs: _MESSAGE_SCOPE_SEL repeats the conversation's turn
+# attributes on purpose, so no contract edit can move typing or a click into a sent message.
+_MESSAGE_SCOPE_SEL = ("article,[data-message-author-role],[data-turn],[data-chatgpt-search-unit-key],"
+                      "[data-turn-key]")
+_EDITOR_SHAPE_SEL = '[contenteditable="true"],[contenteditable=""],[contenteditable="plaintext-only"],textarea'
+# What is never a model switcher (an "Upgrade to Pro" button must not confirm Pro), the attach
+# button, and what makes a popup row an APP (a file or an action row is never clicked as one):
+# refusal and identity rules, so code.
+_NOT_SWITCHER_SRC = ("projects?|share|copy|send|search|attach|new chat|cancel|stop|upgrade|get |"
+                     "settings|log ?in|sign|account")
+_PLUS_BUTTON_ID = "composer-plus-btn"
+_MENTION_APP_SECTION = "plugins"
+_MENTION_APP_ICON = "rounded-2xs"
 # An app-approval click grants a connector access, so what it may click is send authority too: code,
 # never the editable contract (a contract that named "Send" as an allow label would have clicked send).
 _APPROVAL_ALLOW = ["allow once", "允许一次"]
 _APPROVAL_DENY = ["deny", "拒绝"]
+
+# The page-side authority functions. Code, never data: nothing here reads the contract.
+#   __cgcMayType(d)      `d` may be typed into: a visible editor inside the ONE visible form on the
+#                        page that holds a visible editor outside every message (two such forms are
+#                        ambiguous, so nothing is typed or sent), in no conversation
+#                        message (an edit-message box fails), and not itself a button or a menu.
+#   __cgcMayClick(el,p,w) may `el` be clicked, focused or keyed for purpose `p`? Never a send or stop
+#                        button or anything inside one, a submit control, an editor, or an element
+#                        whose name starts with send|stop|deny (or allow, except for 'approve').
+#                        Then per purpose:
+#     'switcher'  a <button>, not the attach button, in no message; inside a form only as a menu
+#                 trigger (aria-haspopup) — the composer's own model switcher;
+#     'picker'    inside an open menu ([role=menu]/[role=listbox]) that is a valid WIDGET;
+#     'mention'   inside `w`, the popup root the caller located, itself a valid WIDGET;
+#     'approve'   outside every form;
+#     anything else, 'send' included: never (the send click has its own scope, _send_click_js).
+#   A WIDGET is not a form and holds no editor and no send or stop button — so no selector, however
+#   wide, can make the composer's form or the page the widget being driven.
+# A refusal clicks nothing: the helper reports not-done, and its caller fails pre-click.
+_MENU_WIDGET_SEL = '[role="menu"],[role="listbox"]'
+# The one statement every JS that may SEND opens with (_send_click_js, the only purpose-'send'
+# helper). A no-send handle (cgc_probe._NoSend) refuses any eval that carries it: the same decision
+# __cgcMayClick makes page-side — nothing but the send helper ever acts for 'send' — made before the
+# JS reaches the page.
+_SEND_MARK = "var __cgcSendAuthority=1;"
+_AUTHORITY_FN = (
+    "function __cgcVisible(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}"
+    "function __cgcComposerForms(){return [].slice.call(document.querySelectorAll('form')).filter(function(f){"
+    "return __cgcVisible(f)&&!f.closest(" + _js_str(_MESSAGE_SCOPE_SEL) + ")&&[].slice.call(f.querySelectorAll("
+    + _js_str(_EDITOR_SHAPE_SEL) + ")).some(__cgcVisible);});}"
+    "function __cgcMayType(d){if(!(!!d&&!!d.matches&&d.matches(" + _js_str(_EDITOR_SHAPE_SEL) + ")"
+    "&&__cgcVisible(d)&&d.tagName!=='FORM'&&!!d.closest('form')"
+    "&&!d.closest(" + _js_str(_MESSAGE_SCOPE_SEL) + ")&&!d.closest('button')"
+    "&&!d.closest(" + _js_str(_MENU_WIDGET_SEL) + ")))return false;"
+    "var fs=__cgcComposerForms();return fs.length===1&&fs[0]===d.closest('form');}"
+    "function __cgcWidget(w){return !!w&&w.tagName!=='FORM'&&!w.querySelector(" + _js_str(_EDITOR_SHAPE_SEL)
+    + ")&&!w.querySelector(" + _js_str(_SEND_BUTTON_SEL + "," + _STOP_BUTTON_SEL) + ");}"
+    "function __cgcName(e){return ((e.getAttribute('aria-label'))||e.innerText||e.textContent||'')"
+    ".replace(/\\s+/g,' ').trim().toLowerCase();}"
+    "function __cgcMayClick(el,p,w){if(!el||!el.closest||!el.getAttribute)return false;"
+    "if(el.closest(" + _js_str(_SEND_BUTTON_SEL + "," + _STOP_BUTTON_SEL) + "))return false;"
+    "if(el.closest('[type=\"submit\"]')||el.closest(" + _js_str(_EDITOR_SHAPE_SEL) + "))return false;"
+    "var n=__cgcName(el);"
+    "if(/^(send|stop|deny|\\u53d1\\u9001|\\u505c\\u6b62|\\u62d2\\u7edd)/.test(n))return false;"
+    "if(p==='approve')return !el.closest('form');"
+    "if(/^(allow|\\u5141\\u8bb8)/.test(n)||el.closest(" + _js_str(_MESSAGE_SCOPE_SEL) + "))return false;"
+    "if(p==='switcher')return el.tagName==='BUTTON'&&el.id!==" + _js_str(_PLUS_BUTTON_ID)
+    + "&&(!el.closest('form')||!!el.getAttribute('aria-haspopup'));"
+    "if(p==='picker')w=el.closest(" + _js_str(_MENU_WIDGET_SEL) + ");"
+    "else if(p!=='mention')return false;"
+    "return __cgcWidget(w)&&w.contains(el);}")
 
 
 CGC_PORT = int(os.environ.get("CGC_PORT", "9333"))
@@ -1423,7 +1494,7 @@ def cmd_status(a) -> int:
 # (aria-haspopup) or is aria-labelled as a model picker; and is NOT an action/nav button.
 _CAND_JS = ("[].slice.call(document.querySelectorAll('button')).filter(function(b){"
             "var t=(b.innerText||'').trim().split('\\n')[0];"
-            "if(!t||t.length>28||/^(" + _js_alt(UI["switcher_not_labels"]) + ")/i.test(t))return false;"
+            "if(!t||t.length>28||/^(" + _NOT_SWITCHER_SRC + ")/i.test(t))return false;"
             "var hp=(b.getAttribute('aria-haspopup')||'');"
             "var al=(b.getAttribute('aria-label')||'');"
             "var menuish=/menu|listbox|dialog|true/i.test(hp)||/model/i.test(al);"
@@ -1441,7 +1512,7 @@ _CAND_JS = ("[].slice.call(document.querySelectorAll('button')).filter(function(
 _FORM_CAND_JS = (
     "[].slice.call((document.querySelector('form')||document.documentElement)"
     ".querySelectorAll('button')).filter(function(b){"
-    "return b.getAttribute('aria-haspopup')==='menu'&&b.id!==" + _js_str(UI["composer_plus_button_id"]) + ";})"
+    "return b.getAttribute('aria-haspopup')==='menu'&&b.id!==" + _js_str(_PLUS_BUTTON_ID) + ";})"
 )
 
 # Every candidate this run considers, form-scoped ones FIRST (see _FORM_CAND_JS) followed by
@@ -1495,10 +1566,10 @@ def _open_cand_by_label_js(label):
     button reads after being clicked."""
     t = json.dumps(label)
     return (
-        "(function(){var c=%s;var want=%s;var idx=-1;"
+        "(function(){" + _AUTHORITY_FN + "var c=%s;var want=%s;var idx=-1;"
         "for(var k=0;k<c.length;k++){"
         "if(((c[k].innerText||'').trim().split('\\n')[0])===want){idx=k;break;}}"
-        "var EL=c[idx];if(!EL)return null;"
+        "var EL=c[idx];if(!EL||!__cgcMayClick(EL,'switcher'))return null;"
         "var got=(EL.innerText||'').trim().split('\\n')[0];%s"
         "return got;})()"
         % (_ALL_CAND_JS, t, _GESTURE)
@@ -1527,8 +1598,8 @@ def _click_item_js(target):
     # (never a loose contains, which would click a description item). Same Radix gesture as
     # opening (a bare .click() misses). Verified live: Medium -> 'Pro' selects 'Pro Extended'.
     t = json.dumps(target.lower())
-    return ("(function(){var T=" + t + ";var ms=[].slice.call(document.querySelectorAll("
-            + _js_str(UI["picker_flat_items"]) + "));"
+    return ("(function(){" + _AUTHORITY_FN + "var T=" + t + ";var ms=[].slice.call(document.querySelectorAll("
+            + _js_str(UI["picker_flat_items"]) + ")).filter(function(x){return __cgcMayClick(x,'picker');});"
             "var EL=ms.find(function(x){var f=(x.innerText||'').trim().toLowerCase().split('\\n')[0];"
             "return f===T||(T.indexOf('pro')===0&&f.indexOf('pro')===0);});"
             "if(EL){" + _GESTURE + " return true;}return false;})()")
@@ -1687,9 +1758,9 @@ _PICKER_STATE_JS = (
     "})()")
 
 _SLIDER_FOCUS_JS = (
-    "(function(){var s=document.querySelector(" + _MENU_SLIDER_SEL + ");"
+    "(function(){" + _AUTHORITY_FN + "var s=document.querySelector(" + _MENU_SLIDER_SEL + ");"
     "if(!s)return false;var mi=s.closest(" + _js_str(UI["picker_menuitem"]) + ");"
-    "if(!mi)return false;mi.focus();return true;})()")
+    "if(!mi||!__cgcMayClick(mi,'picker')||!__cgcMayClick(s,'picker'))return false;mi.focus();return true;})()")
 
 
 # A restore/goto walk must END, and "loop until the value equals the target" is not a bound. Live
@@ -1867,9 +1938,9 @@ def _submenu_count_js():
 
 
 def _open_submenu_js(i):
-    return ("(function(){var els=[].slice.call(document.querySelectorAll("
+    return ("(function(){" + _AUTHORITY_FN + "var els=[].slice.call(document.querySelectorAll("
             + _js_str(UI["picker_submenu_trigger"]) + "));"
-            "var EL=els[" + str(int(i)) + "];if(!EL)return false;"
+            "var EL=els[" + str(int(i)) + "];if(!EL||!__cgcMayClick(EL,'picker'))return false;"
             "['pointerover','pointerenter','mouseover','mousemove'].forEach(function(t){"
             "EL.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));});"
             + _GESTURE + " return true;})()")
@@ -1912,13 +1983,13 @@ def _click_family_js(target):
     the element observed; a radio in some other open menu is not this control. Same _GESTURE as
     everything else in this menu: these are Radix items and a bare .click() does not select them."""
     t = json.dumps((target or "").strip().lower())
-    return ("(function(){var T=" + t + ";"
+    return ("(function(){" + _AUTHORITY_FN + "var T=" + t + ";"
             + _PICKER_OWNER_JS +
             "if(own.length!==1)return false;"
             "var FAMS=[].slice.call(own[0].querySelectorAll(" + _js_str(UI["picker_family_radio"]) + "));"
             "var EL=FAMS.find(function(r){"
             "return ((r.innerText||'').trim().toLowerCase().split('\\n')[0])===T;});"
-            "if(!EL)return false;" + _GESTURE + " return true;})()")
+            "if(!EL||!__cgcMayClick(EL,'picker'))return false;" + _GESTURE + " return true;})()")
 
 
 _FamilyObs = collections.namedtuple("_FamilyObs", "status entries detail")
@@ -2426,7 +2497,7 @@ def _select_model(c, target, family=None):
                 # touch nothing here, keep the reason, and let another candidate or pass try.
                 fam_detail = obs0.detail
                 snap = _picker_snap(c)
-                _close_menus(c)
+                dirty = not _close_menus(c) or dirty
                 continue
             fam = _FamilyPick(True, None, None, False)
             if want_family and obs0.status == "family":
@@ -2439,7 +2510,7 @@ def _select_model(c, target, family=None):
                         proven, _lab = _restore_original(c, lab, orig_family, orig_tier_pos, True)
                         dirty = dirty or not proven
                     snap = _picker_snap(c)
-                    _close_menus(c)
+                    dirty = not _close_menus(c) or dirty
                     return _ModelPick(False, last_slider_label or shown, badge, fam.detail, dirty,
                                       snap)
             tier = _slider_set(c, target)
@@ -2481,7 +2552,7 @@ def _select_model(c, target, family=None):
                     proven, back_label = _restore_original(
                         c, lab, orig_family, orig_tier_pos, bool(orig_family))
                     snap = _picker_snap(c)
-                    _close_menus(c)
+                    dirty = not _close_menus(c) or dirty
                     return _ModelPick(False, conf.tier or back_label or shown_rest, badge,
                                       conf.detail, dirty or not proven, snap)
                 if settled and conf.verdict == "ok":
@@ -2504,7 +2575,7 @@ def _select_model(c, target, family=None):
                 dirty = dirty or not proven
                 last_slider_label = back_label or last_slider_label
                 snap = _picker_snap(c)
-                _close_menus(c)
+                dirty = not _close_menus(c) or dirty
                 continue
             # this WAS the candidate asked for, and it genuinely does not carry target — budget
             # must not be spent reopening it. Undo the whole transaction: the family this attempt
@@ -2517,7 +2588,7 @@ def _select_model(c, target, family=None):
                 last_slider_label = back_label or last_slider_label
             exhausted.add(lab)
             snap = _picker_snap(c)
-            _close_menus(c)
+            dirty = not _close_menus(c) or dirty
         time.sleep(0.4)
     final = [x for x in (c.eval(_cand_labels_js()) or []) if x]
     if final:
@@ -2859,7 +2930,8 @@ def _send_click_js():
       'error-preclick:<msg>'  the lookup threw before any gesture.
     Every negative is returned from inside the try, which ends before the click: only those branches
     can prove nothing was clicked. A throw from click() itself escapes and reads as no value."""
-    return ("(function(){var t;try{" + _COMPOSER_RESOLVE_JS + "var d=__cg();if(!d)return 'no-composer';"
+    return ("(function(){var t;try{" + _SEND_MARK + _COMPOSER_RESOLVE_JS + _AUTHORITY_FN
+            + "var d=__cg();if(!__cgcMayType(d))return 'no-composer';"
             "var f=d.closest('form');var b=Array.prototype.slice.call(f.querySelectorAll("
             + _js_str(_SEND_BUTTON_SEL) + ")).filter(function(x){var r=x.getBoundingClientRect();"
             "return r.width>0&&r.height>0;});"
@@ -2921,14 +2993,14 @@ def _settle_composer(c, seconds=5):
 def _clear_composer_js():
     # Count only meaningful residue: an EMPTY ProseMirror composer keeps a placeholder paragraph
     # whose innerText is "\n" (observed live — a raw length check misread it as a leftover draft).
-    return ("(function(){var d=" + _composer_get_js() + ";if(!d)return -1;d.focus();"
+    return ("(function(){" + _AUTHORITY_FN + "var d=" + _composer_get_js() + ";if(!__cgcMayType(d))return -1;d.focus();"
             "document.execCommand('selectAll',false,null);"
             "document.execCommand('delete',false,null);"
             "return (d.innerText||'').replace(/[\\s\\u200b\\u200c\\ufeff]/g,'').length;})()")
 
 
 def _paste_chunk_js(chunk):
-    return ("(function(){var d=" + _composer_get_js() + ";if(!d)return -1;d.focus();"
+    return ("(function(){" + _AUTHORITY_FN + "var d=" + _composer_get_js() + ";if(!__cgcMayType(d))return -1;d.focus();"
             "document.execCommand('insertText',false," + json.dumps(chunk) + ");"
             "return (d.innerText||'').length;})()")
 
@@ -3025,7 +3097,7 @@ def _mention_type_js(name, token):
     # Stamp every candidate ALREADY on screen with this attempt's token before typing: only what
     # the "@name" keystrokes bring up is the composer's popup. Scoping by cause, not by a popup
     # selector nobody has probed, so an unrelated same-label control can never be picked.
-    return ("(function(){var d=" + _composer_get_js() + ";if(!d)return null;"
+    return ("(function(){" + _AUTHORITY_FN + "var d=" + _composer_get_js() + ";if(!__cgcMayType(d))return null;"
             + _mention_visible_js() + ".forEach(function(e){e.setAttribute('data-cgc-pre',"
             + json.dumps(token) + ");});d.focus();"
             "document.execCommand('insertText',false," + json.dumps("@" + name) + ");"
@@ -3054,7 +3126,7 @@ def _mention_pick_js(name, token):
     # An unconnected exact app is refused and reported, never replaced by another; a row in an allowed section
     # that is not app-shaped is never clicked and is reported as `unverified`. `open` / `loading`: the popup
     # exists / still shows its "Loading suggestions" skeleton.
-    return ("(function(){var want=" + json.dumps(_norm_label(name)) + ";var os=" + _mention_visible_js()
+    return ("(function(){" + _AUTHORITY_FN + "var want=" + json.dumps(_norm_label(name)) + ";var os=" + _mention_visible_js()
             + ".filter(function(e){return e.getAttribute('data-cgc-pre')!==" + json.dumps(token) + ";});"
             "function sp(s){return (s||'').replace(/\\s+/g,' ').trim();}"
             "function lab(e){return sp((e.innerText||e.textContent||'').split('\\n')[0]).replace(/^@/,'')"
@@ -3069,7 +3141,7 @@ def _mention_pick_js(name, token):
             "function tok(n,c){return ((n&&n.getAttribute&&n.getAttribute('class'))||'').split(/\\s+/)"
             ".indexOf(c)>=0;}"
             "function appish(e){var c=body(e);if(!c)return false;var l=c.firstElementChild;"
-            "var i=l&&l.firstElementChild;return !!i&&tok(i," + _js_str(UI["mention_app_icon_class"]) + ");}"
+            "var i=l&&l.firstElementChild;return !!i&&tok(i," + _js_str(_MENTION_APP_ICON) + ");}"
             "function nw(s){return (s||'').replace(/\\s+/g,'');}"
             # a LEAF holds one text node and no element: every captured description and label is exactly that,
             # so a second text node (a bare ' Connect' appended after the description) fails it as well
@@ -3087,7 +3159,7 @@ def _mention_pick_js(name, token):
             "return nw(e.textContent)===nw(lb.textContent+d.textContent);}"
             "var open=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL) + ");"
             "var loading=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL + ' ' + UI["mention_loading"]) + ");"
-            "var sect=os.filter(function(e){var h=hdr(e);return h===" + _js_str(UI["mention_section_header"]) + "||(h===null&&!headed(e));});"
+            "var sect=os.filter(function(e){var h=hdr(e);return h===" + _js_str(_MENTION_APP_SECTION) + "||(h===null&&!headed(e));});"
             "var pl=sect.filter(appish);"
             "var ex=pl.filter(function(e){return lab(e)===want;});"
             "var hit=ex.length===1?ex[0]:null;var amb=ex.length>1?ex.length:0;"
@@ -3097,6 +3169,9 @@ def _mention_pick_js(name, token):
             "if(!hit)return {hit:null,open:open,loading:loading,"
             "seen:pl.filter(plain).map(lab).filter(Boolean).slice(0,20),unconnected:un,unverified:uv,"
             "ambiguous:amb};"
+            "var root=document.querySelector(" + json.dumps(_MENTION_POPUP_SEL) + ");"
+            "if(!__cgcMayClick(hit,'mention',root))return {hit:null,open:open,loading:false,seen:[],"
+            "unconnected:[],unverified:[lab(hit)],ambiguous:0,refused:true};"
             "hit.click();return {hit:lab(hit),open:open,loading:false,seen:[],unconnected:[],"
             "unverified:[],ambiguous:0};})()")
 
@@ -3951,7 +4026,7 @@ def _approval_js(allow):
     # card's text (its header line is the app's label), never a substring — this click grants access,
     # so "WebCodex Demo Clone" must not ride on "WebCodex Demo". The size cap stops a foreign card from
     # climbing into the conversation and matching a line of the prompt.
-    return ("(function(){var allow=" + json.dumps(allow) + ";"
+    return ("(function(){" + _AUTHORITY_FN + "var allow=" + json.dumps(allow) + ";"
             "function vis(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}"
             "function t(e){return (e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim();}"
             "function hasDeny(n){return Array.prototype.slice.call(n.querySelectorAll('button')).some("
@@ -3969,7 +4044,8 @@ def _approval_js(allow):
             "function ones(e){return [].slice.call(e.querySelectorAll('button')).filter(function(b){"
             "return vis(b)&&/^(" + _js_alt(_APPROVAL_ALLOW) + ")/i.test(t(b));}).length;}"
             "for(var m=n.parentElement;!app&&m&&t(m).length<=400&&ones(m)===1;m=m.parentElement){txt=t(m);app=named(m);}"
-            "if(app)ok[i].click();return {app:app,text:txt.slice(0,300)};}return null;})()")
+            "if(app&&__cgcMayClick(ok[i],'approve'))ok[i].click();else if(app)app=null;"
+            "return {app:app,text:txt.slice(0,300)};}return null;})()")
 
 
 def _approve_apps():

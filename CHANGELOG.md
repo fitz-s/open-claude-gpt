@@ -12,8 +12,13 @@ releases until it stabilizes.
   chip, model picker, family label aliases, failure markers, blockers) is now one entry in
   `skill/scripts/chatgpt_contract.json`. Each id has a declared type. The loader refuses an unknown,
   missing or mistyped id with `contract_invalid` before any browser action (the round blocks as
-  proven not sent), and values enter page JS only through their JSON encoding. The send and stop
-  buttons stay code: no contract edit can widen what is clicked. `cgc_probe.py` imports the
+  proven not sent), and values enter page JS only through their JSON encoding. A click is
+  authorized by code, never located by data alone. The contract locates widgets. Every click, focus
+  and keystroke helper first asks the driver's page-side guard (`__cgcMayClick` / `__cgcMayType`).
+  The guard refuses send, stop, approval and submit controls, editors, anything inside a
+  conversation message, and anything outside the widget being driven. The send button, the message
+  scope and the app-row identity are code, so no contract edit can widen what is clicked or typed
+  into. `cgc_probe.py` imports the
   driver's reads and defines no selector of its own. A test fails if a contract-owned literal
   reappears in either file.
 - A break the probe confirms, or a send refused with `model_not_selectable`, `composer_not_ready`

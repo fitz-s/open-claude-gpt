@@ -64,10 +64,6 @@
       "value": "article,[data-message-author-role]",
       "why": "An editor inside a message is an edit-message box, not the composer (2026-07)."
     },
-    "composer_plus_button_id": {
-      "value": "composer-plus-btn",
-      "why": "The composer form's attach button, a menu button that is not a model switcher (2026-08-28)."
-    },
     "trailing_break_class": {
       "value": "ProseMirror-trailingBreak",
       "why": "The editor's placeholder <br> that keeps an empty or line-final block open; not payload (2026-10-13)."
@@ -92,10 +88,6 @@
       "value": "data-menu-row-content",
       "why": "A row's content block: leading icon, then label and description (2026-09-29)."
     },
-    "mention_app_icon_class": {
-      "value": "rounded-2xs",
-      "why": "Class on a connector app's leading icon; actions and files use other icons (2026-09-29)."
-    },
     "mention_description_class": {
       "value": "text-codex-description",
       "why": "Class of a row's description element (2026-09-29)."
@@ -103,10 +95,6 @@
     "mention_loading": {
       "value": "[role=\"status\"]",
       "why": "The popup's 'Loading suggestions' skeleton (2026-09-29)."
-    },
-    "mention_section_header": {
-      "value": "plugins",
-      "why": "Lower-cased popup section header above app rows (2026-09-29)."
     },
     "picker_owner": {
       "value": "[data-testid=\"composer-intelligence-picker-content\"]",
@@ -161,27 +149,6 @@
         "ChatGPT"
       ],
       "why": "Leading text of a composer model/tier switcher button (case-sensitive prefix; version-shaped labels like '5.5' and 'o3' are matched by code). Tiers 2026-08-18, GPT badge 2026-09-06."
-    },
-    "switcher_not_labels": {
-      "value": [
-        "project",
-        "share",
-        "copy",
-        "send",
-        "search",
-        "attach",
-        "new chat",
-        "cancel",
-        "stop",
-        "upgrade",
-        "get ",
-        "settings",
-        "log in",
-        "login",
-        "sign",
-        "account"
-      ],
-      "why": "Case-insensitive leading text of buttons that are never a model switcher ('Upgrade to Pro' must not confirm Pro) (2026-07)."
     },
     "family_aliases": {
       "value": {

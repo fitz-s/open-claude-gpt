@@ -47,13 +47,13 @@ CAPS = {
                  "reads": ("composer", "composer_exclude_ancestor", "trailing_break_class")},
     "mention": {"need": ("mention_popup_attr", "mention_option_attr"),
                 "reads": ("mention_popup_attr", "mention_option_attr", "mention_row_content_attr",
-                          "mention_app_icon_class", "mention_description_class", "mention_section_header",
+                          "mention_description_class",
                           "mention_loading", "mention_chip_attr", "mention_chip_label_attr")},
     "model": {"need": (("picker_owner", "picker_menu"),),
               "reads": ("picker_owner", "picker_menu", "picker_slider", "picker_menuitem",
                         "picker_family_radio", "picker_radio_scaffold", "picker_flat_items",
                         "picker_submenu_trigger", "picker_open_trigger", "family_aliases",
-                        "switcher_labels", "switcher_not_labels")},
+                        "switcher_labels")},
 }
 _SEARCH = {
     "reader": (r"author|turn|message|markdown|unit", r"(^|[:_ -])(user|assistant)$|assistant-message"),
@@ -87,7 +87,7 @@ def selectors(ui, cap):
             out.append((i, f"[{v}]"))
         elif i.endswith("_class"):
             out.append((i, "." + v))
-        elif i == "turn_container" or (isinstance(v, str) and i != "mention_section_header"):
+        elif isinstance(v, str):
             out.append((i, v))
     return out
 

@@ -97,8 +97,9 @@ in the daemon log (`CGC_DRIFT_BUNDLE` / `CGC_UI_DIAGNOSIS`) and in `cgc probe --
 4. Run the bundle's `check.probe_command` (a model break is re-checked by `--only composer`). A pass
    clears the gate and queued rounds resume; `refire` resends a round blocked by `contract_invalid`.
 
-If what changed is a widget's behaviour (a new permission flow, say), or the send/stop button, and
-not a selector or a label, the fix is a code change.
+If what changed is a widget's behaviour (a new permission flow, say), the send/stop button, or what
+a click may land on (the driver's click guard, `__cgcMayClick`), and not a selector or a label, the
+fix is a code change: the contract locates widgets, it never authorizes a click.
 
 ## `CGC_LOGIN needed` / `CGC_ERROR login_needed`
 You're logged out in the dedicated profile. Run `bin/cgc launch`, log into ChatGPT
