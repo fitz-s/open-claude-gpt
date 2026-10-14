@@ -187,7 +187,7 @@ function build(spec, parent){
     return n.childNodes.map(function(k){return k.textContent}).join('')}});
   Object.defineProperty(n,'firstElementChild',{get:function(){return n.children[0]||null}});
   n.querySelector=function(sel){return qin(n,sel)[0]||null};
-  return n;
+  return AUTH(n);
 }
 function all(r){var o=[];(function w(n){o.push(n);(n.children||[]).forEach(w);})(r);return o;}
 function attrs(sel){return sel.split(' ').map(function(p){var m=/^\[([\w-]+)(?:="([^"]*)")?\]$/.exec(p)||/^\.([\w-]+)$/.exec(p);
@@ -286,7 +286,7 @@ def _run_pick_tree(tree, name, token="t0"):
     import shutil, subprocess
     if not shutil.which("node"):
         pytest.skip("node not installed")
-    src = (_NODE_DOM + "var ROOT=build(" + json.dumps(tree) + ",null);\n"
+    src = (open(os.path.join(ROOT, "tests", "authority_shim.js")).read().replace("process.env.CGC_FIXTURE_DOM", json.dumps(os.path.join(ROOT, "skill", "scripts", "fixture_dom.js"))) + _NODE_DOM + "var ROOT=build(" + json.dumps(tree) + ",null);\n"
            "var r=" + CDP._mention_pick_js(name, token) + ";"
            "console.log(JSON.stringify([r,all(ROOT).filter(function(n){return n.clicked;})"
            ".map(function(n){return n.innerText.split('\\n')[0];})]));")
@@ -751,7 +751,7 @@ function el(t,o){o=o||{};var n={nodeType:1,tagName:t.toUpperCase(),_a:o.a||{},ch
   click:function(){this.clicked++},
   focus:function(){if(!this.hiddenDeep())document.activeElement=this;},   // a hidden editor cannot take focus
   _text:'',_sel:false};
-  (o.c||[]).forEach(function(c){c.parent=n;n.children.push(c);});return n;}
+  (o.c||[]).forEach(function(c){c.parent=n;n.children.push(c);});return AUTH(n);}
 var ALL=[];function reg(n){ALL.push(n);n.children.forEach(reg);return n;}
 function match(x,sel){return sel.split(',').some(function(p){p=p.trim();
   if(p==='#prompt-textarea')return x._a.id==='prompt-textarea';
@@ -787,7 +787,7 @@ def _run_forms(tree_js, expr, active=None):
     import shutil, subprocess
     if not shutil.which("node"):
         pytest.skip("node not installed")
-    src = (_NODE_FORMS + "var ROOT=reg(" + tree_js + ");"
+    src = (open(os.path.join(ROOT, "tests", "authority_shim.js")).read().replace("process.env.CGC_FIXTURE_DOM", json.dumps(os.path.join(ROOT, "skill", "scripts", "fixture_dom.js"))) + _NODE_FORMS + "var ROOT=reg(" + tree_js + ");AUTHDOC(document,ROOT);"
            + ("document.activeElement=%s;" % active if active else "")
            + "var R=" + expr + ";console.log(JSON.stringify(R));")
     return json.loads(subprocess.run(["node", "-e", src], capture_output=True, text=True,
@@ -980,10 +980,13 @@ def test_the_paste_verification_reads_the_editor_the_paste_landed_in():
 
 
 def test_the_old_first_match_expression_read_zero_chars_after_a_paste_that_landed():
+    """The old resolver handed every step the HIDDEN editor. The paste then landed in the visible one
+    (focus) while the read saw the hidden one: 0 chars. Under the click-authority guard the paste
+    itself refuses a hidden target (-1), so the same counterfactual now fails before typing at all."""
     old = "document.querySelector(" + json.dumps(CDP._COMPOSER_SEL) + ")"
     r = _paste_then_read(_HIDDEN_FORM_FIRST, get_js=old)
-    assert r["landed"] == len(_CHUNK), "the paste went to the visible editor, where the focus was"
-    assert r["read"] == 0, "and the verification read the hidden one: 'composer holds 0 normalized chars'"
+    assert r["read"] == 0, "the verification reads the hidden one: 'composer holds 0 normalized chars'"
+    assert r["pasted"] == -1 and r["landed"] == 0, "and nothing is typed into a hidden editor any more"
 
 
 # ---- a follow-up with no --mention never opens the @ popup ---------------------------------------------
@@ -1011,7 +1014,7 @@ def test_the_mock_dom_reads_textcontent_like_a_browser_not_like_innertext():
     if not shutil.which("node"):
         pytest.skip("node not installed")
     tree = _popup_tree("Plugins", _app("WebCodex Demo", desc="Local demo"))
-    src = (_NODE_DOM + "var ROOT=build(" + json.dumps(tree) + ",null);"
+    src = (open(os.path.join(ROOT, "tests", "authority_shim.js")).read().replace("process.env.CGC_FIXTURE_DOM", json.dumps(os.path.join(ROOT, "skill", "scripts", "fixture_dom.js"))) + _NODE_DOM + "var ROOT=build(" + json.dumps(tree) + ",null);"
            "var e=document.querySelectorAll('[data-list-navigation-item]')[0];"
            "console.log(JSON.stringify([e.textContent,e.innerText]));")
     tc, it = json.loads(subprocess.run(["node", "-e", src], capture_output=True, text=True, check=True).stdout)

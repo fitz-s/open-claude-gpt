@@ -23,6 +23,10 @@ leaving the recorded state alone. Only a deterministic contract mismatch marks a
   cgc probe                    run every probe now, then print the capability states
   cgc probe --only reader      one probe (mention also runs the composer probe it needs)
   cgc probe --status           print the recorded states; no browser
+  cgc_probe.py --replay DIR    offline: the current contract against a drift bundle's saved page
+
+A break found on the confirming pass leaves a drift-repair bundle (cgc_drift): its path leads the
+recorded cause. Edit the contract ids it names in chatgpt_contract.json, replay, then probe.
 """
 from __future__ import annotations
 
@@ -52,9 +56,12 @@ LEGACY_MAX = 6_000        # a legacy (no marker) turn this short is not collapse
 RENDER_S = 30             # how long a loaded conversation may take to render its first user turn
 HYDRATE_S = 60            # how long the whole thread may take to hydrate before a miss is judged
 
-# What the send path's JS looks like (its button selector, a form submit). A probe step that would
-# evaluate one is refused; Enter is a key, refused in _NoSend.key.
-_SEND_JS = re.compile(r"send-button|requestSubmit|\.submit\(")
+# What the send path's JS looks like: the driver's send-authority mark (cdp._SEND_MARK, which only
+# the driver's send click carries), the send button's own selector, or a form submit. A probe step that would
+# evaluate one is refused; Enter is a key, refused in _NoSend.key. Every other click the probe makes
+# is also refused page-side by the driver's own __cgcMayClick.
+_SEND_JS = re.compile(re.escape(cdp._SEND_MARK) + "|" + re.escape(cdp._js_str(cdp._SEND_BUTTON_SEL))
+                      + r"|requestSubmit|\.submit\(")
 
 
 class SendRefused(AssertionError):
@@ -81,11 +88,23 @@ class Drift(Exception):
         self.cap, self.phase, self.cause = cap, phase, cause
 
 
-def _confirm(t, drift):
+def _confirm(t, drift, diagnose=False, **kw):
     """Every broken verdict passes here: the send path's own blocker rule (cdp._blocker) runs on the
-    page first, and a login wall, a challenge or a rate limit turns the verdict into Blocked."""
+    page first, and a login wall, a challenge or a rate limit turns the verdict into Blocked. On the
+    confirming pass (`diagnose`) the drift-repair bundle is written from the page, and its path
+    leads the recorded cause, so `cgc probe --status` names it."""
     b = cdp._blocker(t)
-    return Blocked(b) if b else drift
+    if b:
+        return Blocked(b)
+    drift.cause = _bundled(t, drift.cap, drift.cause, diagnose, **kw)
+    return drift
+
+
+def _bundled(t, cap, cause, diagnose, rid=None, snap=None, inputs=None):
+    """`cause`, led by the drift bundle's path when one was written for `cap` on `t`."""
+    path = (cdp._diagnose(t, cap, "UI_CONTRACT_BROKEN", cause, rid, snap=snap, inputs=inputs)
+            if diagnose else None)
+    return f"diagnosis {path}/diagnosis.json; {cause}" if path else cause
 
 
 class _NoSend:
@@ -129,16 +148,18 @@ def _close(raw):
         raw.close()
 
 
-def _cleared(t):
+def _cleared(t, diagnose=False):
     left = t.eval(cdp._clear_composer_js(), timeout=45)
     if left != 0:
-        raise _confirm(t, Drift("composer", "clear", f"the composer still holds {left} chars after a clear"))
+        raise _confirm(t, Drift("composer", "clear", f"the composer still holds {left} chars after a clear"),
+                       diagnose)
 
 
 # ---- composer + mention -------------------------------------------------------------------------
-def probe_composer(t, *, model, family, app):
+def probe_composer(t, *, model, family, app, diagnose=False):
     """{cap: (verdict, detail)} for a fresh project tab `t`; raises Drift/Transient for the composer.
-    The mention probe runs only once the composer has passed."""
+    The mention probe runs only once the composer has passed. `diagnose`: write a drift bundle for
+    a break (the confirming pass)."""
     ready, st = cdp._await_composer(t)
     if not ready:
         out = cdp._composer_outcome(st)
@@ -148,7 +169,8 @@ def probe_composer(t, *, model, family, app):
         # editor's markup moved. A page that never rendered the form says nothing about it.
         if out["reason"] == "composer_not_ready" and out.get("form"):
             raise _confirm(t, Drift("composer", "composer",
-                                    f"the app rendered but no composer editor (path {st.get('path')!r})"))
+                                    f"the app rendered but no composer editor (path {st.get('path')!r})"),
+                           diagnose)
         raise Transient(f"{out['reason']} (path {st.get('path')!r}, form={bool(out.get('form'))})")
     if st.get("blocker"):                   # a page showing a human condition proves nothing either way
         raise Blocked(st["blocker"])
@@ -161,27 +183,30 @@ def probe_composer(t, *, model, family, app):
         else:
             why = pick.error or f"wanted {model!r} on {family!r}; the picker shows {pick.shown!r}"
             b = cdp._blocker(t)
-            res["model"] = ("transient", "human:" + b, f"ChatGPT shows {b}") if b else ("broken", why)
+            res["model"] = (("transient", "human:" + b, f"ChatGPT shows {b}") if b
+                            else ("broken", _bundled(t, "model", why, diagnose, snap=pick.snap,
+                                                     inputs={"model": model, "family": family})))
     try:
         cdp._paste_prompt(t, DUMMY)
     except cdp._PreClickFailure as e:
         if e.__cause__ is not None:         # a CDP timeout or socket error, wrapped by the driver
             raise Transient(str(e)) from None
-        raise _confirm(t, Drift("composer", "paste", str(e))) from None
-    _cleared(t)
+        raise _confirm(t, Drift("composer", "paste", str(e)), diagnose) from None
+    _cleared(t, diagnose)
     res["composer"] = ("pass", f"{len(DUMMY)}-char draft pasted, read back whole, cleared")
     if app:
         try:
             cdp._insert_mention(t, app)
         except cdp._MentionFailure as e:
             if getattr(e, "drift", False):
-                raise _confirm(t, Drift("mention", "mention", str(e))) from None
+                raise _confirm(t, Drift("mention", "mention", str(e)), diagnose, snap=e.snap,
+                               inputs={"app": app}) from None
             res["mention"] = ("unestablished", str(e))   # this account's apps, not the page's markup
         except cdp._PreClickFailure as e:
             raise Transient(str(e)) from None
         else:
             res["mention"] = ("pass", f"@{app} chip confirmed")
-        _cleared(t)
+        _cleared(t, diagnose)
     return res
 
 
@@ -232,30 +257,31 @@ def pick_reader_round(s):
     return best[1] if best else None
 
 
-def _read(t, rid):
+def _read(t, rid, d=cdp):
     """One pass of the reads the send contract and the waiter make: (answer, miss), where miss is
-    (phase, cause) for the first read that came up empty, or None when the answer was read."""
-    t.eval(cdp._FORCE_RENDER_JS)
-    texts = t.eval(cdp._all_user_texts_js()) or []
-    loc = cdp._locate_source_turn(texts, rid)
+    (phase, cause) for the first read that came up empty, or None when the answer was read. `d` is
+    the driver module the reads come from (replay passes one loaded on an edited contract)."""
+    t.eval(d._FORCE_RENDER_JS)
+    texts = t.eval(d._all_user_texts_js()) or []
+    loc = d._locate_source_turn(texts, rid)
     if not loc["present"]:
         return "", ("rid", f"{rid}'s turn not identified among {len(texts)} user turns "
                            f"(the last reads as {loc['observed_rid'] or 'no rid'})")
     # The post-click send contract's own "ok": a turn family carries the rid AND shows an assistant
     # turn. A send landing on a page that fails this ends unknown_send or selector_drift.
-    contract = json.loads(t.eval(cdp._contract_js(rid)) or "{}")
+    contract = json.loads(t.eval(d._contract_js(rid)) or "{}")
     if not any(f.get("ridLanded") and f.get("assistants", 0) > 0 for f in contract.get("families", [])):
         return "", ("contract", f"the send contract would not confirm {rid} on its own finished "
                                 f"thread: {json.dumps(contract)[:300]}")
-    st = json.loads(t.eval(cdp._detect_js(rid, scoped=True)) or "{}")
-    ans = (t.eval(cdp._extract_js(rid, scoped=True)) or "") if st.get("done") else ""
+    st = json.loads(t.eval(d._detect_js(rid, scoped=True)) or "{}")
+    ans = (t.eval(d._extract_js(rid, scoped=True)) or "") if st.get("done") else ""
     if ans:
         return ans, None
     return "", ("answer", f"no wrapped answer read for {rid} (node={st.get('node')} "
                           f"len={st.get('len')} done={st.get('done')})")
 
 
-def probe_reader(t, rid, marker=True, settle=None):
+def probe_reader(t, rid, marker=True, settle=None, diagnose=False):
     """The answer's length, or Drift/Transient. `t` is a tab on rid's finished conversation.
 
     The reads are polled for `settle` seconds (default HYDRATE_S): a re-opened thread renders its
@@ -295,7 +321,7 @@ def probe_reader(t, rid, marker=True, settle=None):
     if not (settled or _hydrated(t)):
         raise Transient(f"{rid} not read ({phase}: {cause}); the page never settled")
     if (marker or phase != "rid") and cdp._rid_in_main(t, rid):
-        raise Drift("reader", phase, cause)
+        raise Drift("reader", phase, _bundled(t, "reader", cause, diagnose, rid))
     raise Transient(f"{rid} not read ({phase}: {cause})")
 
 
@@ -336,9 +362,10 @@ def _composer_caps(model, app):
             + (("mention",) if app else ()))
 
 
-def _attempt(composer, reader, pick, *, model, family, app):
+def _attempt(composer, reader, pick, *, model, family, app, diagnose=False):
     """{cap: (verdict, phase, detail)} for one pass of the composer (+ mention when `app`) and/or the
-    reader probe; verdict: pass, broken, unestablished or transient."""
+    reader probe; verdict: pass, broken, unestablished or transient. `diagnose`: the confirming pass,
+    which writes a drift bundle for each break while its tab is still open."""
     out = {}
 
     def run(caps, fn):
@@ -365,7 +392,7 @@ def _attempt(composer, reader, pick, *, model, family, app):
         def composer_probe():
             t, raw = _open(os.environ.get("CGC_PROJECT_URL", cdp.CGC_PROJECT_URL))
             try:
-                return probe_composer(t, model=model, family=family, app=app)
+                return probe_composer(t, model=model, family=family, app=app, diagnose=diagnose)
             finally:
                 _close(raw)
         run(_composer_caps(model, app), composer_probe)
@@ -388,7 +415,7 @@ def _attempt(composer, reader, pick, *, model, family, app):
                         raise Transient(f"conversation {pick['conversation']} became active")
                 t, raw = _open(f"https://chatgpt.com/c/{pick['conversation']}")
                 try:
-                    n = probe_reader(t, pick["rid"], marker=pick["kind"] == "marker")
+                    n = probe_reader(t, pick["rid"], marker=pick["kind"] == "marker", diagnose=diagnose)
                 finally:
                     _close(raw)
             finally:
@@ -425,7 +452,7 @@ def run_probe(only=None, mention=None) -> dict:
         bad = {c for c, v in res.items() if v[0] in ("broken", "transient")}
         if bad:
             res.update(_attempt(bool(bad - {"reader"}), "reader" in bad, pick,
-                                model=model, family=family, app=app))
+                                model=model, family=family, app=app, diagnose=True))
     finally:
         lease.close()
     rev = cgc_backend.driver_rev()
@@ -484,6 +511,103 @@ def print_states(report=None) -> int:
     return 1 if any(v["verdict"] == "transient" for v in (report or {}).values()) else 0
 
 
+# ---- replay: an edited contract against a saved incident, offline -------------------------------
+def _driver(contract):
+    """A fresh cdp_consult module reading `contract` (the one under test), never the running one."""
+    import importlib.util
+    prev = os.environ.get("CGC_CONTRACT")
+    os.environ["CGC_CONTRACT"] = os.path.abspath(contract)
+    try:
+        spec = importlib.util.spec_from_file_location("_cgc_replay_driver", cdp.__file__)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        if prev is None:
+            os.environ.pop("CGC_CONTRACT", None)
+        else:
+            os.environ["CGC_CONTRACT"] = prev
+
+
+def _replay_check(drv, cap, tab, diag):
+    """(ok, detail): the capability's own decision on the fixture, through the driver `drv`."""
+    inp = diag.get("inputs") or {}
+    if cap == "reader":
+        if not diag.get("rid"):
+            return False, "the bundle names no rid to read"
+        ans, miss = _read(tab, diag["rid"], drv)
+        return (True, f"{len(ans)}-char answer read for {diag['rid']}") if not miss else \
+            (False, f"{miss[0]}: {miss[1]}")
+    if cap == "composer":
+        ok = tab.eval("(function(){" + drv._COMPOSER_RESOLVE_JS + "return !!__cg();})()")
+        return bool(ok), "the composer resolves" if ok else "no visible composer editor inside a form"
+    if cap == "model":
+        # _select_model's own rules, on the one picker the fixture holds: the tier by
+        # _slider_state_label's source chain (or, with no slider, a flat item _matches accepts),
+        # and the family settled exactly as it settles there — the radios offer it, or the
+        # picker renders no family control (legacy), or there is no picker and the tier is a flat
+        # item (the pre-picker composer). A failed or ambiguous radio read never settles it.
+        st = tab.eval(drv._PICKER_STATE_JS)
+        obs = drv._family_obs(st)
+        fam, tier = inp.get("family"), inp.get("model")
+        want_family = bool(fam) and str(fam).strip().lower() != "skip"
+        slider = isinstance(st, dict) and st.get("now") is not None
+        items = [] if slider else (tab.eval(drv._FLAT_ITEMS_JS) or [])
+        if not tier or str(tier).lower() == "skip":
+            tier_ok, tier_why = True, "no tier pinned"
+        elif slider:
+            # A read that lands on a family radio's label (the fallback's first group line, on a
+            # GPT-6 picker whose announcement moved) is the family, not a tier.
+            lab = drv._slider_state_label(st)
+            if lab in {x for x, _chk in obs.entries}:
+                lab = ""
+            tier_ok, tier_why = bool(lab), (f"the slider reads tier {lab!r}" if lab else
+                                            "the tier slider's announcement is unreadable")
+        else:
+            tier_ok = any(drv._matches(x, tier) for x in items)
+            tier_why = (f"the menu offers {tier!r} as an item" if tier_ok else
+                        f"no tier slider and no {tier!r} item (items {items[:8]!r})")
+        if not want_family:
+            fam_ok, fam_why = True, "no family pinned"
+        elif obs.status == "family":
+            fam_ok = any(drv._is_family(lab, fam) for lab, _chk in obs.entries)
+            fam_why = f"family {fam!r} {'offered' if fam_ok else 'not offered'} ({[lab for lab, _ in obs.entries]})"
+        elif obs.status == "legacy" or (obs.status == "absent" and not slider and tier_ok):
+            fam_ok, fam_why = True, f"no family control ({obs.status}): the pre-GPT-6 composer"
+        else:
+            fam_ok, fam_why = False, f"the family control did not read ({obs.status}: {obs.detail})"
+        return fam_ok and tier_ok, f"{fam_why}; {tier_why} (the walk itself is live-only)"
+    if cap == "mention":
+        if not inp.get("app"):
+            return False, "the bundle names no app to find"
+        r = tab.eval(drv._mention_pick_js(inp["app"], "cgc-replay")) or {}
+        return bool(r.get("hit")), (f"the popup offers {inp['app']!r} as a connected app" if r.get("hit")
+                                    else f"no app row for {inp['app']!r} (popup open={r.get('open')})")
+    return False, f"no replay for {cap!r}"
+
+
+def replay(incident, contract=None) -> dict:
+    """Run the failed capability's own check against the incident's fixture under `contract`
+    (default: the installed chatgpt_contract.json, i.e. the copy an agent just edited). Offline: the
+    page is the saved fixture in node, nothing reaches Chrome or the network. {ok, capability,
+    contradicted, matches, detail}; ok means the needed contract selectors match the fixture AND
+    the capability's own decision passes (the reader reads the rid's answer through the send
+    contract, the composer resolves, the picker offers the family, the popup offers the app)."""
+    import cgc_drift
+    diag, fixture = cgc_drift.load(incident)
+    drv = _driver(contract or cdp.CONTRACT_PATH)
+    cap = diag["capability"]
+    tab = cgc_drift.FixtureTab(fixture, (diag.get("observed") or {}).get("path") or "/")
+    counts = tab.eval(cgc_drift.counts_js(drv.UI, cap))
+    bad = cgc_drift.contradicted(drv.UI, cap, counts)
+    detail = f"unmatched contract ids: {bad}"
+    if not bad:
+        ok, detail = _replay_check(drv, cap, tab, diag)
+        bad = [] if ok else [cap]
+    return {"ok": not bad, "capability": cap, "contradicted": bad, "detail": detail,
+            "matches": [{"id": c[0], "matches": c[2]} for c in counts]}
+
+
 def main() -> int:
     # The daemon ends a probe it owns with SIGTERM (shutdown, or the timeout). Raised as SystemExit,
     # so every `finally` runs: the probe's own tab is closed and its leases released; nothing is
@@ -496,7 +620,16 @@ def main() -> int:
                    help="the app the mention probe inserts (default: the app a recorded mention "
                         "failure names, else the first CGC_APPS app)")
     p.add_argument("--status", action="store_true", help="print the recorded states; no browser")
+    p.add_argument("--replay", metavar="INCIDENT_DIR",
+                   help="offline: check chatgpt_contract.json against a drift bundle's fixture; no browser")
+    p.add_argument("--contract", metavar="FILE", help="with --replay: the contract copy to check")
     a = p.parse_args()
+    if a.replay:
+        r = replay(a.replay, a.contract)
+        print(json.dumps(r, sort_keys=True))
+        sys.stderr.write(f"CGC_REPLAY {r['capability']}: {'PASS' if r['ok'] else 'FAIL'} — {r['detail']}"
+                         + (" — now `cgc probe` for the live check\n" if r["ok"] else "\n"))
+        return 0 if r["ok"] else 3
     return print_states(None if a.status else run_probe(a.only, a.mention))
 
 

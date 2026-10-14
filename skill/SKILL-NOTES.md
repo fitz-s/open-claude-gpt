@@ -89,6 +89,8 @@ sentinels" / "Why force-render before reading" for the mechanics.
 | `scripts/cgc_spool.py` | The egress gate + the agent-facing `enqueue`/`await`/`status`/`cancel` CLI |
 | `scripts/cgc_daemon.py` | The egress daemon (launchd): claims rounds, runs the gate, drives CDP |
 | `scripts/cdp_consult.py` | Browser adapter: `submit`/`followup`/`wait` — daemon-invoked |
+| `scripts/chatgpt_contract.json` | Every ChatGPT DOM fact the adapter reads; a UI change is fixed here |
+| `scripts/cgc_probe.py` + `cgc_drift.py` + `fixture_dom.js` | No-send UI probe, drift-repair bundle, offline `--replay` |
 | `scripts/cdp_launch.sh` | One-time dedicated debug-Chrome launcher (login probe, loopback origin) |
 | `scripts/cgc_doctor.py` | Health check, for humans (never a pre-fire step for the agent) |
 | `bin/cgc` | Human CLI dispatcher over all of the above |

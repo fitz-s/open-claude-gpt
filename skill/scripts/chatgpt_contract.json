@@ -1,0 +1,187 @@
+{
+  "schema": "cgc.contract.v1",
+  "note": "Every ChatGPT DOM fact the driver reads. Data only: CSS selectors, attribute names and plain labels, each of the type cdp_consult._CONTRACT_SCHEMA declares (the loader refuses anything else). A UI change is fixed here; a changed widget protocol, and what may be clicked to send, are code.",
+  "facts": {
+    "turn_schemas": {
+      "value": [
+        {
+          "adapter": "legacy-author-role-v1",
+          "attr": "data-message-author-role",
+          "level": "message",
+          "role_from": "value",
+          "send_rank": 1
+        },
+        {
+          "adapter": "data-turn-v1",
+          "attr": "data-turn",
+          "level": "turn",
+          "role_from": "value",
+          "send_rank": 0
+        },
+        {
+          "adapter": "search-unit-v1",
+          "attr": "data-chatgpt-search-unit-key",
+          "level": "message",
+          "role_from": "last_colon_segment",
+          "send_rank": 2
+        }
+      ],
+      "why": "Message units, one schema per UI generation. Readers union them in list order (the first attribute present names the role); the send contract tries them one at a time by send_rank, never unioned (data-turn first: that build keeps author-role on the user node only). role_from 'value': attr=\"user|assistant\"; 'last_colon_segment': attr=\"<turn>:<n>:user|assistant\". level 'turn' tags the turn wrapper, 'message' the message itself. author-role 2026-07-01; data-turn ~2026-08; search-unit 2026-09-24."
+    },
+    "assistant_body": {
+      "value": {
+        "attr": "data-markdown-text-style",
+        "value": "assistant-message"
+      },
+      "why": "The answer's markdown body inside an assistant unit; attachment cards follow it in the same unit (2026-09-24)."
+    },
+    "turn_container": {
+      "value": "[data-turn-key]",
+      "why": "The turn wrapper holding a user unit, its answer and its activity header, where the failure marker lives (2026-09-25)."
+    },
+    "conversation_root": {
+      "value": "main",
+      "why": "The conversation region; the sidebar's thread titles are outside it (2026-07)."
+    },
+    "failure_markers": {
+      "value": [
+        "Thinking failed",
+        "Something went wrong",
+        "Network error",
+        "Message stream error"
+      ],
+      "why": "Whole text of a leaf status element in the turn, outside any message body, when a turn will never answer (2026-09-25)."
+    },
+    "model_slug_attr": {
+      "value": "data-message-model-slug",
+      "why": "The producing model's slug on the answer's message node (2026-09-06)."
+    },
+    "composer": {
+      "value": "div[role=\"textbox\"][contenteditable=\"true\"],#prompt-textarea",
+      "why": "The ProseMirror editor; the visible one inside a form is the composer (2026-07-01)."
+    },
+    "composer_exclude_ancestor": {
+      "value": "article,[data-message-author-role]",
+      "why": "An editor inside a message is an edit-message box, not the composer (2026-07)."
+    },
+    "trailing_break_class": {
+      "value": "ProseMirror-trailingBreak",
+      "why": "The editor's placeholder <br> that keeps an empty or line-final block open; not payload (2026-10-13)."
+    },
+    "mention_chip_attr": {
+      "value": "app-mention-name",
+      "why": "A picked app becomes <span app-mention-name> in the composer; a file row does not (2026-09-29)."
+    },
+    "mention_chip_label_attr": {
+      "value": "app-mention-display-name",
+      "why": "The chip's display name, preferred over app-mention-name (2026-09-29)."
+    },
+    "mention_popup_attr": {
+      "value": "data-mention-list-scroll-area",
+      "why": "The @ popup's scroll area; the popup carries no ARIA roles (2026-09-29)."
+    },
+    "mention_option_attr": {
+      "value": "data-list-navigation-item",
+      "why": "Every popup row (plugin, file, action) is a <button> with this attribute (2026-09-29)."
+    },
+    "mention_row_content_attr": {
+      "value": "data-menu-row-content",
+      "why": "A row's content block: leading icon, then label and description (2026-09-29)."
+    },
+    "mention_description_class": {
+      "value": "text-codex-description",
+      "why": "Class of a row's description element (2026-09-29)."
+    },
+    "mention_loading": {
+      "value": "[role=\"status\"]",
+      "why": "The popup's 'Loading suggestions' skeleton (2026-09-29)."
+    },
+    "picker_owner": {
+      "value": "[data-testid=\"composer-intelligence-picker-content\"]",
+      "why": "The open model picker's group holding the family radios and the tier slider (2026-08-18)."
+    },
+    "picker_menu": {
+      "value": "[role=\"menu\"]",
+      "why": "A Radix menu; the picker is the one holding a slider when the owner testid is absent (2026-08-18)."
+    },
+    "picker_slider": {
+      "value": "[role=\"slider\"]",
+      "why": "The tier slider (aria-valuenow 0..4, Pro = 4) inside the picker menu (2026-08-18)."
+    },
+    "picker_menuitem": {
+      "value": "[role=\"menuitem\"]",
+      "why": "The slider's wrapper row; its aria-describedby targets carry the tier announcement (2026-09-06)."
+    },
+    "picker_family_radio": {
+      "value": "[role=\"menuitemradio\"]",
+      "why": "A model family radio (aria-checked) in the picker owner (2026-09-06)."
+    },
+    "picker_radio_scaffold": {
+      "value": "[role=\"radiogroup\"],[role=\"radio\"]",
+      "why": "Radio-group chrome; present with no readable radio means half-rendered (2026-09-06)."
+    },
+    "picker_flat_items": {
+      "value": "[role=\"menuitem\"],[role=\"option\"],[role=\"menuitemradio\"]",
+      "why": "The flat-menu layout where a tier is a plain item (pre-2026-08-18 builds, and the effort submenu)."
+    },
+    "picker_submenu_trigger": {
+      "value": "[role=\"menu\"] [role=\"menuitem\"][aria-haspopup=\"menu\"]",
+      "why": "An Effort/Model row that opens a submenu (2026-08-18; none on the 2026-09-06 build)."
+    },
+    "picker_open_trigger": {
+      "value": "button[aria-expanded=\"true\"]",
+      "why": "The composer switcher whose menu is open, read within the form (2026-08-28)."
+    },
+    "picker_open_menus": {
+      "value": "[role=\"menu\"][data-state=\"open\"],[role=\"menu\"]:not([data-state])",
+      "why": "Menus an Escape is dispatched at; Radix keeps closed ones mounted (2026-09-06)."
+    },
+    "switcher_labels": {
+      "value": [
+        "Instant",
+        "Medium",
+        "High",
+        "Extra High",
+        "Pro",
+        "Auto",
+        "Thinking",
+        "GPT",
+        "ChatGPT"
+      ],
+      "why": "Leading text of a composer model/tier switcher button (case-sensitive prefix; version-shaped labels like '5.5' and 'o3' are matched by code). Tiers 2026-08-18, GPT badge 2026-09-06."
+    },
+    "family_aliases": {
+      "value": {
+        "Latest": "GPT-6"
+      },
+      "why": "Observed family radio label -> the family it is. 'Latest' was relabelled 'GPT-6' in 2026-10, same model, same slot."
+    },
+    "blocker_login": {
+      "value": "input[type=\"password\"]",
+      "why": "A login form on the page (2026-07-01)."
+    },
+    "blocker_login_paths": {
+      "value": [
+        "auth",
+        "login"
+      ],
+      "why": "First path segment of a login page (2026-07-01)."
+    },
+    "blocker_captcha": {
+      "value": "iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]",
+      "why": "A captcha or challenge frame (2026-07)."
+    },
+    "blocker_alert": {
+      "value": "[role=\"alert\"]",
+      "why": "Where a rate-limit notice is shown (2026-07-01)."
+    },
+    "rate_limit_phrases": {
+      "value": [
+        "rate limit",
+        "too many requests",
+        "usage limit"
+      ],
+      "why": "Case-insensitive phrases in the alert that mean a rate limit (2026-07-01)."
+    }
+  }
+}

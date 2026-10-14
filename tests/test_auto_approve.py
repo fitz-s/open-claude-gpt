@@ -23,7 +23,7 @@ function node(tag,text,kids){var n={tag:tag,own:text||'',children:kids||[],
   hidden:false,getBoundingClientRect:function(){return this.hidden?{width:0,height:0}:{width:1,height:1}},
   click:function(){this.clicked++},
   querySelectorAll:function(){var o=[];(function w(x){x.children.forEach(function(k){if(k.tag==='button')o.push(k);w(k);})})(this);return o;}};
-  n.children.forEach(function(k){k.parentElement=n});return n;}
+  n.children.forEach(function(k){k.parentElement=n});return AUTH(n);}
 function btn(t){return node('button',t)}
 """
 
@@ -31,7 +31,7 @@ function btn(t){return node('button',t)}
 def _run(setup, allow):
     if not shutil.which("node"):
         pytest.skip("node not installed")
-    src = (_DOM + setup + "\nvar document={querySelectorAll:function(){return ROOT.querySelectorAll()}};"
+    src = (open(os.path.join(ROOT, "tests", "authority_shim.js")).read().replace("process.env.CGC_FIXTURE_DOM", json.dumps(os.path.join(ROOT, "skill", "scripts", "fixture_dom.js"))) + _DOM + setup + "\nvar document={querySelectorAll:function(){return ROOT.querySelectorAll()}};"
            "var r=" + CDP._approval_js(allow) + ";"
            "console.log(JSON.stringify({r:r,clicks:ROOT.querySelectorAll().map(function(b){return b.clicked})}));")
     return json.loads(subprocess.run(["node", "-e", src], capture_output=True, text=True,
@@ -98,3 +98,12 @@ def test_two_stacked_cards_never_lend_one_card_the_other_apps_name():
              "var ROOT=node('body','',[node('div','',[c1,c2])]);")
     out = _run(setup, ["WebCodex Demo"])
     assert out["clicks"][1] == 0, "Canva's Allow once must never be clicked"
+
+
+def test_no_contract_edit_can_make_an_approval_click_hit_send(tmp_path):
+    """Review 2026-10-14: allow labels in the editable contract set to ['send'] made the approval
+    click hit the composer's send button. The labels are code now, and the approval search skips
+    anything inside a form (the composer)."""
+    assert not any(k.startswith("approval_") for k in CDP.UI)
+    js = CDP._approval_js(["WebCodex Demo"])
+    assert "'send'" not in js.lower() and "closest('form')" in js
