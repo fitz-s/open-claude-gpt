@@ -6,6 +6,21 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Added — one UI contract, and a repair bundle when ChatGPT's page changes
+
+- Every ChatGPT DOM fact the driver reads (turn schemas, answer body, composer, send/stop buttons,
+  mention popup and chip, model picker, family label aliases, failure markers, blockers) is now one
+  entry in `skill/scripts/chatgpt_contract.json`. `cdp_consult.py` builds its page JS from it.
+  `cgc_probe.py` imports the driver's reads and defines no selector of its own. A test fails if a
+  contract-owned literal reappears in either file.
+- A break the probe confirms, or a send refused with `model_not_selectable`, `composer_not_ready`
+  or a mention drift, writes `<data dir>/incidents/<id>/diagnosis.json` (`cgc.drift.v1`, at most
+  8 KB) and a sanitized `fixture.html`. The bundle holds per-selector match counts, nearby candidate
+  selectors, the contract ids to edit and the commands that check the edit. Its path leads the
+  recorded cause and appears in the daemon log.
+- `cgc_probe.py --replay <incident>` runs the capability's reads against the fixture in node,
+  offline, under the current (edited) contract.
+
 ### Fixed — the send boundary claims only what it can prove
 
 - An unknown reply from the send eval (none, an exception, an unlisted token) used to exit 6, "proven

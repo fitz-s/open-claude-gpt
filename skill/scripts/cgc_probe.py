@@ -23,6 +23,10 @@ leaving the recorded state alone. Only a deterministic contract mismatch marks a
   cgc probe                    run every probe now, then print the capability states
   cgc probe --only reader      one probe (mention also runs the composer probe it needs)
   cgc probe --status           print the recorded states; no browser
+  cgc_probe.py --replay DIR    offline: the current contract against a drift bundle's saved page
+
+A break found on the confirming pass leaves a drift-repair bundle (cgc_drift): its path leads the
+recorded cause. Edit the contract ids it names in chatgpt_contract.json, replay, then probe.
 """
 from __future__ import annotations
 
@@ -54,7 +58,7 @@ HYDRATE_S = 60            # how long the whole thread may take to hydrate before
 
 # What the send path's JS looks like (its button selector, a form submit). A probe step that would
 # evaluate one is refused; Enter is a key, refused in _NoSend.key.
-_SEND_JS = re.compile(r"send-button|requestSubmit|\.submit\(")
+_SEND_JS = re.compile(re.escape(cdp._js_str(cdp.UI["send_button"])) + r"|requestSubmit|\.submit\(")
 
 
 class SendRefused(AssertionError):
@@ -81,11 +85,22 @@ class Drift(Exception):
         self.cap, self.phase, self.cause = cap, phase, cause
 
 
-def _confirm(t, drift):
+def _confirm(t, drift, diagnose=False):
     """Every broken verdict passes here: the send path's own blocker rule (cdp._blocker) runs on the
-    page first, and a login wall, a challenge or a rate limit turns the verdict into Blocked."""
+    page first, and a login wall, a challenge or a rate limit turns the verdict into Blocked. On the
+    confirming pass (`diagnose`) the drift-repair bundle is written from the page, and its path
+    leads the recorded cause, so `cgc probe --status` names it."""
     b = cdp._blocker(t)
-    return Blocked(b) if b else drift
+    if b:
+        return Blocked(b)
+    drift.cause = _bundled(t, drift.cap, drift.cause, diagnose)
+    return drift
+
+
+def _bundled(t, cap, cause, diagnose, rid=None):
+    """`cause`, led by the drift bundle's path when one was written for `cap` on `t`."""
+    path = cdp._diagnose(t, cap, "UI_CONTRACT_BROKEN", cause, rid) if diagnose else None
+    return f"diagnosis {path}/diagnosis.json; {cause}" if path else cause
 
 
 class _NoSend:
@@ -136,9 +151,10 @@ def _cleared(t):
 
 
 # ---- composer + mention -------------------------------------------------------------------------
-def probe_composer(t, *, model, family, app):
+def probe_composer(t, *, model, family, app, diagnose=False):
     """{cap: (verdict, detail)} for a fresh project tab `t`; raises Drift/Transient for the composer.
-    The mention probe runs only once the composer has passed."""
+    The mention probe runs only once the composer has passed. `diagnose`: write a drift bundle for
+    a break (the confirming pass)."""
     ready, st = cdp._await_composer(t)
     if not ready:
         out = cdp._composer_outcome(st)
@@ -148,7 +164,8 @@ def probe_composer(t, *, model, family, app):
         # editor's markup moved. A page that never rendered the form says nothing about it.
         if out["reason"] == "composer_not_ready" and out.get("form"):
             raise _confirm(t, Drift("composer", "composer",
-                                    f"the app rendered but no composer editor (path {st.get('path')!r})"))
+                                    f"the app rendered but no composer editor (path {st.get('path')!r})"),
+                           diagnose)
         raise Transient(f"{out['reason']} (path {st.get('path')!r}, form={bool(out.get('form'))})")
     if st.get("blocker"):                   # a page showing a human condition proves nothing either way
         raise Blocked(st["blocker"])
@@ -161,13 +178,14 @@ def probe_composer(t, *, model, family, app):
         else:
             why = pick.error or f"wanted {model!r} on {family!r}; the picker shows {pick.shown!r}"
             b = cdp._blocker(t)
-            res["model"] = ("transient", "human:" + b, f"ChatGPT shows {b}") if b else ("broken", why)
+            res["model"] = (("transient", "human:" + b, f"ChatGPT shows {b}") if b
+                            else ("broken", _bundled(t, "model", why, diagnose)))
     try:
         cdp._paste_prompt(t, DUMMY)
     except cdp._PreClickFailure as e:
         if e.__cause__ is not None:         # a CDP timeout or socket error, wrapped by the driver
             raise Transient(str(e)) from None
-        raise _confirm(t, Drift("composer", "paste", str(e))) from None
+        raise _confirm(t, Drift("composer", "paste", str(e)), diagnose) from None
     _cleared(t)
     res["composer"] = ("pass", f"{len(DUMMY)}-char draft pasted, read back whole, cleared")
     if app:
@@ -175,7 +193,7 @@ def probe_composer(t, *, model, family, app):
             cdp._insert_mention(t, app)
         except cdp._MentionFailure as e:
             if getattr(e, "drift", False):
-                raise _confirm(t, Drift("mention", "mention", str(e))) from None
+                raise _confirm(t, Drift("mention", "mention", str(e)), diagnose) from None
             res["mention"] = ("unestablished", str(e))   # this account's apps, not the page's markup
         except cdp._PreClickFailure as e:
             raise Transient(str(e)) from None
@@ -232,30 +250,31 @@ def pick_reader_round(s):
     return best[1] if best else None
 
 
-def _read(t, rid):
+def _read(t, rid, d=cdp):
     """One pass of the reads the send contract and the waiter make: (answer, miss), where miss is
-    (phase, cause) for the first read that came up empty, or None when the answer was read."""
-    t.eval(cdp._FORCE_RENDER_JS)
-    texts = t.eval(cdp._all_user_texts_js()) or []
-    loc = cdp._locate_source_turn(texts, rid)
+    (phase, cause) for the first read that came up empty, or None when the answer was read. `d` is
+    the driver module the reads come from (replay passes one loaded on an edited contract)."""
+    t.eval(d._FORCE_RENDER_JS)
+    texts = t.eval(d._all_user_texts_js()) or []
+    loc = d._locate_source_turn(texts, rid)
     if not loc["present"]:
         return "", ("rid", f"{rid}'s turn not identified among {len(texts)} user turns "
                            f"(the last reads as {loc['observed_rid'] or 'no rid'})")
     # The post-click send contract's own "ok": a turn family carries the rid AND shows an assistant
     # turn. A send landing on a page that fails this ends unknown_send or selector_drift.
-    contract = json.loads(t.eval(cdp._contract_js(rid)) or "{}")
+    contract = json.loads(t.eval(d._contract_js(rid)) or "{}")
     if not any(f.get("ridLanded") and f.get("assistants", 0) > 0 for f in contract.get("families", [])):
         return "", ("contract", f"the send contract would not confirm {rid} on its own finished "
                                 f"thread: {json.dumps(contract)[:300]}")
-    st = json.loads(t.eval(cdp._detect_js(rid, scoped=True)) or "{}")
-    ans = (t.eval(cdp._extract_js(rid, scoped=True)) or "") if st.get("done") else ""
+    st = json.loads(t.eval(d._detect_js(rid, scoped=True)) or "{}")
+    ans = (t.eval(d._extract_js(rid, scoped=True)) or "") if st.get("done") else ""
     if ans:
         return ans, None
     return "", ("answer", f"no wrapped answer read for {rid} (node={st.get('node')} "
                           f"len={st.get('len')} done={st.get('done')})")
 
 
-def probe_reader(t, rid, marker=True, settle=None):
+def probe_reader(t, rid, marker=True, settle=None, diagnose=False):
     """The answer's length, or Drift/Transient. `t` is a tab on rid's finished conversation.
 
     The reads are polled for `settle` seconds (default HYDRATE_S): a re-opened thread renders its
@@ -295,7 +314,7 @@ def probe_reader(t, rid, marker=True, settle=None):
     if not (settled or _hydrated(t)):
         raise Transient(f"{rid} not read ({phase}: {cause}); the page never settled")
     if (marker or phase != "rid") and cdp._rid_in_main(t, rid):
-        raise Drift("reader", phase, cause)
+        raise Drift("reader", phase, _bundled(t, "reader", cause, diagnose, rid))
     raise Transient(f"{rid} not read ({phase}: {cause})")
 
 
@@ -336,9 +355,10 @@ def _composer_caps(model, app):
             + (("mention",) if app else ()))
 
 
-def _attempt(composer, reader, pick, *, model, family, app):
+def _attempt(composer, reader, pick, *, model, family, app, diagnose=False):
     """{cap: (verdict, phase, detail)} for one pass of the composer (+ mention when `app`) and/or the
-    reader probe; verdict: pass, broken, unestablished or transient."""
+    reader probe; verdict: pass, broken, unestablished or transient. `diagnose`: the confirming pass,
+    which writes a drift bundle for each break while its tab is still open."""
     out = {}
 
     def run(caps, fn):
@@ -365,7 +385,7 @@ def _attempt(composer, reader, pick, *, model, family, app):
         def composer_probe():
             t, raw = _open(os.environ.get("CGC_PROJECT_URL", cdp.CGC_PROJECT_URL))
             try:
-                return probe_composer(t, model=model, family=family, app=app)
+                return probe_composer(t, model=model, family=family, app=app, diagnose=diagnose)
             finally:
                 _close(raw)
         run(_composer_caps(model, app), composer_probe)
@@ -388,7 +408,7 @@ def _attempt(composer, reader, pick, *, model, family, app):
                         raise Transient(f"conversation {pick['conversation']} became active")
                 t, raw = _open(f"https://chatgpt.com/c/{pick['conversation']}")
                 try:
-                    n = probe_reader(t, pick["rid"], marker=pick["kind"] == "marker")
+                    n = probe_reader(t, pick["rid"], marker=pick["kind"] == "marker", diagnose=diagnose)
                 finally:
                     _close(raw)
             finally:
@@ -425,7 +445,7 @@ def run_probe(only=None, mention=None) -> dict:
         bad = {c for c, v in res.items() if v[0] in ("broken", "transient")}
         if bad:
             res.update(_attempt(bool(bad - {"reader"}), "reader" in bad, pick,
-                                model=model, family=family, app=app))
+                                model=model, family=family, app=app, diagnose=True))
     finally:
         lease.close()
     rev = cgc_backend.driver_rev()
@@ -484,6 +504,42 @@ def print_states(report=None) -> int:
     return 1 if any(v["verdict"] == "transient" for v in (report or {}).values()) else 0
 
 
+# ---- replay: an edited contract against a saved incident, offline -------------------------------
+def _driver(contract):
+    """A fresh cdp_consult module reading `contract` (the one under test), never the running one."""
+    import importlib.util
+    os.environ["CGC_CONTRACT"] = os.path.abspath(contract)
+    try:
+        spec = importlib.util.spec_from_file_location("_cgc_replay_driver", cdp.__file__)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        os.environ.pop("CGC_CONTRACT", None)
+
+
+def replay(incident, contract=None) -> dict:
+    """Run the failed capability's own reads against the incident's fixture under `contract`
+    (default: the installed chatgpt_contract.json, i.e. the copy an agent just edited). Offline: the
+    page is the saved fixture in node, nothing reaches Chrome or the network. {ok, capability,
+    contradicted, matches, detail}; ok means every selector fact the capability reads matches the
+    fixture and, for the reader, the incident rid's answer is read through the send contract."""
+    import cgc_drift
+    diag, fixture = cgc_drift.load(incident)
+    drv = _driver(contract or cdp.CONTRACT_PATH)
+    cap = diag["capability"]
+    tab = cgc_drift.FixtureTab(fixture, (diag.get("observed") or {}).get("path") or "/")
+    counts = tab.eval(cgc_drift.counts_js(drv.UI, cap))
+    bad = cgc_drift.contradicted(drv.UI, cap, counts)
+    detail = f"unmatched contract ids: {bad}" if bad else "every contract selector matches the fixture"
+    if not bad and cap == "reader" and diag.get("rid"):
+        ans, miss = _read(tab, diag["rid"], drv)
+        bad = [] if not miss else ["reader:" + miss[0]]
+        detail = f"{len(ans)}-char answer read for {diag['rid']}" if not miss else f"{miss[0]}: {miss[1]}"
+    return {"ok": not bad, "capability": cap, "contradicted": bad, "detail": detail,
+            "matches": [{"id": c[0], "matches": c[2]} for c in counts]}
+
+
 def main() -> int:
     # The daemon ends a probe it owns with SIGTERM (shutdown, or the timeout). Raised as SystemExit,
     # so every `finally` runs: the probe's own tab is closed and its leases released; nothing is
@@ -496,7 +552,16 @@ def main() -> int:
                    help="the app the mention probe inserts (default: the app a recorded mention "
                         "failure names, else the first CGC_APPS app)")
     p.add_argument("--status", action="store_true", help="print the recorded states; no browser")
+    p.add_argument("--replay", metavar="INCIDENT_DIR",
+                   help="offline: check chatgpt_contract.json against a drift bundle's fixture; no browser")
+    p.add_argument("--contract", metavar="FILE", help="with --replay: the contract copy to check")
     a = p.parse_args()
+    if a.replay:
+        r = replay(a.replay, a.contract)
+        print(json.dumps(r, sort_keys=True))
+        sys.stderr.write(f"CGC_REPLAY {r['capability']}: {'PASS' if r['ok'] else 'FAIL'} — {r['detail']}"
+                         + (" — now `cgc probe` for the live check\n" if r["ok"] else "\n"))
+        return 0 if r["ok"] else 3
     return print_states(None if a.status else run_probe(a.only, a.mention))
 
 

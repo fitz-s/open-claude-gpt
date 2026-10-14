@@ -1575,6 +1575,10 @@ def _send_evidence(res: dict) -> dict:
     err = _stderr_error_line(res.get("stderr") or "")
     if err:
         ev["error"] = err[:300]
+    bundle = re.search(r"^CGC_DRIFT_BUNDLE \w+: (\S+/diagnosis\.json)", res.get("stderr") or "", re.M)
+    if bundle:                              # the driver's drift-repair bundle (cgc_drift) for this send
+        ev["diagnosis"] = bundle.group(1)
+        sys.stderr.write(f"CGC_UI_DIAGNOSIS {ev.get('reason') or '?'}: {bundle.group(1)}\n")
     return ev
 
 
