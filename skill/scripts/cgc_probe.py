@@ -180,7 +180,7 @@ def probe_composer(t, *, model, family, app, diagnose=False):
             why = pick.error or f"wanted {model!r} on {family!r}; the picker shows {pick.shown!r}"
             b = cdp._blocker(t)
             res["model"] = (("transient", "human:" + b, f"ChatGPT shows {b}") if b
-                            else ("broken", _bundled(t, "model", why, diagnose,
+                            else ("broken", _bundled(t, "model", why, diagnose, snap=pick.snap,
                                                      inputs={"model": model, "family": family})))
     try:
         cdp._paste_prompt(t, DUMMY)
@@ -546,9 +546,23 @@ def _replay_check(drv, cap, tab, diag):
             if obs.status != "family" or not hit:
                 return False, (f"family {fam!r} not offered (picker {obs.status}: "
                                f"{[lab for lab, _ in obs.entries]}{'; ' + obs.detail if obs.detail else ''})")
-        if not isinstance(st, dict) or st.get("now") is None:
-            return False, "the picker shows no tier slider"
-        return True, f"the picker offers {fam or 'its family'} and a tier slider (the tier walk is live-only)"
+        tier = inp.get("model")
+        if not tier or str(tier).lower() == "skip":
+            return True, f"the picker offers {fam!r}"
+        if isinstance(st, dict) and st.get("now") is not None:
+            # The slider path: the tier must be read by IDENTITY from the control (its describedby
+            # announcement, or the group's announcement line), as _slider_state_label reads it.
+            lab = (next((drv._announced_tier(x) for x in st.get("descs") or [] if drv._announced_tier(x)), "")
+                   or next((drv._announced_tier(x) for x in st.get("lines") or [] if drv._announced_tier(x)), ""))
+            if not lab:
+                return False, ("the tier slider's announcement is unreadable (descs "
+                               f"{st.get('descs')!r}, lines {st.get('lines')!r})")
+            return True, f"the picker offers {fam or 'its family'} and announces tier {lab!r} (the walk is live-only)"
+        # The flat-menu fallback: the tier is a plain item in the open menu.
+        items = tab.eval(drv._FLAT_ITEMS_JS) or []
+        if any(drv._matches(x, tier) for x in items):
+            return True, f"the menu offers tier {tier!r} as an item"
+        return False, f"no tier slider and no {tier!r} item in the menu (items {items[:8]!r})"
     if cap == "mention":
         if not inp.get("app"):
             return False, "the bundle names no app to find"

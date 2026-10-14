@@ -876,25 +876,19 @@ def _diagnose(c, cap, code, detail, rid=None, snap=None, inputs=None):
     """Write the drift-repair bundle (cgc_drift) for the page `c` shows: its incident dir, or None.
     Pre-click only, after a refusal, and fail-soft; skipped when the page shows a human condition,
     which says nothing about the contract. `snap`: a capture the failing step took before its own
-    cleanup (a mention). A model refusal has already closed its menu, so the picker is reopened —
-    the same open the selection walk performs, nothing selected — captured, and closed again.
-    `inputs`: what replay needs to re-run the capability's own check (the family, the app)."""
-    import cgc_drift
+    cleanup (a mention, the model picker while open: _ModelPick.snap). Otherwise the page is read as
+    it rests; nothing is opened, clicked or typed. `inputs`: what replay needs to re-run the
+    capability's own check (the family and tier, the app)."""
     try:
+        import cgc_drift
         if _blocker(c):
             return None
-        if snap is None and cap == "model":
-            opened = _reopen_picker(c, "") is not None
-            snap = cgc_drift.snapshot(c, UI, cap)
-            if opened:
-                _close_menus(c)
-        elif snap is None:
-            snap = cgc_drift.snapshot(c, UI, cap)
+        snap = snap or cgc_drift.snapshot(c, UI, cap)
+        path = cgc_drift.record(snap, UI, cap=cap, code=code, detail=detail,
+                                contract_path=CONTRACT_PATH, rid=rid, inputs=inputs)
     except Exception as e:                  # a diagnosis never changes the refusal it describes
-        sys.stderr.write(f"CGC_WARN drift capture for {cap} failed ({type(e).__name__}: {e})\n")
+        sys.stderr.write(f"CGC_WARN drift bundle for {cap} not written ({type(e).__name__}: {e})\n")
         return None
-    path = cgc_drift.record(snap, UI, cap=cap, code=code, detail=detail, contract_path=CONTRACT_PATH,
-                            rid=rid, inputs=inputs)
     if path:
         sys.stderr.write(f"CGC_DRIFT_BUNDLE {cap}: {path}/diagnosis.json — edit the contract ids it "
                          f"names, then `python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cgc_probe.py')} --replay {path}`\n")
@@ -1438,6 +1432,11 @@ def _open_cand_by_label_js(label):
         "return got;})()"
         % (_ALL_CAND_JS, t, _GESTURE)
     )
+
+
+# The first lines of the flat menu's items, read-only: what _click_item_js would choose among.
+_FLAT_ITEMS_JS = ("[].slice.call(document.querySelectorAll(" + _js_str(UI["picker_flat_items"])
+                  + ")).map(function(x){return (x.innerText||'').trim().split('\\n')[0];})")
 
 
 def _click_item_js(target):
@@ -2228,7 +2227,18 @@ def _close_menus(c):
     return c.eval(_DISMISS_JS) == 0
 
 
-_ModelPick = collections.namedtuple("_ModelPick", "confirmed shown badge error dirty")
+def _picker_snap(c):
+    """A read-only drift capture of the model picker as a refusal finds it, before its menu is
+    closed; fail-soft (None). Taken only on a refusal path, so a confirmed pick never pays for it."""
+    try:
+        import cgc_drift
+        return cgc_drift.snapshot(c, UI, "model")
+    except Exception:
+        return None
+
+
+_ModelPick = collections.namedtuple("_ModelPick", "confirmed shown badge error dirty snap",
+                                    defaults=(None,))
 """The whole verdict of one selection attempt, in one value, because it is now more than one fact:
 
   confirmed  the TIER is pinned to the target (and no family miss vetoed the run)
@@ -2248,6 +2258,8 @@ _ModelPick = collections.namedtuple("_ModelPick", "confirmed shown badge error d
              the first leaves a human believing an untouched tab. Never a receipt field — it is
              appended to the refusal sentence, because the receipt schema belongs to another
              change.
+  snap       on a refusal, the drift capture (cgc_drift) of the last picker this run saw open,
+             taken read-only before that menu was closed; None otherwise.
 """
 
 
@@ -2353,8 +2365,10 @@ def _select_model(c, target, family=None):
                     if fam.touched:
                         proven, _lab = _restore_original(c, lab, orig_family, orig_tier_pos, True)
                         dirty = dirty or not proven
+                    snap = _picker_snap(c)
                     _close_menus(c)
-                    return _ModelPick(False, last_slider_label or shown, badge, fam.detail, dirty)
+                    return _ModelPick(False, last_slider_label or shown, badge, fam.detail, dirty,
+                                      snap)
             tier = _slider_set(c, target)
             if tier.label:
                 last_slider_label = tier.label
@@ -2393,9 +2407,10 @@ def _select_model(c, target, family=None):
                     # under the tier walk is still a family this run is responsible for.
                     proven, back_label = _restore_original(
                         c, lab, orig_family, orig_tier_pos, bool(orig_family))
+                    snap = _picker_snap(c)
                     _close_menus(c)
                     return _ModelPick(False, conf.tier or back_label or shown_rest, badge,
-                                      conf.detail, dirty or not proven)
+                                      conf.detail, dirty or not proven, snap)
                 if settled and conf.verdict == "ok":
                     return _ModelPick(True, conf.tier, badge, None, dirty)
                 if settled and ok_rest and rested:
@@ -2913,9 +2928,13 @@ class _MentionFailure(_PreClickFailure):
 
 
 def _mention_snap(c):
-    """The drift capture of the page as the mention failed, taken before the composer is cleared."""
-    import cgc_drift
-    return cgc_drift.snapshot(c, UI, "mention")
+    """The drift capture of the page as the mention failed, taken before the composer is cleared.
+    Read-only and fail-soft (None)."""
+    try:
+        import cgc_drift
+        return cgc_drift.snapshot(c, UI, "mention")
+    except Exception:
+        return None
 
 
 def _norm_label(s):
@@ -3316,7 +3335,7 @@ def cmd_submit(a) -> int:
                 sys.stderr.write(
                     f"CGC_ERROR model_not_selectable: {why} — NOT submitting. Fix: {fix}, or "
                     f"pass --allow-model-mismatch.\n")
-                _diagnose(c, "model", "model_not_selectable", why, a.rid,
+                _diagnose(c, "model", "model_not_selectable", why, a.rid, snap=pick.snap,
                           inputs={"model": target, "family": a.model_family})
                 return 3
             if not model_confirmed:
@@ -3667,7 +3686,7 @@ def cmd_followup(a) -> int:
                     f"CGC_ERROR model_not_selectable: {why} — NOT sending this follow-up (it "
                     f"would answer on a DEGRADED model, the Instant-stall failure). Fix: {fix}, "
                     f"or pass --allow-model-mismatch to override.\n")
-                _diagnose(c, "model", "model_not_selectable", why, rid,
+                _diagnose(c, "model", "model_not_selectable", why, rid, snap=pick.snap,
                           inputs={"model": target, "family": a.model_family})
                 return 2
         # Count user messages BEFORE sending so we can confirm a NEW one landed (the

@@ -22,6 +22,7 @@ import html
 import html.parser
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -48,7 +49,7 @@ CAPS = {
                 "reads": ("mention_popup_attr", "mention_option_attr", "mention_row_content_attr",
                           "mention_app_icon_class", "mention_description_class", "mention_section_header",
                           "mention_loading", "mention_chip_attr", "mention_chip_label_attr")},
-    "model": {"need": (("picker_owner", "picker_menu"), "picker_slider"),
+    "model": {"need": (("picker_owner", "picker_menu"),),
               "reads": ("picker_owner", "picker_menu", "picker_slider", "picker_menuitem",
                         "picker_family_radio", "picker_radio_scaffold", "picker_flat_items",
                         "picker_submenu_trigger", "picker_open_trigger", "family_aliases",
@@ -115,27 +116,29 @@ def counts_js(ui, cap) -> str:
 
 # One read-only pass over the live page: match counts, candidates, and the sanitized tree (walked
 # last child first, so when the node budget runs out it is the oldest content that is dropped).
-# Page text and every attribute value that is not structure share ONE 200-character budget. Structure,
-# kept whole: a value the contract itself names (V), a turn-role value ("t1:2:assistant"), a short
-# lowercase identifier in an attribute developers author (role, type, data-testid, id, the aria
-# states, class tokens). A value holding / \ @ or :// (a URL, a path, an address) is replaced, never
-# kept. The rid marker tokens are kept and the text around them is cut to the budget, so a fixture
-# still reads as the same turn.
+# Every page-derived string (text, attribute values, candidate names) passes clean(): URLs, paths
+# and addresses become '…' first, then what remains is charged to ONE 200-character budget. Two
+# exemptions, both bounded: a value or class token the contract itself names (V, exact match) is
+# kept free; an identifier-shaped value (<= 24 chars of [A-Za-z0-9_:-], no spaces: a role, an aria
+# state, an id, a testid, a turn-role key) is kept from a separate 600-character budget. Other
+# class tokens are dropped. The rid marker tokens are kept, the text around them budgeted, so the
+# fixture still reads as the same turn.
 _CAPTURE = _COUNTS_FN + r"""
-var BUD=200,NODES=LIM,TOK=/((?:CGC_RID|BEGIN_RESPONSE|END_RESPONSE):REQ-[0-9]{8}-[0-9]{6}-[0-9a-f]{6})/;
-var VS={};V.forEach(function(v){VS[v]=1;});
-function take(s,cap){s=(s||'').replace(/[ \t\r\f\v]+/g,' ');var k=Math.min(s.length,cap,BUD);BUD-=k;
- return k<s.length?s.slice(0,k)+'…':s;}
+var BUD=200,SBUD=600,NODES=LIM,TOK=/((?:CGC_RID|BEGIN_RESPONSE|END_RESPONSE):REQ-[0-9]{8}-[0-9]{6}-[0-9a-f]{6})/;
+var VS=new Set(V);
+var PRIV=/[a-z][\w+.-]*:\/\/\S*|\S*@\S+\.\S+|(^|[\s"'(=])(~|\.{1,2})?[\/\\][^\s"')]*/gi;
+function take(s,cap){s=(s||'').replace(PRIV,function(m,p){return (p||'')+'…';}).replace(/[ \t\r\f\v]+/g,' ');
+ var k=Math.min(s.length,cap,BUD);BUD-=k;return k<s.length?s.slice(0,k)+'…':s;}
+function ident(s){if(s.length>24||!/^[A-Za-z0-9_:-]+$/.test(s)||SBUD<s.length)return null;SBUD-=s.length;return s;}
 function lines(s){return s.split('\n').map(function(l){return /\S/.test(l)?(take(l,40)||'…'):l;}).join('\n');}
 function txt(s){s=s||'';if(!/\S/.test(s))return null;
  return s.split(TOK).map(function(p,i){return i%2?p:lines(p);}).join('');}
 var KEEP=/^(role|aria-(label|checked|expanded|haspopup|valuenow|valuemin|valuemax|describedby|selected|disabled|hidden)|data-[\w-]+|app-[\w-]+|[\w-]*mention[\w-]*|type|contenteditable|id|class|disabled|hidden)$/;
-var DEV=/^(role|type|contenteditable|data-testid|id|aria-(checked|expanded|haspopup|valuenow|valuemin|valuemax|describedby|selected|disabled|hidden))$/;
 var SKIP={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,LINK:1,META:1,NAV:1,IFRAME:1,OBJECT:1,EMBED:1,CANVAS:1,VIDEO:1,AUDIO:1};
-function val(n,v){if(VS[v]||v===''||/^[\w-]*(:[\w-]+)*:(user|assistant)$/.test(v))return v;
- if(n==='class')return v.split(/\s+/).filter(function(t){return VS[t]||/^[a-z0-9-]{1,40}$/.test(t);}).join(' ');
- if(DEV.test(n)&&/^[A-Za-z0-9_ -]{1,60}$/.test(v)&&!/\s\S+\s/.test(v))return v;
- if(/[\/\\@]/.test(v))return '…';return take(v,40)||'…';}
+function val(n,v){if(v===''||VS.has(v))return v;
+ if(n==='class')return v.split(/\s+/).filter(function(t){return VS.has(t);}).join(' ');
+ if(n==='aria-describedby'){var ids=v.split(/\s+/).map(ident);return ids.indexOf(null)<0?ids.join(' '):'…';}
+ var i=n==='aria-label'?null:ident(v);return i!==null?i:(take(v,40)||'…');}
 function attrs(e){var o={};for(var j=0;j<e.attributes.length;j++){var a=e.attributes[j],n=a.name;
  if(!KEEP.test(n)||/^data-cgc/.test(n))continue;o[n]=val(n,a.value||'');}return o;}
 function walk(e){NODES--;var kids=[];if(!/^svg$/i.test(e.tagName)){
@@ -143,16 +146,16 @@ function walk(e){NODES--;var kids=[];if(!/^svg$/i.test(e.tagName)){
   if(c.nodeType===3)k=txt(c.nodeValue);else if(c.nodeType===1&&!SKIP[c.tagName.toUpperCase()])k=walk(c);
   if(k!==null&&k!=='')kids.unshift(k);}}
  return [e.tagName.toLowerCase(),attrs(e),kids];}
-var NR=new RegExp(SR[0],'i'),VR=new RegExp(SR[1],'i'),seen={},cands=[];
+var NR=new RegExp(SR[0],'i'),VR=new RegExp(SR[1],'i'),seen=new Set(),cands=[];
 var all=document.body?document.body.querySelectorAll('*'):[];
 for(var i=0;i<all.length&&cands.length<40;i++){var e=all[i];if(e.closest('nav'))continue;
  for(var j=0;j<e.attributes.length;j++){var a=e.attributes[j],n=a.name,v=a.value||'',sel=null;
   if(/^data-cgc|^(class|style|id)$/.test(n))continue;
-  if(v.length<=40&&VR.test(v)&&!/["\\\]]/.test(v))sel=/:/.test(v)?'['+n+'$=":'+v.split(':').pop()+'"]':'['+n+'="'+v+'"]';
+  if(v.length<=40&&VR.test(v)&&/^[A-Za-z0-9_: -]+$/.test(v))sel=/:/.test(v)?'['+n+'$=":'+v.split(':').pop()+'"]':'['+n+'="'+v+'"]';
   else if(n!=='role'&&NR.test(n))sel='['+n+']';
-  if(!sel||seen[sel])continue;seen[sel]=1;var m;try{m=[].slice.call(document.querySelectorAll(sel));}catch(x){continue;}
+  if(!sel||seen.has(sel))continue;seen.add(sel);var m;try{m=[].slice.call(document.querySelectorAll(sel));}catch(x){continue;}
   var leaf=!e.children.length?(e.textContent||''):'';
-  cands.push({selector:sel,tag:e.tagName.toLowerCase(),role:e.getAttribute('role')||'',
+  cands.push({selector:sel,tag:e.tagName.toLowerCase(),role:val('role',e.getAttribute('role')||''),
    name:take(e.getAttribute('aria-label')||(leaf.length<=40?leaf:''),40),matches:m.length,
    visible:m.filter(__cgcVis).length});}}
 var counts=__cgcCounts(S);
@@ -277,6 +280,12 @@ class FixtureTab:
 
 
 # ---- the bundle ------------------------------------------------------------------------------------
+# The page-side PRIV rule, for the driver's own failure message (which quotes page labels): URLs,
+# addresses and paths become '…'. The message is the driver's template around page strings already
+# cut to 40 characters each, and the whole is cut to 300.
+_PRIV = re.compile(r"[a-z][\w+.-]*://\S*|\S*@\S+\.\S+|(^|[\s\"'(=])(?:~|\.{1,2})?[/\\][^\s\"')]*", re.I)
+
+
 def _now():
     return datetime.datetime.now(datetime.timezone.utc)
 
@@ -306,7 +315,7 @@ def bundle(ui, snap, *, cap, code, detail, contract_path, rid=None, inputs=None,
         "created_at": _now().isoformat(),
         "capability": cap,
         "code": code,
-        "detail": (detail or "")[:300],
+        "detail": _PRIV.sub(lambda m: (m.group(1) or "") + "…", detail or "")[:300],
         "rid": rid,
         "inputs": {k: v for k, v in (inputs or {}).items() if v},
         "contract": {"file": contract_path, "sha256": contract_sha},

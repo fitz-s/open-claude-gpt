@@ -303,6 +303,25 @@ def test_sol_attribute_values_share_the_text_budget_and_lose_urls_and_paths(mods
     assert '"data-turn": "user"' in page and '"data-testid": "conversation-turn-3"' in page
 
 
+def test_sol_identifier_shapes_and_candidates_cannot_carry_content(mods):
+    cdp, _probe, drift = mods
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    leak = "privateconversationcontent"
+    nodes = [["div", {"id": leak * 2, "class": leak, "aria-describedby": leak * 3,
+                      "data-k": leak + ":user", "data-x": "constructor"}, []] for _ in range(10)]
+    nodes.append(["div", {"data-message-id": "1", "aria-label": "https://private.example/secret"},
+                  ["see /" + "Users/private/file now"]])
+    tree = ["html", {}, [["body", {}, [["main", {}, nodes]]]]]
+    snap = _capture(drift, cdp, tree)
+    out = json.dumps(snap)
+    assert out.count(leak) <= 12, out.count(leak)
+    assert "private.example" not in out and "Users/private" not in out
+    d, fx = drift.bundle(cdp.UI, snap, cap="reader", code="x", contract_path=cdp.CONTRACT_PATH,
+                         detail="the popup offered 'https://private.example/x' and /" + "Users/me/f")
+    assert "private.example" not in d["detail"] and "Users/me" not in d["detail"]
+
+
 def test_sol_a_one_node_wrapper_still_reads_after_capture(mods, monkeypatch):
     """BEGIN, body and END in ONE text node: the fixture keeps the markers and a stand-in body."""
     cdp, probe, drift = mods
@@ -316,13 +335,16 @@ def test_sol_a_one_node_wrapper_still_reads_after_capture(mods, monkeypatch):
     assert miss is None and ans.strip()
 
 
-def _picker_tree(families):
+def _picker_tree(families, announced=True):
+    """The GPT-6 picker as read live 2026-09-06: family radios, and a slider whose wrapper's
+    aria-describedby names the tier announcement."""
     radios = [["div", {"role": "menuitemradio", "aria-checked": "true" if i == 0 else "false"}, [f]]
               for i, f in enumerate(families)]
-    slider = ["div", {"role": "menuitem", "aria-label": "Power"},
+    slider = ["div", {"role": "menuitem", "aria-label": "Power", "aria-describedby": "_r_cn_"},
               [["span", {"role": "slider", "aria-valuenow": "4", "aria-valuemin": "0",
                          "aria-valuemax": "4"}, []]]]
-    owner = ["div", {"data-testid": "composer-intelligence-picker-content"}, radios + [slider]]
+    desc = ["span", {"id": "_r_cn_"}, ["Pro, 5 of 5." if announced else ""]]
+    owner = ["div", {"data-testid": "composer-intelligence-picker-content"}, radios + [slider, desc]]
     return ["html", {}, [["body", {}, [["div", {"role": "menu"}, [owner]]]]]]
 
 
@@ -344,7 +366,22 @@ def test_sol_model_replay_runs_the_family_decision(mods, tmp_path):
     assert r["ok"] is False and "GPT-6" in r["detail"], r
     inc = _bundle_of(drift, cdp, "model", _picker_tree(["Latest", "GPT-5.5"]),
                      {"model": "Pro", "family": "GPT-6"}, tmp_path)
-    assert probe.replay(inc)["ok"] is True, "a demonstrated relabel is the family"
+    r = probe.replay(inc)
+    assert r["ok"] is True, r
+    # Sol: the family offered but the tier unreadable (no announcement) is not a pass.
+    inc = _bundle_of(drift, cdp, "model", _picker_tree(["GPT-6"], announced=False),
+                     {"model": "Pro", "family": "GPT-6"}, tmp_path)
+    assert probe.replay(inc)["ok"] is False
+
+
+def test_sol_model_replay_accepts_the_flat_menu_fallback(mods, tmp_path):
+    cdp, probe, drift = mods
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    tree = ["html", {}, [["body", {}, [["div", {"role": "menu"}, [
+        ["div", {"role": "menuitem"}, ["Instant"]], ["div", {"role": "menuitem"}, ["Pro Extended"]]]]]]]]
+    inc = _bundle_of(drift, cdp, "model", tree, {"model": "Pro", "family": "skip"}, tmp_path)
+    assert probe.replay(inc)["ok"] is True
 
 
 def test_sol_composer_replay_runs_the_resolver(mods, tmp_path):
