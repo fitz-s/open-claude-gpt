@@ -116,17 +116,21 @@ def counts_js(ui, cap) -> str:
 
 # One read-only pass over the live page: match counts, candidates, and the sanitized tree (walked
 # last child first, so when the node budget runs out it is the oldest content that is dropped).
-# Every page-derived string (text, attribute values, candidate names) passes clean(): URLs, paths
+# Every page-derived string (text, attribute values, candidate names) passes take(): URLs, paths
 # and addresses become '…' first, then what remains is charged to ONE 200-character budget. Two
 # exemptions, both bounded: a value or class token the contract itself names (V, exact match) is
-# kept free; an identifier-shaped value (<= 24 chars of [A-Za-z0-9_:-], no spaces: a role, an aria
-# state, an id, a testid, a turn-role key) is kept from a separate 600-character budget. Other
-# class tokens are dropped. The rid marker tokens are kept, the text around them budgeted, so the
-# fixture still reads as the same turn.
+# kept free; in a STRUCTURAL attribute only — the ARIA/role/id/testid attributes developers author
+# (SATTR), the attributes the contract names (SA: the turn schemas, the mention chip, …), and the
+# aria-describedby id list — an identifier-shaped value (<= 24 chars of [A-Za-z0-9_:-]) is kept
+# from a separate 600-character budget. Any other attribute (data-preview, …) is prose and shares
+# the 200. Other class tokens are dropped. The rid marker tokens are kept, the text around them
+# budgeted, so the fixture still reads as the same turn.
 _CAPTURE = _COUNTS_FN + r"""
 var BUD=200,SBUD=600,NODES=LIM,TOK=/((?:CGC_RID|BEGIN_RESPONSE|END_RESPONSE):REQ-[0-9]{8}-[0-9]{6}-[0-9a-f]{6})/;
 var VS=new Set(V);
-var PRIV=/[a-z][\w+.-]*:\/\/\S*|\S*@\S+\.\S+|(^|[\s"'(=])(~|\.{1,2})?[\/\\][^\s"')]*/gi;
+var PRIV=/[a-z][\w+.-]*:\/\/\S*|\S*@\S+\.\S+|(^|[^\w.~])(~|\.{1,2})?[\/\\][^\s"'`)\]>]*/gi;
+var SATTR=/^(role|type|contenteditable|id|data-testid|aria-(checked|expanded|haspopup|valuenow|valuemin|valuemax|selected|disabled|hidden))$/;
+var SNAMES=new Set(SA);
 function take(s,cap){s=(s||'').replace(PRIV,function(m,p){return (p||'')+'…';}).replace(/[ \t\r\f\v]+/g,' ');
  var k=Math.min(s.length,cap,BUD);BUD-=k;return k<s.length?s.slice(0,k)+'…':s;}
 function ident(s){if(s.length>24||!/^[A-Za-z0-9_:-]+$/.test(s)||SBUD<s.length)return null;SBUD-=s.length;return s;}
@@ -138,7 +142,7 @@ var SKIP={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,LINK:1,META:1,NAV:1,IFRAME:1,OB
 function val(n,v){if(v===''||VS.has(v))return v;
  if(n==='class')return v.split(/\s+/).filter(function(t){return VS.has(t);}).join(' ');
  if(n==='aria-describedby'){var ids=v.split(/\s+/).map(ident);return ids.indexOf(null)<0?ids.join(' '):'…';}
- var i=n==='aria-label'?null:ident(v);return i!==null?i:(take(v,40)||'…');}
+ var i=SATTR.test(n)||SNAMES.has(n)?ident(v):null;return i!==null?i:(take(v,40)||'…');}
 function attrs(e){var o={};for(var j=0;j<e.attributes.length;j++){var a=e.attributes[j],n=a.name;
  if(!KEEP.test(n)||/^data-cgc/.test(n))continue;o[n]=val(n,a.value||'');}return o;}
 function walk(e){NODES--;var kids=[];if(!/^svg$/i.test(e.tagName)){
@@ -165,8 +169,15 @@ return {counts:counts,candidates:cands,path:'/'+(p.length?p[0]+(p.length>1?'/x':
 
 
 def capture_js(ui, cap, nodes=FIXTURE_NODES) -> str:
-    return ("(function(S,SR,LIM,V){" + _CAPTURE + "})(" + json.dumps(selectors(ui, cap)) + ","
-            + json.dumps(_SEARCH[cap]) + "," + str(int(nodes)) + "," + json.dumps(_vocab(ui)) + ")")
+    return ("(function(S,SR,LIM,V,SA){" + _CAPTURE + "})(" + json.dumps(selectors(ui, cap)) + ","
+            + json.dumps(_SEARCH[cap]) + "," + str(int(nodes)) + "," + json.dumps(_vocab(ui)) + ","
+            + json.dumps(_attr_names(ui)) + ")")
+
+
+def _attr_names(ui):
+    """The attribute names the contract reads values of: their identifier values are structure."""
+    names = {s["attr"] for s in ui["turn_schemas"]} | {ui["assistant_body"]["attr"]}
+    return sorted(names | {v for k, v in ui.items() if k.endswith("_attr") and isinstance(v, str)})
 
 
 def contradicted(ui, cap, counts) -> list:
@@ -283,7 +294,7 @@ class FixtureTab:
 # The page-side PRIV rule, for the driver's own failure message (which quotes page labels): URLs,
 # addresses and paths become '…'. The message is the driver's template around page strings already
 # cut to 40 characters each, and the whole is cut to 300.
-_PRIV = re.compile(r"[a-z][\w+.-]*://\S*|\S*@\S+\.\S+|(^|[\s\"'(=])(?:~|\.{1,2})?[/\\][^\s\"')]*", re.I)
+_PRIV = re.compile(r"[a-z][\w+.-]*://\S*|\S*@\S+\.\S+|(^|[^\w.~])(?:~|\.{1,2})?[/\\][^\s\"'`)\]>]*", re.I)
 
 
 def _now():

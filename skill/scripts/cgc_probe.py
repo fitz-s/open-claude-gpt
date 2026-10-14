@@ -538,31 +538,41 @@ def _replay_check(drv, cap, tab, diag):
         ok = tab.eval("(function(){" + drv._COMPOSER_RESOLVE_JS + "return !!__cg();})()")
         return bool(ok), "the composer resolves" if ok else "no visible composer editor inside a form"
     if cap == "model":
+        # _select_model's own rules, on the one picker the fixture holds: the tier by
+        # _slider_state_label's source chain (or, with no slider, a flat item _matches accepts),
+        # and the family settled exactly as it settles there — the radios offer it, or the
+        # picker renders no family control (legacy), or there is no picker and the tier is a flat
+        # item (the pre-picker composer). A failed or ambiguous radio read never settles it.
         st = tab.eval(drv._PICKER_STATE_JS)
         obs = drv._family_obs(st)
-        fam = inp.get("family")
-        if fam and str(fam).lower() != "skip":
-            hit = [lab for lab, _chk in obs.entries if drv._is_family(lab, fam)]
-            if obs.status != "family" or not hit:
-                return False, (f"family {fam!r} not offered (picker {obs.status}: "
-                               f"{[lab for lab, _ in obs.entries]}{'; ' + obs.detail if obs.detail else ''})")
-        tier = inp.get("model")
+        fam, tier = inp.get("family"), inp.get("model")
+        want_family = bool(fam) and str(fam).strip().lower() != "skip"
+        slider = isinstance(st, dict) and st.get("now") is not None
+        items = [] if slider else (tab.eval(drv._FLAT_ITEMS_JS) or [])
         if not tier or str(tier).lower() == "skip":
-            return True, f"the picker offers {fam!r}"
-        if isinstance(st, dict) and st.get("now") is not None:
-            # The slider path: the tier must be read by IDENTITY from the control (its describedby
-            # announcement, or the group's announcement line), as _slider_state_label reads it.
-            lab = (next((drv._announced_tier(x) for x in st.get("descs") or [] if drv._announced_tier(x)), "")
-                   or next((drv._announced_tier(x) for x in st.get("lines") or [] if drv._announced_tier(x)), ""))
-            if not lab:
-                return False, ("the tier slider's announcement is unreadable (descs "
-                               f"{st.get('descs')!r}, lines {st.get('lines')!r})")
-            return True, f"the picker offers {fam or 'its family'} and announces tier {lab!r} (the walk is live-only)"
-        # The flat-menu fallback: the tier is a plain item in the open menu.
-        items = tab.eval(drv._FLAT_ITEMS_JS) or []
-        if any(drv._matches(x, tier) for x in items):
-            return True, f"the menu offers tier {tier!r} as an item"
-        return False, f"no tier slider and no {tier!r} item in the menu (items {items[:8]!r})"
+            tier_ok, tier_why = True, "no tier pinned"
+        elif slider:
+            # A read that lands on a family radio's label (the fallback's first group line, on a
+            # GPT-6 picker whose announcement moved) is the family, not a tier.
+            lab = drv._slider_state_label(st)
+            if lab in {x for x, _chk in obs.entries}:
+                lab = ""
+            tier_ok, tier_why = bool(lab), (f"the slider reads tier {lab!r}" if lab else
+                                            "the tier slider's announcement is unreadable")
+        else:
+            tier_ok = any(drv._matches(x, tier) for x in items)
+            tier_why = (f"the menu offers {tier!r} as an item" if tier_ok else
+                        f"no tier slider and no {tier!r} item (items {items[:8]!r})")
+        if not want_family:
+            fam_ok, fam_why = True, "no family pinned"
+        elif obs.status == "family":
+            fam_ok = any(drv._is_family(lab, fam) for lab, _chk in obs.entries)
+            fam_why = f"family {fam!r} {'offered' if fam_ok else 'not offered'} ({[lab for lab, _ in obs.entries]})"
+        elif obs.status == "legacy" or (obs.status == "absent" and not slider and tier_ok):
+            fam_ok, fam_why = True, f"no family control ({obs.status}): the pre-GPT-6 composer"
+        else:
+            fam_ok, fam_why = False, f"the family control did not read ({obs.status}: {obs.detail})"
+        return fam_ok and tier_ok, f"{fam_why}; {tier_why} (the walk itself is live-only)"
     if cap == "mention":
         if not inp.get("app"):
             return False, "the bundle names no app to find"

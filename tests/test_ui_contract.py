@@ -384,6 +384,36 @@ def test_sol_model_replay_accepts_the_flat_menu_fallback(mods, tmp_path):
     assert probe.replay(inc)["ok"] is True
 
 
+def test_sol_model_replay_follows_the_drivers_legacy_rules(mods, tmp_path):
+    """A flat Pro menu with no picker (the pre-picker composer) settles the family; a bare 'Pro'
+    slider (legacy, no announcement) reads its tier the way _slider_state_label does."""
+    cdp, probe, drift = mods
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    flat = ["html", {}, [["body", {}, [["div", {"role": "menu"}, [
+        ["div", {"role": "menuitem"}, ["Pro"]]]]]]]]
+    assert probe.replay(_bundle_of(drift, cdp, "model", flat, {"model": "Pro", "family": "GPT-6"},
+                                   tmp_path))["ok"] is True
+    bare = ["html", {}, [["body", {}, [["div", {"role": "menu"}, [
+        ["div", {"data-testid": "composer-intelligence-picker-content"}, [
+            ["div", {}, ["Pro"]],
+            ["div", {"role": "menuitem"}, [["span", {"role": "slider", "aria-valuenow": "4"}, []]]]]]]]]]]]
+    assert probe.replay(_bundle_of(drift, cdp, "model", bare, {"model": "Pro", "family": "skip"},
+                                   tmp_path))["ok"] is True
+
+
+def test_sol_backticked_paths_and_unstructured_data_attrs_are_budgeted(mods):
+    cdp, _probe, drift = mods
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    nodes = [["div", {"data-preview": "privatecontent" + str(i)}, []] for i in range(40)]
+    nodes.append(["p", {"data-message-author-role": "user"}, ["see `/" + "Users/private/file` now"]])
+    snap = _capture(drift, cdp, ["html", {}, [["body", {}, [["main", {}, nodes]]]]])
+    out = json.dumps(snap["tree"])
+    assert "Users/private" not in out and out.count("privatecontent") <= 15
+    assert '"data-message-author-role": "user"' in out
+
+
 def test_sol_composer_replay_runs_the_resolver(mods, tmp_path):
     cdp, probe, drift = mods
     if not shutil.which("node"):

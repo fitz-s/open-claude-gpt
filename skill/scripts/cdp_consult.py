@@ -2320,6 +2320,7 @@ def _select_model(c, target, family=None):
     if ok and not want_family:
         return _ModelPick(True, shown, badge, None, False)
     last_slider_label = None
+    snap = None            # the last picker this run saw fail, captured before its menu closed
     # Whether the family dimension was actually ESTABLISHED (inside a menu that really opened, on a
     # schema whose family control was positively recognized), as opposed to merely not having
     # failed. Without this, a composer already sitting on the target tier whose picker never opens
@@ -2353,6 +2354,7 @@ def _select_model(c, target, family=None):
                 # not a build without one, and it is not a licence to drive the tier behind it:
                 # touch nothing here, keep the reason, and let another candidate or pass try.
                 fam_detail = obs0.detail
+                snap = _picker_snap(c)
                 _close_menus(c)
                 continue
             fam = _FamilyPick(True, None, None, False)
@@ -2430,6 +2432,7 @@ def _select_model(c, target, family=None):
                     c, lab, orig_family, orig_tier_pos, fam.touched)
                 dirty = dirty or not proven
                 last_slider_label = back_label or last_slider_label
+                snap = _picker_snap(c)
                 _close_menus(c)
                 continue
             # this WAS the candidate asked for, and it genuinely does not carry target — budget
@@ -2442,6 +2445,7 @@ def _select_model(c, target, family=None):
                 dirty = dirty or not proven
                 last_slider_label = back_label or last_slider_label
             exhausted.add(lab)
+            snap = _picker_snap(c)
             _close_menus(c)
         time.sleep(0.4)
     final = [x for x in (c.eval(_cand_labels_js()) or []) if x]
@@ -2457,8 +2461,8 @@ def _select_model(c, target, family=None):
         return _ModelPick(False, shown, badge,
                           fam_detail or
                           "model family '%s' could not be verified — the composer's picker menu "
-                          "never opened, so the radios were never readable" % family, dirty)
-    return _ModelPick(bool(ok), shown, badge, None, dirty)
+                          "never opened, so the radios were never readable" % family, dirty, snap)
+    return _ModelPick(bool(ok), shown, badge, None, dirty, None if ok else snap)
 
 
 # A real code-source URL: https:// on github.com / gist.github.com / raw.githubusercontent.com,
