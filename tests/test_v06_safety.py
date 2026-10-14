@@ -481,3 +481,16 @@ def test_a_same_length_body_swap_between_done_polls_is_not_published(monkeypatch
     assert CDP.cmd_wait(ns) == 0
     assert out.read_text() == "Block access.", "the first body was published on the second's length"
     assert tab.i == 3, "the swapped body needed its own confirming poll"
+
+
+def test_the_live_composer_dom_of_a_markdown_paste_reads_back_exactly(monkeypatch):
+    """Recorded from the real composer: one <p> per line, a blank line is an empty paragraph holding
+    the trailingBreak placeholder, and no markdown input rule rewrote '#', '-', '>' or the fence."""
+    import json as _j
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    fx = _j.load(open(os.path.join(os.path.dirname(__file__), "fixtures", "composer_markdown_paste.json")))
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "skill", "scripts"))
+    import cgc_probe
+    lines = cgc_probe.DUMMY.split("\n")
+    head = "\n".join(lines[:lines.index(next(x for x in lines if "line 003" in x)) + 1])
+    _verify(fx["html"], head)
