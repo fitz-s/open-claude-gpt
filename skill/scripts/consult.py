@@ -794,7 +794,7 @@ def cmd_prep(a: argparse.Namespace) -> int:
         "prompt_file": prompt_file,
         "logical_sha": logical_sha,
     }
-    if prompt_file:
+    if prompt_file and getattr(a, "cmd", None) == "prep":   # fire enqueues it itself
         spool_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgc_spool.py")
         argv = ["python3", spool_py, "enqueue", "--rid", rid, "--prompt-file", prompt_file]
         sys.stderr.write(
@@ -1110,12 +1110,29 @@ def main() -> int:
         "deliver", help="build purpose-grouped GitHub refs (agent-driven)"))
     pd.set_defaults(fn=cmd_deliver)
 
+    if (sys.argv[1:2] or [""])[0] == "fire":
+        # The agent path: stdout ends with exactly one envelope line, refusals included.
+        import cgc_backend
+        return cgc_backend.agent_cli(lambda: _fire_envelope(cmd_fire(p.parse_args())))
     a = p.parse_args()
     r = a.fn(a)
     if isinstance(r, dict):
         print(json.dumps(r, ensure_ascii=False, indent=2))
         return 0
     return r
+
+
+def _fire_envelope(r) -> int:
+    """fire's receipt as the agent envelope: next_command IS the detached await to run."""
+    if not isinstance(r, dict):
+        return r
+    import cgc_backend
+    import cgc_store
+    with cgc_store.Store() as s:
+        row = s.get_round(r["rid"])
+    cgc_backend.envelope(rid=r["rid"], state=row["state"] if row else None, code="ok",
+                         next_command=r["await"], **{k: v for k, v in r.items() if k != "rid"})
+    return 0
 
 
 if __name__ == "__main__":

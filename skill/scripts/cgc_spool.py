@@ -953,8 +953,28 @@ def main() -> int:
     rf.add_argument("--rid", required=True, help="the terminal, proven-not-sent round to replay")
     rf.set_defaults(fn=cmd_refire)
 
-    a = p.parse_args()
-    return a.fn(a)
+    dg = sub.add_parser("diagnose", help="one bounded JSON line on a stuck/failed round: state, "
+                                         "code, phases, last driver verdict, UI verdicts, and the "
+                                         "next command — read this, never the log")
+    dg.add_argument("--rid", required=True)
+    dg.set_defaults(fn=lambda a: __import__("cgc_backend").diagnose(a.rid))
+
+    import cgc_backend
+    if (sys.argv[1:2] or [""])[0] == "stats":   # an operator report, not an agent verb
+        a = p.parse_args()
+        return a.fn(a)
+    return cgc_backend.agent_cli(lambda: (lambda a: a.fn(a))(p.parse_args()), _argv_rid)
+
+
+def _argv_rid():
+    """The --rid the caller named, for an envelope synthesized before (or without) parsing."""
+    argv = sys.argv[1:]
+    for i, x in enumerate(argv):
+        if x == "--rid" and i + 1 < len(argv):
+            return argv[i + 1]
+        if x.startswith("--rid="):
+            return x[6:]
+    return None
 
 
 if __name__ == "__main__":

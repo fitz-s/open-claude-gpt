@@ -211,8 +211,18 @@ def store_status(up: bool, rid: str | None = None) -> int:
                 if gate:
                     fields["human_action"] = paused_text(gate)
                 print(f"  round[{rid}]: {json.dumps(fields)}")
+                step = next_step(s, rr, up)
+                envelope(rid=rid, state=rr["state"], **step,
+                         answer_path=out if fields["answer_on_disk"] else None,
+                         detail=rr["error_code"], answer_on_disk=fields["answer_on_disk"],
+                         conversation=fields["conversation"], daemon_up=up)
             else:
                 print(f"  round[{rid}]: (not in store)")
+                envelope(rid=rid, state="missing", code="not_found", detail="no such round in the store")
+        else:
+            envelope(code="ok" if up else "service_unavailable", daemon_up=up,
+                     human_action=None if up else "run `cgc install-daemon` (daemon down)",
+                     counts={r["state"]: r["c"] for r in rows}, needs_reconcile=needs_human[:8])
     return 0
 
 
@@ -339,7 +349,7 @@ def record_feedback(a) -> int:
         rev = _consult.policy_rev()
         with store_mod.Store() as s:
             s.record_policy_update(rev, text)
-        print(json.dumps({"recorded": "policy_update", "policy_rev": rev}))
+        envelope(code="ok", recorded="policy_update", policy_rev=rev)
         return 0
 
     missing = [f"--{n}" for n in ("rid", "grade", "reason", "action")
@@ -369,7 +379,7 @@ def record_feedback(a) -> int:
         if target != a.rid:
             detail["via_retrieve"] = a.rid
         s.record_outcome(target, detail)
-    print(json.dumps({"recorded": "consult_outcome", "rid": target, **detail}))
+    envelope(rid=target, code="ok", recorded="consult_outcome", **detail)
     return 0
 
 
@@ -538,9 +548,12 @@ def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str, a
     sys.stderr.write(f"CGC_IDEMPOTENT request-key {rkey!r} already enqueued as "
                      f"{prior['rid']} — returning the original receipt, nothing new "
                      "queued.\n")
-    print(json.dumps({"queued": True, "rid": prior["rid"],
-                      "out": prior["out_path"] or out, "backend": "store",
-                      "idempotent_repeat": True}))
+    if getattr(a, "quiet", False):
+        return 0   # composed into `fire`, which prints the one envelope
+    envelope(rid=prior["rid"], state=prior["state"], code="ok",
+             next_command=f"{_py('cgc_spool.py')} await --rid {prior['rid']}",
+             detail="idempotent repeat: the original receipt, nothing new queued",
+             queued=True, out=prior["out_path"] or out, backend="store", idempotent_repeat=True)
     return 0
 
 
@@ -557,7 +570,9 @@ def _post_create_receipt(a, out: str, queued: bool = True) -> int:
         # Composed into `fire`, which prints the one receipt that matters. Two receipts for one
         # action is pure noise.
         return 0
-    print(json.dumps({"queued": queued, "rid": a.rid, "out": out, "backend": "store"}))
+    envelope(rid=a.rid, state=store_mod.QUEUED if queued else None, code="ok",
+             next_command=f"{_py('cgc_spool.py')} await --rid {a.rid}",
+             queued=queued, out=out, backend="store")
     argv = ["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cgc_spool.py"),
             "await", "--rid", a.rid]
     import shlex
@@ -826,6 +841,7 @@ def cancel_round(rid: str) -> int:
             return 2
         if r["state"] in (store_mod.FAILED,) and (r["error_code"] or "").startswith("cancelled"):
             sys.stderr.write(f"CGC_CANCELLED {rid} (already cancelled — idempotent no-op).\n")
+            envelope(rid=rid, state=r["state"], code="ok", detail="already cancelled")
             return 0
         if r["state"] not in (store_mod.QUEUED, store_mod.READY):
             sys.stderr.write(
@@ -841,6 +857,7 @@ def cancel_round(rid: str) -> int:
                              "it is being dispatched. Await it instead.\n")
             return 2
     sys.stderr.write(f"CGC_CANCELLED {rid}: cancelled before send.\n")
+    envelope(rid=rid, state=store_mod.FAILED, code="ok", detail="cancelled before send")
     return 0
 
 
@@ -869,6 +886,9 @@ def reconcile_not_sent(rid: str, evidence: str) -> int:
     sys.stderr.write(
         f"CGC_RECONCILED {rid}: {old_state} -> {new_row['state']} "
         f"(send_disposition={new_row['send_disposition']}).\n")
+    envelope(rid=rid, state=new_row["state"], code="ok",
+             detail=f"{old_state} -> {new_row['state']} ({new_row['send_disposition']}); "
+                    "`refire --rid` now replays it if still needed")
     return 0
 
 
@@ -938,13 +958,329 @@ def refire_round(old_rid: str) -> int:
     return enqueue_round(a, new_prompt, out)
 
 
+# ---- the agent envelope: one JSON line, one decision ------------------------------------------
+# Every agent-path verb (fire, await, status, cancel, refire, feedback, reconcile, diagnose) ENDS
+# stdout with exactly one JSON line led by ENVELOPE_KEYS — refusals and argument errors included
+# (cgc_spool.main / consult.main guarantee the line on every exit). `code` is the action class; the
+# detailed cause stays in `detail`/`error`, and `diagnose` holds the rest.
+ENVELOPE_KEYS = ("schema", "rid", "state", "code", "next_command", "human_action", "answer_path",
+                 "detail")
+CODES = ("ok", "invalid_request", "policy_denied", "service_unavailable", "human_required",
+         "ui_contract_broken", "send_uncertain", "source_unresolved", "remote_failed",
+         "observation_deadline", "result_unverified", "not_found")
+
+# THE table. A state's code when its error names nothing more specific (in-flight = ok: nothing has
+# gone wrong yet). missing/stuck/error are await's synthetic outcomes.
+STATE_CODE = {
+    store_mod.QUEUED: "ok", store_mod.READY: "ok", store_mod.SENDING: "ok",
+    store_mod.ACCEPTED: "ok", store_mod.WAITING: "ok", store_mod.COMPLETED_VERIFIED: "ok",
+    store_mod.COMPLETED_UNVERIFIED: "result_unverified",
+    store_mod.POSSIBLY_ACCEPTED: "send_uncertain",
+    store_mod.BLOCKED: "human_required",
+    store_mod.GATE_REJECTED: "policy_denied",
+    store_mod.FAILED: "remote_failed",
+    "missing": "not_found", "stuck": "observation_deadline", "error": "service_unavailable",
+}
+# An error's code by its leading name: every `CGC_ERROR <name>` the scripts write, plus the first
+# words of the marker-free error_code texts the worker stores. service_unavailable = nothing went
+# out and a later retry is safe; send_uncertain = it may have gone out.
+_ERRORS = {
+    "ok": "cancelled",
+    "invalid_request": (
+        "already_enqueued bad_rid bad_schedule cancel_raced conversation_not_canonical "
+        "evidence_required fire_no_refs followup_no_thread followup_parent_unresolved "
+        "need_conversation need_prompt_file no_code_source no_reconcile_action not_cancellable "
+        "not_sent_reconcile_refused refire_no_prompt refire_rewrite_failed refs_source_conflict "
+        "request_key_conflict request_key_needs_logical_sha retrieve_needs_source_rid "
+        "retrieve_parent_never_sent retrieve_parent_sends_nothing rid_prompt_mismatch "
+        "workspace_conflict workspace_needs_mention feedback_mixed policy_empty feedback_incomplete "
+        "retrieve_source_unknown ambiguous_followup ambiguous_rid_in_prompt_file "
+        "rid_not_found_in_prompt_file prompt_file_unreadable followup_no_input followup_prep_failed "
+        "followup_prep_unparseable no_active_thread rid_autodetect_failed missing_dep usage "
+        "retrieve_needs_an followup_has_no followup_conversation_is"),
+    "policy_denied": "gate_secret gate_refused refused",
+    "service_unavailable": (
+        "store_mismatch attach_failed cdp_attach_failed new_tab new_tab_failed new_tab_no_ws no_page_target "
+        "browser_unreachable chrome chrome_unavailable not_sent_preclick unverified daemon_down "
+        "submit_failed_before followup_failed_before reconciled_not_sent"),
+    "human_required": "login_needed captcha rate_limit approval_needed mention_not_found "
+                      "request_key_locked attribution_mismatch",
+    "ui_contract_broken": "selector_drift composer_not_ready model_not_selectable wrong_page "
+                          "ui_contract",
+    "send_uncertain": (
+        "unknown_send wait_produced_no submit_did_not followup_send_failed daemon_died "
+        "worker_exited daemon_startup periodic_sweep refire_refused "
+        "chatgpt_failed_the accepted_but_no"),
+    "source_unresolved": (
+        "rid_absent rid_superseded rid_ambiguous ambiguous_rid ambiguous_target rid_mismatch "
+        "rid_echo_mismatch rid_unresolved rid_not_on_any_open_tab conversation_mismatch "
+        "conversation_not_found no_conversation_id retrieve_could_not retrieve_parent_unresolved"),
+    "remote_failed": "turn_failed",
+    "observation_deadline": "timeout_no_answer observation_deadline_passed expired",
+    "not_found": "no_such_round",
+}
+ERROR_CODE = {name: code for code, names in _ERRORS.items() for name in names.split()}
+
+
+def _error_words(error) -> list:
+    """'CGC_ERROR rid_absent: …' -> ['rid','absent']; 'submit did not confirm …' -> its words."""
+    text = re.sub(r"^\s*CGC_[A-Z]+\s+", "", str(error or "")).lower()
+    return re.findall(r"[a-z]+", text.split(":")[0])[:6]
+
+
+def code_of(state, error=None) -> str:
+    """The one state/error -> code mapping: the error decides when it names a known cause (a
+    `failed` round may be a failed turn, an unresolved source, or a deadline), else the state."""
+    words = _error_words(error)
+    for n in range(len(words), 0, -1):
+        hit = ERROR_CODE.get("_".join(words[:n]))
+        if hit:
+            return hit
+    return STATE_CODE.get(state, "service_unavailable")
+
+
+_EMITTED = False
+
+
+def envelope(**fields) -> dict:
+    """Print THE agent envelope line: ENVELOPE_KEYS first (defaults filled, detail ≤200 chars), then
+    any verb-specific extras. Marks the process as having emitted, so main adds no second line."""
+    global _EMITTED
+    env = {"schema": 1, "rid": None, "state": None, "code": "ok", "next_command": None,
+           "human_action": None, "answer_path": None, "detail": None}
+    env.update(fields)
+    if env["detail"] is not None:
+        env["detail"] = str(env["detail"])[:200]
+    print(json.dumps(env, ensure_ascii=False), flush=True)
+    _EMITTED = True
+    return env
+
+
+def emitted() -> bool:
+    return _EMITTED
+
+
+class _StderrTap:
+    """sys.stderr, remembering the last `CGC_ERROR`/`CGC_BLOCKER` line and the last line overall —
+    what a verb that refused in prose meant, recovered for its envelope."""
+    def __init__(self, inner):
+        self.inner, self.err, self.last, self._buf = inner, None, None, ""
+
+    def write(self, text):
+        self._buf += text
+        *lines, self._buf = self._buf.split("\n")
+        for ln in lines:
+            ln = ln.strip()
+            if ln:
+                self.last = ln
+                if ln.startswith(("CGC_ERROR", "CGC_BLOCKER")):
+                    self.err = ln
+        return self.inner.write(text)
+
+    def flush(self):
+        return self.inner.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def agent_cli(call, rid_of=lambda: None) -> int:
+    """Run one agent verb so stdout ENDS with exactly one envelope line, whatever happens: a verb
+    that printed its own envelope is left alone; a prose refusal, an argparse error, a SystemExit
+    message or a crash gets one synthesized from its last CGC_ERROR line. `--help` gets none."""
+    import traceback
+    tap = sys.stderr = _StderrTap(sys.stderr)
+    crashed = False
+    try:
+        try:
+            rc = call()
+        except SystemExit as e:
+            if isinstance(e.code, str):
+                sys.stderr.write(e.code + "\n")
+                rc = 1
+            else:
+                rc = e.code or 0
+        except Exception as e:
+            traceback.print_exc()
+            tap.err, crashed, rc = f"{type(e).__name__}: {e}", True, 1
+    finally:
+        sys.stderr = tap.inner
+    rid = rid_of()
+    if emitted() or (rc == 0 and any(x in ("-h", "--help") for x in sys.argv)):
+        return rc
+    if rc == 0:
+        envelope(rid=rid, code="ok", detail=tap.last)
+        return rc
+    why = tap.err or tap.last
+    code = ("service_unavailable" if crashed else
+            code_of(None, why) if tap.err else "invalid_request")
+    envelope(rid=rid, state="refused", code=code, detail=why,
+             next_command=diagnose_cmd(rid) if rid and code not in ("not_found", "invalid_request") else None)
+    return rc
+
+
+def _py(script: str) -> str:
+    return f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), script)}"
+
+
+def diagnose_cmd(rid: str) -> str:
+    return f"{_py('cgc_spool.py')} diagnose --rid {rid}"
+
+
+def _retrieve_cmd(rid: str, conv) -> str:
+    if conv:
+        return f"{_py('cgc_spool.py')} enqueue --kind retrieve --conversation {conv} --parent {rid}"
+    return f"{_py('cdp_consult.py')} find-conversation --rid {rid}"
+
+
+def next_step(s, r: dict, daemon_up: bool) -> dict:
+    """The controller's next move for a round, from the store alone: {code, next_command,
+    human_action}. `diagnose` decides with it, so its answer never depends on reading a log."""
+    rid, state = r["rid"], r["state"]
+    code = code_of(state, r.get("error_code"))
+    conv = s.conversation_of(rid)
+    gate = s.gated_by(r) if state == store_mod.QUEUED else {}
+    probe = f"{_py('cgc_probe.py')} --status"
+    if state == store_mod.COMPLETED_VERIFIED:
+        return {"code": "ok", "next_command": None, "human_action": None}
+    if state == store_mod.COMPLETED_UNVERIFIED:
+        return {"code": code, "next_command": None,
+                "human_action": "verify the salvaged answer is complete and belongs to this round"}
+    if gate:
+        return {"code": "ui_contract_broken", "next_command": probe,
+                "human_action": paused_text(gate)}
+    if state not in store_mod.TERMINAL and state != store_mod.POSSIBLY_ACCEPTED:
+        return {"code": "ok" if daemon_up else "service_unavailable",
+                "next_command": f"{_py('cgc_spool.py')} await --rid {rid}",
+                "human_action": None if daemon_up else "run `cgc install-daemon` (daemon down)"}
+    unsent = _release_eligible(s, r)
+    if state == store_mod.POSSIBLY_ACCEPTED or (state == store_mod.BLOCKED and not unsent):
+        return {"code": code, "next_command": _retrieve_cmd(rid, conv),
+                "human_action": "check the ChatGPT window; retrieve, never re-send"}
+    if code == "ok":   # cancelled before send
+        return {"code": code, "next_command": None, "human_action": None}
+    if code == "ui_contract_broken":
+        nxt = probe
+    elif unsent and r.get("rendered_prompt") and code != "policy_denied":
+        nxt = f"{_py('cgc_spool.py')} refire --rid {rid}"
+    else:
+        nxt = None
+    if state == store_mod.BLOCKED:
+        human = "fix the cause in `detail`, then run next_command (nothing was sent)"
+    elif code == "policy_denied":
+        human = "remove what the gate refused (`detail`), then fire again"
+    elif code == "source_unresolved":
+        human = "the source turn was not found on the page; check the ChatGPT window, never re-send"
+    elif nxt is None:
+        human = "the send went out and failed: re-fire with a NEW --request-key if still needed"
+    else:
+        human = None
+    return {"code": code, "next_command": nxt, "human_action": human}
+
+
+DIAGNOSE_MAX = 1500
+_PHASE_EVENTS = ("created", "claimed", "begin_send", "accepted")
+
+
+def _last_marker(path) -> str | None:
+    """The log's last CGC_ERROR / CGC_BLOCKER line — the driver's own verdict — from its tail."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 65536))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    hits = [ln.strip() for ln in lines if ln.startswith(("CGC_ERROR", "CGC_BLOCKER"))]
+    return hits[-1] if hits else None
+
+
+def _incident_bundle(rid: str, since) -> str | None:
+    """The newest incidents/<id>/diagnosis.json (under the state or data dir) that names this rid or
+    was written after its claim. Optional: no such dir means no bundle."""
+    import glob
+    import cgc_spool as _spool
+    try:
+        since_ts = datetime.datetime.fromisoformat(since).timestamp() if since else None
+    except ValueError:
+        since_ts = None
+    best = None
+    for root in {_spool.CGC_STATE_DIR, store_mod.data_dir()}:
+        for p in glob.glob(os.path.join(root, "incidents", "*", "diagnosis.json")):
+            try:
+                mt = os.path.getmtime(p)
+                hit = since_ts is not None and mt >= since_ts
+                if not hit and os.path.getsize(p) < 262144:
+                    with open(p, encoding="utf-8", errors="replace") as f:
+                        hit = rid in f.read()
+            except OSError:
+                continue
+            if hit and (best is None or mt > best[0]):
+                best = (mt, p)
+    return best[1] if best else None
+
+
+def diagnose(rid: str) -> int:
+    """`diagnose --rid R`: what an agent needs to decide on a stuck or failed round, in one line of
+    at most DIAGNOSE_MAX bytes, so it never reads the log or the driver. Read-only."""
+    import cgc_spool as _spool
+    with store_mod.Store() as s:
+        r = s.get_round(rid)
+        if r is None:
+            envelope(rid=rid, state="missing", code="not_found", detail="no such round in the store")
+            return 1
+        step = next_step(s, r, _spool.daemon_alive())
+        evs = s.events(rid)
+        needs = list(store_mod.round_needs(r.get("kind") or "", r.get("spec_json")))
+        broken = {k: (v.get("cause") or "")[:80] for k, v in s.gated_by(r).items()}
+        conv = s.conversation_of(rid)
+        attempts = s.attempt_count(rid)
+        send = s.send_evidence(rid) or {}
+    phases = {}
+    for e in evs:
+        if e["kind"] in _PHASE_EVENTS and (e["kind"] != "created" or "created" not in phases):
+            phases[e["kind"]] = e["at"][:19]
+        elif e["kind"] == "state" and "-> waiting" in (e.get("detail") or ""):
+            phases["waiting"] = e["at"][:19]
+    if r["state"] in store_mod.TERMINAL or r["state"] == store_mod.POSSIBLY_ACCEPTED:
+        phases["finished"] = r["updated_at"][:19]
+    out = r.get("out_path")
+    on_disk = bool(out and os.path.exists(out))
+    claimed = phases.get("claimed")
+    bundle = _incident_bundle(rid, claimed and next(
+        e["at"] for e in reversed(evs) if e["kind"] == "claimed"))
+    if bundle and step["code"] == "ui_contract_broken":
+        step["human_action"] = f"{step['human_action'] or 'the UI contract is broken'}; see bundle"
+    env = {"rid": rid, "state": r["state"], **step, "answer_path": out if on_disk else None,
+           "detail": r.get("error_code"), "kind": r["kind"], "attempts": attempts,
+           "conversation": conv, "answer_on_disk": on_disk,
+           "last_marker": _last_marker(_spool.log_path(rid)), "phases": phases,
+           "ui": {"needs": needs, "broken": broken}, "bundle": bundle,
+           "send": {k: send[k] for k in ("submitted", "reason", "phase") if k in send} or None}
+    # Bounded: shorten the free text until the line fits; the decision keys are never dropped.
+    for key, cap in (("last_marker", 200), ("human_action", 160), ("detail", 120),
+                     ("last_marker", 80), ("detail", 60), ("last_marker", 0)):
+        if len(json.dumps({"schema": 1, **env}, ensure_ascii=False).encode()) <= DIAGNOSE_MAX:
+            break
+        if env.get(key):
+            env[key] = env[key][:cap] or None
+    envelope(**env)
+    return 0
+
+
 # ---- the outcome envelope ----------------------------------------------------
 # Every await exit prints ONE machine-readable JSON line on stdout (prose stays on stderr): an
 # agent should never have to infer state by scraping prose. schema=1 is the envelope's version.
 def _emit(rid, state, *, retryable, human_action=None, next_command=None, answer_path=None,
           parent_rid=None, confidence=None, error=None, source_rid=None, observed_rid=None,
-          model_badge=None, model_slug=None, attribution=None):
+          model_badge=None, model_slug=None, attribution=None, code=None):
     import cgc_spool as _spool
+    code = code or code_of(state, error)
+    # A non-success outcome that names no move of its own points at `diagnose`, which decides from
+    # the store (and the log's last verdict) so the agent never reads the log itself. A completed
+    # answer is self-explanatory, and so is a rid the store has never seen.
+    if next_command is None and code != "ok" and not answer_path and state != "missing":
+        next_command = diagnose_cmd(rid)
     # The driver's typed outcome for this round's last send attempt, read here so EVERY envelope
     # carries it (None: no attempt, or one that predates typed outcomes).
     try:
@@ -962,10 +1298,10 @@ def _emit(rid, state, *, retryable, human_action=None, next_command=None, answer
         has_log = os.path.exists(log)
     except OSError:
         has_log = False
-    print(json.dumps({
-        "schema": 1, "rid": rid, "parent_rid": parent_rid, "state": state,
-        "retryable": retryable, "human_action": human_action, "next_command": next_command,
-        "answer_path": answer_path, "log_path": log if has_log else None,
+    envelope(**{
+        "rid": rid, "state": state, "code": code, "next_command": next_command,
+        "human_action": human_action, "answer_path": answer_path, "detail": error,
+        "parent_rid": parent_rid, "retryable": retryable, "log_path": log if has_log else None,
         "confidence": confidence, "error": error,
         # source_rid: for a retrieve round, the rid of the round it recovers (transparency — a
         # retrieve's own rid is fresh and means nothing on its own). observed_rid: on a rid-mismatch
@@ -983,7 +1319,7 @@ def _emit(rid, state, *, retryable, human_action=None, next_command=None, answer
         # send: the driver's typed outcome for the round's last send attempt (_send_evidence) —
         # submitted (true / false / null = unknown), reason, phase, drift, the contract it observed.
         "send": send,
-    }))
+    })
 
 
 # ---- the UI contract: typed send outcomes and the capability gate -------------------------------
@@ -1119,7 +1455,10 @@ def await_round(a) -> int:
                   error=f"{type(e).__name__}: {e}")
         except Exception:
             print(json.dumps({"schema": 1, "rid": getattr(a, "rid", None), "state": "error",
-                              "retryable": False, "error": f"{type(e).__name__}: {e}"}))
+                              "code": "service_unavailable", "next_command": None,
+                              "human_action": "read the traceback on stderr", "answer_path": None,
+                              "detail": f"{type(e).__name__}: {e}"[:200], "retryable": False,
+                              "error": f"{type(e).__name__}: {e}"}))
         return 1
 
 
@@ -1199,7 +1538,7 @@ def _await_round(a) -> int:
             if not text:
                 sys.stderr.write(f"CGC_BROKEN {a.rid}: round is {state} but its result_text is empty.\n")
                 _emit(a.rid, state, retryable=False, parent_rid=parent,
-                      error="completed but result_text empty")
+                      error="completed but result_text empty", code="result_unverified")
                 return 1
             _materialize(out, text)
             n = len(text.encode("utf-8"))
@@ -1221,7 +1560,7 @@ def _await_round(a) -> int:
                     f"  {out}\nRead it as a human would; do NOT auto-chain a follow-up on it.\n")
                 _emit(a.rid, state, retryable=False, parent_rid=parent, answer_path=out,
                       confidence="verified", source_rid=src_rid, model_badge=model_badge,
-                      model_slug=model_slug, attribution=attribution,
+                      model_slug=model_slug, attribution=attribution, code="human_required",
                       human_action=f"answer produced by {model_slug!r}, which {_ATTR_GATE_ENV} "
                                    "does not admit — judge it yourself before using it")
                 return 3
@@ -1353,10 +1692,10 @@ def _await_round(a) -> int:
                   source_rid=src_rid, observed_rid=_parse_observed_rid(err) if src_rid else None)
             return 1
         time.sleep(getattr(a, "poll", None) or store_mod.__dict__.get("POLL_S", 20) or 20)
-    sys.stderr.write(f"CGC_STUCK {a.rid}: no terminal state within {a.timeout}s — read the daemon log.\n")
+    sys.stderr.write(f"CGC_STUCK {a.rid}: no terminal state within {a.timeout}s — run: {diagnose_cmd(a.rid)}\n")
     _spool._point_at_log(a.rid, out)
     _emit(a.rid, "stuck", retryable=False, error=f"no terminal state within {a.timeout}s",
-          human_action="read the job log; the consult is broken, not slow")
+          human_action="the consult is broken, not slow — run next_command (diagnose)")
     return 1
 
 
