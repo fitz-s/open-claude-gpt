@@ -1,6 +1,6 @@
 {
   "schema": "cgc.contract.v1",
-  "note": "Every ChatGPT DOM fact the driver reads. Data only: CSS selectors, attribute names and plain labels. A UI change is fixed here; a changed widget protocol is a code change. Selectors must not contain a quote ' or a backslash.",
+  "note": "Every ChatGPT DOM fact the driver reads. Data only: CSS selectors, attribute names and plain labels, each of the type cdp_consult._CONTRACT_SCHEMA declares (the loader refuses anything else). A UI change is fixed here; a changed widget protocol, and what may be clicked to send, are code.",
   "facts": {
     "turn_schemas": {
       "value": [
@@ -29,14 +29,6 @@
     "model_slug_attr": {
       "value": "data-message-model-slug",
       "why": "The producing model's slug on the answer's message node (2026-09-06)."
-    },
-    "stop_button": {
-      "value": "[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"],button[aria-label*=\"停止\"]",
-      "why": "Visible while a reply streams; a generation signal, never a completion signal (2026-07-01)."
-    },
-    "send_button": {
-      "value": "button[data-testid=\"send-button\"],button[aria-label*=\"Send\" i],button[aria-label*=\"发送\"]",
-      "why": "Inside the composer's own form, rendered once it holds text (2026-07-01)."
     },
     "composer": {
       "value": "div[role=\"textbox\"][contenteditable=\"true\"],#prompt-textarea",

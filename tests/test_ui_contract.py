@@ -63,13 +63,13 @@ def test_every_contract_id_is_read_by_the_driver():
 # The facts the contract owns, as the literals they used to be written as. None may reappear in the
 # driver or the probe: a second copy is the copy a UI fix misses.
 _OWNED = ("data-message-author-role", "data-chatgpt-search-unit-key", "data-turn=", "[data-turn]",
-          "data-turn-key", "data-markdown-text-style", "assistant-message", "stop-button", "send-button",
+          "data-turn-key", "data-markdown-text-style", "assistant-message",
           "prompt-textarea", "contenteditable=", "app-mention", "trailingBreak", "data-mention-list",
           "data-list-navigation-item", "data-menu-row-content", "rounded-2xs", "text-codex-description",
           "composer-intelligence-picker-content", "composer-plus-btn", "menuitemradio", 'role="slider"',
           'role=\\"slider', "radiogroup", "aria-haspopup=\\\"menu", 'aria-expanded=\\"true',
           "data-message-model-slug", "Thinking failed", "Message stream error", "captcha\\\" i",
-          'type="password', "too many requests", "allow once", "允许", "停止", "发送", "拒绝",
+          'type="password', "too many requests", "allow once", "允许", "拒绝",
           "querySelector('main')", "'plugins'", "Extra High", "upgrade|")
 
 
@@ -88,6 +88,10 @@ def _code_strings(name):
             if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docs]
 
 
+# The schema's own enumeration words (role_from, level), which the loader's type check must name.
+_SCHEMA_WORDS = {"last_colon_segment"}
+
+
 @pytest.mark.parametrize("name", ["cdp_consult.py", "cgc_probe.py"])
 def test_no_contract_owned_literal_is_written_twice(name):
     code = _code_strings(name)
@@ -103,7 +107,7 @@ def test_no_contract_owned_literal_is_written_twice(name):
                 vals.append(x)
             elif isinstance(x, (list, dict)):
                 stack.extend(x.values() if isinstance(x, dict) else x)
-    hits += sorted({x for x in vals if len(x) >= 12 and any(x in s for s in code)})
+    hits += sorted({x for x in vals if len(x) >= 12 and x not in _SCHEMA_WORDS and any(x in s for s in code)})
     assert hits == [], f"{name} re-spells contract facts: {hits}"
 
 
@@ -120,14 +124,172 @@ def test_the_probe_imports_the_drivers_reads_and_defines_no_selector():
         assert redefined not in src, redefined
 
 
-def test_a_contract_value_that_would_break_the_js_is_refused(tmp_path, mods):
-    cdp = mods[0]
-    facts = _facts()
-    facts["composer"]["value"] = "div[data-x='y']"
+def _write(tmp_path, facts):
     p = tmp_path / "c.json"
     p.write_text(json.dumps({"facts": facts}))
+    return str(p)
+
+
+REPRO = ("/private/tmp/claude-501/-Users-leofitz-chatgpt-consult/67c829ec-c5f0-415e-8ed9-5f9b7a6a8b0b/"
+         "scratchpad/contract-review-repro")
+# The reviewer's payload: a LIST where an attribute name belongs, which a repr() splice turned into
+# executable JS inside a single-quoted string.
+_INJECTION = [");};globalThis.contractReviewInjected=1;function __review(){return void("]
+
+
+def test_law1_the_reviewers_list_payload_is_refused(tmp_path, mods):
+    cdp = mods[0]
+    facts = _facts()
+    facts["turn_schemas"]["value"][0]["attr"] = _INJECTION
     with pytest.raises(SystemExit, match="contract_invalid"):
-        cdp._load_contract(str(p))
+        cdp._load_contract(_write(tmp_path, facts))
+
+
+@pytest.mark.parametrize("fid", sorted(_facts()))
+@pytest.mark.parametrize("wrong", [None, 1, True, ["x"], {"a": "b"}, "", "a\nb"])
+def test_law1_every_id_refuses_every_other_type(tmp_path, mods, fid, wrong):
+    cdp = mods[0]
+    facts = _facts()
+    v = facts[fid]["value"]
+    if type(wrong) is type(v) and wrong != "" and wrong != "a\nb":
+        return                                          # same type: not a mismatch to test here
+    facts[fid]["value"] = wrong
+    with pytest.raises(SystemExit, match="contract_invalid"):
+        cdp._load_contract(_write(tmp_path, facts))
+
+
+def test_law1_an_unknown_or_missing_id_is_refused(tmp_path, mods):
+    cdp = mods[0]
+    facts = _facts()
+    facts["extra"] = {"value": "x", "why": "2026-10"}
+    with pytest.raises(SystemExit, match="contract_invalid"):
+        cdp._load_contract(_write(tmp_path, facts))
+    facts = _facts()
+    del facts["composer"]
+    with pytest.raises(SystemExit, match="contract_invalid"):
+        cdp._load_contract(_write(tmp_path, facts))
+
+
+def test_law1_a_quote_in_a_selector_is_encoded_not_executed(tmp_path, mods):
+    """With the JSON encoding the character filter is only control characters: a quote or a
+    backslash in a selector is data, and the JS it lands in still parses to that exact string."""
+    cdp = mods[0]
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    import subprocess
+    for s in ("div[data-x='y']", 'a[b="c"]', "x\\y", "停止", "\U0001f600", "');alert(1);('"):
+        js = "console.log(JSON.stringify(" + cdp._js_str(s) + "))"
+        assert json.loads(subprocess.run(["node", "-e", js], capture_output=True, text=True,
+                                         check=True).stdout) == s
+    facts = _facts()
+    facts["composer"]["value"] = "div[data-x='y']"
+    assert cdp._load_contract(_write(tmp_path, facts))["composer"] == "div[data-x='y']"
+    with pytest.raises(TypeError):
+        cdp._js_str(["not", "a", "string"])
+
+
+def test_law4_an_invalid_contract_blocks_the_round_as_proven_not_sent(tmp_path, mods, monkeypatch):
+    """The driver dies at import on an invalid contract, before any browser call. Through
+    process_round, with the driver's own real stderr: blocked, not_sent_proven, the error kept, and
+    refire eligible once the contract is fixed."""
+    import subprocess
+    import cgc_backend
+    import cgc_store
+    facts = _facts()
+    facts["turn_schemas"]["value"][0]["attr"] = _INJECTION
+    monkeypatch.setenv("CGC_CONTRACT", _write(tmp_path, facts))
+    drv = subprocess.run([sys.executable, os.path.join(SCRIPTS, "cdp_consult.py"), "submit",
+                          "--prompt-file", "-"], input="p", capture_output=True, text=True)
+    assert drv.returncode != 0 and drv.stderr.startswith("CGC_ERROR contract_invalid")
+    rid = "REQ-20261014-120000-0000d1"
+    with cgc_store.Store() as s:
+        s.create_round(rid, "submit", prompt="p", spec_json=json.dumps({"model": "Pro"}))
+        s.set_state(rid, cgc_store.READY)
+        res = {"code": drv.returncode, "conversation": "", "stderr": drv.stderr, "outcome": {}}
+        final = cgc_backend.process_round(s, s.get_round(rid), lambda kind, **kw: res,
+                                          daemon_instance_id="d", validate=lambda p: (True, "ok"))
+        r = s.get_round(rid)
+        assert final == cgc_store.BLOCKED and r["state"] == cgc_store.BLOCKED
+        assert r["send_disposition"] == cgc_store.NOT_SENT_PROVEN
+        assert r["error_code"].startswith("contract_invalid") and "turn_schemas" in r["error_code"]
+        assert cgc_backend._release_eligible(s, r), "refire may resend it once the contract is fixed"
+
+
+_GOLDEN_JS = "ed610bb4a4f950450e98822770a7fc5587e5ab72bedbdff365b88e01bc5e9cc9"
+
+
+def _generated_js(cdp):
+    """Every JS string the driver generates from the shipped contract, keyed by name (the
+    sample-argument dump the refactor was proven EXACT_EQUAL against)."""
+    import inspect
+    sample = {"rid": "REQ-20261011-120000-0000a1", "target": "Pro", "name": "WebCodex Demo",
+              "token": "tok1", "chunk": "a\nb", "label": "6", "allow": ["WebCodex Demo"], "i": 1}
+    out = {}
+    for k in sorted(dir(cdp)):
+        v = getattr(cdp, k)
+        if k in ("_SEND_BUTTON_SEL", "_STOP_BUTTON_SEL"):
+            continue                                    # names the reviewed dump did not have
+        if isinstance(v, str) and ("function" in v or "querySelector" in v or "[" in v):
+            out[k] = v
+        elif isinstance(v, tuple) and k.startswith("_ADAPT"):
+            out[k] = repr(v)
+        elif callable(v) and k.endswith("_js") and inspect.isfunction(v):
+            sig = inspect.signature(v)
+            args, ok = {}, True
+            for p in sig.parameters.values():
+                if p.kind == p.KEYWORD_ONLY:
+                    continue
+                if p.name in sample:
+                    args[p.name] = sample[p.name]
+                elif p.default is p.empty:
+                    ok = False
+            if not ok:
+                out[k] = "SKIP " + str(sig)
+                continue
+            out[k] = v(**args)
+            if "scoped" in sig.parameters:
+                out[k + "[scoped]"] = v(**args, scoped=True)
+    return out
+
+
+def test_law1_the_shipped_contract_generates_exactly_the_reviewed_js(mods):
+    import hashlib
+    js = _generated_js(mods[0])
+    assert hashlib.sha256(json.dumps(js, sort_keys=True).encode()).hexdigest() == _GOLDEN_JS
+
+
+def test_law2_the_send_button_is_not_in_the_contract(tmp_path, mods):
+    """Send authority is code: the contract has no id for it, and adding one is refused."""
+    cdp = mods[0]
+    assert "send_button" not in _facts() and "stop_button" not in _facts()
+    for bad in ("widened-contract.json", "invalid-contract.json"):
+        path = os.path.join(REPRO, bad)
+        if not os.path.exists(path):
+            pytest.skip("reviewer repro not present")
+        with pytest.raises(SystemExit, match="contract_invalid"):
+            cdp._load_contract(path)
+
+
+def test_law2_no_contract_edit_can_widen_what_the_send_click_clicks(tmp_path, mods, monkeypatch):
+    """The send click's selector is the code constant whatever contract is loaded."""
+    _cdp, probe, _drift = mods
+    facts = _facts()
+    for k, v in facts.items():                         # every selector fact widened to `button`
+        if isinstance(v["value"], str) and "[" in v["value"]:
+            v["value"] = "button"
+    drv = probe._driver(_write(tmp_path, facts))
+    js = drv._send_click_js()
+    # The only button query inside the composer's form is the code constant.
+    assert re.findall(r"f\.querySelectorAll\(([^)]*)\)", js) == [drv._js_str(drv._SEND_BUTTON_SEL)]
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    # The reviewer's case, in a real DOM: a form holding the editor and a Cancel button only.
+    t = mods[2].FixtureTab("", "/c/x")
+    t.tree = [["html", {}, [["body", {}, [["form", {}, [
+        ["div", {"role": "textbox", "contenteditable": "true"}, []],
+        ["button", {"aria-label": "Cancel"}, ["Cancel"]]]]]]]]]
+    assert t.eval(drv._send_click_js()) != "clicked", "Cancel is never clicked"
+    assert t.eval(mods[0]._send_click_js()) in ("no-send", "no-focus"), "nor under the shipped contract"
 
 
 def test_a_demonstrated_relabel_is_the_family_and_nothing_else_is(mods):
@@ -258,7 +420,7 @@ def test_the_bundle_is_capped_and_its_page_text_bounded(mods):
     snap = {"counts": [], "candidates": [{"selector": f"[data-x{i}]", "matches": 1, "visible": 1}
                                           for i in range(40)],
             "tree": ["body", {}, [big]], "path": "/c/x"}
-    d, _fixture = drift.bundle(cdp.UI, snap, cap="reader", code="UI_CONTRACT_BROKEN", detail="d" * 900,
+    d, _fixture = drift.bundle(cdp.UI, snap, cap="reader", code="UI_CONTRACT_BROKEN", detail="word " * 180,
                                contract_path=cdp.CONTRACT_PATH)
     assert len(json.dumps(d, indent=1).encode()) <= drift.JSON_CAP
     assert len(d["detail"]) == 300
@@ -424,7 +586,7 @@ def test_sol_candidate_selectors_carry_no_page_prose(mods):
     snap = _capture(drift, cdp, ["html", {}, [["body", {}, [["main", {}, nodes]]]]], cap="model")
     sels = [c["selector"] for c in snap["candidates"]]
     assert not any("private-model-description" in s for s in sels), sels
-    assert "[data-model-label]" in sels
+    assert not any("data-model-label" in s for s in sels), "a name off the allowlist is not kept"
     snap = _capture(drift, cdp, ["html", {}, [["body", {}, [["main", {}, nodes]]]]])
     assert '[data-message-unit$=":assistant"]' in [c["selector"] for c in snap["candidates"]]
 
@@ -449,13 +611,10 @@ def test_sol_family_names_compare_alike_on_both_sides(mods):
 def test_sol_contract_values_splice_as_js(mods, tmp_path):
     cdp = mods[0]
     assert cdp._js_str("停止") == "'\\u505c\\u6b62'"
-    for bad in ("x\ny", "\U0001f600"):
-        facts = _facts()
-        facts["composer"]["value"] = bad
-        p = tmp_path / "c.json"
-        p.write_text(json.dumps({"facts": facts}))
-        with pytest.raises(SystemExit, match="contract_invalid"):
-            cdp._load_contract(str(p))
+    facts = _facts()
+    facts["composer"]["value"] = "x\ny"
+    with pytest.raises(SystemExit, match="contract_invalid"):
+        cdp._load_contract(_write(tmp_path, facts))
 
 
 def test_sol_replay_leaves_cgc_contract_as_it_found_it(mods, monkeypatch):
@@ -463,6 +622,75 @@ def test_sol_replay_leaves_cgc_contract_as_it_found_it(mods, monkeypatch):
     monkeypatch.setenv("CGC_CONTRACT", CONTRACT)
     probe._driver(CONTRACT)
     assert os.environ["CGC_CONTRACT"] == CONTRACT
+
+
+# ---- law 3: privacy by allowlist ------------------------------------------------------------------
+
+def test_law3_the_reviewers_cases_keep_nothing_private(mods, tmp_path):
+    cdp, _probe, drift = mods
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    long_name = "data-" + "x" * 360                          # a 365-character attribute name
+    nodes = [
+        ["div", {"data-message-author-role": "user", "data-cookie": "sid=abc123",
+                 "data-session-id": "s3cr3t", long_name: "v", "data-preview": "private text",
+                 "data-testid": "https://private.example/secret", "aria-label": "../../etc/passwd",
+                 "class": "flex hiddenvalue=1 " + "a" * 40}, ["see ./notes/plan.md and https://x.io/a"]],
+        ["div", {"data-message-author-role": "assistant", "data-src": "/" + "Users/me/f"}, ["ok"]]]
+    tree = ["html", {}, [["body", {}, [["main", {}, nodes]]]]]
+    snap = _capture(drift, cdp, tree)
+    d, fixture = drift.bundle(cdp.UI, snap, cap="reader", code="x", contract_path=cdp.CONTRACT_PATH,
+                              detail="the popup offered https://private.example/x and ../a/b")
+    out = fixture + json.dumps(d)
+    for leak in ("private.example", "x.io", "etc/passwd", "notes/plan", "Users/me", "sid=", "abc123",
+                 "s3cr3t", "x" * 41, "private text", "hiddenvalue", "a" * 33):
+        assert leak not in out, leak
+    assert "data-cookie" not in out and "data-session-id" not in out and "data-preview" not in out
+    assert 'data-message-author-role="user"' in fixture and 'class="flex"' in fixture
+
+
+def test_law3_page_text_shares_one_200_character_budget(mods):
+    cdp, _probe, drift = mods
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    nodes = [["p", {"data-message-author-role": "user", "aria-label": "label words here"},
+              ["secret words " * 10]] for _ in range(30)]
+    snap = _capture(drift, cdp, ["html", {}, [["body", {}, [["main", {}, nodes]]]]])
+    d, fixture = drift.bundle(cdp.UI, snap, cap="reader", code="x", detail="",
+                              contract_path=cdp.CONTRACT_PATH)
+    text = re.sub(r"<[^>]*>", "", fixture) + "".join(
+        re.findall(r'aria-label="([^"]*)"', fixture))
+    assert len(re.sub(r"[\s…]", "", text)) <= 200
+
+
+# ---- law 5: replay fidelity ------------------------------------------------------------------------
+
+def test_law5_a_hidden_composer_does_not_replay_as_present(mods, tmp_path):
+    cdp, probe, drift = mods
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    hidden = ["html", {}, [["body", {}, [["form", {}, [
+        ["div", {"role": "textbox", "contenteditable": "true", "hidden": ""}, ["draft"]]]]]]]]
+    inc = _bundle_of(drift, cdp, "composer", hidden, {}, tmp_path)
+    assert 'data-cgc-invisible=""' in open(os.path.join(inc, "fixture.html")).read()
+    assert probe.replay(inc)["ok"] is False
+    old = os.path.join(REPRO, "incidents", "I-20261014-161205-composer-21cbe0")
+    if os.path.isdir(old):
+        assert probe.replay(old)["ok"] is False, "the reviewer's hidden-composer capture"
+
+
+def test_law5_the_recorded_mention_popup_replays_as_a_hit(mods, tmp_path):
+    """tests/fixtures/mention_popup.json webcodex_demo, captured and replayed with the shipped
+    contract: the label and description spans (flex items) read as two lines, not one."""
+    cdp, probe, drift = mods
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    fx = json.load(open(os.path.join(ROOT, "tests", "fixtures", "mention_popup.json")))
+    popup = drift.parse_fixture(fx["cases"]["webcodex_demo"]["popup_html"])
+    tree = ["html", {}, [["body", {}, popup]]]
+    inc = _bundle_of(drift, cdp, "mention", tree, {"app": "WebCodex Demo"}, tmp_path)
+    r = probe.replay(inc)
+    assert r["ok"] is True, r
 
 
 def test_a_send_refusal_carries_its_bundle_into_the_attempt_and_the_daemon_log(mods, capsys):

@@ -1,12 +1,23 @@
 // A minimal offline DOM for replaying the driver's page JS against a saved, sanitized fixture
 // (cgc_drift.FixtureTab). stdin: {"tree": [...], "path": "/c/x", "js": "<expression>"}; stdout: the
 // expression's value as JSON. Selectors: lists, descendant combinators, tag, *, #id, .class,
-// [a], [a=v], [a*=v], [a^=v], [a$=v], [a~=v] (with an i flag) and :not(<compound>). No layout:
-// every element is visible. No network, no timers.
+// [a], [a=v], [a*=v], [a^=v], [a$=v], [a~=v] (with an i flag) and :not(<compound>). No network, no
+// timers. Layout, as far as the driver reads it:
+//   visibility  an element is 0x0 when it, or an ancestor, carries data-cgc-invisible (the capture's
+//               record of a 0x0 box) or `hidden`; every other element is 1x1.
+//   innerText   a line break around each block-level child: a block tag, an element the capture
+//               recorded as block-level (data-cgc-block), or a child of a flex/grid container
+//               (CSS blockifies flex and grid items — a row's label and description spans).
 'use strict';
 const VOID = new Set(['br', 'hr', 'input', 'img', 'meta', 'link', 'area', 'base', 'col', 'embed',
   'source', 'track', 'wbr']);
 const BLOCK = /^(P|DIV|LI|UL|OL|H[1-6]|PRE|BLOCKQUOTE|TABLE|TR|SECTION|ARTICLE|MAIN|FORM|HEADER|FOOTER|NAV)$/;
+const FLEXBOX = /(^|\s)(inline-)?(flex|grid)(\s|$)/;
+function isBlock(c) {
+  if (BLOCK.test(c.tagName) || 'data-cgc-block' in c._a) return true;
+  const p = c.parentElement;
+  return !!p && p.nodeType === 1 && FLEXBOX.test(p._a['class'] || '');
+}
 
 class Text {
   constructor(v) { this.nodeType = 3; this.nodeValue = v; this.parentElement = null; }
@@ -38,14 +49,19 @@ class El {
     for (const c of this.childNodes) {
       if (c.nodeType === 3) { o += c.nodeValue; continue; }
       if (c.tagName === 'BR') { o += '\n'; continue; }
-      const b = BLOCK.test(c.tagName), t = c.innerText;
+      const b = isBlock(c), t = c.innerText;
       if (b && o && !o.endsWith('\n')) o += '\n';
       o += t;
       if (b && t && !t.endsWith('\n')) o += '\n';
     }
-    return o;
+    return o.replace(/^\n+|\n+$/g, '');   // a block's own leading/trailing breaks are not its text
   }
-  getBoundingClientRect() { return { width: 1, height: 1, top: 0, left: 0, right: 1, bottom: 1 }; }
+  getBoundingClientRect() {
+    for (let n = this; n && n.nodeType === 1; n = n.parentElement)
+      if ('data-cgc-invisible' in n._a || 'hidden' in n._a)
+        return { width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
+    return { width: 1, height: 1, top: 0, left: 0, right: 1, bottom: 1 };
+  }
   contains(n) { for (; n; n = n.parentElement) if (n === this) return true; return false; }
   closest(sel) { const L = parse(sel); for (let n = this; n && n.nodeType === 1; n = n.parentElement) if (matchList(n, L)) return n; return null; }
   matches(sel) { return matchList(this, parse(sel)); }

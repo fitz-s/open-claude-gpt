@@ -8,14 +8,18 @@ releases until it stabilizes.
 
 ### Added — one UI contract, and a repair bundle when ChatGPT's page changes
 
-- Every ChatGPT DOM fact the driver reads (turn schemas, answer body, composer, send/stop buttons,
-  mention popup and chip, model picker, family label aliases, failure markers, blockers) is now one
-  entry in `skill/scripts/chatgpt_contract.json`. `cdp_consult.py` builds its page JS from it.
-  `cgc_probe.py` imports the driver's reads and defines no selector of its own. A test fails if a
-  contract-owned literal reappears in either file.
+- Every ChatGPT DOM fact the driver reads (turn schemas, answer body, composer, mention popup and
+  chip, model picker, family label aliases, failure markers, blockers) is now one entry in
+  `skill/scripts/chatgpt_contract.json`. Each id has a declared type. The loader refuses an unknown,
+  missing or mistyped id with `contract_invalid` before any browser action (the round blocks as
+  proven not sent), and values enter page JS only through their JSON encoding. The send and stop
+  buttons stay code: no contract edit can widen what is clicked. `cgc_probe.py` imports the
+  driver's reads and defines no selector of its own. A test fails if a contract-owned literal
+  reappears in either file.
 - A break the probe confirms, or a send refused with `model_not_selectable`, `composer_not_ready`
   or a mention drift, writes `<data dir>/incidents/<id>/diagnosis.json` (`cgc.drift.v1`, at most
-  8 KB) and a sanitized `fixture.html`. The bundle holds per-selector match counts, nearby candidate
+  8 KB) and a `fixture.html` that keeps only allowlisted attribute names and scrubbed values, and at
+  most 200 characters of page text. The bundle holds per-selector match counts, nearby candidate
   selectors, the contract ids to edit and the commands that check the edit. Its path leads the
   recorded cause and appears in the daemon log.
 - `cgc_probe.py --replay <incident>` runs the capability's reads against the fixture in node,

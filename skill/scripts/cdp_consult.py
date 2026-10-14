@@ -118,48 +118,113 @@ try:
 except Exception:
     pass
 
-# Every ChatGPT DOM fact this driver reads (selectors, attribute names, labels) lives in ONE data file,
+# The ChatGPT DOM facts this driver READS (selectors, attribute names, labels) live in ONE data file,
 # chatgpt_contract.json, so a UI change is repaired there and not in this file. CGC_CONTRACT points at
-# another copy (how `cgc_probe.py --replay` checks an edited one). Values are spliced into single-quoted
-# JS strings, so a value holding ' or \ is refused here instead of breaking every page read.
+# another copy (how `cgc_probe.py --replay` checks an edited one). What may be CLICKED to send is not
+# a fact to repair: the send and stop buttons are code (_SEND_BUTTON_SEL, _STOP_BUTTON_SEL below).
 CONTRACT_PATH = os.environ.get("CGC_CONTRACT") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "chatgpt_contract.json")
 
+# Every contract id and its type. The loader accepts exactly these ids, each of exactly this type:
+#   "sel"   a CSS selector string     "attr"  an attribute name ([a-z][a-z0-9-]*)
+#   "word"  a plain label string      "words" a non-empty list of labels
+#   "alias" {label: label}            "class" a class token ([A-Za-z0-9_-]+)
+#   "body"  {attr: <attr>, value: <word>}
+#   "schemas" a non-empty list of {adapter: word, attr: attr, level: turn|message,
+#             role_from: value|last_colon_segment, send_rank: int}, send_ranks distinct
+_CONTRACT_SCHEMA = {
+    "turn_schemas": "schemas", "assistant_body": "body", "turn_container": "sel",
+    "conversation_root": "sel", "failure_markers": "words", "model_slug_attr": "attr",
+    "composer": "sel", "composer_exclude_ancestor": "sel", "composer_plus_button_id": "word",
+    "trailing_break_class": "class", "mention_chip_attr": "attr", "mention_chip_label_attr": "attr",
+    "mention_popup_attr": "attr", "mention_option_attr": "attr", "mention_row_content_attr": "attr",
+    "mention_app_icon_class": "class", "mention_description_class": "class", "mention_loading": "sel",
+    "mention_section_header": "word", "picker_owner": "sel", "picker_menu": "sel",
+    "picker_slider": "sel", "picker_menuitem": "sel", "picker_family_radio": "sel",
+    "picker_radio_scaffold": "sel", "picker_flat_items": "sel", "picker_submenu_trigger": "sel",
+    "picker_open_trigger": "sel", "picker_open_menus": "sel", "switcher_labels": "words",
+    "switcher_not_labels": "words", "family_aliases": "alias", "blocker_login": "sel",
+    "blocker_login_paths": "words", "blocker_captcha": "sel", "blocker_alert": "sel",
+    "rate_limit_phrases": "words", "approval_allow_labels": "words", "approval_deny_labels": "words",
+}
+_ATTR_RE = re.compile(r"[a-z][a-z0-9-]*\Z")
+_CLASS_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
+
+
+def _text(v):
+    """A non-empty string with no control character (the only text the contract may hold)."""
+    return isinstance(v, str) and v != "" and not any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in v)
+
+
+def _typed(kind, v):
+    if kind in ("sel", "word"):
+        return _text(v)
+    if kind == "attr":
+        return isinstance(v, str) and bool(_ATTR_RE.match(v))
+    if kind == "class":
+        return isinstance(v, str) and bool(_CLASS_RE.match(v))
+    if kind == "words":
+        return isinstance(v, list) and bool(v) and all(_text(x) for x in v)
+    if kind == "alias":
+        return isinstance(v, dict) and all(_text(a) and _text(b) for a, b in v.items())
+    if kind == "body":
+        return (isinstance(v, dict) and set(v) == {"attr", "value"} and _typed("attr", v["attr"])
+                and _text(v["value"]))
+    if kind == "schemas":
+        return (isinstance(v, list) and bool(v) and all(
+            isinstance(s, dict) and set(s) == {"adapter", "attr", "level", "role_from", "send_rank"}
+            and _text(s["adapter"]) and _typed("attr", s["attr"])
+            and s["level"] in ("turn", "message") and s["role_from"] in ("value", "last_colon_segment")
+            and type(s["send_rank"]) is int for s in v)
+            and len({s["send_rank"] for s in v}) == len(v))
+    return False
+
 
 def _load_contract(path):
-    with open(path, encoding="utf-8") as f:
-        ui = {k: v["value"] for k, v in json.load(f)["facts"].items()}
-
-    def strings(v):
-        if isinstance(v, str):
-            yield v
-        elif isinstance(v, (list, dict)):
-            for x in (v.values() if isinstance(v, dict) else v):
-                yield from strings(x)
-    bad = [k for k, v in ui.items() for s in strings(v)
-           if "'" in s or "\\" in s or any(ord(ch) < 0x20 or ord(ch) > 0xFFFF for ch in s)]
+    """The contract's {id: value}, or SystemExit(contract_invalid) before any browser action: an id
+    missing, unknown, or of the wrong type (_CONTRACT_SCHEMA)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            facts = json.load(f)["facts"]
+        ui = {k: v["value"] for k, v in facts.items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        raise SystemExit(f"CGC_ERROR contract_invalid: {path}: unreadable ({type(e).__name__}: {e})")
+    bad = sorted(set(_CONTRACT_SCHEMA) ^ set(ui))
+    bad += [k for k, kind in _CONTRACT_SCHEMA.items() if k in ui and not _typed(kind, ui[k])]
     if bad:
-        raise SystemExit(f"CGC_ERROR contract_invalid: {path}: {bad} hold a ' , a backslash, a "
-                         "control character or a character outside the BMP")
+        raise SystemExit(f"CGC_ERROR contract_invalid: {path}: {bad} missing, unknown or not of "
+                         "their declared type")
     return ui
 
 
 UI = _load_contract(CONTRACT_PATH)
 
 
-def _u(s):
-    """Non-ASCII as JS \\uXXXX escapes (the loader admits only BMP characters, so one per char)."""
-    return "".join(ch if ord(ch) < 0x80 else "\\u%04x" % ord(ch) for ch in s)
-
-
 def _js_str(s):
-    """A contract value as a single-quoted JS string literal."""
-    return "'" + _u(s) + "'"
+    """THE way a contract value enters generated JS: its JSON string encoding (json.dumps escapes
+    every backslash, quote, control and non-ASCII character), re-delimited with single quotes to
+    match the driver's own literals — `"` needs no escape there, `'` gets one. Strings only."""
+    if not isinstance(s, str):
+        raise TypeError(f"a contract string, not {type(s).__name__}")
+    return "'" + json.dumps(s)[1:-1].replace('\\"', '"').replace("'", "\\'") + "'"
 
 
 def _js_alt(words):
-    """Plain contract labels as one JS regex alternation (each label matched literally)."""
-    return "|".join(_u(re.sub(r"([\\^$.|?*+()\[\]{}/])", r"\\\1", w)) for w in words)
+    """Plain contract labels as one JS regex alternation, each label matched literally: regex
+    metacharacters escaped, then the JSON escapes for anything non-ASCII. Strings only."""
+    if not (isinstance(words, list) and all(isinstance(w, str) for w in words)):
+        raise TypeError("a list of contract labels")
+    return "|".join(re.sub(r"[^\x00-\x7f]", lambda m: json.dumps(m.group())[1:-1],
+                           re.sub(r"([\\^$.|?*+()\[\]{}/])", r"\\\1", w)) for w in words)
+
+
+# What may be clicked to SEND, and what signals a reply is streaming, are send authority, not page
+# facts to repair from data (an edit widening the send button would click whatever it named). They
+# stay here, in code, reviewed as code.
+_SEND_BUTTON_SEL = ('button[data-testid="send-button"],button[aria-label*="Send" i],'
+                    'button[aria-label*="发送"]')
+_STOP_BUTTON_SEL = ('[data-testid="stop-button"],button[aria-label*="Stop"],'
+                    'button[aria-label*="停止"]')
 
 
 CGC_PORT = int(os.environ.get("CGC_PORT", "9333"))
@@ -644,8 +709,9 @@ _IN_MESSAGE_SEL = ",".join([f'[{_BODY["attr"]}]'] + [f'[{s["attr"]}]' for s in _
 
 # Whichever attribute this build uses, the role reads the same way.
 _ROLE_FN = ("function __cgcRole(el){return "
-            + "".join(f"el.getAttribute('{s['attr']}')||" if s["role_from"] == "value" else
-                      f"((el.getAttribute('{s['attr']}')||'').split(':').pop())||" for s in _SCHEMAS)
+            + "".join("el.getAttribute(" + _js_str(s["attr"]) + ")||" if s["role_from"] == "value" else
+                      "((el.getAttribute(" + _js_str(s["attr"]) + ")||'').split(':').pop())||"
+                      for s in _SCHEMAS)
             + "'';}")
 
 # Layout-independent innerText approximation: a textContent walk that re-inserts newlines at block
@@ -707,7 +773,8 @@ _NODE_FN = (
     # no turn at all (the waiter read len=0 for 90 minutes beside a finished answer) or, worse, a
     # LATER round's turn. Returns null when the source turn is not rendered — the caller must fail
     # closed rather than search outside the (unresolvable) interval.
-    "function __cgcBody(n,BG){var m=n.querySelectorAll('[" + _BODY["attr"] + "=\"" + _BODY["value"] + "\"]');"
+    "function __cgcBody(n,BG){var m=n.querySelectorAll("
+    + _js_str("[" + _BODY["attr"] + "=" + json.dumps(_BODY["value"]) + "]") + ");"
     "for(var i=m.length-1;i>=0;i--){if((m[i].textContent||'').indexOf(BG)>=0)return m[i];}return n;}"
     "function __cgcNode(BG,RID){"
     "var nx=document.querySelectorAll(" + _JS_ANY + ");"
@@ -958,7 +1025,7 @@ def _detect_js(rid: str, *, scoped=False) -> str:
         "var rawT=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
         "var res=" + sentinel + ";"
         "var hasB=rawT.indexOf(BG)>=0,hasE=rawT.indexOf(EN)>=0;"
-        "var stop=!!document.querySelector(" + _js_str(UI["stop_button"]) + ");"
+        "var stop=!!document.querySelector(" + _js_str(_STOP_BUTTON_SEL) + ");"
         + _BLOCKER_FN + "var blocker=__cgcBlocker();"
         "var done=(res.done&&a.length>0);"
         "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,node:where,superseded:sup,"
@@ -2538,7 +2605,7 @@ def _contract_js(rid):
             "for(var j=0;j<us.length;j++){if(__cgcRid(__cgcText(us[j]))===RID){hit=true;break;}}"
             "out.push({adapter:F[i].name,ridLanded:hit,users:us.length,assistants:as.length});}"
             "var gen=!!document.querySelector(%s);"
-            "return JSON.stringify({families:out,generating:gen});})()" % (tag, fams, _js_str(UI["stop_button"])))
+            "return JSON.stringify({families:out,generating:gen});})()" % (tag, fams, _js_str(_STOP_BUTTON_SEL)))
 
 
 def _await_contract(c, rid):
@@ -2790,7 +2857,7 @@ def _send_click_js():
     can prove nothing was clicked. A throw from click() itself escapes and reads as no value."""
     return ("(function(){var t;try{" + _COMPOSER_RESOLVE_JS + "var d=__cg();if(!d)return 'no-composer';"
             "var f=d.closest('form');var b=Array.prototype.slice.call(f.querySelectorAll("
-            + _js_str(UI["send_button"]) + ")).filter(function(x){var r=x.getBoundingClientRect();"
+            + _js_str(_SEND_BUTTON_SEL) + ")).filter(function(x){var r=x.getBoundingClientRect();"
             "return r.width>0&&r.height>0;});"
             "if(b.length>1)return 'ambiguous';if(b.length===1){if(b[0].disabled)return 'disabled';t=b[0];}"
             "else{var a=document.activeElement;return (a===d||d.contains(a))?'no-send':'no-focus';}"
@@ -2994,7 +3061,7 @@ def _mention_pick_js(name, token):
             "p=p.previousElementSibling;return p?txt(p).toLowerCase():null;}"
             "function headed(e){var k=e.parentElement.children;for(var i=0;i<k.length;i++)"
             "if(!row(k[i])&&txt(k[i]))return true;return false;}"
-            "function body(e){return e.querySelector('[" + UI["mention_row_content_attr"] + "]');}"
+            "function body(e){return e.querySelector(" + _js_str("[" + UI["mention_row_content_attr"] + "]") + ");}"
             "function tok(n,c){return ((n&&n.getAttribute&&n.getAttribute('class'))||'').split(/\\s+/)"
             ".indexOf(c)>=0;}"
             "function appish(e){var c=body(e);if(!c)return false;var l=c.firstElementChild;"
@@ -3004,7 +3071,7 @@ def _mention_pick_js(name, token):
             # so a second text node (a bare ' Connect' appended after the description) fails it as well
             "function leaf(n){return !!n&&n.children.length===0&&n.childNodes.length<=1;}"
             "function plain(e){var c=body(e);if(!c||e.children.length!==1||c.children.length!==2)return false;"
-            "var d=c.querySelector('." + UI["mention_description_class"] + "');if(!d||!leaf(d))return false;"
+            "var d=c.querySelector(" + _js_str("." + UI["mention_description_class"]) + ");if(!d||!leaf(d))return false;"
             # the label element is the description's first text sibling: the innermost element holding the
             # label. Both must be LEAVES (no element inside them), so a Connect control nested inside the
             # description or the label cannot hide there, and the whole button must read exactly label +
@@ -3034,7 +3101,8 @@ def _composer_mentions_js():
     # The composer's APP mention nodes: a picked app becomes <span app-mention-name=... app-mention-display-name=...>;
     # a picked file or any other row does not. Returns the normalized display names ([] when there is no composer).
     return ("(function(){var d=" + _composer_get_js() + ";if(!d)return [];"
-            "return Array.prototype.map.call(d.querySelectorAll('[" + UI["mention_chip_attr"] + "]'),function(e){"
+            "return Array.prototype.map.call(d.querySelectorAll(" + _js_str("[" + UI["mention_chip_attr"] + "]")
+            + "),function(e){"
             "return (e.getAttribute(" + _js_str(UI["mention_chip_label_attr"]) + ")||e.getAttribute("
             + _js_str(UI["mention_chip_attr"]) + ")||'')"
             ".replace(/\\s+/g,' ').trim().toLowerCase();});})()")

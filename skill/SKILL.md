@@ -91,7 +91,7 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid>
   "enable/connect the app in ChatGPT" and stop; a row that "is not an app" or a popup that "never
   opened" → a driver/DOM problem, relay it verbatim, do not retry.
 - A UI change (`ChatGPT UI changed`, or a `diagnosis.json` path in the error/log) is repairable from
-  data: follow docs/TROUBLESHOOTING.md "When ChatGPT's UI changes" (edit the contract ids, `--replay`, probe).
+  data: follow docs/TROUBLESHOOTING.md "When ChatGPT's UI changes" (edit the ids, run the bundle's `check` commands).
 - Do NOT preflight: never run `doctor`/`queue`/`status` before firing. The daemon is installed
   once (`cgc install-daemon`, launchd keeps it alive); if it is genuinely down, fire/await say so
   in one line — relay `cgc install-daemon` to the user and stop.

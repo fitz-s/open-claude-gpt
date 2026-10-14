@@ -58,7 +58,7 @@ HYDRATE_S = 60            # how long the whole thread may take to hydrate before
 
 # What the send path's JS looks like (its button selector, a form submit). A probe step that would
 # evaluate one is refused; Enter is a key, refused in _NoSend.key.
-_SEND_JS = re.compile(re.escape(cdp._js_str(cdp.UI["send_button"])) + r"|requestSubmit|\.submit\(")
+_SEND_JS = re.compile(re.escape(cdp._js_str(cdp._SEND_BUTTON_SEL)) + r"|requestSubmit|\.submit\(")
 
 
 class SendRefused(AssertionError):

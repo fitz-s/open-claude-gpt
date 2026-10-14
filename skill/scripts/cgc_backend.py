@@ -40,8 +40,11 @@ import cgc_store as store_mod
 #       immediately succeed. Includes the "browser can't open a working tab" family (attach_failed /
 #       new_tab*) that the file-spool path handled via browser-repair — requeuing lets a transient
 #       tab-open glitch retry instead of stranding a provably-unsent round as uncertain.
+#   contract_invalid: chatgpt_contract.json failed its schema at the driver's import, before any
+#       browser call — not sent, and no retry can help until the contract is fixed: blocked, so
+#       `refire` resends it once the edit replays.
 _NOT_SENT_BLOCK = ("login_needed", "CGC_LOGIN", "captcha", "rate_limit", "usage",
-                   "mention_not_found")
+                   "mention_not_found", "contract_invalid")
 _NOT_SENT_RETRY = ("model_not_selectable", "composer_not_ready", "no_page_target",
                    "attach_failed", "new_tab", "wrong_page", "gate_refused")
 
@@ -2483,9 +2486,10 @@ def _deadline_passed(store, rid) -> str:
 
 def _block_code(raw_stderr: str) -> str:
     """error_code for a pre-send BLOCKED round. A missing @mention keeps its whole line: it names
-    the apps the popup DID offer, which is the one fact the agent needs to re-fire correctly."""
+    the apps the popup DID offer, which is the one fact the agent needs to re-fire correctly; an
+    invalid contract keeps its whole line too: it names the contract ids to fix."""
     for line in (raw_stderr or "").splitlines():
-        if "mention_not_found" in line:
+        if "mention_not_found" in line or line.startswith("CGC_ERROR contract_invalid"):
             return line.replace("CGC_ERROR ", "").strip()[:400]
     return _not_sent_marker({"stderr": raw_stderr}, _NOT_SENT_BLOCK) or "not_sent"
 

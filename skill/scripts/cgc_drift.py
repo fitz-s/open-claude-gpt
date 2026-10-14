@@ -5,7 +5,7 @@ leave a local agent everything it needs to fix the contract in one read.
                                              involved, each selector's match count on the page, a
                                              bounded excerpt, candidate selectors, what to edit and
                                              how to check the edit
-  <data dir>/incidents/<id>/fixture.html     the page, sanitized: allowlisted attributes, at most 200
+  <data dir>/incidents/<id>/fixture.html     the page, by allowlist: kept attribute names, scrubbed values, at most 200
                                              characters of page text (the rid markers aside), no
                                              sidebar, scripts, frames or URLs
 
@@ -33,7 +33,7 @@ _FIXTURE_JS = os.path.join(_HERE, "fixture_dom.js")
 JSON_CAP = 8 * 1024
 FIXTURE_NODES = 2500
 KEEP_INCIDENTS = 20
-SANITIZER_REV = 1
+SANITIZER_REV = 2
 
 # Per capability: `need`, the selector facts the page must match for the capability to work (a tuple
 # is a set of alternatives: one matching is enough, as the picker owner's testid OR a menu holding a
@@ -114,60 +114,78 @@ def counts_js(ui, cap) -> str:
     return "(function(){" + _COUNTS_FN + "return __cgcCounts(" + json.dumps(selectors(ui, cap)) + ");})()"
 
 
-# One read-only pass over the live page: match counts, candidates, and the sanitized tree (walked
-# last child first, so when the node budget runs out it is the oldest content that is dropped).
-# Every page-derived string (text, attribute values, candidate names) passes take(): URLs, paths
-# and addresses become '…' first, then what remains is charged to ONE 200-character budget. Two
-# exemptions, both bounded: a value or class token the contract itself names (V, exact match) is
-# kept free; in a STRUCTURAL attribute only — the ARIA/role/id/testid attributes developers author
-# (SATTR), the attributes the contract names (SA: the turn schemas, the mention chip, …), and the
-# aria-describedby id list — an identifier-shaped value (<= 24 chars of [A-Za-z0-9_:-]) is kept
-# from a separate 600-character budget. Any other attribute (data-preview, …) is prose and shares
-# the 200. Other class tokens are dropped. The rid marker tokens are kept, the text around them
-# budgeted, so the fixture still reads as the same turn.
+# One read-only pass over the live page: match counts, the sanitized tree, candidates. PRIVACY BY
+# ALLOWLIST — nothing from the page is kept unless named here:
+#   attribute NAMES: the fixed structural set (_KEEP_NAMES), every attribute the contract's own
+#     selectors and attribute facts name (_attr_names), and aria-*; each <= 40 chars; a name
+#     matching cookie|token|session|auth|secret|key is dropped unless the contract or code names it
+#     (the search-unit schema attribute ends in "key"). One more, the only page-chosen name: an
+#     attribute whose value is a turn role ("t1:2:assistant", <= 40 chars) — the one shape a schema
+#     rename leaves, without which a renamed unit attribute could be neither found nor replayed.
+#   attribute VALUES: of kept names only; each scrubbed (a token holding . / \ @ = or a run of >= 24
+#     letters/digits becomes '…', end punctuation aside) and cut to 40; text-bearing aria values
+#     (label, valuetext, …) are charged to the TEXT budget, the rest to a 2 KB STRUCTURAL budget.
+#   class tokens: kept even if unknown, each <= 32 chars and scrubbed, from the structural budget
+#     (contract vocabulary and CSS layout keywords free).
+#   text: every text node and every candidate name, scrubbed, from ONE 200-character budget; the
+#     rid marker tokens (CGC_RID/BEGIN_RESPONSE/END_RESPONSE:<rid>) are kept outside it.
+#   visibility: each element whose rendered box is 0x0 is marked data-cgc-invisible, which
+#     fixture_dom.js honours; the page's own data-cgc-* attributes are never kept.
+# Candidate selectors are built from the sanitized tree, so only kept names and values reach them.
 _CAPTURE = _COUNTS_FN + r"""
-var BUD=200,SBUD=600,NODES=LIM,TOK=/((?:CGC_RID|BEGIN_RESPONSE|END_RESPONSE):REQ-[0-9]{8}-[0-9]{6}-[0-9a-f]{6})/;
-var VS=new Set(V);
-var PRIV=/[a-z][\w+.-]*:\/\/\S*|\S*@\S+\.\S+|(^|[^\w.~])(~|\.{1,2})?[\/\\][^\s"'`)\]>]*/gi;
-var SATTR=/^(role|type|contenteditable|id|data-testid|aria-(checked|expanded|haspopup|valuenow|valuemin|valuemax|selected|disabled|hidden))$/;
-var SNAMES=new Set(SA);
-function take(s,cap){s=(s||'').replace(PRIV,function(m,p){return (p||'')+'…';}).replace(/[ \t\r\f\v]+/g,' ');
- var k=Math.min(s.length,cap,BUD);BUD-=k;return k<s.length?s.slice(0,k)+'…':s;}
-function ident(s){if(s.length>24||!/^[A-Za-z0-9_:-]+$/.test(s)||SBUD<s.length)return null;SBUD-=s.length;return s;}
+var BUD=200,SBUD=2048,NODES=LIM,TOK=/((?:CGC_RID|BEGIN_RESPONSE|END_RESPONSE):REQ-[0-9]{8}-[0-9]{6}-[0-9a-f]{6})/;
+var VS=new Set(V),NAMES=new Set(SA),DENY=/cookie|token|session|auth|secret|key/i;
+var TEXTATTR=new Set(['aria-label','aria-valuetext','aria-description','aria-placeholder','aria-roledescription']);
+var FREECLS=new Set(['flex','inline-flex','grid','inline-grid','block','inline-block','inline','hidden']);
+var ROLEV=/^(?:[\w-]{1,24}:){0,3}(user|assistant)$/;
+function bad(t){var c=t.replace(/^[(\[{"'`]+|[)\]}"'`.,;:!?]+$/g,'');return /[.\/\\@=]/.test(c)||/[A-Za-z0-9]{24,}/.test(c);}
+function scrub(s){return s.split(/(\s+)/).map(function(t){return /\S/.test(t)&&bad(t)?'…':t;}).join('');}
+function take(s,cap){s=scrub((s||'').replace(/[ \t\r\f\v]+/g,' '));var k=Math.min(s.length,cap,BUD);BUD-=k;
+ return k<s.length?s.slice(0,k)+'…':s;}
+function sval(v){v=scrub(v);if(v.length>40)v=v.slice(0,40)+'…';if(SBUD<v.length)return null;SBUD-=v.length;return v;}
 function lines(s){return s.split('\n').map(function(l){return /\S/.test(l)?(take(l,40)||'…'):l;}).join('\n');}
 function txt(s){s=s||'';if(!/\S/.test(s))return null;
  return s.split(TOK).map(function(p,i){return i%2?p:lines(p);}).join('');}
-var KEEP=/^(role|aria-(label|checked|expanded|haspopup|valuenow|valuemin|valuemax|describedby|selected|disabled|hidden)|data-[\w-]+|app-[\w-]+|[\w-]*mention[\w-]*|type|contenteditable|id|class|disabled|hidden)$/;
+function named(n){if(n.length>40||/^data-cgc/.test(n))return false;if(NAMES.has(n))return true;
+ return !DENY.test(n)&&/^aria-[a-z]+$/.test(n);}
+function roleShaped(n,v){return n.length<=40&&!/^data-cgc/.test(n)&&!DENY.test(n)&&v.length<=40&&ROLEV.test(v)&&!bad(v);}
 var SKIP={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,LINK:1,META:1,NAV:1,IFRAME:1,OBJECT:1,EMBED:1,CANVAS:1,VIDEO:1,AUDIO:1};
-function val(n,v){if(v===''||VS.has(v))return v;
- if(n==='class')return v.split(/\s+/).filter(function(t){return VS.has(t);}).join(' ');
- if(n==='aria-describedby'){var ids=v.split(/\s+/).map(ident);return ids.indexOf(null)<0?ids.join(' '):'…';}
- var i=SATTR.test(n)||SNAMES.has(n)?ident(v):null;return i!==null?i:(take(v,40)||'…');}
-function attrs(e){var o={};for(var j=0;j<e.attributes.length;j++){var a=e.attributes[j],n=a.name;
- if(!KEEP.test(n)||/^data-cgc/.test(n))continue;o[n]=val(n,a.value||'');}return o;}
+function attrs(e){var o={};for(var j=0;j<e.attributes.length;j++){var a=e.attributes[j],n=a.name,v=a.value||'';
+  if(n==='class'){var ks=v.split(/\s+/).filter(function(t){if(!t||t.length>32||bad(t))return false;
+    if(VS.has(t)||FREECLS.has(t))return true;if(SBUD<t.length)return false;SBUD-=t.length;return true;});
+   if(ks.length)o['class']=ks.join(' ');continue;}
+  if(!named(n)&&!roleShaped(n,v))continue;
+  if(v===''||VS.has(v)){o[n]=v;continue;}
+  if(TEXTATTR.has(n)){o[n]=take(v,40)||'…';continue;}
+  var k=sval(v);if(k!==null)o[n]=k;}
+ var r=e.getBoundingClientRect();if(!(r.width>0&&r.height>0))o['data-cgc-invisible']='';
+ try{var d=getComputedStyle(e).display;if(/^(block|flex|grid|list-item|table)$/.test(d))o['data-cgc-block']='';}catch(x){}
+ return o;}
 function walk(e){NODES--;var kids=[];if(!/^svg$/i.test(e.tagName)){
  for(var i=e.childNodes.length-1;i>=0&&NODES>0;i--){var c=e.childNodes[i],k=null;
   if(c.nodeType===3)k=txt(c.nodeValue);else if(c.nodeType===1&&!SKIP[c.tagName.toUpperCase()])k=walk(c);
   if(k!==null&&k!=='')kids.unshift(k);}}
  return [e.tagName.toLowerCase(),attrs(e),kids];}
+var tree=document.body?walk(document.body):['body',{},[]];
 var NR=new RegExp(SR[0],'i'),VR=new RegExp(SR[1],'i'),seen=new Set(),cands=[];
-var all=document.body?document.body.querySelectorAll('*'):[];
-for(var i=0;i<all.length&&cands.length<40;i++){var e=all[i];if(e.closest('nav'))continue;
- for(var j=0;j<e.attributes.length;j++){var a=e.attributes[j],n=a.name,v=a.value||'',sel=null;
-  if(/^data-cgc|^(class|style|id)$/.test(n))continue;
-  var rk=/:(user|assistant)$/.exec(v);
-  if(rk&&/^[\w:-]+$/.test(v))sel='['+n+'$=":'+rk[1]+'"]';
-  else if(VR.test(v)&&(VS.has(v)||((SATTR.test(n)||SNAMES.has(n))&&ident(v)!==null)))sel='['+n+'="'+v+'"]';
+(function find(nd){if(typeof nd==='string'||cands.length>=40)return;var at=nd[1];
+ Object.keys(at).forEach(function(n){var v=at[n],sel=null,rk;if(n==='class'||/^data-cgc/.test(n))return;
+  if((rk=/:(user|assistant)$/.exec(v))&&ROLEV.test(v))sel='['+n+'$=":'+rk[1]+'"]';
+  else if(v&&VS.has(v)&&VR.test(v))sel='['+n+'='+JSON.stringify(v)+']';
   else if(n!=='role'&&NR.test(n))sel='['+n+']';
-  if(!sel||seen.has(sel))continue;seen.add(sel);var m;try{m=[].slice.call(document.querySelectorAll(sel));}catch(x){continue;}
-  var leaf=!e.children.length?(e.textContent||''):'';
-  cands.push({selector:sel,tag:e.tagName.toLowerCase(),role:val('role',e.getAttribute('role')||''),
-   name:take(e.getAttribute('aria-label')||(leaf.length<=40?leaf:''),40),matches:m.length,
-   visible:m.filter(__cgcVis).length});}}
+  if(!sel||seen.has(sel)||cands.length>=40)return;seen.add(sel);var m;
+  try{m=[].slice.call(document.querySelectorAll(sel));}catch(x){return;}
+  var t=nd[2].length===1&&typeof nd[2][0]==='string'?nd[2][0]:'';
+  cands.push({selector:sel,tag:nd[0],role:at.role||'',name:at['aria-label']||t,matches:m.length,
+   visible:m.filter(__cgcVis).length});});
+ nd[2].forEach(find);})(tree);
 var counts=__cgcCounts(S);
 var p=(location.pathname||'/').split('/').filter(Boolean);
-return {counts:counts,candidates:cands,path:'/'+(p.length?p[0]+(p.length>1?'/x':''):''),
- tree:document.body?walk(document.body):['body',{},[]]};"""
+return {counts:counts,candidates:cands,path:'/'+(p.length?p[0]+(p.length>1?'/x':''):''),tree:tree};"""
+
+# The structural attribute names kept whatever the contract says (the fixture's replay reads them).
+_KEEP_NAMES = ("role", "id", "data-testid", "contenteditable", "type", "disabled",
+               "data-empty-paragraph", "data-markdown-text-style")
 
 
 def capture_js(ui, cap, nodes=FIXTURE_NODES) -> str:
@@ -177,9 +195,14 @@ def capture_js(ui, cap, nodes=FIXTURE_NODES) -> str:
 
 
 def _attr_names(ui):
-    """The attribute names the contract reads values of: their identifier values are structure."""
-    names = {s["attr"] for s in ui["turn_schemas"]} | {ui["assistant_body"]["attr"]}
-    return sorted(names | {v for k, v in ui.items() if k.endswith("_attr") and isinstance(v, str)})
+    """Every attribute name the fixture keeps by name: the fixed structural set, the attributes the
+    contract's selectors name, and its attribute facts (schema attrs, body attr, *_attr)."""
+    names = set(_KEEP_NAMES) | {s["attr"] for s in ui["turn_schemas"]} | {ui["assistant_body"]["attr"]}
+    names |= {v for k, v in ui.items() if k.endswith("_attr") and isinstance(v, str)}
+    for v in ui.values():
+        for sel in ([v] if isinstance(v, str) else []):
+            names |= set(re.findall(r"\[\s*([A-Za-z][\w-]*)", sel))
+    return sorted(n for n in names if len(n) <= 40)
 
 
 def contradicted(ui, cap, counts) -> list:
@@ -296,7 +319,13 @@ class FixtureTab:
 # The page-side PRIV rule, for the driver's own failure message (which quotes page labels): URLs,
 # addresses and paths become '…'. The message is the driver's template around page strings already
 # cut to 40 characters each, and the whole is cut to 300.
-_PRIV = re.compile(r"[a-z][\w+.-]*://\S*|\S*@\S+\.\S+|(^|[^\w.~])(?:~|\.{1,2})?[/\\][^\s\"'`)\]>]*", re.I)
+def _scrub(s):
+    """The page-side scrubber, for the driver's own failure message (which quotes page labels): a
+    token holding . / \\ @ = or a run of >= 24 letters/digits (end punctuation aside) becomes '…'."""
+    def bad(t):
+        c = re.sub(r"""^[(\[{"'`]+|[)\]}"'`.,;:!?]+$""", "", t)
+        return bool(re.search(r"[./\\@=]", c) or re.search(r"[A-Za-z0-9]{24,}", c))
+    return "".join("\u2026" if t.strip() and bad(t) else t for t in re.split(r"(\s+)", s or ""))
 
 
 def _now():
@@ -328,7 +357,7 @@ def bundle(ui, snap, *, cap, code, detail, contract_path, rid=None, inputs=None,
         "created_at": _now().isoformat(),
         "capability": cap,
         "code": code,
-        "detail": _PRIV.sub(lambda m: (m.group(1) or "") + "…", detail or "")[:300],
+        "detail": _scrub(detail)[:300],
         "rid": rid,
         "inputs": {k: v for k, v in (inputs or {}).items() if v},
         "contract": {"file": contract_path, "sha256": contract_sha},
