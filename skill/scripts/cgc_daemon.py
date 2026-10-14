@@ -155,6 +155,8 @@ def _make_run_cdp():
                    "--out", kw["out"], "--poll", poll, "--timeout", str(timeout)]
             if kw.get("idle_exit"):
                 cmd += ["--idle-exit", str(int(kw["idle_exit"]))]
+            if not kw.get("approve", True):
+                cmd += ["--no-approve"]
             code, so, se = _run(cmd, timeout + 40, kw["rid"], pass_fds=fds)
             # `wait`'s stdout receipt carries the producer attribution read off the very node it
             # extracted the answer from. None here means either "the provider stamped nothing" or

@@ -548,3 +548,17 @@ def test_the_continue_click_is_bounded_by_the_observation_deadline(sent):
     import datetime as dt
     na = dt.datetime.fromisoformat(cdp.calls[1][1]["not_after"]).timestamp()
     assert abs(na - s.observation_deadline(RID, 5400)) < 1
+
+
+def test_only_the_send_worker_may_answer_an_approval_card(sent):
+    """Granting an app access is a mutation: the send worker's wait carries approve=True, a recovery
+    wait approve=False (the daemon then passes --no-approve to the waiter)."""
+    sm, backend, s = sent
+    rec = _cdp(FAILED_WAIT)
+    backend.resume_round(s, s.get_round(RID), rec)               # recovery first: round stays live
+    assert [kw["approve"] for k, kw in rec.calls if k == "wait"] == [False]
+    s.db.execute("UPDATE rounds SET state='waiting', error_code=NULL WHERE rid=?", (RID,))
+    s.db.commit()
+    worker = _cdp({"answer": f"BEGIN_RESPONSE:{RID}\nok\nEND_RESPONSE:{RID}"})
+    backend._wait_phase(s, RID, CONV, {"model": "Pro", "timeout": 5400}, worker, may_continue=True)
+    assert [kw["approve"] for k, kw in worker.calls if k == "wait"] == [True]
