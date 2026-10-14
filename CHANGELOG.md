@@ -14,11 +14,14 @@ releases until it stabilizes.
   takes the uncertain path (`possibly_accepted`, never resent automatically).
 - The post-paste check required the composer to hold at least as many characters as the prompt, so a
   same-length substitution or foreign text around the paste was sent. The composer's typed text, with
-  app chip nodes left out by structure, must now equal the prompt after whitespace and zero-width
-  normalization; a mismatch is a pre-click failure (exit 6).
+  app chip nodes left out by structure, must now equal the prompt line for line, indentation included.
+  Only the editor's own layout is normalized: CRLF, NBSP, U+200B/U+FEFF, trailing spaces, blank lines.
+  The attached apps must equal the requested ones, an empty request included. Any mismatch is a
+  pre-click failure (exit 6).
 - A wrapper complete in one snapshot was published at once, though a stream can pause after END and
-  continue. The waiter now publishes only when done holds at the same length on two consecutive polls,
-  one poll later than before.
+  continue. A wrapped answer is now published verified only after two equal reads one poll apart. The
+  settle path no longer publishes one. At timeout a second read is taken, and if it differs the answer
+  is delivered unverified. An empty extraction on a done poll is no longer a success.
 
 ### Fixed — a note typed into a thread mid-round no longer hides the answer
 

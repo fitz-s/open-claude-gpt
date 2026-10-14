@@ -90,7 +90,8 @@ def _drive(monkeypatch, tmp_path, cmd, reply):
 
 
 @pytest.mark.parametrize("cmd", ["submit", "followup"])
-@pytest.mark.parametrize("reply", [None, "weird", "", "error-postclick", TimeoutError("ws read timed out")])
+@pytest.mark.parametrize("reply", [None, "weird", "", "error-postclick", TimeoutError("ws read timed out"),
+                                   {"clicked": True}, ["clicked"]])
 def test_click_reply_unknown_is_never_retryable(monkeypatch, tmp_path, capfd, cmd, reply):
     """No reply, an exception, or a reply nobody listed may have come AFTER click(): the round is uncertain,
     never exit 6 (which the backend files NOT_SENT_PROVEN and releases the request-key for a resend)."""
@@ -298,3 +299,152 @@ def test_stream_pause_after_end_is_not_final(monkeypatch, tmp_path):
     body = out.read_text()
     assert "Additional material." in body, "the wrapper prefix seen at one poll was published as final"
     assert body == CDP._sentinel_parse(final, RID)[1]
+
+
+def _wait_env(monkeypatch, tmp_path, tab, *, timeout, poll=1, settle=30):
+    for k, v in (("CGC_STATE_DIR", str(tmp_path)), ("STATE_PATH", str(tmp_path / "a.json")),
+                 ("STATE_LOCK_PATH", str(tmp_path / "a.lock"))):
+        monkeypatch.setattr(CDP, k, v)
+    monkeypatch.setattr(CDP, "CDP", lambda *a, **k: tab)
+    clock = {"t": 1e6}
+    monkeypatch.setattr(CDP.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + max(s, 0.001)))
+    out = tmp_path / "answer.txt"
+    return out, types.SimpleNamespace(rid=RID, conversation=CONV, port=9333, out=str(out), poll=poll,
+                                      timeout=timeout, settle_seconds=settle, min_unwrapped=2000,
+                                      keep_tab=False)
+
+
+_EARLY = f"BEGIN_RESPONSE:{RID}\nPreliminary.\nEND_RESPONSE:{RID}"
+_LATER = f"BEGIN_RESPONSE:{RID}\nPreliminary, and more.\nEND_RESPONSE:{RID}"
+
+
+class _NeverDoneTab(_StreamTab):
+    """detect never reports done (the node is virtualized out of its read); the n-th extract returns
+    bodies[n] (the last one repeating)."""
+
+    def __init__(self, bodies):
+        super().__init__([_EARLY])
+        self.bodies, self.extracts = list(bodies), 0
+
+    def eval(self, js, timeout=None):
+        if "generating:stop,done:done" in js:
+            self.i += 1
+            return json.dumps({"generating": False, "done": False, "blocker": None, "failed": None,
+                               "node": "found", "superseded": False, "len": 100, "begin": True,
+                               "end": False, "ac": 1})
+        if "res.done?res.body" in js:
+            self.extracts += 1
+            return CDP._sentinel_parse(self.bodies[min(self.extracts - 1, len(self.bodies) - 1)], RID)[1]
+        return super().eval(js, timeout)
+
+
+def test_a_wrapped_answer_at_settle_waits_for_confirmation(monkeypatch, tmp_path, capfd):
+    """One wrapped read at the settle instant is not published there: only a confirmed read is."""
+    tab = _NeverDoneTab([_EARLY])
+    out, ns = _wait_env(monkeypatch, tmp_path, tab, timeout=6, settle=1)
+    assert CDP.cmd_wait(ns) == 0
+    err = capfd.readouterr().err
+    assert "recovered at settle" not in err and "rescued at timeout" in err and "UNCONFIRMED" not in err
+    assert not os.path.exists(ns.out + ".raw"), "two equal reads a poll apart: verified"
+
+
+def test_timeout_rescue_never_publishes_verified_from_one_read(monkeypatch, tmp_path):
+    tab = _NeverDoneTab([_EARLY])
+    out, ns = _wait_env(monkeypatch, tmp_path, tab, timeout=1)
+    assert CDP.cmd_wait(ns) == 0 and not os.path.exists(ns.out + ".raw")
+    assert tab.extracts >= 2, "the verified rescue was read twice (plus the clean read)"
+
+
+def test_timeout_rescue_that_moves_on_its_confirm_read_is_unverified(monkeypatch, tmp_path, capfd):
+    tab = _NeverDoneTab([_EARLY, _LATER])
+    out, ns = _wait_env(monkeypatch, tmp_path, tab, timeout=1)
+    assert CDP.cmd_wait(ns) == 0
+    assert "UNCONFIRMED" in capfd.readouterr().err
+    assert os.path.exists(ns.out + ".raw"), "a rescue read that changed is never graded verified"
+
+
+def test_an_empty_extraction_on_a_done_poll_is_not_success(monkeypatch, tmp_path, capfd):
+    """detect says done, extract finds nothing: never a success, never a closed tab."""
+    class Disagree(_StreamTab):
+        def eval(self, js, timeout=None):
+            if "res.done?res.body" in js:
+                return ""
+            return super().eval(js, timeout)
+    tab = Disagree([_EARLY])
+    out, ns = _wait_env(monkeypatch, tmp_path, tab, timeout=5)
+    rc = CDP.cmd_wait(ns)
+    assert "CGC_DONE wrote 0 chars" not in capfd.readouterr().err
+    assert rc != 0 and not (out.exists() and out.read_text() == "")
+
+
+def test_done_confirmation_resets_after_a_failed_read(monkeypatch, tmp_path):
+    growing = _EARLY + "\nmore"
+
+    class Transient(_StreamTab):
+        def eval(self, js, timeout=None):
+            if "generating:stop,done:done" in js and self.i == 1:
+                self.i += 1
+                raise TimeoutError("one transient read")
+            return super().eval(js, timeout)
+    tab = Transient([_EARLY, growing, _EARLY, _EARLY])
+    out, ns = _wait_env(monkeypatch, tmp_path, tab, timeout=10)
+    assert CDP.cmd_wait(ns) == 0 and tab.i == 4
+
+
+# ---- review follow-ups: non-string replies, unrequested chips, indentation ---------------------------
+
+def test_a_non_string_send_reply_is_unknown():
+    for reply in ({}, [], {"clicked": True}, ["clicked"]):
+        assert CDP._send_verdict(reply)[0] == "unknown", reply
+
+
+def test_an_enter_that_fails_part_way_leaves_no_not_sent_marker(monkeypatch, tmp_path, capfd):
+    def fail(self, *a):
+        self.keys.append(a)
+        raise TimeoutError("keyUp timed out after keyDown accepted")
+    monkeypatch.setattr(_Tab, "key", fail)
+    for cmd in ("submit", "followup"):
+        with pytest.raises(TimeoutError, match="keyUp"):
+            _drive(monkeypatch, tmp_path, cmd, "no-send")
+        err = capfd.readouterr().err
+        assert BACKEND._not_sent_marker({"code": 1, "stderr": err}, BACKEND._NOT_SENT_RETRY) is None
+        assert BACKEND._not_sent_marker({"code": 1, "stderr": err}, BACKEND._NOT_SENT_BLOCK) is None
+
+
+def test_an_unrequested_chip_is_refused_before_the_click(monkeypatch):
+    """A rehydrated draft can restore a chip after the clear: no mention requested means none allowed."""
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    with pytest.raises(CDP._PreClickFailure, match="none was requested"):
+        _verify(f"<p>{CHIP} review this</p>", "review this", [])
+    _verify("<p>review this</p>", "review this", [])
+
+
+def test_a_mention_check_that_cannot_read_is_pre_click(monkeypatch):
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+
+    class Lost(_Composer):
+        def eval(self, js, timeout=None):
+            if "app-mention-display-name" in js:
+                raise TimeoutError("ws read timed out")
+            return super().eval(js, timeout)
+    with pytest.raises(CDP._PreClickFailure, match="TimeoutError"):
+        CDP._paste_prompt(Lost("<p>review this</p>"), "review this", [])
+
+
+def test_code_indentation_is_payload(monkeypatch):
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    want = "```python\nif enabled:\n    allow()\n    deny()\n```"
+    _verify("<p>```python</p><p>if enabled:</p><p>    allow()</p><p>    deny()</p><p>```</p>", want)
+    with pytest.raises(CDP._PreClickFailure):           # deny() made unconditional: another program
+        _verify("<p>```python</p><p>if enabled:</p><p>    allow()</p><p>deny()</p><p>```</p>", want)
+    with pytest.raises(CDP._PreClickFailure):           # two lines joined into one
+        _verify("<p>if enabled: allow()</p>", "if enabled:\nallow()")
+
+
+def test_zwj_and_zwnj_are_payload(monkeypatch):
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    with pytest.raises(CDP._PreClickFailure):
+        _verify("<p>a‍b</p>", "ab")
+    _verify("<p>a‍b</p>", "a‍b")
+    _verify("<p>a​b﻿</p>", "ab")

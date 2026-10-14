@@ -2706,7 +2706,7 @@ def _send_verdict(sent_via):
         return "clicked", ""
     if sent_via == "no-send":
         return "enter", ""
-    if sent_via in _SEND_NEGATIVES or (isinstance(sent_via, str) and sent_via.startswith("error-preclick:")):
+    if isinstance(sent_via, str) and (sent_via in _SEND_NEGATIVES or sent_via.startswith("error-preclick:")):
         return "not-sent", f"send target {sent_via!r}"
     return "unknown", f"send eval replied {sent_via!r}"
 
@@ -2767,13 +2767,20 @@ def _composer_text_js():
             "return __cgcKids(d);})()")
 
 
-# Whitespace runs and zero-width characters (ProseMirror pads non-editable inline nodes with U+FEFF;
-# an empty paragraph keeps U+200B) are the editor's to lay out; every other character is the payload.
-_ZW_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+# The zero-width characters the editor itself inserts (ProseMirror pads non-editable inline nodes with
+# U+FEFF; an empty paragraph keeps U+200B). ZWJ/ZWNJ are text (emoji, scripts) and stay.
+_ZW_RE = re.compile("[\u200b\ufeff]")
 
 
 def _canonical_payload(text):
-    return _WS_RUN_RE.sub(" ", _ZW_RE.sub("", text or "")).strip()
+    """The payload with only the editor's own layout removed, both sides alike: CRLF/CR -> LF, NBSP ->
+    space (a contenteditable shows runs of spaces as NBSP), the zero-width padding above, trailing
+    whitespace per line, and blank lines (a pasted newline becomes a paragraph split, so their count is
+    the editor's; the text walk also brackets each block in newlines). Line boundaries and indentation
+    are payload and are kept, except the whitespace leading the whole text: the separator typed after
+    each @mention chip (tests/fixtures/mention_popup.json composer_after_pick, `</span>  </p>`)."""
+    t = _ZW_RE.sub("", (text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " "))
+    return "\n".join(ln for ln in (x.rstrip() for x in t.split("\n")) if ln).strip()
 
 
 # ---- @mention (ChatGPT apps/plugins) ------------------------------------------------------------
@@ -2998,8 +3005,9 @@ def _paste_prompt(c, prompt: str, mentions=()) -> None:
     """Clear the composer and paste `prompt` in bounded chunks via execCommand('insertText') — kept
     (never a raw textContent/value assignment, which would not drive ChatGPT's React composer state)
     so a leftover draft from a previous failed attempt can never be PREPENDED to this paste. Every
-    step here runs strictly BEFORE the send click; any failure — a raised exception or a failed
-    length verification — is raised as _PreClickFailure so the caller can report the distinct
+    step here runs strictly BEFORE the send click; any failure — a raised exception or a composer
+    that does not hold exactly the prompt and the requested apps — is raised as _PreClickFailure so
+    the caller can report the distinct
     provably-not-sent exit code instead of the uncertain unknown_send/crash path."""
     try:
         _settle_composer(c)
@@ -3017,6 +3025,7 @@ def _paste_prompt(c, prompt: str, mentions=()) -> None:
             if got is None or got < 0:
                 raise _PreClickFailure(f"composer disappeared mid-paste (chunk offset {i})")
         got_text = c.eval(_composer_text_js(), timeout=45)
+        kept = c.eval(_composer_mentions_js(), timeout=45)
     except _PreClickFailure:
         raise
     except Exception as e:
@@ -3037,13 +3046,18 @@ def _paste_prompt(c, prompt: str, mentions=()) -> None:
                else "the composer text is not the approved prompt")
         raise _PreClickFailure(f"composer holds {len(got)} normalized chars, prompt is {len(want)}, "
                                f"first difference at {at} — {why}")
-    if mentions:
-        kept = sorted(c.eval(_composer_mentions_js(), timeout=45) or [])
-        wanted = sorted(_norm_label(m) for m in mentions)
-        if kept != wanted:
-            raise _MentionFailure(
-                f"mention_not_found: the composer holds the app mentions {kept!r} after the paste, not "
-                f"the requested {wanted!r} — refusing to send the prompt with the wrong apps")
+    # The apps attached are part of the payload too, and are compared even when none was requested: a
+    # chip a rehydrated draft restored after the clear would otherwise ride along unasked.
+    if not isinstance(kept, list):
+        raise _PreClickFailure("composer not found for the app mention check")
+    kept, wanted = sorted(kept), sorted(_norm_label(m) for m in mentions or ())
+    if kept != wanted and not wanted:
+        raise _PreClickFailure(f"the composer holds the app mentions {kept!r} after the paste and none "
+                               "was requested — refusing to send them")
+    if kept != wanted:
+        raise _MentionFailure(
+            f"mention_not_found: the composer holds the app mentions {kept!r} after the paste, not "
+            f"the requested {wanted!r} — refusing to send the prompt with the wrong apps")
 
 
 def _turn_rid_conflicts(rid, prompt, mentions=()):
@@ -3745,6 +3759,18 @@ def _answer_approval(c):
     return (r.get("app"), r.get("text") or "") if r else None
 
 
+def _confirm_wrapped(c, rid, strict, body, gap):
+    """`body` if a second wrapped read `gap` seconds later returns the same text, else ''. The timeout
+    rescue's form of the waiter's one finality rule: the same answer on two reads a poll apart."""
+    time.sleep(gap)
+    try:
+        again = (c.eval(_extract_js(rid, scoped=strict)) or ""
+                 or _sentinel_parse(c.eval(_last_assistant_js(rid, scoped=strict)) or "", rid)[1])
+    except Exception:
+        return ""
+    return body if again == body else ""
+
+
 def cmd_wait(a) -> int:
     deadline = time.time() + a.timeout
     conv = _resolve_conv(a.conversation)  # 'auto'/None → the active thread
@@ -3858,7 +3884,9 @@ def cmd_wait(a) -> int:
         idle_exit = getattr(a, "idle_exit", 0) or 0   # followup --watch reuses this waiter
         # A valid wrapper in ONE snapshot is not finality: a stream can pause right after END and then
         # continue below it. So done must be read twice, on consecutive polls, at the same length
-        # before anything is published. Stop-button independent (see _detect_js); costs one poll.
+        # before anything is published verified — the ONE confirmation rule for a wrapped answer; the
+        # settle path defers to it and the timeout rescue applies it once more (_confirm_wrapped).
+        # Stop-button independent (see _detect_js); costs one poll.
         done_len = None
         while time.time() < deadline:
             try:
@@ -3955,8 +3983,10 @@ def cmd_wait(a) -> int:
                 done_len = st.get("len")      # first sighting at this length: confirm on the next poll
                 time.sleep(a.poll)
                 continue
-            if st.get("done"):
-                ans = c.eval(_extract_js(rid, scoped=strict)) or ""
+            ans = (c.eval(_extract_js(rid, scoped=strict)) or "") if st.get("done") else ""
+            if st.get("done") and not ans:
+                done_len = None               # detect and extract disagree: nothing is published
+            if ans:
                 _write_answer(c, rid, a.out, ans, strict)  # answer file stays PURE — the follow-up recipe goes to stderr only
                 # Attribution is read from the SAME scoped node that produced `ans`, and BEFORE the
                 # tab is closed below — afterwards the node is gone and the fact is unrecoverable.
@@ -4006,16 +4036,11 @@ def cmd_wait(a) -> int:
                     raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
                     # The extract and this read are separate evals of one node, so an answer can
                     # finish between them: text the canonical parser finds wrapped is never
-                    # salvaged as unwrapped.
-                    ans = ans or _sentinel_parse(raw, rid)[1]
-                    if ans:
-                        _write_answer(c, rid, a.out, ans, strict)
-                        _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
-                        sys.stderr.write(f"CGC_DONE wrote {len(ans)} chars to {a.out} (recovered at settle)\n")
-                        if not a.keep_tab:
-                            c.close_tab()
-                        return 0
-                    if allowed and len(raw) >= a.min_unwrapped:
+                    # salvaged as unwrapped — nor published from this single read. It is left to the
+                    # done path's two-poll confirmation, and the settle clock restarts.
+                    if ans or _sentinel_parse(raw, rid)[1]:
+                        settle_start = None
+                    elif allowed and len(raw) >= a.min_unwrapped:
                         _write_private(a.out, raw)
                         _write_private(a.out + ".raw", raw)
                         _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
@@ -4026,7 +4051,7 @@ def cmd_wait(a) -> int:
                         if not a.keep_tab:
                             c.close_tab()
                         return 0
-                    if not allowed and len(raw) >= a.min_unwrapped:
+                    elif not allowed and len(raw) >= a.min_unwrapped:
                         _write_private(a.out + ".raw", raw)
                         sys.stderr.write(
                             f"CGC_WAIT ambiguous-stable: source_rid={rid} is no longer the "
@@ -4086,9 +4111,16 @@ def cmd_wait(a) -> int:
         raw = c.eval(_last_assistant_js(rid, scoped=strict)) or ""
         rescue = rescue or _sentinel_parse(raw, rid)[1]   # wrapped text is never salvaged as unwrapped
         if rescue:
-            _write_answer(c, rid, a.out, rescue, strict)
+            final = _confirm_wrapped(c, rid, strict, rescue, a.poll)
+            if final:
+                _write_answer(c, rid, a.out, final, strict)
+            else:
+                # It moved between the two reads: deliver the read, graded unverified by its sidecar.
+                _write_private(a.out, rescue)
+                _write_private(a.out + ".raw", rescue)
             _wait_receipt(rid, a.out, _read_attribution(c, rid, scoped=strict))
-            sys.stderr.write(f"CGC_DONE wrote {len(rescue)} chars to {a.out} (rescued at timeout)\n")
+            sys.stderr.write(f"CGC_DONE wrote {len(rescue)} chars to {a.out} (rescued at timeout"
+                             f"{'' if final else ', UNCONFIRMED: it changed on a second read'})\n")
             if not a.keep_tab:
                 c.close_tab()
             return 0
