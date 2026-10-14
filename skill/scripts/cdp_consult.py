@@ -290,13 +290,15 @@ _AUTHORITY_FN = (
     ".replace(/\\s+/g,' ').trim().toLowerCase();}"
     "function __cgcMayClick(el,p,w){if(!el||!el.closest||!el.getAttribute)return false;"
     "if(el.closest(" + _js_str(_SEND_BUTTON_SEL + "," + _STOP_BUTTON_SEL) + "))return false;"
+    # A form button with no type attribute submits the form; only an explicit non-submit one may be clicked.
+    "var sb=el.closest('button');if(sb&&sb.closest('form')&&(sb.getAttribute('type')||'submit').toLowerCase()==='submit')return false;"
     "if(el.closest('[type=\"submit\"]')||el.closest(" + _js_str(_EDITOR_SHAPE_SEL) + "))return false;"
     "var n=__cgcName(el);"
     "if(/^(send|stop|deny|\\u53d1\\u9001|\\u505c\\u6b62|\\u62d2\\u7edd)/.test(n))return false;"
     "if(p==='approve')return !el.closest('form');"
     "if(/^(allow|\\u5141\\u8bb8)/.test(n)||el.closest(" + _js_str(_MESSAGE_SCOPE_SEL) + "))return false;"
     "if(p==='switcher')return el.tagName==='BUTTON'&&el.id!==" + _js_str(_PLUS_BUTTON_ID)
-    + "&&(!el.closest('form')||!!el.getAttribute('aria-haspopup'));"
+    + "&&(!el.closest('form')||/^(true|menu|listbox|dialog|tree|grid)$/i.test(el.getAttribute('aria-haspopup')||''));"
     "if(p==='picker')w=el.closest(" + _js_str(_MENU_WIDGET_SEL) + ");"
     "else if(p!=='mention')return false;"
     "return __cgcWidget(w)&&w.contains(el);}")

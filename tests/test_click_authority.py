@@ -132,7 +132,7 @@ def test_sol_minimal_case_through_the_whole_model_selection_reports_dirty_honest
     """Whole _select_model under the one-id edit: nothing protected is clicked; and if anything at all
     was clicked before a failure, the pick reports dirty=true."""
     d = _driver(tmp_path, {"picker_submenu_trigger": 'button[data-testid="send-button"]'})
-    pill = ["button", {"id": "pill", "aria-haspopup": "menu"}, ["Instant"]]
+    pill = ["button", {"id": "pill", "type": "button", "aria-haspopup": "menu"}, ["Instant"]]
     tree = _page(["form", {}, [EDITOR, pill, SEND]])
 
     class Tab:
@@ -163,7 +163,7 @@ def test_a_menu_the_run_cannot_prove_closed_is_reported_dirty(tmp_path, monkeypa
     d = _driver(tmp_path, {})
     monkeypatch.setattr(d.time, "sleep", lambda s: None)
     monkeypatch.setattr(d, "_picker_snap", lambda c: None)
-    pill = ["button", {"id": "pill", "aria-haspopup": "menu", "aria-expanded": "true"}, ["Instant"]]
+    pill = ["button", {"id": "pill", "type": "button", "aria-haspopup": "menu", "aria-expanded": "true"}, ["Instant"]]
     tree = _page(["form", {}, [EDITOR, pill, SEND]], ["div", {"role": "menu"}, [
         ["div", {"data-testid": "composer-intelligence-picker-content"}, [
             ["div", {"role": "menuitemradio", "aria-checked": "true"}, ["GPT-6"]],
@@ -315,7 +315,7 @@ def test_law7_the_shipped_contract_still_drives_the_model_picker(tmp_path):
     """The GPT-6 picker as read live 2026-09-06: a composer pill opens a menu with the family radios
     and the tier slider. Opening, picking a family and focusing the slider all still act."""
     d = _driver(tmp_path, {})
-    pill = ["button", {"id": "pill", "aria-haspopup": "menu"}, ["6"]]
+    pill = ["button", {"id": "pill", "type": "button", "aria-haspopup": "menu"}, ["6"]]
     radios = [["div", {"id": "r6", "role": "menuitemradio", "aria-checked": "true"}, ["GPT-6"]],
               ["div", {"id": "r55", "role": "menuitemradio", "aria-checked": "false"}, ["GPT-5.5"]]]
     slider = ["div", {"id": "power", "role": "menuitem"}, [["span", {"id": "sl", "role": "slider"}, []]]]
@@ -380,3 +380,17 @@ def test_replay_reads_the_contract_it_is_given_not_the_installed_one(tmp_path):
     p.write_text(json.dumps({"facts": facts}))
     assert cgc_probe._driver(str(p)).UI["turn_container"] == "[data-edited-turn-key]"
     assert cgc_probe.cdp.UI["turn_container"] == "[data-turn-key]"
+
+
+def test_a_form_button_without_a_type_is_a_submit_and_never_clicked():
+    """Sol 2026-10-14: a form button with no type submits the form. Live ChatGPT composer buttons all
+    carry type="button" (checked 2026-10-14); one that does not is refused, as is aria-haspopup="false"."""
+    import cdp_consult as CDP
+    def may(attrs):
+        b = ["button", dict(attrs, id="b"), ["Model"]]
+        tree = _page(["form", {"id": "f"}, [EDITOR, b]])
+        return _run(tree, "(function(){" + CDP._AUTHORITY_FN +
+                    "return __cgcMayClick(document.getElementById('b'),'switcher');})()")["result"]
+    assert may({"type": "button", "aria-haspopup": "menu"}) is True
+    assert may({"aria-haspopup": "menu"}) is False
+    assert may({"type": "button", "aria-haspopup": "false"}) is False

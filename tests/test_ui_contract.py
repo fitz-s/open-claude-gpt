@@ -226,8 +226,8 @@ def test_law4_an_invalid_contract_blocks_the_round_as_proven_not_sent(tmp_path, 
         assert cgc_backend._release_eligible(s, r), "refire may resend it once the contract is fixed"
 
 
-# Updated 2026-10-14: approval labels moved to code, approval search excludes the composer form.
-_GOLDEN_JS = "bfbf3b842976be524962828e4de926d0063b74c6d02d132fbfbbe33674bc6315"
+# Updated 2026-10-14: approval labels moved to code; LAW 7 click guard; implicit-submit and aria-haspopup="false" refused.
+_GOLDEN_JS = "aab68ec505dbdcd50b4fa40b8627e91886c410552564398f29bbdf805559848e"
 
 
 def _generated_js(cdp):
