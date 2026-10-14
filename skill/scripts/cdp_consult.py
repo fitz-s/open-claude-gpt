@@ -118,6 +118,44 @@ try:
 except Exception:
     pass
 
+# Every ChatGPT DOM fact this driver reads (selectors, attribute names, labels) lives in ONE data file,
+# chatgpt_contract.json, so a UI change is repaired there and not in this file. CGC_CONTRACT points at
+# another copy (how `cgc_probe.py --replay` checks an edited one). Values are spliced into single-quoted
+# JS strings, so a value holding ' or \ is refused here instead of breaking every page read.
+CONTRACT_PATH = os.environ.get("CGC_CONTRACT") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "chatgpt_contract.json")
+
+
+def _load_contract(path):
+    with open(path, encoding="utf-8") as f:
+        ui = {k: v["value"] for k, v in json.load(f)["facts"].items()}
+
+    def strings(v):
+        if isinstance(v, str):
+            yield v
+        elif isinstance(v, (list, dict)):
+            for x in (v.values() if isinstance(v, dict) else v):
+                yield from strings(x)
+    bad = [k for k, v in ui.items() for s in strings(v) if "'" in s or "\\" in s]
+    if bad:
+        raise SystemExit(f"CGC_ERROR contract_invalid: {path}: {bad} hold a ' or a backslash")
+    return ui
+
+
+UI = _load_contract(CONTRACT_PATH)
+
+
+def _js_str(s):
+    """A contract value as a single-quoted JS string literal, non-ASCII as \\u escapes."""
+    return "'" + s.encode("ascii", "backslashreplace").decode() + "'"
+
+
+def _js_alt(words):
+    """Plain contract labels as one JS regex alternation (each label matched literally)."""
+    return "|".join(re.sub(r"([\\^$.|?*+()\[\]{}/])", r"\\\1", w).encode("ascii", "backslashreplace")
+                    .decode() for w in words)
+
+
 CGC_PORT = int(os.environ.get("CGC_PORT", "9333"))
 CGC_STATE_DIR = os.environ.get("CGC_STATE_DIR", "/tmp/cgc")
 # Auto model-selection is a toggle. ON (default): pick CGC_MODEL in the composer
@@ -575,22 +613,34 @@ class CDP:
 # sentinel could never be found and EVERY consult ran its full 25-minute budget before reporting
 # "no answer" with ac=0 — the tool looked alive and produced nothing, twice, before this was found.
 # Match either shape. This is the single fact about ChatGPT's DOM that the whole file rests on, so
-# it is named once here instead of being retyped inside six JS string literals where a future
-# rename would again have to be found six times.
+# it is named once (the contract's turn_schemas) instead of being retyped inside six JS string
+# literals where a future rename would again have to be found six times.
 # 2026-09-24: a third shape. Neither attribute exists any more; each message is a unit tagged
 # data-chatgpt-search-unit-key="<turn>:<n>:user|assistant" (one per message, no nested duplicate).
 # An in-progress answer has no assistant unit until it finishes, which reads as "not done yet".
-_SEL_A = ('[data-message-author-role="assistant"],[data-turn="assistant"],'
-          '[data-chatgpt-search-unit-key$=":assistant"]')
-_SEL_U = ('[data-message-author-role="user"],[data-turn="user"],'
-          '[data-chatgpt-search-unit-key$=":user"]')
-_SEL_ANY = '[data-message-author-role],[data-turn],[data-chatgpt-search-unit-key]'
+_SCHEMAS = UI["turn_schemas"]
+
+
+def _role_sel(s, role):
+    """One schema's selector for one role: the attribute IS the role, or ends ':<role>'."""
+    return f'[{s["attr"]}="{role}"]' if s["role_from"] == "value" else f'[{s["attr"]}$=":{role}"]'
+
+
+_SEL_A = ",".join(_role_sel(s, "assistant") for s in _SCHEMAS)
+_SEL_U = ",".join(_role_sel(s, "user") for s in _SCHEMAS)
+_SEL_ANY = ",".join(f'[{s["attr"]}]' for s in _SCHEMAS)
 _JS_A, _JS_U, _JS_ANY = json.dumps(_SEL_A), json.dumps(_SEL_U), json.dumps(_SEL_ANY)
+_BODY = UI["assistant_body"]
+# Inside a message: its markdown body or a message-level unit (a turn-level wrapper holds the whole
+# turn, activity header included, so it is not "inside a message").
+_IN_MESSAGE_SEL = ",".join([f'[{_BODY["attr"]}]'] + [f'[{s["attr"]}]' for s in _SCHEMAS
+                                                     if s["level"] == "message"])
 
 # Whichever attribute this build uses, the role reads the same way.
-_ROLE_FN = ("function __cgcRole(el){return el.getAttribute('data-message-author-role')||"
-            "el.getAttribute('data-turn')||"
-            "((el.getAttribute('data-chatgpt-search-unit-key')||'').split(':').pop())||'';}")
+_ROLE_FN = ("function __cgcRole(el){return "
+            + "".join(f"el.getAttribute('{s['attr']}')||" if s["role_from"] == "value" else
+                      f"((el.getAttribute('{s['attr']}')||'').split(':').pop())||" for s in _SCHEMAS)
+            + "'';}")
 
 # Layout-independent innerText approximation: a textContent walk that re-inserts newlines at block
 # boundaries, so the extracted answer keeps its line structure WITHOUT needing the tab rendered.
@@ -651,7 +701,7 @@ _NODE_FN = (
     # no turn at all (the waiter read len=0 for 90 minutes beside a finished answer) or, worse, a
     # LATER round's turn. Returns null when the source turn is not rendered — the caller must fail
     # closed rather than search outside the (unresolvable) interval.
-    "function __cgcBody(n,BG){var m=n.querySelectorAll('[data-markdown-text-style=\"assistant-message\"]');"
+    "function __cgcBody(n,BG){var m=n.querySelectorAll('[" + _BODY["attr"] + "=\"" + _BODY["value"] + "\"]');"
     "for(var i=m.length-1;i>=0;i--){if((m[i].textContent||'').indexOf(BG)>=0)return m[i];}return n;}"
     "function __cgcNode(BG,RID){"
     "var nx=document.querySelectorAll(" + _JS_ANY + ");"
@@ -808,11 +858,27 @@ def _sentinel_js(rid: str, text_expr: str) -> str:
 # the driver can read ChatGPT's markup, so it never marks a capability broken.
 _BLOCKER_FN = (
     "function __cgcBlocker(){"
-    "if(document.querySelector('input[type=\"password\"]')||/^\\/(auth|login)(\\/|$)/i.test(location.pathname))return 'login';"
-    "if(document.querySelector('iframe[src*=\"captcha\" i],iframe[title*=\"captcha\" i],[id*=\"challenge\"]'))return 'captcha';"
-    "var al=document.querySelector('[role=\"alert\"]');"
-    "if(al&&/rate limit|too many requests|usage limit/i.test(al.textContent||''))return 'rate_limit';"
+    "if(document.querySelector(" + _js_str(UI["blocker_login"]) + ")||/^\\/(" + _js_alt(UI["blocker_login_paths"])
+    + ")(\\/|$)/i.test(location.pathname))return 'login';"
+    "if(document.querySelector(" + _js_str(UI["blocker_captcha"]) + "))return 'captcha';"
+    "var al=document.querySelector(" + _js_str(UI["blocker_alert"]) + ");"
+    "if(al&&/" + _js_alt(UI["rate_limit_phrases"]) + "/i.test(al.textContent||''))return 'rate_limit';"
     "return null;}")
+
+
+def _diagnose(c, cap, code, detail, rid=None):
+    """Write the drift-repair bundle (cgc_drift) for the page `c` shows: its incident dir, or None.
+    Read-only and fail-soft; skipped when the page shows a human condition, which says nothing
+    about the contract."""
+    if _blocker(c):
+        return None
+    import cgc_drift
+    path = cgc_drift.record(c, UI, cap=cap, code=code, detail=detail, contract_path=CONTRACT_PATH,
+                            rid=rid)
+    if path:
+        sys.stderr.write(f"CGC_DRIFT_BUNDLE {cap}: {path}/diagnosis.json — edit the contract ids it "
+                         f"names, then `python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cgc_probe.py')} --replay {path}`\n")
+    return path
 
 
 def _blocker(c):
@@ -865,21 +931,20 @@ def _detect_js(rid: str, *, scoped=False) -> str:
         "var failed=null;(function(){var u=src>=0?nx[src]:null;"
         "if(!RID){for(var i=nx.length-1;i>=0;i--)"
         "if(__cgcRole(nx[i])==='user'&&__cgcRid(__cgcText(nx[i]))===" + json.dumps(rid) + "){u=nx[i];break;}}"
-        "var t=u&&u.closest('[data-turn-key]');if(!t)return;"
+        "var t=u&&u.closest(" + _js_str(UI["turn_container"]) + ");if(!t)return;"
         # The marker is a status element whose WHOLE text is the phrase (live 2026-09-25: a lone
         # "Thinking failed" span in the turn's activity header). Matching an exact element text,
         # outside any message body, means an answer line that merely starts "Network error…" can
         # never read as a failed turn.
         "var es=t.querySelectorAll('*');for(var k=0;k<es.length;k++){var p=es[k];"
         "if(p.children&&p.children.length)continue;var v=(p.textContent||'').trim();"
-        "if(v.length>80||!/^(Thinking failed|Something went wrong|Network error|"
-        "Message stream error)\\b/.test(v))continue;"
-        "if(p.closest('[data-markdown-text-style],[data-message-author-role],[data-chatgpt-search-unit-key]'))continue;"
+        "if(v.length>80||!/^(" + _js_alt(UI["failure_markers"]) + ")\\b/.test(v))continue;"
+        "if(p.closest(" + _js_str(_IN_MESSAGE_SEL) + "))continue;"
         "failed=v;}})();"
         "var rawT=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
         "var res=" + sentinel + ";"
         "var hasB=rawT.indexOf(BG)>=0,hasE=rawT.indexOf(EN)>=0;"
-        "var stop=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"],button[aria-label*=\"\\u505c\\u6b62\"]');"
+        "var stop=!!document.querySelector(" + _js_str(UI["stop_button"]) + ");"
         + _BLOCKER_FN + "var blocker=__cgcBlocker();"
         "var done=(res.done&&a.length>0);"
         "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,node:where,superseded:sup,"
@@ -1084,7 +1149,7 @@ def _extract_js(rid: str, *, scoped=False) -> str:
 def _model_slug_js(rid: str, *, scoped=False) -> str:
     """JS returning the producing model's slug for the rid's OWN answer node, or '' when the
     provider has not written one (a legitimate outcome — see SHARED CONTRACT #4)."""
-    return ("(function(){" + _NODE_FN + "var A='data-message-model-slug';"
+    return ("(function(){" + _NODE_FN + "var A=" + _js_str(UI["model_slug_attr"]) + ";"
             "var n=" + _node_call(rid, scoped) + ";if(!n)return '';"
             "var v=n.getAttribute(A);if(v)return v;"
             "var d=n.querySelector('['+A+']');if(d){v=d.getAttribute(A);if(v)return v;}"
@@ -1184,7 +1249,7 @@ def _reload_stale_tab(c, reason):
 # times out on an answer that is actually PRESENT (the "no answer" exit-4 on a finished consult).
 # Scrolling the list to the bottom fires the virtualizer's scroll handler synchronously, which
 # renders+commits the final node so textContent becomes readable — no foregrounding needed.
-_FORCE_RENDER_JS = ("(function(){try{var sc=document.querySelector('main')||document.scrollingElement;"
+_FORCE_RENDER_JS = ("(function(){try{var sc=document.querySelector(" + _js_str(UI["conversation_root"]) + ")||document.scrollingElement;"
                     "if(sc)sc.scrollTop=sc.scrollHeight;"
                     "var a=document.querySelectorAll(" + _JS_A + ");"
                     "if(a.length)a[a.length-1].scrollIntoView(false);}catch(e){}return 1;})()")
@@ -1291,7 +1356,7 @@ _CAND_JS = ("[].slice.call(document.querySelectorAll('button')).filter(function(
 _FORM_CAND_JS = (
     "[].slice.call((document.querySelector('form')||document.documentElement)"
     ".querySelectorAll('button')).filter(function(b){"
-    "return b.getAttribute('aria-haspopup')==='menu'&&b.id!=='composer-plus-btn';})"
+    "return b.getAttribute('aria-haspopup')==='menu'&&b.id!==" + _js_str(UI["composer_plus_button_id"]) + ";})"
 )
 
 # Every candidate this run considers, form-scoped ones FIRST (see _FORM_CAND_JS) followed by
@@ -1372,11 +1437,11 @@ def _click_item_js(target):
     # (never a loose contains, which would click a description item). Same Radix gesture as
     # opening (a bare .click() misses). Verified live: Medium -> 'Pro' selects 'Pro Extended'.
     t = json.dumps(target.lower())
-    return ("(function(){var T=%s;var ms=[].slice.call(document.querySelectorAll("
-            "'[role=\"menuitem\"],[role=\"option\"],[role=\"menuitemradio\"]'));"
+    return ("(function(){var T=" + t + ";var ms=[].slice.call(document.querySelectorAll("
+            + _js_str(UI["picker_flat_items"]) + "));"
             "var EL=ms.find(function(x){var f=(x.innerText||'').trim().toLowerCase().split('\\n')[0];"
             "return f===T||(T.indexOf('pro')===0&&f.indexOf('pro')===0);});"
-            "if(EL){%s return true;}return false;})()" % (t, _GESTURE))
+            "if(EL){" + _GESTURE + " return true;}return false;})()")
 
 
 # ---- slider path (primary on the build probed 2026-08-18) ----
@@ -1498,30 +1563,33 @@ def _slider_state_label(st):
 #   scaffold  radio-group chrome ([role=radiogroup] / [role=radio]) inside the owner. A picker
 #             with scaffolding but zero readable radios is a half-rendered group, not a build
 #             that has no such control.
+# The open picker that owns the model radios: its testid group, else the one menu holding a slider.
+_PICKER_OWNER_JS = (
+    "var own=[].slice.call(document.querySelectorAll(" + _js_str(UI["picker_owner"]) + "));"
+    "if(!own.length){own=[].slice.call(document.querySelectorAll(" + _js_str(UI["picker_menu"]) + "))"
+    ".filter(function(m){return !!m.querySelector(" + _js_str(UI["picker_slider"]) + ");});}")
+_MENU_SLIDER_SEL = _js_str(UI["picker_menu"] + " " + UI["picker_slider"])
 _PICKER_STATE_JS = (
     "(function(){"
-    "var own=[].slice.call(document.querySelectorAll("
-    "'[data-testid=\"composer-intelligence-picker-content\"]'));"
-    "if(!own.length){own=[].slice.call(document.querySelectorAll('[role=\"menu\"]'))"
-    ".filter(function(m){return !!m.querySelector('[role=\"slider\"]');});}"
-    "var fam={owners:own.length,menus:document.querySelectorAll('[role=\"menu\"]').length,"
+    + _PICKER_OWNER_JS +
+    "var fam={owners:own.length,menus:document.querySelectorAll(" + _js_str(UI["picker_menu"]) + ").length,"
     "radios:null,scaffold:0};"
     "if(own.length===1){var o=own[0];"
-    "fam.radios=[].slice.call(o.querySelectorAll('[role=\"menuitemradio\"]')).map(function(r){"
+    "fam.radios=[].slice.call(o.querySelectorAll(" + _js_str(UI["picker_family_radio"]) + ")).map(function(r){"
     "return {label:((r.innerText||'').trim().split('\\n')[0]),"
     "checked:r.getAttribute('aria-checked')==='true'};});"
-    "fam.scaffold=o.querySelectorAll('[role=\"radiogroup\"],[role=\"radio\"]').length;}"
-    "var s=document.querySelector('[role=\"menu\"] [role=\"slider\"]');"
+    "fam.scaffold=o.querySelectorAll(" + _js_str(UI["picker_radio_scaffold"]) + ").length;}"
+    "var s=document.querySelector(" + _MENU_SLIDER_SEL + ");"
     "if(!s)return {fam:fam,first:'',lines:[],descs:[],btnLabel:'',now:null,min:null,max:null};"
-    "var mi=s.closest('[role=\"menuitem\"]');"
-    "var grp=document.querySelector('[data-testid=\"composer-intelligence-picker-content\"]');"
+    "var mi=s.closest(" + _js_str(UI["picker_menuitem"]) + ");"
+    "var grp=document.querySelector(" + _js_str(UI["picker_owner"]) + ");"
     "var src=grp||mi;"
     "var lines=((src&&src.innerText)||'').split('\\n').map(function(x){return x.trim();})"
     ".filter(function(x){return !!x;});"
     "var descs=[];((mi&&mi.getAttribute('aria-describedby'))||'').split(/\\s+/)"
     ".forEach(function(id){var e=id?document.getElementById(id):null;"
     "if(e)descs.push((e.textContent||'').trim());});"
-    "var trig=(document.querySelector('form')||document).querySelector('button[aria-expanded=\"true\"]');"
+    "var trig=(document.querySelector('form')||document).querySelector(" + _js_str(UI["picker_open_trigger"]) + ");"
     "var btnLabel=((trig&&trig.innerText)||'').trim().split('\\n')[0];"
     "return {fam:fam,first:lines[0]||'',lines:lines,descs:descs,btnLabel:btnLabel,"
     "now:parseInt(s.getAttribute('aria-valuenow'),10),"
@@ -1529,8 +1597,8 @@ _PICKER_STATE_JS = (
     "})()")
 
 _SLIDER_FOCUS_JS = (
-    "(function(){var s=document.querySelector('[role=\"menu\"] [role=\"slider\"]');"
-    "if(!s)return false;var mi=s.closest('[role=\"menuitem\"]');"
+    "(function(){var s=document.querySelector(" + _MENU_SLIDER_SEL + ");"
+    "if(!s)return false;var mi=s.closest(" + _js_str(UI["picker_menuitem"]) + ");"
     "if(!mi)return false;mi.focus();return true;})()")
 
 
@@ -1705,16 +1773,16 @@ def _slider_set(c, target):
 # did.
 def _submenu_count_js():
     return ("(function(){return [].slice.call(document.querySelectorAll("
-            "'[role=\"menu\"] [role=\"menuitem\"][aria-haspopup=\"menu\"]')).length;})()")
+            + _js_str(UI["picker_submenu_trigger"]) + ")).length;})()")
 
 
 def _open_submenu_js(i):
     return ("(function(){var els=[].slice.call(document.querySelectorAll("
-            "'[role=\"menu\"] [role=\"menuitem\"][aria-haspopup=\"menu\"]'));"
-            "var EL=els[%d];if(!EL)return false;"
+            + _js_str(UI["picker_submenu_trigger"]) + "));"
+            "var EL=els[" + str(int(i)) + "];if(!EL)return false;"
             "['pointerover','pointerenter','mouseover','mousemove'].forEach(function(t){"
             "EL.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));});"
-            "%s return true;})()" % (i, _GESTURE))
+            + _GESTURE + " return true;})()")
 
 
 def _submenu_try(c, target):
@@ -1754,16 +1822,13 @@ def _click_family_js(target):
     the element observed; a radio in some other open menu is not this control. Same _GESTURE as
     everything else in this menu: these are Radix items and a bare .click() does not select them."""
     t = json.dumps((target or "").strip().lower())
-    return ("(function(){var T=%s;"
-            "var own=[].slice.call(document.querySelectorAll("
-            "'[data-testid=\"composer-intelligence-picker-content\"]'));"
-            "if(!own.length){own=[].slice.call(document.querySelectorAll('[role=\"menu\"]'))"
-            ".filter(function(m){return !!m.querySelector('[role=\"slider\"]');});}"
+    return ("(function(){var T=" + t + ";"
+            + _PICKER_OWNER_JS +
             "if(own.length!==1)return false;"
-            "var FAMS=[].slice.call(own[0].querySelectorAll('[role=\"menuitemradio\"]'));"
+            "var FAMS=[].slice.call(own[0].querySelectorAll(" + _js_str(UI["picker_family_radio"]) + "));"
             "var EL=FAMS.find(function(r){"
             "return ((r.innerText||'').trim().toLowerCase().split('\\n')[0])===T;});"
-            "if(!EL)return false;%s return true;})()" % (t, _GESTURE))
+            "if(!EL)return false;" + _GESTURE + " return true;})()")
 
 
 _FamilyObs = collections.namedtuple("_FamilyObs", "status entries detail")
@@ -1869,6 +1934,14 @@ def _reopen_picker(c, lab):
 
 
 _FamilyPick = collections.namedtuple("_FamilyPick", "ok label detail touched")
+
+
+def _is_family(label, family):
+    """Does the radio labelled `label` select `family`? Exact and case-insensitive, after the
+    contract's demonstrated relabels (family_aliases: 'Latest' is 'GPT-6'); any other label is
+    only itself, never an assumed equivalent."""
+    lab = (label or "").strip()
+    return UI["family_aliases"].get(lab, lab).lower() == (family or "").strip().lower()
 """`touched` means a gesture was DISPATCHED at the radio group — whether or not it was confirmed.
 Anything touched must be restored on a later failure, because a click whose confirmation could not
 be read is not a click that provably did nothing."""
@@ -1882,15 +1955,14 @@ def _apply_family(c, lab, obs, target):
 
     A real change returns only after re-reading aria-checked and seeing it flip; when the click
     committed the menu closed, the menu is REOPENED first so that re-read can happen at all."""
-    want = target.strip().lower()
-    hit = next(((l, chk) for l, chk in obs.entries if l.lower() == want), None)
+    hit = next(((l, chk) for l, chk in obs.entries if _is_family(l, target)), None)
     if hit is None:
         return _FamilyPick(False, None, (
             "model family '%s' is not offered in this picker (offered: %s)"
             % (target, ", ".join(l for l, _ in obs.entries))), False)
     if hit[1]:
         return _FamilyPick(True, hit[0], None, False)
-    if not c.eval(_click_family_js(target)):
+    if not c.eval(_click_family_js(hit[0])):
         return _FamilyPick(False, None,
                            "model family '%s' is listed but its radio could not be clicked" % target,
                            False)
@@ -1905,7 +1977,7 @@ def _apply_family(c, lab, obs, target):
             "model family '%s' was clicked but the picker could not be re-read to confirm it"
             % target), True)
     cur = _family_checked(obs2)
-    if cur is not None and cur.lower() == want:
+    if cur is not None and _is_family(cur, target):
         return _FamilyPick(True, cur, None, True)
     return _FamilyPick(False, cur, (
         "model family '%s' did not take — aria-checked never flipped after the click" % target),
@@ -2074,7 +2146,7 @@ def _confirm_pinned(c, lab, target, family, want_family):
         return _Confirm("unreadable", tier, obs.detail)
     if want_family and obs.status == "family":
         chk = _family_checked(obs)
-        if not chk or chk.strip().lower() != family.strip().lower():
+        if not chk or not _is_family(chk, family):
             return _Confirm("contradiction", tier, (
                 "the composer settled on model family '%s', not '%s' — the tier walk did not "
                 "leave the model where it was pinned" % (chk or "nothing", family)))
@@ -2095,14 +2167,14 @@ _DISMISS_JS = (
     "(function(){var E={key:'Escape',code:'Escape',keyCode:27,which:27,"
     "bubbles:true,cancelable:true};"
     "[document.activeElement].concat([].slice.call(document.querySelectorAll("
-    "'[role=\"menu\"][data-state=\"open\"],[role=\"menu\"]:not([data-state])')))"
+    + _js_str(UI["picker_open_menus"]) + ")))"
     ".forEach(function(t){if(t)t.dispatchEvent(new KeyboardEvent('keydown',E));});"
     # COMPOSER-SCOPED, exactly like _PICKER_STATE_JS's own btnLabel read. A document-wide count is
     # useless: live 2026-09-06 a RESTING ChatGPT page already carries four button[aria-expanded=
     # "true"] (sidebar and account disclosures), so "did the composer's menu close" measured
     # page-wide never reads zero and the dismissal loop can never see success.
     "return (document.querySelector('form')||document)"
-    ".querySelectorAll('button[aria-expanded=\"true\"]').length;})()")
+    ".querySelectorAll(" + _js_str(UI["picker_open_trigger"]) + ").length;})()")
 
 
 def _close_menus(c):
@@ -2397,12 +2469,8 @@ def _egress_gate(prompt: str):
 # selectors: when both attributes are present at different levels of the DOM, one union query
 # double-counts wrapper and content nodes and interleaves their order. Pick the family whose USER
 # turns contain this request's rid, then read the page through that family alone.
-_ADAPTERS = (
-    ("data-turn-v1", '[data-turn="user"]', '[data-turn="assistant"]'),
-    ("legacy-author-role-v1", '[data-message-author-role="user"]', '[data-message-author-role="assistant"]'),
-    ("search-unit-v1", '[data-chatgpt-search-unit-key$=":user"]',
-     '[data-chatgpt-search-unit-key$=":assistant"]'),
-)
+_ADAPTERS = tuple((s["adapter"], _role_sel(s, "user"), _role_sel(s, "assistant"))
+                  for s in sorted(_SCHEMAS, key=lambda s: s["send_rank"]))
 
 # How long after the click the request's own user turn must appear, and how long after that some
 # sign of generation must appear. These are failure DETECTORS, not deadlines — they never extend or
@@ -2425,8 +2493,8 @@ def _contract_js(rid):
             "var us=document.querySelectorAll(F[i].u),as=document.querySelectorAll(F[i].a),hit=false;"
             "for(var j=0;j<us.length;j++){if(__cgcRid(__cgcText(us[j]))===RID){hit=true;break;}}"
             "out.push({adapter:F[i].name,ridLanded:hit,users:us.length,assistants:as.length});}"
-            "var gen=!!document.querySelector('[data-testid=\"stop-button\"],button[aria-label*=\"Stop\"]');"
-            "return JSON.stringify({families:out,generating:gen});})()" % (tag, fams))
+            "var gen=!!document.querySelector(%s);"
+            "return JSON.stringify({families:out,generating:gen});})()" % (tag, fams, _js_str(UI["stop_button"])))
 
 
 def _await_contract(c, rid):
@@ -2467,8 +2535,8 @@ def _await_contract(c, rid):
 # the adapters are blind because ChatGPT's DOM moved, and the same move could drop this element —
 # silently restoring the whole-body scan that matches our rid in the sidebar of tabs that never held
 # it. An unreadable page is an unproven one.
-_JS_RID_IN_MAIN = """(function(r){var m=document.querySelector('main');
-  return !!m && (m.innerText||'').indexOf(r)>=0;})(%s)"""
+_JS_RID_IN_MAIN = ("""(function(r){var m=document.querySelector(""" + _js_str(UI["conversation_root"]) + """);
+  return !!m && (m.innerText||'').indexOf(r)>=0;})(%s)""")
 
 
 def _rid_in_main(c, rid) -> bool:
@@ -2531,7 +2599,7 @@ def _write_private(path, text):
 # nothing about WHY, and the caller's only guess was "tab not on ChatGPT or login lapsed". That sent
 # a human off to re-log-in while they were already logged in and the page had merely not finished
 # loading. A failure has to name which of those it actually is.
-_COMPOSER_SEL = 'div[role="textbox"][contenteditable="true"],#prompt-textarea'
+_COMPOSER_SEL = UI["composer"]
 
 
 def _composer_state_js():
@@ -2656,7 +2724,7 @@ class _PreClickFailure(Exception):
 _COMPOSER_RESOLVE_JS = (
     "function __cg(){var l=Array.prototype.slice.call(document.querySelectorAll("
     + json.dumps(_COMPOSER_SEL) + ")).filter(function(e){var r=e.getBoundingClientRect();"
-    "return r.width>0&&r.height>0&&!!e.closest('form')&&!e.closest('article,[data-message-author-role]');});"
+    "return r.width>0&&r.height>0&&!!e.closest('form')&&!e.closest(" + _js_str(UI["composer_exclude_ancestor"]) + ");});"
     "var f=l.filter(function(e){return e===document.activeElement||e.contains(document.activeElement);});"
     "return f[0]||l[0]||null;}")
 
@@ -2678,8 +2746,7 @@ def _send_click_js():
     can prove nothing was clicked. A throw from click() itself escapes and reads as no value."""
     return ("(function(){var t;try{" + _COMPOSER_RESOLVE_JS + "var d=__cg();if(!d)return 'no-composer';"
             "var f=d.closest('form');var b=Array.prototype.slice.call(f.querySelectorAll("
-            "'button[data-testid=\"send-button\"],button[aria-label*=\"Send\" i],"
-            "button[aria-label*=\"\\u53d1\\u9001\"]')).filter(function(x){var r=x.getBoundingClientRect();"
+            + _js_str(UI["send_button"]) + ")).filter(function(x){var r=x.getBoundingClientRect();"
             "return r.width>0&&r.height>0;});"
             "if(b.length>1)return 'ambiguous';if(b.length===1){if(b[0].disabled)return 'disabled';t=b[0];}"
             "else{var a=document.activeElement;return (a===d||d.contains(a))?'no-send':'no-focus';}"
@@ -2766,11 +2833,13 @@ def _composer_text_js():
             "var B=/^(P|DIV|PRE|LI|UL|OL|BLOCKQUOTE|H[1-6])$/;"
             "function blk(n){return n.nodeType===1&&B.test(n.tagName);}"
             "function __cgcPlain(n){if(n.nodeType===3)return n.nodeValue||'';if(n.nodeType!==1)return '';"
-            "if(n.hasAttribute&&n.hasAttribute('app-mention-name'))return '';if(n.tagName==='BR')return '\\n';"
+            "if(n.hasAttribute&&n.hasAttribute(" + _js_str(UI["mention_chip_attr"]) + "))return '';"
+            "if(n.tagName==='BR')return '\\n';"
             "var o='',k=n.childNodes,pb=false;for(var i=0;i<k.length;i++){var b=blk(k[i]);"
             "if(i>0&&(b||pb))o+='\\n';o+=__cgcPlain(k[i]);pb=b;}"
             "var l=k.length?k[k.length-1]:null;"
-            "if(blk(n)&&l&&l.nodeType===1&&l.tagName==='BR'&&/(^|\\s)ProseMirror-trailingBreak(\\s|$)/"
+            "if(blk(n)&&l&&l.nodeType===1&&l.tagName==='BR'&&/(^|\\s)" + _js_alt([UI["trailing_break_class"]])
+            + "(\\s|$)/"
             ".test((l.getAttribute&&l.getAttribute('class'))||''))o=o.slice(0,-1);return o;}"
             "return __cgcPlain(d);})()")
 
@@ -2803,8 +2872,8 @@ _MENTION_SETTLE_POLLS = 6  # x0.4s for the composer to show the picked app's men
 # Probed live 2026-09-29: the popup carries NO ARIA roles. It is a floating panel whose scroll area
 # is [data-mention-list-scroll-area]; every row (plugin, file, ...) is a plain
 # <button data-list-navigation-item> inside it. The roles this once guessed matched nothing.
-_MENTION_POPUP_SEL = '[data-mention-list-scroll-area]'
-_MENTION_OPT_SEL = _MENTION_POPUP_SEL + ' [data-list-navigation-item]'
+_MENTION_POPUP_SEL = f'[{UI["mention_popup_attr"]}]'
+_MENTION_OPT_SEL = _MENTION_POPUP_SEL + f' [{UI["mention_option_attr"]}]'
 
 
 class _MentionFailure(_PreClickFailure):
@@ -2864,23 +2933,23 @@ def _mention_pick_js(name, token):
             "function sp(s){return (s||'').replace(/\\s+/g,' ').trim();}"
             "function lab(e){return sp((e.innerText||e.textContent||'').split('\\n')[0]).replace(/^@/,'')"
             ".toLowerCase();}"
-            "function row(n){return n.hasAttribute('data-list-navigation-item');}"
+            "function row(n){return n.hasAttribute(" + _js_str(UI["mention_option_attr"]) + ");}"
             "function txt(n){return (n.innerText||'').trim();}"
             "function hdr(e){var p=e.previousElementSibling;while(p&&(row(p)||!txt(p)))"
             "p=p.previousElementSibling;return p?txt(p).toLowerCase():null;}"
             "function headed(e){var k=e.parentElement.children;for(var i=0;i<k.length;i++)"
             "if(!row(k[i])&&txt(k[i]))return true;return false;}"
-            "function body(e){return e.querySelector('[data-menu-row-content]');}"
+            "function body(e){return e.querySelector('[" + UI["mention_row_content_attr"] + "]');}"
             "function tok(n,c){return ((n&&n.getAttribute&&n.getAttribute('class'))||'').split(/\\s+/)"
             ".indexOf(c)>=0;}"
             "function appish(e){var c=body(e);if(!c)return false;var l=c.firstElementChild;"
-            "var i=l&&l.firstElementChild;return !!i&&tok(i,'rounded-2xs');}"
+            "var i=l&&l.firstElementChild;return !!i&&tok(i," + _js_str(UI["mention_app_icon_class"]) + ");}"
             "function nw(s){return (s||'').replace(/\\s+/g,'');}"
             # a LEAF holds one text node and no element: every captured description and label is exactly that,
             # so a second text node (a bare ' Connect' appended after the description) fails it as well
             "function leaf(n){return !!n&&n.children.length===0&&n.childNodes.length<=1;}"
             "function plain(e){var c=body(e);if(!c||e.children.length!==1||c.children.length!==2)return false;"
-            "var d=c.querySelector('.text-codex-description');if(!d||!leaf(d))return false;"
+            "var d=c.querySelector('." + UI["mention_description_class"] + "');if(!d||!leaf(d))return false;"
             # the label element is the description's first text sibling: the innermost element holding the
             # label. Both must be LEAVES (no element inside them), so a Connect control nested inside the
             # description or the label cannot hide there, and the whole button must read exactly label +
@@ -2891,8 +2960,8 @@ def _mention_pick_js(name, token):
             "if(!leaf(lb))return false;"
             "return nw(e.textContent)===nw(lb.textContent+d.textContent);}"
             "var open=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL) + ");"
-            "var loading=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL + ' [role="status"]') + ");"
-            "var sect=os.filter(function(e){var h=hdr(e);return h==='plugins'||(h===null&&!headed(e));});"
+            "var loading=!!document.querySelector(" + json.dumps(_MENTION_POPUP_SEL + ' ' + UI["mention_loading"]) + ");"
+            "var sect=os.filter(function(e){var h=hdr(e);return h===" + _js_str(UI["mention_section_header"]) + "||(h===null&&!headed(e));});"
             "var pl=sect.filter(appish);"
             "var ex=pl.filter(function(e){return lab(e)===want;});"
             "var hit=ex.length===1?ex[0]:null;var amb=ex.length>1?ex.length:0;"
@@ -2910,8 +2979,9 @@ def _composer_mentions_js():
     # The composer's APP mention nodes: a picked app becomes <span app-mention-name=... app-mention-display-name=...>;
     # a picked file or any other row does not. Returns the normalized display names ([] when there is no composer).
     return ("(function(){var d=" + _composer_get_js() + ";if(!d)return [];"
-            "return Array.prototype.map.call(d.querySelectorAll('[app-mention-name]'),function(e){"
-            "return (e.getAttribute('app-mention-display-name')||e.getAttribute('app-mention-name')||'')"
+            "return Array.prototype.map.call(d.querySelectorAll('[" + UI["mention_chip_attr"] + "]'),function(e){"
+            "return (e.getAttribute(" + _js_str(UI["mention_chip_label_attr"]) + ")||e.getAttribute("
+            + _js_str(UI["mention_chip_attr"]) + ")||'')"
             ".replace(/\\s+/g,' ').trim().toLowerCase();});})()")
 
 
@@ -3167,7 +3237,10 @@ def cmd_submit(a) -> int:
         ready, _cstate = _await_composer(c)
         if not ready:
             _code, _msg = _composer_failure(_cstate)
-            print(json.dumps(_composer_outcome(_cstate)))
+            _out = _composer_outcome(_cstate)
+            if _out["reason"] == "composer_not_ready" and _out.get("form"):
+                _diagnose(c, "composer", "composer_not_ready", _msg, a.rid)   # the app rendered, no editor
+            print(json.dumps(_out))
             sys.stderr.write(_msg + "\n")
             return _code
         # Model selection — fully automated (must run AFTER navigate, which resets the
@@ -3201,6 +3274,7 @@ def cmd_submit(a) -> int:
                 sys.stderr.write(
                     f"CGC_ERROR model_not_selectable: {why} — NOT submitting. Fix: {fix}, or "
                     f"pass --allow-model-mismatch.\n")
+                _diagnose(c, "model", "model_not_selectable", why, a.rid)
                 return 3
             if not model_confirmed:
                 sys.stderr.write(f"CGC_WARN proceeding on '{model_now}' not '{target}' "
@@ -3217,6 +3291,8 @@ def cmd_submit(a) -> int:
             print(json.dumps({"ok": False, "submitted": False, "reason": "mention_not_found",
                               "phase": "mention"}))
             sys.stderr.write(f"CGC_ERROR {e} — NOT submitted.\n")
+            if e.drift:
+                _diagnose(c, "mention", "mention_not_found", str(e), a.rid)
             return 3
         except _PreClickFailure as e:
             sys.stderr.write(f"CGC_ERROR not_sent_preclick: {e} — NOT submitted; safe to retry with "
@@ -3491,7 +3567,10 @@ def cmd_followup(a) -> int:
         ready, _cstate = _await_composer(c)
         if not ready:
             _code, _msg = _composer_failure(_cstate)
-            print(json.dumps(_composer_outcome(_cstate)))
+            _out = _composer_outcome(_cstate)
+            if _out["reason"] == "composer_not_ready" and _out.get("form"):
+                _diagnose(c, "composer", "composer_not_ready", _msg, rid)   # the app rendered, no editor
+            print(json.dumps(_out))
             sys.stderr.write(_msg + "\n")
             return _code
         # CONVERSATION-INTEGRITY GUARD (before any model-selection/insert): after attaching to a
@@ -3544,6 +3623,7 @@ def cmd_followup(a) -> int:
                     f"CGC_ERROR model_not_selectable: {why} — NOT sending this follow-up (it "
                     f"would answer on a DEGRADED model, the Instant-stall failure). Fix: {fix}, "
                     f"or pass --allow-model-mismatch to override.\n")
+                _diagnose(c, "model", "model_not_selectable", why, rid)
                 return 2
         # Count user messages BEFORE sending so we can confirm a NEW one landed (the
         # thread already has >=1 user message, so an absolute >0 check would false-pass).
@@ -3586,6 +3666,8 @@ def cmd_followup(a) -> int:
             print(json.dumps({"ok": False, "submitted": False, "reason": "mention_not_found",
                               "phase": "mention"}))
             sys.stderr.write(f"CGC_ERROR {e} — NOT sent.\n")
+            if e.drift:
+                _diagnose(c, "mention", "mention_not_found", str(e), rid)
             return 3
         except _PreClickFailure as e:
             sys.stderr.write(f"CGC_ERROR not_sent_preclick: {e} — NOT sent; safe to retry with the "
@@ -3732,19 +3814,19 @@ def _approval_js(allow):
             "function vis(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}"
             "function t(e){return (e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim();}"
             "function hasDeny(n){return Array.prototype.slice.call(n.querySelectorAll('button')).some("
-            "function(b){return vis(b)&&/^(deny|\u62d2\u7edd)/i.test(t(b));});}"
+            "function(b){return vis(b)&&/^(" + _js_alt(UI["approval_deny_labels"]) + ")/i.test(t(b));});}"
             "function named(e){var ls=(e.innerText||'').split('\\n').map(function(l){"
             "return l.replace(/\\s+/g,' ').trim().toLowerCase();});return allow.filter(function(a){"
             "return ls.indexOf(a.toLowerCase())>=0;})[0]||null;}"
             "var ok=Array.prototype.slice.call(document.querySelectorAll('button')).filter(function(b){"
-            "return vis(b)&&/^(allow once|\u5141\u8bb8\u4e00\u6b21)/i.test(t(b));});"
+            "return vis(b)&&/^(" + _js_alt(UI["approval_allow_labels"]) + ")/i.test(t(b));});"
             "for(var i=0;i<ok.length;i++){var n=ok[i].parentElement,d=0;"
             "while(n&&d<6&&!hasDeny(n)){n=n.parentElement;d++;}if(!n||d>=6)continue;"
             "var txt=t(n),app=named(n);"
             # Climb only while the ancestor still holds exactly ONE visible "Allow once": a parent of
             # two stacked cards would otherwise lend the second card's app name to the first's button.
             "function ones(e){return [].slice.call(e.querySelectorAll('button')).filter(function(b){"
-            "return vis(b)&&/^(allow once|\\u5141\\u8bb8\\u4e00\\u6b21)/i.test(t(b));}).length;}"
+            "return vis(b)&&/^(" + _js_alt(UI["approval_allow_labels"]) + ")/i.test(t(b));}).length;}"
             "for(var m=n.parentElement;!app&&m&&t(m).length<=400&&ones(m)===1;m=m.parentElement){txt=t(m);app=named(m);}"
             "if(app)ok[i].click();return {app:app,text:txt.slice(0,300)};}return null;})()")
 
