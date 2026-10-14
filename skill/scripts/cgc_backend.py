@@ -2352,7 +2352,10 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
         return _deadline_passed(store, rid)
     res = run_cdp("wait", rid=wait_rid or rid, conversation=conv, out=out_tmp,
                   poll=spec.get("poll"), timeout=RETRIEVE_IDLE_EXIT_S if last_look else left,
-                  idle_exit=RETRIEVE_IDLE_EXIT_S if is_retrieve or last_look else None)
+                  idle_exit=RETRIEVE_IDLE_EXIT_S if is_retrieve or last_look else None,
+                  # Granting an app access is a mutation like a send: only the worker that sent the
+                  # round answers its approval card; recovery leaves the card for a human.
+                  approve=may_continue)
     code = res.get("code")
     turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
     if turn_failed and not is_retrieve:
@@ -2394,7 +2397,7 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
             if left <= 0:
                 return _deadline_passed(store, rid)
             res = run_cdp("wait", rid=rid, conversation=conv, out=out_tmp,
-                          poll=spec.get("poll"), timeout=left)
+                          poll=spec.get("poll"), timeout=left, approve=may_continue)
             code = res.get("code")
             turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
     answer_path = res.get("out") or out_tmp

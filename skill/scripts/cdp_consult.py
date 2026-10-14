@@ -4021,7 +4021,7 @@ def cmd_followup(a) -> int:
 # Found by what a person sees, not by an unprobed container class: a visible "Allow once" button whose
 # nearest ancestor (<= 6 up) also holds a visible "Deny" button is one card. The click is a page-level
 # element.click() over CDP — no mouse, no focus, no window activation — in this consult's own tab only.
-def _approval_js(allow):
+def _approval_js(allow, click=True):
     # From each visible "Allow once": climb to the first ancestor that also holds a visible "Deny" (the
     # card's button row), then keep climbing while the text stays card-sized (<= 400 chars) until it
     # names an allowlisted app. "Names" is an exact, case-insensitive match against one LINE of the
@@ -4046,7 +4046,7 @@ def _approval_js(allow):
             "function ones(e){return [].slice.call(e.querySelectorAll('button')).filter(function(b){"
             "return vis(b)&&/^(" + _js_alt(_APPROVAL_ALLOW) + ")/i.test(t(b));}).length;}"
             "for(var m=n.parentElement;!app&&m&&t(m).length<=400&&ones(m)===1;m=m.parentElement){txt=t(m);app=named(m);}"
-            "if(app&&__cgcMayClick(ok[i],'approve'))ok[i].click();else if(app)app=null;"
+            "if(app&&" + ("" if click else "false&&") + "__cgcMayClick(ok[i],'approve'))ok[i].click();else if(app)app=null;"
             "return {app:app,text:txt.slice(0,300)};}return null;})()")
 
 
@@ -4057,12 +4057,12 @@ def _approve_apps():
     return [x for x in (p.strip().lstrip("@") for p in raw.split(",")) if x]
 
 
-def _answer_approval(c):
+def _answer_approval(c, click=True):
     """None when no card is showing; else (app, text) — app None means the card is for an app not in
     CGC_AUTO_APPROVE and was left untouched. A click is not proof: the caller's next poll sees the
-    card again if it did not take, and gives up after a few tries."""
+    card again if it did not take, and gives up after a few tries. `click=False` only reads the card."""
     try:
-        r = c.eval(_approval_js(_approve_apps()))
+        r = c.eval(_approval_js(_approve_apps(), click))
     except Exception:
         return None
     return (r.get("app"), r.get("text") or "") if r else None
@@ -4220,12 +4220,13 @@ def cmd_wait(a) -> int:
                                  f"len={st.get('len')} done={st.get('done')} begin={st.get('begin')} "
                                  f"end={st.get('end')} ac={st.get('ac')} "
                                  f"t+{int(time.time()-(deadline-a.timeout))}s\n")
-            card = _answer_approval(c)
+            card = _answer_approval(c, click=not getattr(a, "no_approve", False))
             if card:
                 app, text = card
                 approvals += 1
-                if not app or approvals > 5:
-                    why = "not in CGC_AUTO_APPROVE" if not app else "still showing after 5 clicks"
+                if not app or approvals > 5 or getattr(a, "no_approve", False):
+                    why = ("a recovery wait never grants access" if getattr(a, "no_approve", False)
+                           else "not in CGC_AUTO_APPROVE" if not app else "still showing after 5 clicks")
                     sys.stderr.write(f"CGC_BLOCKER approval_needed: {text[:160]!r} ({why}) — answer it "
                                      "in the ChatGPT window, then retrieve\n")
                     return 3
@@ -4668,6 +4669,8 @@ def main() -> int:
     w.add_argument("--settle-seconds", type=int, default=300,
                    help="consider completion only after the answer is non-generating AND byte-stable "
                         "this long (default 300s — long enough not to trip on a Pro Thinking pause)")
+    w.add_argument("--no-approve", action="store_true",
+                   help="never click an app-approval card (recovery waits): report approval_needed")
     w.add_argument("--idle-exit", type=int, default=0,
                    help="recovery waits only: end with timeout_no_answer once the turn has been idle "
                         "(not generating, no answer) this many seconds. 0 = off (a live round may "

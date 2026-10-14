@@ -107,3 +107,11 @@ def test_no_contract_edit_can_make_an_approval_click_hit_send(tmp_path):
     assert not any(k.startswith("approval_") for k in CDP.UI)
     js = CDP._approval_js(["WebCodex Demo"])
     assert "'send'" not in js.lower() and "closest('form')" in js
+
+
+def test_a_read_only_approval_check_never_clicks(monkeypatch):
+    """Recovery waits read the card but never grant access (the backend's approve=False)."""
+    orig = CDP._approval_js
+    monkeypatch.setattr(CDP, "_approval_js", lambda allow, click=True: orig(allow, False))
+    out = _run(CARD, ["WebCodex Demo"])
+    assert out["r"] is not None and sum(out["clicks"]) == 0
