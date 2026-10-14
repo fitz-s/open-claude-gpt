@@ -583,12 +583,15 @@ def test_a_retrieve_is_never_fenced_out_of_a_busy_thread(store):
 
 
 def test_an_unreconciled_uncertain_round_does_not_block_its_thread_forever(store):
-    """possibly_accepted has no automatic exit, so counting it as 'live' would make one unreconciled
-    round a permanent embargo on its whole thread."""
+    """possibly_accepted has no automatic exit, so counting it as 'live' unconditionally would make one
+    unreconciled round a permanent embargo on its whole thread. It holds the thread only until its
+    one-shot auto-retrieve has run; once that is spent, the thread frees."""
     sm, s = store
     conv = "6a684b38-bef4-83ea-83d4-134bf9610e05"
     _thread_round(s, sm, "REQ-20260721-000000-00cc05", "followup", conv, sm.POSSIBLY_ACCEPTED)
     _thread_round(s, sm, "REQ-20260721-000000-00cc06", "followup", conv, sm.QUEUED)
+    assert s.claim_auto_retrieve("REQ-20260721-000000-00cc05")
+    s.set_state("REQ-20260721-000000-00cc05", sm.POSSIBLY_ACCEPTED)   # the retrieve found nothing
     got = s.claim_ready("d1")
     assert got is not None and got["rid"] == "REQ-20260721-000000-00cc06"
 

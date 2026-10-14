@@ -20,12 +20,14 @@ the anti-duplicate invariant holds on every path.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 
 import cgc_store as store_mod
@@ -1361,15 +1363,23 @@ def _await_round(a) -> int:
 def _materialize(out: str, text: str) -> None:
     """Write the store's authoritative result to the derived answer file atomically (0600). The file
     is a rematerializable view of the store, so 'done but file missing' is repairable, not a
-    contradiction."""
+    contradiction.
+
+    The temp is UNIQUE per call (mkstemp, 0600, same directory so the replace stays atomic): the
+    producer and an `await` can materialize the same round at once, and a shared `<out>.tmp` let one
+    writer truncate the file the other was about to rename into place."""
     d = os.path.dirname(out)
     if d:
         os.makedirs(d, exist_ok=True)
-    tmp = out + ".tmp"
-    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, out)
+    fd, tmp = tempfile.mkstemp(dir=d or ".", prefix=os.path.basename(out) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, out)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
 
 
 def _publish_answer(store, rid: str, text: str) -> None:
@@ -1512,7 +1522,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
             store.mark_accepted(attempt, conv, model_badge=send.get("model_badge"))
             store.mark_waiting(rid)
             _project_send(store, attempt, rid, send)    # after the state + address; fail-soft
-            return _wait_phase(store, rid, conv, spec, run_cdp)
+            return _wait_phase(store, rid, conv, spec, run_cdp, may_continue=True)
         # Every other outcome: its durable state FIRST, then the driver's typed outcome (the
         # `finally`, after whichever branch ran). _project_send is diagnostics and fail-soft, so it
         # can never move the round or lose its address.
@@ -1568,7 +1578,7 @@ def process_round(store, r: dict, run_cdp, *, daemon_instance_id: str, validate)
         store.mark_accepted(attempt, conv, model_badge=sub.get("model_badge"))
         store.mark_waiting(rid)
         _project_send(store, attempt, rid, sub)        # after the state + address; fail-soft
-        return _wait_phase(store, rid, conv, spec, run_cdp)
+        return _wait_phase(store, rid, conv, spec, run_cdp, may_continue=True)
 
     # Every other outcome: its durable state and address FIRST, then the driver's typed outcome (the
     # `finally`). _project_send is diagnostics and fail-soft: it can never move the round or lose
@@ -1627,9 +1637,12 @@ def _why_unconfirmed(res: dict) -> str:
 
 def resume_round(store, r: dict, run_cdp) -> str:
     """Reattach to a round and resume polling its existing conversation — the store peer of the
-    spool's orphan recovery. It never re-sends the round's prompt (the one exception is the single
-    automatic "continue" _wait_phase sends when ChatGPT itself marked the landed turn failed) (attach + wait is read-only; the waiter's rid-sentinel
-    check means it completes only if THIS round's own answer is on the thread). Handles three inputs:
+    spool's orphan recovery. It sends NOTHING — not the prompt, and not the automatic "continue" either:
+    that is a new paid message, and only the original send worker's first wait may spend it (recovery
+    has no send authority; a failed turn found here ends FAILED, telling the agent to re-fire). Attach
+    + wait is read-only; the waiter's rid-sentinel check means it completes only if THIS round's own
+    answer is on the thread, and it watches only what is left of the send's observation deadline.
+    Handles three inputs:
       - accepted / waiting          — a worker died mid-poll; resume it.
       - possibly_accepted + conv    — a ONE-SHOT auto-retrieve (recover() only offers these once): the
                                       send may have landed; read-only attach recovers it if so, and
@@ -1650,7 +1663,8 @@ def resume_round(store, r: dict, run_cdp) -> str:
         # a human rather than racing another worker onto the same read-only retrieve.
         if not store.claim_auto_retrieve(rid):
             return store_mod.POSSIBLY_ACCEPTED
-    elif r["state"] == store_mod.ACCEPTED:
+        return _wait_phase(store, rid, conv, spec, run_cdp, final_look=True)
+    if r["state"] == store_mod.ACCEPTED:
         store.mark_waiting(rid)
     return _wait_phase(store, rid, conv, spec, run_cdp)
 
@@ -1755,7 +1769,29 @@ def _newer_send(store, rid, conv):
         (conv, rid, rid)).fetchone()
 
 
-def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
+def _past_deadline(rid, deadline, where) -> bool:
+    """A continue whose answer nobody has time left to watch is a message paid for nothing."""
+    if time.time() < deadline:
+        return False
+    sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — the observation deadline passed {where}.\n")
+    return True
+
+
+def _click_not_after(spec, deadline) -> str:
+    """The instant the continue's click must not pass: the earlier of the round's use-by and its
+    observation deadline. The driver re-checks it at the click, so a slow attach/paste that crosses
+    the deadline ends provably not sent (its pre-click exit) instead of sending unwatched."""
+    obs = datetime.datetime.fromtimestamp(deadline, datetime.timezone.utc)
+    try:
+        use_by = datetime.datetime.fromisoformat(_use_by(spec))
+        if use_by.tzinfo is None:
+            use_by = use_by.replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return obs.isoformat()
+    return min(use_by, obs).isoformat()
+
+
+def _auto_continue(store, rid, conv, spec, run_cdp, deadline) -> str:
     """Send the one automatic continue for a round whose turn ChatGPT marked failed. Returns (and,
     once claimed, durably records) the outcome:
       "landed"   the continue provably landed — re-wait on the same rid;
@@ -1763,6 +1799,8 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
       "unsure"   the click may have happened (timeout, crash, unconfirmed echo)."""
     import cgc_spool as _spool
     prompt = _continue_prompt(rid)
+    if _past_deadline(rid, deadline, "before it was considered"):
+        return "not_sent"
     if _use_by_passed(spec):
         # The answer is worthless past use-by, and a continue is a second paid message for it.
         # Declined BEFORE the claim, so no auto_continue event exists and nothing is charged; the
@@ -1783,25 +1821,29 @@ def _auto_continue(store, rid, conv, spec, run_cdp) -> str:
         sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — {newer['rid']} was sent into "
                          f"{conv} after it, so 'answer that same request' would be ambiguous.\n")
         return "not_sent"
+    if _past_deadline(rid, deadline, "while the continue was validated"):
+        return "not_sent"                             # before the claim: nothing spent
     if not store.claim_auto_continue(rid, store_mod.sha256(prompt)):
         return "not_sent"                             # already spent — at most one per round
-    outcome = _send_continue(store, rid, conv, spec, run_cdp, prompt)
+    outcome = _send_continue(store, rid, conv, spec, run_cdp, prompt, deadline)
     store.record_auto_continue(rid, outcome)
     return outcome
 
 
-def _send_continue(store, rid, conv, spec, run_cdp, prompt) -> str:
+def _send_continue(store, rid, conv, spec, run_cdp, prompt, deadline) -> str:
     import cgc_spool as _spool
-    lease, end = None, time.time() + CONTINUE_LEASE_WAIT_S
+    lease, end = None, min(time.time() + CONTINUE_LEASE_WAIT_S, deadline)
     while lease is None and time.time() < end:
         lease = _spool.acquire_conversation_lease(conv)
         if lease is None:
             time.sleep(2)
     if lease is None:
         sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — another send held conversation "
-                         f"{conv} for {CONTINUE_LEASE_WAIT_S}s.\n")
+                         f"{conv} until the lease wait or the observation deadline ran out.\n")
         return "not_sent"
     try:
+        if _past_deadline(rid, deadline, "while waiting for the conversation"):
+            return "not_sent"
         if _use_by_passed(spec):                 # the lease wait (up to 60 s) may have crossed it
             sys.stderr.write(f"CGC_WARN {rid}: auto-continue skipped — use-by {_use_by(spec)} "
                              "passed while waiting for the conversation.\n")
@@ -1815,7 +1857,8 @@ def _send_continue(store, rid, conv, spec, run_cdp, prompt) -> str:
             sent = run_cdp("followup", rid=rid, conversation=conv, prompt=prompt,
                            model=spec.get("model") or "Pro",
                            model_family=spec.get("model_family") or "GPT-6",
-                           mentions=spec.get("mentions") or [], not_after=_use_by(spec))
+                           mentions=spec.get("mentions") or [],
+                           not_after=_click_not_after(spec, deadline))
         except Exception as e:                        # noqa: BLE001 — a crash may follow the click
             sys.stderr.write(f"CGC_WARN {rid}: auto-continue crashed ({type(e).__name__}: {e}).\n")
             return "unsure"
@@ -1832,7 +1875,21 @@ def _send_continue(store, rid, conv, spec, run_cdp, prompt) -> str:
     return "landed"
 
 
-def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=False) -> str:
+def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=False,
+                may_continue=False, final_look=False) -> str:
+    """Wait for the round's answer and commit what the waiter saw.
+
+    `may_continue` is SEND AUTHORITY, and only the worker that just sent the round holds it: a failed
+    turn there earns the one automatic continue. Every other caller — a reattach, the auto-retrieve,
+    a retrieve — is recovery, and recovery is read-only, so it defaults off.
+
+    The budget is the send's, not this call's: the round's observation_deadline (begin_send + its
+    timeout) bounds this wait and the continue's re-wait alike, so neither a restart nor a continue
+    can extend it. At the deadline the round ends uncertain (retrieve, don't resend), never extended.
+    The one exception is `final_look`, the one-shot auto-retrieve: past the deadline it still gets ONE
+    short read-only look (RETRIEVE_IDLE_EXIT_S, idle-bounded), because its whole purpose is the answer
+    that finished while nobody was watching — the waiter that died at minute 89. One-shot by its event
+    marker, so the bound is budget + RETRIEVE_IDLE_EXIT_S, once."""
     out_tmp = os.path.join(store_mod.CGC_STATE_DIR, f"_wait_{rid}.txt")
     # Clear any stale answer + .raw sidecar from a PRIOR wait on this rid (e.g. a timed-out first
     # wait, before an auto-retrieve). _wait_phase decides completed_verified vs _unverified purely
@@ -1846,16 +1903,31 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
     # A recovery (retrieve) looks at a turn sent long ago, so an idle turn there is final, not a
     # thinking pause; bound it instead of holding one of the daemon's few worker slots for the full
     # 90-minute budget (three stuck retrieves starved a new send for ~40 min, 2026-09-25).
-    wait_started = time.time()
+    budget = int(spec.get("timeout") or _spool_stuck_after())
+    deadline = (None if is_retrieve else store.observation_deadline(rid, budget)) \
+        or time.time() + budget
+
+    # The remainder is read ONCE per wait: the value checked is the value passed. Reading the clock
+    # twice let a 1 s check become a 0 s argv, which the driver used to read as "no budget".
+    left = int(deadline - time.time())
+    last_look = final_look and left < RETRIEVE_IDLE_EXIT_S
+    if left <= 0 and not last_look:
+        return _deadline_passed(store, rid)
     res = run_cdp("wait", rid=wait_rid or rid, conversation=conv, out=out_tmp,
-                  poll=spec.get("poll"), timeout=spec.get("timeout"),
-                  idle_exit=RETRIEVE_IDLE_EXIT_S if is_retrieve else None)
+                  poll=spec.get("poll"), timeout=RETRIEVE_IDLE_EXIT_S if last_look else left,
+                  idle_exit=RETRIEVE_IDLE_EXIT_S if is_retrieve or last_look else None)
     code = res.get("code")
     turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
     if turn_failed and not is_retrieve:
         prior = store.auto_continue_state(rid)
-        if prior is None:
-            outcome = _auto_continue(store, rid, conv, spec, run_cdp)
+        if prior is None and not may_continue:
+            # Recovery found the failed turn. The continue is a paid send and recovery has none to
+            # spend: end FAILED below ("no automatic continue went out"), and the agent re-fires.
+            sys.stderr.write(f"CGC_WARN {rid}: turn failed, seen by a recovery wait — no continue "
+                             "is sent from recovery.\n")
+            outcome = "not_sent"
+        elif prior is None:
+            outcome = _auto_continue(store, rid, conv, spec, run_cdp, deadline)
         elif prior in ("claimed", "unsure"):
             # An earlier continue may have landed (a worker died after its click, or it went
             # unconfirmed), yet this rid's latest turn is still the failed one. The one-shot read-only
@@ -1881,8 +1953,9 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
                     os.remove(_p)
                 except OSError:
                     pass
-            budget = int(spec.get("timeout") or _spool_stuck_after())
-            left = max(600, budget - int(time.time() - wait_started))
+            left = int(deadline - time.time())
+            if left <= 0:
+                return _deadline_passed(store, rid)
             res = run_cdp("wait", rid=rid, conversation=conv, out=out_tmp,
                           poll=spec.get("poll"), timeout=left)
             code = res.get("code")
@@ -1959,6 +2032,18 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
     store.set_state(rid, store_mod.POSSIBLY_ACCEPTED,
                     error_code=(f"wait produced no answer (exit {code}) — retrieve, don't resend"
                                 + (f"; original disposition: {prior}" if prior else "")))
+    return store_mod.POSSIBLY_ACCEPTED
+
+
+def _deadline_passed(store, rid) -> str:
+    """The send's observation budget is spent before this wait could start. Not "not sent", not "remote
+    failed": the turn may still be answering, so the round ends uncertain for an explicit retrieve —
+    the same disposition a wait that ran out of time gets — keeping why it was uncertain before."""
+    prior_row = store.get_round(rid)
+    prior = prior_row["error_code"] if prior_row else None
+    store.set_state(rid, store_mod.POSSIBLY_ACCEPTED,
+                    error_code="observation deadline passed — retrieve, don't resend"
+                               + (f"; original disposition: {prior}" if prior else ""))
     return store_mod.POSSIBLY_ACCEPTED
 
 

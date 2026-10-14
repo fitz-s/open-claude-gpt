@@ -31,8 +31,11 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
+import tempfile
+import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -563,6 +566,30 @@ def _gate_keys(broken: dict) -> set:
     return keys
 
 
+# A canonical ChatGPT conversation id (cgc_spool._CONV_ID_RE, which imports this module — so the
+# shape is restated here rather than imported), as a regex and as the GLOB SQL can match on.
+_CONV_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_CONV_GLOB = "-".join("[0-9a-f]" * n for n in (8, 4, 4, 4, 12))
+
+
+def _is_conv_id(value) -> bool:
+    return bool(_CONV_RE.fullmatch(value or ""))
+
+
+def _valid_backup(path: str, version: int) -> bool:
+    """A backup is valid iff sqlite reads it as an intact DB whose schema_version is `version`."""
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            ok = db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            row = db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            return ok and row is not None and row[0] == str(version)
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return False
+
+
 def new_daemon_instance_id() -> str:
     """A fresh identity per daemon process — recorded on attempts so ownership is the daemon
     INSTANCE, not a reusable OS pid."""
@@ -595,6 +622,30 @@ class Store:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
         self._migrate()
+        self._backfill_thread_addresses()
+
+    def _backfill_thread_addresses(self) -> None:
+        """Give a legacy thread row (created before create_round stamped conversation_id) the address it
+        already implies: its thread_id when that is a canonical conversation id — thread_id IS the
+        conversation id at every call site — else the canonical `conversation` a round's spec in it
+        carries. Without this, conversation_of() is None, an uncertain round there is never offered
+        its one read-only retrieve, and its answer is stranded. Idempotent; writes only when a NULL
+        row has a recoverable address."""
+        rows = self.db.execute(
+            "SELECT t.thread_id, (SELECT json_extract(r.spec_json,'$.conversation') FROM rounds r "
+            "  WHERE r.thread_id=t.thread_id AND json_valid(r.spec_json) "
+            "  AND json_extract(r.spec_json,'$.conversation') GLOB ? LIMIT 1) spec_conv "
+            "FROM threads t WHERE t.conversation_id IS NULL", (_CONV_GLOB,)).fetchall()
+        fixes = [(r["thread_id"] if _is_conv_id(r["thread_id"]) else r["spec_conv"], r["thread_id"])
+                 for r in rows]
+        fixes = [f for f in fixes if f[0]]
+        if not fixes:
+            return
+        with self._tx():
+            for conv, tid in fixes:
+                self.db.execute("UPDATE threads SET conversation_id=?,updated_at=? "
+                                "WHERE thread_id=? AND conversation_id IS NULL", (conv, _now(), tid))
+                self._event("thread_backfill", detail=f"{tid} -> {conv}")
 
     # ---- schema / migration --------------------------------------------------
     def _migrate(self) -> None:
@@ -609,8 +660,10 @@ class Store:
         self.db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         row = self.db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         if row is None:
+            # Idempotent (IF NOT EXISTS / OR IGNORE): two first opens racing on one fresh file both
+            # run this, and the loser must not die on the version row the winner inserted.
             self.db.executescript(_DDL)
-            self.db.execute("INSERT INTO meta(key,value) VALUES('schema_version',?)",
+            self.db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version',?)",
                             (str(SCHEMA_VERSION),))
             self.db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('store_uuid',?)",
                             (_new_id(),))
@@ -626,26 +679,84 @@ class Store:
                         (_new_id(),))
         if have == SCHEMA_VERSION:
             return
-        self._backup(f".v{have}.bak")
+        # ONE migrator. Two openers (the daemon and a CLI after an upgrade) both read v<n> above; the
+        # loser must not back up the DB the winner has already migrated, which overwrote the original
+        # control.db.v<n>.bak with a v<n+1> copy. So the version check, the backup and the steps run
+        # under one exclusive flock, and the version is re-read once it is held.
+        lock = self._migration_lock()
+        try:
+            have = int(self.db.execute(
+                "SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"])
+            if have >= SCHEMA_VERSION:
+                return
+            self._backup(have)
+            self._apply_migrations()
+        finally:
+            if lock is not None:
+                os.close(lock)
+
+    def _migration_lock(self) -> int | None:
+        """Exclusive flock on a lock file beside the DB (None for :memory:, which no peer can open).
+        The file is never unlinked, for the reason _relocate_legacy_db gives."""
+        if self.path == ":memory:":
+            return None
+        import fcntl
+        fd = os.open(self.path + ".migrate.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def _apply_migrations(self) -> None:
+        have = int(self.db.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"])
         for target in range(have + 1, SCHEMA_VERSION + 1):
             with self._tx():
+                # Re-read under the write lock too: an opener that does not take the migration
+                # flock (an older install's code) may have applied this step since. A step already
+                # applied is skipped, never re-run — a second ALTER TABLE ADD COLUMN fails.
+                at = int(self.db.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"])
+                if at >= target:
+                    continue
                 for stmt in _MIGRATIONS[target]:
                     self.db.execute(stmt)
                 self.db.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(target),))
 
-    def _backup(self, suffix: str) -> None:
-        """Consistent point-in-time copy of the DB file (skipped for :memory:)."""
+    def _backup(self, version: int) -> None:
+        """The pre-migration copy control.db.v<version>.bak (skipped for :memory:), taken under the
+        migration flock. WRITE-ONCE but never trusted by existence: a valid backup of that version is
+        the original and is kept; an invalid one — a crash mid-copy leaves a 0-byte or partial file —
+        is renamed aside (.corrupt-<ts>, never deleted) and rebuilt from the still-unmigrated DB.
+        The copy goes to a unique 0600 temp in the same directory, is verified and fsynced, and only
+        then renamed into place, so the final name only ever holds a verified backup."""
         if self.path == ":memory:":
             return
-        dst_path = self.path + suffix
-        dst = sqlite3.connect(dst_path)
+        dst_path = f"{self.path}.v{version}.bak"
+        if os.path.exists(dst_path):
+            if _valid_backup(dst_path, version):
+                return
+            os.replace(dst_path, f"{dst_path}.corrupt-{int(time.time())}")
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst_path) or ".",
+                                   prefix=os.path.basename(dst_path) + ".", suffix=".tmp")
+        os.close(fd)
         try:
-            with dst:
-                self.db.backup(dst)
-        finally:
-            dst.close()
-        with contextlib.suppress(OSError):
-            os.chmod(dst_path, 0o600)
+            dst = sqlite3.connect(tmp)
+            try:
+                with dst:
+                    self.db.backup(dst)
+            finally:
+                dst.close()
+            if not _valid_backup(tmp, version):
+                raise sqlite3.DatabaseError(f"backup of v{version} failed verification — not migrating")
+            fd = os.open(tmp, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, dst_path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
 
     def store_uuid(self) -> str:
         """The stable identity of THIS database file, minted once at creation/migration. The daemon
@@ -872,9 +983,17 @@ class Store:
         first round is still being answered from. Enforced here rather than by holding that lease
         longer, because refusing at claim time spawns no worker and therefore cannot spin: the round
         stays QUEUED and is picked up the moment the thread frees. Scoped to follow-ups — a `retrieve`
-        is read-only and IS the recovery path, so it must never be fenced out of a busy thread — and
-        to genuinely live states, since an unreconciled `possibly_accepted` would otherwise block its
-        thread forever.
+        is read-only and IS the recovery path, so it must never be fenced out of a busy thread.
+
+        "Live" starts at READY, not SENDING: two queued follow-ups claimed back to back are both
+        READY, and the composer lease serializes only their clicks — B would send the moment A's
+        landed, while A is being answered. And an uncertain send (`possibly_accepted`) may be
+        generating in that thread right now, so it holds the thread too — but only while its one-shot
+        auto-retrieve is still pending: the thread has an address (recover() schedules that retrieve
+        only then) and the retrieve has not run. That retrieve is automatic and bounded, and it either
+        resolves the round or leaves it for a human; past it — or with no address, where it can never
+        be scheduled — an unreconciled round would embargo its thread forever, since possibly_accepted
+        has no automatic exit.
 
         `not_before`: a round requeued with a backoff (cgc_backend._gate_requeue_or_block) is not
         eligible until that instant — this is the ONE place that fence has to be enforced, since it
@@ -908,9 +1027,12 @@ class Store:
                 "AND ("
                 "  r.kind!='followup' OR r.thread_id IS NULL OR NOT EXISTS ("
                 "    SELECT 1 FROM rounds o WHERE o.thread_id=r.thread_id AND o.rid!=r.rid"
-                f"     AND o.state IN (?,?,?)))"
+                "     AND (o.state IN (?,?,?,?) OR (o.state=? AND EXISTS ("
+                "       SELECT 1 FROM threads t WHERE t.thread_id=o.thread_id"
+                "       AND t.conversation_id IS NOT NULL) AND NOT EXISTS ("
+                "       SELECT 1 FROM events e WHERE e.rid=o.rid AND e.kind='auto_retrieve')))))"
                 " ORDER BY r.created_at" + ("" if broken else " LIMIT 1"),
-                (QUEUED, now, SENDING, ACCEPTED, WAITING))
+                (QUEUED, now, READY, SENDING, ACCEPTED, WAITING, POSSIBLY_ACCEPTED))
             row = next((c for c in cur
                         if not broken & set(round_needs(c["kind"], c["spec_json"]))), None)
             cur.close()
@@ -1264,6 +1386,19 @@ class Store:
         row = self.db.execute("SELECT detail FROM events WHERE rid=? AND kind='auto_continue_result' "
                               "ORDER BY id DESC LIMIT 1", (rid,)).fetchone()
         return row["detail"] if row else "claimed"
+
+    def observation_deadline(self, rid: str, budget_s: float) -> float | None:
+        """The epoch instant past which nothing may keep watching this round: its CURRENT attempt's
+        begin_send (seconds before the click) plus the wait budget. Derived from the attempt row that
+        is already durable, so a worker restart, a reattach and the auto-continue's re-wait all spend
+        the one budget the send started, instead of each minting a fresh one. None when the round
+        never crossed begin_send (a retrieve, a pre-store migrated row) — there is no send to bound."""
+        row = self.db.execute(
+            "SELECT a.started_at s FROM rounds r JOIN attempts a ON a.attempt_id=r.current_attempt_id "
+            "WHERE r.rid=?", (rid,)).fetchone()
+        if row is None:
+            return None
+        return datetime.datetime.fromisoformat(row["s"]).timestamp() + budget_s
 
     def was_auto_retrieved(self, rid: str) -> bool:
         row = self.db.execute(
