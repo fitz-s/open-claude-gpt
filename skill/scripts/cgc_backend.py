@@ -211,10 +211,12 @@ def store_status(up: bool, rid: str | None = None) -> int:
                 if gate:
                     fields["human_action"] = paused_text(gate)
                 print(f"  round[{rid}]: {json.dumps(fields)}")
-                step = next_step(s, rr, up, fields["answer_on_disk"])
-                envelope(rid=rid, state=rr["state"], **step,
-                         answer_path=out if fields["answer_on_disk"] else None,
-                         detail=rr["error_code"], answer_on_disk=fields["answer_on_disk"],
+                d = decide(s, rr, daemon_up=up)
+                envelope(rid=rid, state=rr["state"], code=d["code"],
+                         next_command=d["next_command"], human_action=d["human_action"],
+                         answer_path=d["answer_path"],
+                         detail=None if rr["state"] in _DONE_STATES else rr["error_code"],
+                         retryable=d["retryable"], answer_on_disk=d["answer_path"] is not None,
                          conversation=fields["conversation"], daemon_up=up)
             else:
                 print(f"  round[{rid}]: (not in store)")
@@ -544,7 +546,9 @@ def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str, a
             f"--rid {prior['rid']} --not-sent --evidence \"...\"` if you have verified it never "
             "sent — or use a new key.\n")
         return 2
+    global _COMMITTED
     a.rid, a.out = prior["rid"], prior["out_path"] or out
+    _COMMITTED = prior["rid"]
     sys.stderr.write(f"CGC_IDEMPOTENT request-key {rkey!r} already enqueued as "
                      f"{prior['rid']} — returning the original receipt, nothing new "
                      "queued.\n")
@@ -555,6 +559,11 @@ def _idempotent_receipt(s, prior: dict, fingerprint: str, rkey: str, out: str, a
              detail="idempotent repeat: the original receipt, nothing new queued",
              queued=True, out=prior["out_path"] or out, backend="store", idempotent_repeat=True)
     return 0
+
+
+def _committed(rid: str) -> None:
+    global _COMMITTED
+    _COMMITTED = rid
 
 
 def _post_create_receipt(a, out: str, queued: bool = True) -> int:
@@ -613,6 +622,7 @@ def _enqueue_transfer(s, a, prompt: str, out: str, prior: dict, fingerprint: str
         if isinstance(res, int):
             return res
         return _enqueue_transfer(s, a, prompt, out, winner, fingerprint, rkey)
+    _committed(a.rid)
     return _post_create_receipt(a, out)
 
 
@@ -696,6 +706,7 @@ def enqueue_round(a, prompt: str, out: str) -> int:
                 sys.stderr.write(
                     f"CGC_IDEMPOTENT {a.rid} is already in the store ('{st}') with these exact "
                     "bytes — nothing new queued; await it for the answer.\n")
+                _committed(a.rid)
                 return _post_create_receipt(a, out, queued=False)
             if st in (store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED):
                 nxt = (f"read its answer: {existing['out_path']}  (or re-materialize it: python3 "
@@ -825,6 +836,7 @@ def enqueue_round(a, prompt: str, out: str) -> int:
             # the racing winner had itself terminally failed proven-not-sent — its key is released;
             # move it onto this retry atomically (a second conflict is a real error and propagates).
             return _enqueue_transfer(s, a, prompt, out, prior, fingerprint, rkey)
+        _committed(a.rid)
     return _post_create_receipt(a, out)
 
 
@@ -1040,6 +1052,7 @@ def code_of(state, error=None) -> str:
 
 
 _EMITTED = False
+_COMMITTED = None   # the rid a create/transfer/idempotent match just made durable, this invocation
 
 
 def envelope(**fields) -> dict:
@@ -1052,9 +1065,32 @@ def envelope(**fields) -> dict:
     env.update(fields)
     if env["detail"] is not None:
         env["detail"] = str(env["detail"])[:200]
-    print(json.dumps(env), flush=True)
-    _EMITTED = True
+    line = _line(env) + "\n"
+    with _no_sigint():
+        _EMITTED = True
+        sys.stdout.write(line)
+        sys.stdout.flush()
     return env
+
+
+def _line(env: dict) -> str:
+    return json.dumps(env)
+
+
+@contextlib.contextmanager
+def _no_sigint():
+    """Hold SIGINT off for the one envelope write, so an interrupt can neither cut the line nor
+    land between "emitted" and the write (where it would leave zero lines or provoke a second)."""
+    import signal
+    mask = getattr(signal, "pthread_sigmask", None)
+    if mask is None:
+        yield
+        return
+    old = mask(signal.SIG_BLOCK, {signal.SIGINT})
+    try:
+        yield
+    finally:
+        mask(signal.SIG_SETMASK, old)
 
 
 def emitted() -> bool:
@@ -1092,7 +1128,8 @@ def agent_cli(call, rid_of=lambda: None) -> int:
     when there is one). The emitted flag is scoped to this invocation."""
     import traceback
     global _EMITTED
-    outer, _EMITTED = _EMITTED, False
+    global _COMMITTED
+    outer, _EMITTED, _COMMITTED = _EMITTED, False, None
     tap = sys.stderr = _StderrTap(sys.stderr)
     crashed = interrupted = False
     try:
@@ -1114,24 +1151,40 @@ def agent_cli(call, rid_of=lambda: None) -> int:
     try:
         if _EMITTED:
             return rc
-        rid = rid_of()
-        if interrupted:
-            # Only this observation stopped; the round (if any) lives on in the store.
-            envelope(rid=rid, state="interrupted", code="observation_deadline",
-                     detail="interrupted before an outcome; nothing about the round changed",
-                     next_command=diagnose_cmd(rid) if rid else None)
-        elif rc == 0:
-            envelope(rid=rid, code="ok", detail=tap.last)
-        else:
-            why = tap.err or tap.last
-            code = ("service_unavailable" if crashed else
-                    code_of(None, why) if tap.err else "invalid_request")
-            envelope(rid=rid, state="refused", code=code, detail=why,
-                     next_command=(diagnose_cmd(rid) if rid
-                                   and code not in ("not_found", "invalid_request") else None))
+        rid = _COMMITTED or rid_of()
+        try:
+            _synthesize(rid, rc, tap, crashed, interrupted)
+        except KeyboardInterrupt:   # delivered once the guarded write is done: the line is out
+            rc = 130
         return rc
     finally:
         _EMITTED = outer
+
+
+def _synthesize(rid, rc, tap, crashed, interrupted):
+    """The envelope for a verb that printed none."""
+    if rid and rid == _COMMITTED:
+        # The round is durably in the store: whatever failed came after, so the rid is the receipt.
+        with store_mod.Store() as s:
+            r = s.get_round(rid)
+        envelope(rid=rid, state=r["state"] if r else None, code="ok",
+                 next_command=_cmd("cgc_spool.py", "await", "--rid", rid),
+                 detail="the round is queued; this command failed after committing it: "
+                        + str(tap.err or tap.last or "interrupted"))
+    elif interrupted:
+        # Only this observation stopped; the round (if any) lives on in the store.
+        envelope(rid=rid, state="interrupted", code="observation_deadline",
+                 detail="interrupted before an outcome; nothing about the round changed",
+                 next_command=diagnose_cmd(rid) if rid else None)
+    elif rc == 0:
+        envelope(rid=rid, code="ok", detail=tap.last)
+    else:
+        why = tap.err or tap.last
+        code = ("service_unavailable" if crashed else
+                code_of(None, why) if tap.err else "invalid_request")
+        envelope(rid=rid, state="refused", code=code, detail=why,
+                 next_command=(diagnose_cmd(rid) if rid
+                               and code not in ("not_found", "invalid_request") else None))
 
 
 def _cmd(script: str, *args) -> str:
@@ -1152,63 +1205,118 @@ def _retrieve_cmd(rid: str, conv) -> str:
     return _cmd("cdp_consult.py", "find-conversation", "--rid", rid)
 
 
-def next_step(s, r: dict, daemon_up: bool, on_disk: bool = True) -> dict:
-    """The controller's next move for a round, from the store alone: {code, next_command,
-    human_action}. `diagnose` and `status --rid` decide with it, so neither depends on a log.
+def _answer_file(r: dict, out: str | None = None) -> str | None:
+    """The answer file iff the round is COMPLETED and the file holds exactly the store's result —
+    rebuilt from the store when it is missing or stale (the file is a derived view; the store is the
+    authority). Never a path for a non-completed round: a leftover file there is not its answer."""
+    import cgc_spool as _spool
+    out = out or r.get("out_path") or os.path.abspath(_spool.default_out(r["rid"]))
+    text = r.get("result_text") or ""
+    if r["state"] not in _DONE_STATES or not out or not text:
+        return None
+    try:
+        with open(out, encoding="utf-8") as f:
+            if f.read() == text:
+                return out
+    except OSError:
+        pass
+    try:
+        _materialize(out, text)
+    except OSError:
+        return None
+    return out
 
-    The send fence rules it, exactly as for await: only a round the store PROVES never sent
-    (_release_eligible) may be refired; one that crossed the fence without that proof is retrieved,
-    never re-sent — unless ChatGPT itself declared the turn dead (turn_failed)."""
+
+_DONE_STATES = (store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED)
+_PROVIDER_FINAL = ("turn_failed", "CGC_ERROR turn_failed")
+
+
+def decide(s, r: dict, *, daemon_up: bool = True, out: str | None = None) -> dict:
+    """THE controller decision for a round — await, diagnose and status all print this, so the three
+    never disagree. From the store alone: {code, next_command, human_action, retryable,
+    answer_path, confidence}. Rules, in order:
+
+      - completed: classified from the result and attribution, never a stale error_code. The answer
+        path is returned only when the file matches the store's result (rebuilt if not).
+      - in flight: re-arm await (daemon down → service_unavailable); a gated queued round → probe.
+      - a retrieve sends nothing: recovery is always for its SOURCE round, never the observer.
+      - proven not sent (_release_eligible) → refire. The ONLY path to a re-send.
+      - ChatGPT declared the turn dead (turn_failed, after the one auto-continue) → a new fire.
+      - anything else crossed the send fence without proof → retrieve, never re-send."""
     rid, state, kind = r["rid"], r["state"], r.get("kind")
-    code = code_of(state, r.get("error_code"))
-    rearm = _cmd("cgc_spool.py", "await", "--rid", rid)   # also rewrites a missing answer file
-    if state in (store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED):
-        human = None
+    err = r.get("error_code")
+    rearm = _cmd("cgc_spool.py", "await", "--rid", rid)
+    d = {"code": code_of(state, err), "next_command": None, "human_action": None,
+         "retryable": False, "answer_path": None, "confidence": None}
+    if state in _DONE_STATES:
+        d["code"] = STATE_CODE[state]
+        d["answer_path"] = _answer_file(r, out)
+        if d["answer_path"] is None:
+            d.update(code="result_unverified", next_command=rearm,
+                     human_action="the stored result is empty or could not be written; a human "
+                                  "checks the ChatGPT thread")
+            return d
         if state == store_mod.COMPLETED_UNVERIFIED:
-            human = "verify the salvaged answer is complete and belongs to this round"
-        elif r.get("attribution") == store_mod.ATTR_MISMATCHED:
-            code, human = "human_required", (f"answer produced by {r.get('model_slug')!r}, which "
-                                             f"{_ATTR_GATE_ENV} does not admit — judge it yourself")
-        return {"code": code, "next_command": None if on_disk else rearm, "human_action": human}
+            d.update(confidence="unverified",
+                     human_action="verify the salvaged answer is complete and belongs to this round")
+        else:
+            d["confidence"] = "verified"
+            if r.get("attribution") == store_mod.ATTR_MISMATCHED:
+                d.update(code="human_required",
+                         human_action=f"answer produced by {r.get('model_slug')!r}, which "
+                                      f"{_ATTR_GATE_ENV} does not admit — judge it yourself before "
+                                      "using it")
+        return d
     gate = s.gated_by(r) if state == store_mod.QUEUED else {}
     if gate:
-        return {"code": "ui_contract_broken", "next_command": _cmd("cgc_probe.py", "--status"),
-                "human_action": paused_text(gate)}
+        d.update(code="ui_contract_broken", next_command=_cmd("cgc_probe.py", "--status"),
+                 human_action=paused_text(gate), retryable=True)
+        return d
     if state not in store_mod.TERMINAL and state != store_mod.POSSIBLY_ACCEPTED:
-        return {"code": "ok" if daemon_up else "service_unavailable", "next_command": rearm,
-                "human_action": None if daemon_up else "run `cgc install-daemon` (daemon down)"}
-    if code == "ok":   # cancelled before send
-        return {"code": code, "next_command": None, "human_action": None}
+        d.update(code="ok" if daemon_up else "service_unavailable", next_command=rearm,
+                 retryable=not daemon_up,
+                 human_action=None if daemon_up else "run `cgc install-daemon` (the daemon is not "
+                                                     "running)")
+        return d
+    if d["code"] == "ok":   # cancelled before send
+        return d
     if kind == "retrieve":
-        # A retrieve sends nothing: recover the SOURCE round, never the observer itself.
         src = r.get("parent_rid") or _spec_of(r).get("parent_rid")
-        src_conv = (src and s.conversation_of(src)) or s.conversation_of(rid)
         if not src:
-            return {"code": code, "next_command": None,
-                    "human_action": "this retrieve names no source round; nothing to recover"}
+            d["human_action"] = "this retrieve names no source round; nothing to recover"
+            return d
+        src_conv = s.conversation_of(src) or s.conversation_of(rid)
         if state == store_mod.BLOCKED:
-            return {"code": code, "next_command": _retrieve_cmd(src, src_conv),
-                    "human_action": "clear the blocker in the ChatGPT window, then retrieve again"}
-        return {"code": code, "next_command": _cmd("cdp_consult.py", "find-conversation", "--rid", src),
-                "human_action": "the source turn was not confirmed; check the ChatGPT window, "
-                                "never re-send"}
-    conv = s.conversation_of(rid)
+            d.update(next_command=_retrieve_cmd(src, src_conv),
+                     human_action="clear the blocker in the ChatGPT window, then run next_command")
+        else:
+            d.update(next_command=_cmd("cdp_consult.py", "find-conversation", "--rid", src),
+                     human_action="the source turn was not confirmed; check the ChatGPT window, "
+                                  "never re-send")
+        return d
     if _release_eligible(s, r):
-        if code == "policy_denied" or not r.get("rendered_prompt"):
-            return {"code": code, "next_command": None,
-                    "human_action": "remove what the gate refused (`detail`), then fire again"
-                    if code == "policy_denied" else "nothing was sent; fire again"}
-        why = ("fix the UI (`cgc probe` must pass)" if code == "ui_contract_broken" else
+        if d["code"] == "policy_denied" or not r.get("rendered_prompt"):
+            d["human_action"] = ("remove what the gate refused (`detail`), then fire again"
+                                 if d["code"] == "policy_denied" else "nothing was sent; fire again")
+            d["retryable"] = str(err or "").startswith("unverified:")
+            return d
+        why = ("fix the UI (`cgc probe` must pass)" if d["code"] == "ui_contract_broken" else
                "fix the cause in `detail`" if state == store_mod.BLOCKED else "if still needed")
-        return {"code": code, "next_command": _cmd("cgc_spool.py", "refire", "--rid", rid),
-                "human_action": f"nothing was sent: {why}, then run next_command"}
-    if code == "remote_failed" and state == store_mod.FAILED:
-        return {"code": code, "next_command": None,
-                "human_action": "ChatGPT failed the turn: re-fire with a NEW --request-key if "
-                                "still needed"}
-    return {"code": code, "next_command": _retrieve_cmd(rid, conv),
-            "human_action": "the send may have landed: check the ChatGPT window; retrieve, never "
-                            "re-send"}
+        d.update(next_command=_cmd("cgc_spool.py", "refire", "--rid", rid), retryable=True,
+                 human_action=f"nothing was sent: {why}, then run next_command")
+        return d
+    if (state == store_mod.FAILED and str(err or "").startswith(_PROVIDER_FINAL)
+            and s.auto_continue_state(rid) not in ("claimed", "unsure")):
+        d.update(code="remote_failed",
+                 human_action="ChatGPT failed the turn: re-fire with a NEW --request-key if still "
+                              "needed")
+        return d
+    d.update(next_command=_retrieve_cmd(rid, s.conversation_of(rid)),
+             human_action="the send may have landed: check the ChatGPT window; retrieve, never "
+                          "re-send")
+    if state == store_mod.FAILED and d["code"] == "remote_failed":
+        d["code"] = "send_uncertain"
+    return d
 
 
 DIAGNOSE_MAX = 1500
@@ -1253,11 +1361,18 @@ def _incident_bundle(rid: str, since) -> str | None:
     return best[1] if best else None
 
 
+def _short_path(p, keep: int = 120):
+    """A path cut in the middle (`head…tail`) — still names the file, bounded in bytes."""
+    if not p or len(p) <= keep:
+        return p
+    return p[:keep // 2 - 1] + "…" + p[-(keep // 2):]
+
+
 def _fit(env: dict, limit: int) -> dict:
-    """Shrink `env` until its JSON line is ≤ limit bytes. Free text shortens first, then optional
-    diagnostics drop; the decision keys (code, next_command, answer_path) are kept whole — they only
-    outgrow the budget with paths over ~600 characters, and a cut command would be worse."""
-    size = lambda: len(json.dumps(env).encode())   # noqa: E731 — what envelope() prints
+    """Shrink `env` until its printed line is ≤ limit bytes: free text shortens, optional
+    diagnostics drop, then paths are cut in the middle (the full `answer_path` stays only while it
+    fits). Measured exactly as envelope() prints it."""
+    size = lambda: len(_line(env).encode())   # noqa: E731
     for key, cap in (("last_marker", 160), ("human_action", 160), ("detail", 120),
                      ("last_marker", 60), ("detail", 60)):
         if size() <= limit:
@@ -1268,8 +1383,13 @@ def _fit(env: dict, limit: int) -> dict:
         env["ui"] = {"needs": env["ui"]["needs"], "broken": {k: "" for k in env["ui"]["broken"]}}
     for key in ("send", "last_marker", "phases", "ui", "bundle", "conversation", "kind"):
         if size() <= limit:
-            break
+            return env
         env.pop(key, None)
+    for key in ("answer_path", "next_command", "human_action", "detail"):
+        if size() <= limit:
+            return env
+        if env.get(key):
+            env[key] = _short_path(env[key], 160)
     for key in ("detail", "human_action"):
         if size() > limit and env.get(key):
             env[key] = env[key][:max(0, len(env[key]) - (size() - limit))] or None
@@ -1278,16 +1398,15 @@ def _fit(env: dict, limit: int) -> dict:
 
 def diagnose(rid: str) -> int:
     """`diagnose --rid R`: what an agent needs to decide on a stuck or failed round, in one line of
-    at most DIAGNOSE_MAX bytes, so it never reads the log or the driver. Read-only."""
+    at most DIAGNOSE_MAX bytes, so it never reads the log or the driver. Read-only (apart from
+    rebuilding a completed round's missing answer file from the store)."""
     import cgc_spool as _spool
     with store_mod.Store() as s:
         r = s.get_round(rid)
         if r is None:
             envelope(rid=rid, state="missing", code="not_found", detail="no such round in the store")
             return 1
-        out = r.get("out_path")
-        on_disk = bool(out and os.path.exists(out))
-        step = next_step(s, r, _spool.daemon_alive(), on_disk)
+        d = decide(s, r, daemon_up=_spool.daemon_alive())
         evs = s.events(rid)
         needs = list(store_mod.round_needs(r.get("kind") or "", r.get("spec_json")))
         broken = {k: (v.get("cause") or "")[:80] for k, v in s.gated_by(r).items()}
@@ -1304,16 +1423,19 @@ def diagnose(rid: str) -> int:
     if r["state"] in store_mod.TERMINAL or r["state"] == store_mod.POSSIBLY_ACCEPTED:
         phases["finished"] = r["updated_at"][:19]
     bundle = _incident_bundle(rid, claimed)
-    if bundle and step["code"] == "ui_contract_broken":
-        step["human_action"] = f"{step['human_action'] or 'the UI contract is broken'}; see bundle"
-    env = {"rid": rid, "state": r["state"], **step, "answer_path": out if on_disk else None,
-           "detail": r.get("error_code"), "kind": r["kind"], "attempts": attempts,
-           "conversation": conv, "answer_on_disk": on_disk,
+    if bundle and d["code"] == "ui_contract_broken":
+        d["human_action"] = f"{d['human_action'] or 'the UI contract is broken'}; see bundle"
+    env = {"schema": 1, "rid": rid, "state": r["state"], "code": d["code"],
+           "next_command": d["next_command"], "human_action": d["human_action"],
+           "answer_path": d["answer_path"],
+           "detail": None if r["state"] in _DONE_STATES else r.get("error_code"),
+           "retryable": d["retryable"], "kind": r["kind"], "attempts": attempts,
+           "conversation": conv, "answer_on_disk": d["answer_path"] is not None,
            "last_marker": _last_marker(_spool.log_path(rid)), "phases": phases,
            "ui": {"needs": needs, "broken": broken}, "bundle": bundle,
            "send": {k: str(send[k])[:60] for k in ("submitted", "reason", "phase") if k in send}
            or None}
-    envelope(**_fit({"schema": 1, **env}, DIAGNOSE_MAX))
+    envelope(**_fit(env, DIAGNOSE_MAX))
     return 0
 
 
@@ -1510,240 +1632,96 @@ def await_round(a) -> int:
 
 
 def _await_round(a) -> int:
-    """Poll the round until terminal, materialize the stored result to --out, and map to the
-    three-outcome contract (0 answer / 3 human / 1 broken).
+    """Poll the round until there is something to act on, then print `decide`'s verdict — the same
+    one diagnose and status print — and route the exit code from it (0 answer / 3 a human must act /
+    1 broken). This function only decides WHEN to stop watching: at a terminal or uncertain state,
+    when a dead daemon outlasts its grace, or when the UI gate has held the round past a probe run.
 
     Liveness is checked in EVERY non-terminal state: the round only advances while a daemon is
-    alive to advance it, so a dead daemon must surface as broken-with-next-step promptly — not as
-    90 silent minutes of polling a row nobody is working."""
+    alive to advance it, so a dead daemon must surface promptly — not as 90 silent minutes of
+    polling a row nobody is working. "Still running" is never an outcome."""
     import cgc_spool as _spool
-    out = None
     deadline = time.time() + a.timeout
-    down_since = None
-    gated_since = None
+    down_since = gated_since = None
     while time.time() < deadline:
         with store_mod.Store() as s:
             r = s.get_round(a.rid)
-        if r is None:
-            sys.stderr.write(f"CGC_BROKEN {a.rid}: no such round in the store.\n")
-            _emit(a.rid, "missing", retryable=False, error="no such round in the store")
-            return 1
-        # The answer's address belongs to the ROUND, not to this invocation: it was chosen at
-        # creation (--out, or the default) and recorded. Resolve it from there so `await --rid R`
-        # writes exactly where the receipt promised. An explicit --out still overrides, for a human
-        # who wants a second copy elsewhere; it is deliberately not written back, so the round keeps
-        # naming the address every other reader (status, raw-salvage lookup) already trusts.
-        if out is None:
-            out = os.path.abspath(getattr(a, "out", None) or r.get("out_path")
-                                  or _spool.default_out(a.rid))
-        state = r["state"]
-        parent = r.get("parent_rid")
-        # A retrieve round stores the rid it is RECOVERING in the same parent_rid column (its own
-        # rid is fresh and means nothing on its own) — surface it in the envelope as source_rid so
-        # a human/agent never has to guess which round a retrieve was for.
-        src_rid = parent if r.get("kind") == "retrieve" else None
-        if state not in (store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED,
-                         store_mod.BLOCKED, store_mod.POSSIBLY_ACCEPTED, store_mod.FAILED,
-                         store_mod.GATE_REJECTED):
-            if _spool.daemon_alive():
-                down_since = None
-            else:
-                if down_since is None:
-                    down_since = time.time()
-                    sys.stderr.write("CGC_WAIT no live daemon; holding briefly in case it is restarting…\n")
-                elif time.time() - down_since > _spool.DAEMON_GRACE_S:
-                    sys.stderr.write(
-                        f"CGC_BROKEN {a.rid}: round is '{state}' but no daemon is alive to work it. "
-                        "Relay ONE line to the user — `cgc install-daemon` (launchd agent: starts at "
-                        "login, respawns if it dies). The round stays in the store and runs as soon "
-                        "as the daemon is up.\n")
-                    _emit(a.rid, state, retryable=True, parent_rid=parent,
-                          human_action="run `cgc install-daemon` (the daemon is not running)",
-                          next_command=f"python3 {_spool.__file__} await --rid {a.rid}",
-                          error="daemon down")
-                    return 1
-        if state == store_mod.QUEUED:
-            # The UI-contract gate holds this round: nothing was sent and nothing will be until a
-            # probe clears the capability. Reported once the pause has outlasted a probe run, so a
-            # break the very next probe disproves never surfaces; the round stays queued either way.
-            with store_mod.Store() as _s:
-                gate = _s.gated_by(r)
-            if not gate:
-                gated_since = None
-            elif gated_since is None:
-                gated_since = time.time()
-            elif time.time() - gated_since >= GATE_GRACE_S:
-                why = paused_text(gate)
-                sys.stderr.write(f"CGC_PAUSED {a.rid}: {why}. Nothing was sent; the round runs once "
-                                 "the capability passes again.\n")
-                _emit(a.rid, state, retryable=True, parent_rid=parent, human_action=why,
-                      next_command=f"python3 {_spool.__file__} await --rid {a.rid}",
-                      error="ui_contract: " + ",".join(sorted(gate)))
-                return 3
-        if state == store_mod.COMPLETED_VERIFIED:
-            text = r["result_text"] or ""
-            if not text:
-                sys.stderr.write(f"CGC_BROKEN {a.rid}: round is {state} but its result_text is empty.\n")
-                _emit(a.rid, state, retryable=False, parent_rid=parent,
-                      error="completed but result_text empty", code="result_unverified")
+            if r is None:
+                sys.stderr.write(f"CGC_BROKEN {a.rid}: no such round in the store.\n")
+                _emit(a.rid, "missing", retryable=False, error="no such round in the store")
                 return 1
-            _materialize(out, text)
-            n = len(text.encode("utf-8"))
-            attribution = r.get("attribution")
-            model_slug, model_badge = r.get("model_slug"), r.get("model_badge")
-            # THE GATE, and the only one. The answer verified against its own rid sentinel — that
-            # property is untouched, the state stays completed_verified, confidence stays
-            # "verified". What fails here is a DIFFERENT property: the provider says a model this
-            # installation does not accept produced it. So the answer is still materialized for a
-            # human, but it is not handed back as automatically-consumable: no next_command to
-            # chain a follow-up onto, and exit 3 (the existing "a human must look" outcome) rather
-            # than a new terminal state nothing else would mean. `unknown` does NOT gate — a
-            # provider that stamps nothing has told us nothing, and refusing an otherwise good
-            # consult over silence would be inventing a verdict.
-            if attribution == store_mod.ATTR_MISMATCHED:
-                _, why = _attribution_verdict(model_slug)
-                sys.stderr.write(
-                    f"CGC_ATTRIBUTION_MISMATCH {a.rid}: {why}. The answer ({n} bytes) IS written to:\n"
-                    f"  {out}\nRead it as a human would; do NOT auto-chain a follow-up on it.\n")
-                _emit(a.rid, state, retryable=False, parent_rid=parent, answer_path=out,
-                      confidence="verified", source_rid=src_rid, model_badge=model_badge,
-                      model_slug=model_slug, attribution=attribution, code="human_required",
-                      human_action=f"answer produced by {model_slug!r}, which {_ATTR_GATE_ENV} "
-                                   "does not admit — judge it yourself before using it")
-                return 3
-            sys.stderr.write(
-                f"CGC_DONE {a.rid}: answer ready ({n} bytes). READ IT AT:\n  {out}\n"
-                + (f"Producer attribution: {model_slug} (selection evidence: {model_badge or 'none'}).\n"
-                   if model_slug else
-                   "Producer attribution: UNKNOWN — the provider stamped no model on this answer; "
-                   "which model served it is not established.\n")
-                + "This round is closed. Read the answer and decide from it alone whether anything "
-                "further is warranted.\n")
-            # next_command stays NULL on success (2026-09-06 review). A ready-to-run follow-up
-            # command printed here landed at the exact instant the calling agent picked its next
-            # action, and recommended another paid round before anything had judged the answer —
-            # a ChatGPT Pro plan allows tens of messages A WEEK. It also fired for a completed
-            # `retrieve`, a read-only recovery that resolved nothing and so can have nothing to
-            # continue. Recovery outcomes below keep their commands: a blocked / failed / not-sent
-            # round genuinely needs the operator to run something, which is a move out of a hole,
-            # not a purchase. Continuing a thread is still supported — it is now a decision the
-            # caller makes from the answer, not a default the envelope proposes.
-            _emit(a.rid, state, retryable=False, parent_rid=parent, answer_path=out,
-                  confidence="verified", source_rid=src_rid,
-                  model_badge=model_badge, model_slug=model_slug, attribution=attribution)
-            return 0
-        if state == store_mod.COMPLETED_UNVERIFIED:
-            text = r["result_text"] or ""
-            _materialize(out, text)  # materialize so a human CAN read it — but this is NOT auto-success
-            n = len(text.encode("utf-8"))
-            sys.stderr.write(
-                f"CGC_REVIEW_REQUIRED {a.rid}: an answer was salvaged WITHOUT the BEGIN/END_RESPONSE:"
-                f"{a.rid} wrapper ({n} bytes) written to:\n  {out}\n"
-                "A HUMAN must verify it is (a) complete/not cut off AND (b) actually this round's "
-                "answer — an unwrapped salvage can pick up a different message if another consult ran "
-                "on the same thread. Do NOT auto-chain a follow-up on it; re-run the consult if in "
-                "doubt.\n")
-            # Already a human outcome, so the attribution gate has nothing to add to the verdict —
-            # but the evidence still rides along, since a human judging a salvaged answer wants to
-            # know who produced it as much as anyone.
-            _emit(a.rid, state, retryable=False, parent_rid=parent, answer_path=out,
-                  confidence="unverified", source_rid=src_rid,
-                  model_badge=r.get("model_badge"), model_slug=r.get("model_slug"),
-                  attribution=r.get("attribution"),
-                  human_action="verify the salvaged answer is complete and belongs to this round")
-            return 3
-        if state == store_mod.BLOCKED:
-            # Pre- or post-send is decided by the durable not-sent stamp, NEVER by whether the round
-            # has a conversation. A follow-up inherits its parent's thread at enqueue, so
-            # conversation_of() is truthy for every follow-up: keying on it reported a mention or login
-            # refusal that provably never clicked as "already sent" and pointed at a retrieve for an
-            # answer that does not exist. The stamp is what _release_eligible (and refire) trust.
-            with store_mod.Store() as _s:
-                conv = _s.conversation_of(a.rid)
-                proven_unsent = _release_eligible(_s, r)
-            if proven_unsent:
-                sys.stderr.write(
-                    f"CGC_BLOCKER {a.rid} (pre-send): {r['error_code'] or 'login/captcha/rate-limit'}\n"
-                    "Nothing was sent: the driver refused before the send click, and the store holds "
-                    "that proof. Fix the cause (a human clears it in the ChatGPT window, or the "
-                    "--mention/name is corrected), then re-fire it under a fresh rid:\n"
-                    f"  python3 {_spool.__file__} refire --rid {a.rid}\n"
-                    "Do NOT retrieve: there is no answer to find.\n")
-                _emit(a.rid, state, retryable=True, parent_rid=parent,
-                      human_action="fix the cause named in `error`, then re-fire (nothing was sent)",
-                      next_command=f"python3 {_spool.__file__} refire --rid {a.rid}",
-                      error=r["error_code"])
-            elif conv:
-                # A blocker AFTER a confirmed send (login/captcha/rate-limit hit during the wait) is
-                # NOT safely re-enqueued: the consult may still be generating or already complete.
-                # --parent pins the SOURCE rid the retrieve must verify on the page — never let it
-                # auto-adopt whatever the conversation's latest turn happens to be by the time a
-                # human clears the blocker and runs this.
-                retrieve = (f"python3 {_spool.__file__} enqueue --kind retrieve "
-                            f"--conversation {conv} --parent {a.rid}")
-                sys.stderr.write(
-                    f"CGC_BLOCKER {a.rid} (post-send): {r['error_code'] or 'login/captcha/rate-limit'}\n"
-                    f"The consult was already sent to conversation {conv}. Clear the blocker in the "
-                    "ChatGPT window, then RETRIEVE it (enqueue --kind retrieve --conversation "
-                    f"{conv} --parent {a.rid}) — do NOT re-enqueue a fresh consult, it would "
-                    "duplicate this one.\n")
-                _emit(a.rid, state, retryable=False, parent_rid=parent,
-                      human_action="clear the blocker in the ChatGPT window",
-                      next_command=retrieve, error=r["error_code"])
-            else:
-                sys.stderr.write(
-                    f"CGC_BLOCKER {a.rid} (pre-send): {r['error_code'] or 'login/captcha/rate-limit'}\n"
-                    "Nothing was sent. A human must clear it in the ChatGPT window, then re-enqueue.\n")
-                _emit(a.rid, state, retryable=True, parent_rid=parent,
-                      human_action="clear the blocker in the ChatGPT window, then re-fire",
-                      error=r["error_code"])
-            return 3
-        if state == store_mod.POSSIBLY_ACCEPTED:
-            # The recovery instruction: a fresh kind=retrieve round, read-only, pinned to THIS
-            # round's rid via --parent — never auto-adopt whatever the conversation's latest turn
-            # is by the time a human/agent runs it (a later same-thread send would otherwise be
-            # mistaken for this round's answer).
-            with store_mod.Store() as _s:
-                conv = _s.conversation_of(a.rid)
-            # With no conversation recorded there is still one thing to try before a human reads the
-            # screen: the rid is inside the prompt that was sent, so an open tab carrying it IS this
-            # round's thread. That search is read-only and cannot duplicate anything.
-            cdp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cdp_consult.py")
-            retrieve = (f"python3 {_spool.__file__} enqueue --kind retrieve "
-                        f"--conversation {conv} --parent {a.rid}") if conv else (
-                        f"python3 {cdp} find-conversation --rid {a.rid}")
-            sys.stderr.write(
-                f"CGC_UNCERTAIN {a.rid}: the send may have reached ChatGPT but was not confirmed "
-                f"({r['error_code'] or 'unknown'}). NOT auto-resent to avoid a duplicate consult — "
-                + (f"retrieve it:\n  {retrieve}\n" if conv else
-                   "no conversation was captured, so first ASK THE BROWSER which thread holds this "
-                   f"rid (read-only, sends nothing):\n  {retrieve}\n"
-                   "If it names a conversation, retrieve from it (enqueue --kind retrieve "
-                   f"--conversation <id> --parent {a.rid}); if it finds none, a human must look at "
-                   "the ChatGPT window before any re-send.\n"))
-            _emit(a.rid, state, retryable=False, parent_rid=parent,
-                  human_action="check the ChatGPT window; retrieve by conversation before re-sending",
-                  next_command=retrieve, error=r["error_code"])
-            # 3, not 1. The documented contract is 0 answer / 3 a human must act / 1 BROKEN, and an
-            # uncertain send is the definition of "a human must act" — nothing is broken, the send
-            # may well have landed. Reporting it as broken is what made every one of these read as a
-            # tool failure in the caller's log ("failed with exit code 1") instead of as the one
-            # action item it is, which is how an hour went into hunting a crash that never happened.
-            return 3
-        if state in (store_mod.FAILED, store_mod.GATE_REJECTED):
-            err = r["error_code"] or "the daemon could not deliver an answer"
-            sys.stderr.write(f"CGC_BROKEN {a.rid}: {err}\n")
-            _spool._point_at_log(a.rid, out)
-            # `unverified:` gate failures are transient (gh outage) — the round is re-fireable.
-            _emit(a.rid, state, retryable=err.startswith("unverified:"), parent_rid=parent, error=err,
-                  source_rid=src_rid, observed_rid=_parse_observed_rid(err) if src_rid else None)
-            return 1
-        time.sleep(getattr(a, "poll", None) or store_mod.__dict__.get("POLL_S", 20) or 20)
-    sys.stderr.write(f"CGC_STUCK {a.rid}: no terminal state within {a.timeout}s — run: {diagnose_cmd(a.rid)}\n")
-    _spool._point_at_log(a.rid, out)
+            state = r["state"]
+            settled = state in store_mod.TERMINAL or state == store_mod.POSSIBLY_ACCEPTED
+            up = _spool.daemon_alive()
+            stop = settled
+            if not settled:
+                if up:
+                    down_since = None
+                elif down_since is None:
+                    down_since = time.time()
+                    sys.stderr.write("CGC_WAIT no live daemon; holding briefly in case it is "
+                                     "restarting…\n")
+                elif time.time() - down_since > _spool.DAEMON_GRACE_S:
+                    stop = True
+                gate = s.gated_by(r) if state == store_mod.QUEUED else {}
+                if not gate:
+                    gated_since = None
+                elif gated_since is None:
+                    gated_since = time.time()
+                elif time.time() - gated_since >= GATE_GRACE_S:
+                    stop = True
+            if stop:
+                # The round's own address (chosen at creation) unless --out asks for a second copy.
+                d = decide(s, r, daemon_up=up or not settled and down_since is None,
+                           out=os.path.abspath(a.out) if getattr(a, "out", None) else None)
+        if stop:
+            return _report(a.rid, r, d)
+        time.sleep(getattr(a, "poll", None) or 20)
+    sys.stderr.write(f"CGC_STUCK {a.rid}: no terminal state within {a.timeout}s — run: "
+                     f"{diagnose_cmd(a.rid)}\n")
     _emit(a.rid, "stuck", retryable=False, error=f"no terminal state within {a.timeout}s",
           human_action="the consult is broken, not slow — run next_command (diagnose)")
     return 1
+
+
+def _report(rid: str, r: dict, d: dict) -> int:
+    """Print `decide`'s verdict as the await envelope plus one prose line on stderr, and map it to
+    the exit code: 0 a usable answer, 3 a human must act (or may act: an uncertain send, a review),
+    1 broken."""
+    state, err = r["state"], r.get("error_code")
+    src = r.get("parent_rid") if r.get("kind") == "retrieve" else None
+    answer = d["answer_path"]
+    if answer and d["code"] == "ok":
+        sys.stderr.write(
+            f"CGC_DONE {rid}: answer ready ({len((r.get('result_text') or '').encode())} bytes). "
+            f"READ IT AT:\n  {answer}\n"
+            + (f"Producer attribution: {r.get('model_slug')} (selection evidence: "
+               f"{r.get('model_badge') or 'none'}).\n" if r.get("model_slug") else
+               "Producer attribution: UNKNOWN — the provider stamped no model on this answer.\n")
+            + "This round is closed. Read the answer and decide from it alone whether anything "
+              "further is warranted.\n")
+        rc = 0
+    else:
+        tag = {"human_required": "CGC_BLOCKER", "send_uncertain": "CGC_UNCERTAIN",
+               "result_unverified": "CGC_REVIEW_REQUIRED",
+               "ui_contract_broken": "CGC_PAUSED"}.get(d["code"], "CGC_BROKEN")
+        if state == store_mod.BLOCKED:
+            tag += (" (pre-send) Nothing was sent; Do NOT retrieve, there is no answer to find —"
+                    if d["retryable"] else " (post-send) the send may have landed; never re-send —")
+        sys.stderr.write(f"{tag} {rid}: {err or d['human_action'] or state}\n"
+                         + (f"  next: {d['next_command']}\n" if d["next_command"] else "")
+                         + (f"  human: {d['human_action']}\n" if d["human_action"] else ""))
+        broken = (state in (store_mod.FAILED, store_mod.GATE_REJECTED)
+                  or d["code"] == "service_unavailable"
+                  or (d["code"] == "result_unverified" and not answer))
+        rc = 1 if broken else 3
+    _emit(rid, state, retryable=d["retryable"], parent_rid=r.get("parent_rid"),
+          human_action=d["human_action"], next_command=d["next_command"], answer_path=answer,
+          confidence=d["confidence"], error=err if state not in _DONE_STATES else None,
+          source_rid=src, observed_rid=_parse_observed_rid(err) if src else None,
+          model_badge=r.get("model_badge"), model_slug=r.get("model_slug"),
+          attribution=r.get("attribution"), code=d["code"])
+    return rc
 
 
 def _materialize(out: str, text: str) -> None:
