@@ -135,12 +135,12 @@ def test_await_failure_envelope_names_a_move(env, state, error, code, want):
 
 # ---- diagnose -------------------------------------------------------------------------------------
 
-def _diag(env):
+def _diag(env, full=True):
     rc, out = _run(env, "cgc_spool.py", "diagnose", "--rid", RID)
     raw = subprocess.run([sys.executable, os.path.join(SCRIPTS, "cgc_spool.py"), "diagnose", "--rid",
                           RID], capture_output=True, text=True, env=env).stdout
     assert len(raw.strip().encode()) <= backend.DIAGNOSE_MAX, len(raw)
-    for k in ("phases", "attempts", "conversation", "answer_on_disk", "last_marker", "ui", "bundle"):
+    for k in ("phases", "attempts", "conversation", "answer_on_disk", "last_marker", "ui", "bundle") if full else ():
         assert k in out
     return out
 
@@ -154,19 +154,97 @@ def _diag(env):
      f"refire --rid {RID}"),
     (dict(state=store_mod.BLOCKED, error="captcha", conv=CONV), "human_required",
      "enqueue --kind retrieve"),
-    (dict(state=store_mod.FAILED, error="CGC_ERROR selector_drift: sent, unreadable"),
-     "ui_contract_broken", "cgc_probe.py --status"),
+    (dict(state=store_mod.FAILED, error="CGC_ERROR selector_drift: sent, unreadable", sent=True,
+          conv=CONV), "ui_contract_broken", "enqueue --kind retrieve"),
+    (dict(state=store_mod.BLOCKED, error="model_not_selectable — still failing after 3", unsent=True),
+     "ui_contract_broken", f"refire --rid {RID}"),
+    # crossed the send fence, no not-sent proof, not a provider-declared failure: retrieve, never re-send
     (dict(state=store_mod.FAILED, error="CGC_ERROR timeout_no_answer: stalled", sent=True),
-     "observation_deadline", None),
+     "observation_deadline", f"find-conversation --rid {RID}"),
+    (dict(state=store_mod.FAILED, error="CGC_ERROR rid_absent: gone", sent=True, conv=CONV),
+     "source_unresolved", "enqueue --kind retrieve"),
     (dict(state=store_mod.FAILED, error="CGC_ERROR turn_failed: failed twice", sent=True),
      "remote_failed", None),
-    (dict(state=store_mod.COMPLETED_VERIFIED), "ok", None),
+    (dict(state=store_mod.COMPLETED_VERIFIED), "ok", f"await --rid {RID}"),  # file missing: rematerialize
 ])
 def test_diagnose_next_command_per_state(env, setup, code, want):
     _round(setup.pop("state"), **setup)
     out = _diag(env)
     assert out["code"] == code, out
     assert (out["next_command"] is None) if want is None else (want in out["next_command"]), out
+
+
+def test_never_refire_or_new_key_for_a_round_that_may_have_sent(env):
+    _round(store_mod.FAILED, error="CGC_ERROR timeout_no_answer: may still answer", sent=True)
+    out = _diag(env)
+    assert "refire" not in out["next_command"] and "request-key" not in (out["human_action"] or "")
+
+
+def test_mismatched_attribution_is_not_ok_in_diagnose(env, tmp_path):
+    _round(store_mod.COMPLETED_VERIFIED)
+    with store_mod.Store() as s:
+        s.db.execute("UPDATE rounds SET attribution=?, model_slug='gpt-4o', out_path=? WHERE rid=?",
+                     (store_mod.ATTR_MISMATCHED, str(tmp_path / "a.txt"), RID))
+        s.db.commit()
+    (tmp_path / "a.txt").write_text("answer")
+    out = _diag(env)
+    assert out["code"] == "human_required" and "gpt-4o" in out["human_action"]
+
+
+def test_completed_but_file_missing_rearms_await(env):
+    _round(store_mod.COMPLETED_VERIFIED)
+    out = _diag(env)
+    assert out["answer_on_disk"] is False and f"await --rid {RID}" in out["next_command"]
+
+
+def test_blocked_retrieve_recovers_its_source_not_itself(env):
+    src = "REQ-20261014-110000-ffffff"
+    with store_mod.Store() as s:
+        s.create_round(src, "submit", thread_id=CONV, prompt="CGC_RID:y\n", spec_json="{}")
+    _round(store_mod.BLOCKED, error="captcha", kind="retrieve", conv=CONV, prompt=None)
+    with store_mod.Store() as s:
+        s.db.execute("UPDATE rounds SET parent_rid=? WHERE rid=?", (src, RID))
+        s.db.commit()
+    out = _diag(env)
+    assert f"--parent {src}" in out["next_command"] and f"--parent {RID}" not in out["next_command"]
+
+
+def test_commands_are_shell_quoted(monkeypatch):
+    import shlex
+    monkeypatch.setattr(backend, "__file__", "/opt/Name With Spaces/skill/scripts/cgc_backend.py")
+    argv = shlex.split(backend.diagnose_cmd(RID))
+    assert argv[1] == "/opt/Name With Spaces/skill/scripts/cgc_spool.py" and argv[-1] == RID
+
+
+def test_help_and_interrupt_still_end_in_one_envelope(env):
+    rc, out = _run(env, "cgc_spool.py", "cancel", "--help")
+    assert rc == 0 and out["code"] == "ok"
+    _round(store_mod.QUEUED)
+    import signal
+    import time
+    p = subprocess.Popen([sys.executable, os.path.join(SCRIPTS, "cgc_spool.py"), "await", "--rid",
+                          RID, "--timeout", "30", "--poll", "10"], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, env=env)
+    time.sleep(1.5)
+    p.send_signal(signal.SIGINT)
+    so, _ = p.communicate(timeout=20)
+    line = json.loads(so.strip().splitlines()[-1])
+    assert line["state"] == "interrupted" and "diagnose" in line["next_command"]
+    assert sum(1 for ln in so.splitlines() if ln.startswith('{"schema"')) == 1
+
+
+def test_non_utf8_stdout_still_gets_one_envelope(env):
+    _round(store_mod.FAILED, error="CGC_ERROR turn_failed: 界界界", sent=True)
+    _, out = _run({**env, "PYTHONIOENCODING": "ascii"}, "cgc_spool.py", "await", "--rid", RID,
+                  "--timeout", "2")
+    assert out["code"] == "remote_failed" and out["detail"].endswith("界界界")
+
+
+def test_emitted_flag_is_per_invocation(capsys):
+    backend.envelope(code="ok")
+    capsys.readouterr()
+    assert backend.agent_cli(lambda: 2, lambda: RID) == 2
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["state"] == "refused"
 
 
 def test_diagnose_gated_round_names_probe_and_bundle(env, tmp_path):
@@ -190,6 +268,18 @@ def test_diagnose_is_bounded_with_huge_fields(env, tmp_path):
     out = _diag(env)
     assert out["last_marker"] is None or out["last_marker"].startswith("CGC_ERROR selector_drift")
     assert out["next_command"], "the decision survives the trim"
+
+
+def test_diagnose_bound_holds_with_every_capability_broken_and_wide_text(env, tmp_path):
+    _round(store_mod.QUEUED, spec={"model": "Pro", "model_family": "GPT-6", "mentions": ["App"]})
+    with store_mod.Store() as s:
+        for cap in ("composer", "mention", "reader"):
+            s.mark_broken(cap, phase="p", cause="界" * 80)
+        s.mark_broken("model", phase="p", cause="界" * 80, ref="model:Pro@GPT-6")
+        s.db.execute("UPDATE rounds SET error_code=? WHERE rid=?", ("界" * 400, RID))
+        s.db.commit()
+    out = _diag(env, full=False)   # optional diagnostics may drop; the decision may not
+    assert out["code"] == "ui_contract_broken" and out["next_command"] and "attempts" in out
 
 
 def test_diagnose_reports_phases_and_attempts(env):
