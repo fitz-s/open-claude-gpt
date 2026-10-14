@@ -6,6 +6,20 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — the send boundary claims only what it can prove
+
+- An unknown reply from the send eval (none, an exception, an unlisted token) used to exit 6, "proven
+  not sent", which released the request-key for a resend of a click that may have fired. Only an
+  explicit negative from a branch that returns before the gesture proves not-sent now; anything else
+  takes the uncertain path (`possibly_accepted`, never resent automatically).
+- The post-paste check required the composer to hold at least as many characters as the prompt, so a
+  same-length substitution or foreign text around the paste was sent. The composer's typed text, with
+  app chip nodes left out by structure, must now equal the prompt after whitespace and zero-width
+  normalization; a mismatch is a pre-click failure (exit 6).
+- A wrapper complete in one snapshot was published at once, though a stream can pause after END and
+  continue. The waiter now publishes only when done holds at the same length on two consecutive polls,
+  one poll later than before.
+
 ### Fixed — a note typed into a thread mid-round no longer hides the answer
 
 A human note typed while the model was still reasoning ended the round's answer interval, so the

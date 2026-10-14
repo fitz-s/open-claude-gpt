@@ -643,8 +643,9 @@ def test_a_followup_without_a_mention_is_a_first_class_path(env, monkeypatch):
 
 
 # ---- the send verdict at BOTH click sites: nothing but clicked/no-send may go on, Enter only for no-send ----
+# (an unknown reply is not a refusal: tests/test_v06_safety.py pins that it is never exit 6)
 
-@pytest.mark.parametrize("verdict", ["no-composer", "ambiguous", None, "disabled", "no-focus", "weird"])
+@pytest.mark.parametrize("verdict", ["no-composer", "ambiguous", "disabled", "no-focus", "error-preclick:x"])
 def test_followup_never_presses_enter_or_sends_on_a_refused_send_target(env, monkeypatch, verdict):
     import cdp_consult as c
     tab = _FollowupTab([_turn("REQ-20260925-110000-0000ff")], lands=_turn(RID), send=verdict)
@@ -693,7 +694,7 @@ def _run_submit(monkeypatch, tab, reuse_tab=False, mention=(), paste=None):
     return c.cmd_submit(ns)
 
 
-@pytest.mark.parametrize("verdict", ["no-composer", "ambiguous", None, "disabled", "no-focus"])
+@pytest.mark.parametrize("verdict", ["no-composer", "ambiguous", "disabled", "no-focus", "error-preclick:x"])
 def test_submit_never_presses_enter_or_sends_on_a_refused_send_target(env, monkeypatch, verdict):
     import cdp_consult as c
     tab = _FollowupTab([], lands=None, send=verdict)

@@ -62,6 +62,8 @@ class _Composer:
         self.keys, self.calls, self.closed = [], [], 0
 
     def eval(self, js, timeout=None):
+        if "__cgcPlain" in js:                       # the typed-text read (chips excluded)
+            return self.text
         if "loginWall" in js:
             return json.dumps({"composer": True, "form": True, "onChatGPT": True,
                                "readyState": "complete", "blocker": self.blocker})
@@ -87,8 +89,6 @@ class _Composer:
                 return True
             self.text += json.loads(js.split("execCommand('insertText',false,", 1)[1].rsplit(");", 1)[0])
             return len(self.text)
-        if "return d?(d.innerText" in js:
-            return self.text
         raise AssertionError("unexpected js: " + js[:80])
 
     def key(self, *a):

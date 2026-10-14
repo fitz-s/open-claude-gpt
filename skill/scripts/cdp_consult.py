@@ -829,7 +829,9 @@ def _detect_js(rid: str, *, scoped=False) -> str:
     done comes from the canonical bare-line _sentinel_js parser (SHARED CONTRACT #1) — a line
     merely CONTAINING BEGIN/END_RESPONSE:<rid> (quoted in prose or a code block) never counts,
     only a bare standalone sentinel line does. This is NOT stop-button driven: the model writes
-    END_RESPONSE only as its final line, so its presence == complete + extractable. Depending on
+    END_RESPONSE only as its final line, so its presence == a complete wrapper in THIS snapshot —
+    not finality, since a stream can pause after END and go on; cmd_wait publishes only once done
+    holds at the same len on two consecutive polls. Depending on
     the stop-button was fragile — if that UI selector ever persists, done would never fire and
     wait would only return on timeout. node/begin/end/ac are diagnostics for the heartbeat: node
     is 'found', 'none' (no assistant node in the interval yet) or 'source_unrendered' (the scoped
@@ -2670,30 +2672,51 @@ def _send_click_js():
       'ambiguous'    several visible send buttons in that form (picking one would be a guess);
       'disabled'     exactly one, but it is disabled;
       'no-send'      no send button yet AND focus is inside the resolved editor (Enter would act on it);
-      'no-focus'     no send button and focus is NOT inside the resolved editor (Enter would act elsewhere).
-    Only 'clicked' and 'no-send' may go on to send; see _send_verdict."""
-    return ("(function(){" + _COMPOSER_RESOLVE_JS + "var d=__cg();if(!d)return 'no-composer';"
+      'no-focus'     no send button and focus is NOT inside the resolved editor (Enter would act elsewhere);
+      'error-preclick:<msg>'  the lookup threw before any gesture.
+    Every negative is returned from inside the try, which ends before the click: only those branches
+    can prove nothing was clicked. A throw from click() itself escapes and reads as no value."""
+    return ("(function(){var t;try{" + _COMPOSER_RESOLVE_JS + "var d=__cg();if(!d)return 'no-composer';"
             "var f=d.closest('form');var b=Array.prototype.slice.call(f.querySelectorAll("
             "'button[data-testid=\"send-button\"],button[aria-label*=\"Send\" i],"
             "button[aria-label*=\"\\u53d1\\u9001\"]')).filter(function(x){var r=x.getBoundingClientRect();"
             "return r.width>0&&r.height>0;});"
-            "if(b.length>1)return 'ambiguous';if(b.length===1){if(b[0].disabled)return 'disabled';"
-            "b[0].click();return 'clicked';}"
-            "var a=document.activeElement;return (a===d||d.contains(a))?'no-send':'no-focus';})()")
+            "if(b.length>1)return 'ambiguous';if(b.length===1){if(b[0].disabled)return 'disabled';t=b[0];}"
+            "else{var a=document.activeElement;return (a===d||d.contains(a))?'no-send':'no-focus';}"
+            "}catch(e){return 'error-preclick:'+String(e&&e.message||e).slice(0,120);}"
+            "t.click();return 'clicked';})()")
+
+
+# The replies _send_click_js returns from a branch that ends before the gesture. Only these prove
+# not-sent; the set is closed so a reply nobody listed can never be read as one.
+_SEND_NEGATIVES = frozenset({"no-composer", "ambiguous", "disabled", "no-focus"})
 
 
 def _send_verdict(sent_via):
-    """(may_proceed, press_enter, note). The send eval must return one of the values above. Anything else,
-    including None (the eval timed out or returned nothing), 'disabled', 'ambiguous', 'no-composer' and
-    'no-focus', means NOTHING was clicked and Enter must not be pressed: Enter submits whatever is
-    focused, and on a composer we could not name or focus that may be nothing or the wrong thing. The
-    only Enter fallback is 'no-send' (a composer whose send button has not rendered) with focus verified
-    inside that composer, the pre-existing behaviour."""
+    """(verdict, note) for the send eval's reply, verdict one of:
+      'clicked'   the button was clicked;
+      'enter'     'no-send': no button rendered yet, focus verified inside the composer — press Enter
+                  (the only Enter fallback: Enter submits whatever is focused);
+      'not-sent'  an explicit pre-click negative (_SEND_NEGATIVES, 'error-preclick:...') — nothing was
+                  clicked, so the round is provably unsent;
+      'unknown'   anything else, None included (the eval threw, timed out or returned nothing after it
+                  may have reached click()). Never proof of not-sent: the caller presses nothing and
+                  reads the landing evidence like any other uncertain send."""
     if sent_via == "clicked":
-        return True, False, ""
+        return "clicked", ""
     if sent_via == "no-send":
-        return True, True, ""
-    return False, False, f"send target {sent_via!r}"
+        return "enter", ""
+    if sent_via in _SEND_NEGATIVES or (isinstance(sent_via, str) and sent_via.startswith("error-preclick:")):
+        return "not-sent", f"send target {sent_via!r}"
+    return "unknown", f"send eval replied {sent_via!r}"
+
+
+def _send_eval(c):
+    """The send eval's reply; an exception is no reply (None): it may have come after the click."""
+    try:
+        return c.eval(_send_click_js())
+    except Exception:
+        return None
 
 
 def _settle_composer(c, seconds=5):
@@ -2729,7 +2752,28 @@ def _paste_chunk_js(chunk):
 
 
 def _composer_text_js():
-    return "(function(){var d=" + _composer_get_js() + ";return d?(d.innerText||''):null;})()"
+    """The composer's TYPED text, with every app mention chip ([app-mention-name], see
+    _composer_mentions_js) left out by structure: a chip is a composer action, verified by name on its
+    own, never prose. Walks the live nodes rather than a detached clone, whose innerText degrades to
+    textContent and would run block paragraphs together; a block or <br> boundary emits a newline,
+    which the canonical form below collapses like any other whitespace."""
+    return ("(function(){var d=" + _composer_get_js() + ";if(!d)return null;"
+            "var B=/^(P|DIV|PRE|LI|UL|OL|BLOCKQUOTE|H[1-6])$/;"
+            "function __cgcPlain(n){if(n.nodeType===3)return n.nodeValue||'';if(n.nodeType!==1)return '';"
+            "if(n.hasAttribute&&n.hasAttribute('app-mention-name'))return '';if(n.tagName==='BR')return '\\n';"
+            "var o=__cgcKids(n);return B.test(n.tagName)?'\\n'+o+'\\n':o;}"
+            "function __cgcKids(n){var o='';for(var i=0;i<n.childNodes.length;i++)o+=__cgcPlain(n.childNodes[i]);"
+            "return o;}"
+            "return __cgcKids(d);})()")
+
+
+# Whitespace runs and zero-width characters (ProseMirror pads non-editable inline nodes with U+FEFF;
+# an empty paragraph keeps U+200B) are the editor's to lay out; every other character is the payload.
+_ZW_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+
+
+def _canonical_payload(text):
+    return _WS_RUN_RE.sub(" ", _ZW_RE.sub("", text or "")).strip()
 
 
 # ---- @mention (ChatGPT apps/plugins) ------------------------------------------------------------
@@ -2981,16 +3025,18 @@ def _paste_prompt(c, prompt: str, mentions=()) -> None:
         raise _PreClickFailure(f"{type(e).__name__} during paste: {e}") from e
     if got_text is None:
         raise _PreClickFailure("composer not found for post-paste verification")
-    # Length, not equality: ChatGPT's contenteditable composer normalizes newline runs (observed to
-    # collapse/expand \n differently than a plain textarea would), so collapse all whitespace on both
-    # sides and require the composer to hold AT LEAST as much content as the prompt — a shortfall is
-    # exactly the truncated-by-a-DOM-stall signature this whole helper exists to catch.
-    want_len = len(_WS_RUN_RE.sub(" ", prompt).strip())
-    got_len = len(_WS_RUN_RE.sub(" ", got_text).strip())
-    if got_len < want_len:
-        raise _PreClickFailure(
-            f"composer holds {got_len} normalized chars, prompt needs >= {want_len} — paste "
-            "looks truncated by a DOM stall")
+    # Equality of the canonical forms, not length: ChatGPT's contenteditable composer lays newline runs
+    # out its own way (observed to collapse/expand \n differently than a plain textarea would), so both
+    # sides go through the same _canonical_payload — and then the composer must hold EXACTLY the
+    # approved prompt. A length floor caught a truncating DOM stall and nothing else: a same-length
+    # substitution or foreign text around the paste passed it and would have been sent.
+    want, got = _canonical_payload(prompt), _canonical_payload(got_text)
+    if got != want:
+        at = next((i for i, (x, y) in enumerate(zip(got, want)) if x != y), min(len(got), len(want)))
+        why = ("paste looks truncated by a DOM stall" if want.startswith(got)
+               else "the composer text is not the approved prompt")
+        raise _PreClickFailure(f"composer holds {len(got)} normalized chars, prompt is {len(want)}, "
+                               f"first difference at {at} — {why}")
     if mentions:
         kept = sorted(c.eval(_composer_mentions_js(), timeout=45) or [])
         wanted = sorted(_norm_label(m) for m in mentions)
@@ -3178,14 +3224,17 @@ def cmd_submit(a) -> int:
         # Submit. Prefer the send button; fall back to Enter. (POST-click from here: a failure past
         # this point is uncertain, never provably-not-sent.)
         pre_click = False        # the eval below may click: from here a failure is uncertain
-        may_send, press_enter, why = _send_verdict(c.eval(_send_click_js()))
-        if not may_send:
-            # Nothing was clicked and Enter is not pressed, so this is still provably unsent.
+        verdict, why = _send_verdict(_send_eval(c))
+        if verdict == "not-sent":
+            # An explicit pre-click negative: nothing was clicked and Enter is not pressed.
             pre_click = True
             sys.stderr.write(f"CGC_ERROR not_sent_preclick: {why} — NOT submitted; safe to retry with the "
                              "same --request-key.\n")
             return EXIT_NOT_SENT_PRECLICK
-        if press_enter:
+        if verdict == "unknown":
+            sys.stderr.write(f"CGC_WARN send_reply_unknown: {why} — the click may have fired; reading "
+                             "the landing evidence, never resending.\n")
+        if verdict == "enter":
             c.key("Enter", "Enter", 13)   # no send button rendered yet, focus verified inside the composer
         # Confirm a user message actually landed (poll — render lags the click). On a reused
         # tab, requiring merely "count > 0" would false-positive on OLD messages already in
@@ -3526,14 +3575,17 @@ def cmd_followup(a) -> int:
                              "send — NOT sent.\n")
             return EXIT_NOT_SENT_PRECLICK
         click_attempted = True    # from here on a failure is post-click: uncertain, tab kept as evidence
-        may_send, press_enter, why = _send_verdict(c.eval(_send_click_js()))
-        if not may_send:
-            # Nothing was clicked and Enter is not pressed, so this is still provably unsent.
+        verdict, why = _send_verdict(_send_eval(c))
+        if verdict == "not-sent":
+            # An explicit pre-click negative: nothing was clicked and Enter is not pressed.
             click_attempted = False
             sys.stderr.write(f"CGC_ERROR not_sent_preclick: {why} — NOT sent; safe to retry with the "
                              "same --request-key.\n")
             return EXIT_NOT_SENT_PRECLICK
-        if press_enter:
+        if verdict == "unknown":
+            sys.stderr.write(f"CGC_WARN send_reply_unknown: {why} — the click may have fired; reading "
+                             "the landing evidence, never resending.\n")
+        if verdict == "enter":
             c.key("Enter", "Enter", 13)   # no send button rendered yet, focus verified inside the composer
         # Landed-confirmation: on a long thread the DOM virtualizes older turns, so the rendered
         # user-turn COUNT can stay flat forever after a real send (observed live: a landed follow-up
@@ -3804,6 +3856,10 @@ def cmd_wait(a) -> int:
         idle_since, idle_len = time.time(), None
         sup_since = None
         idle_exit = getattr(a, "idle_exit", 0) or 0   # followup --watch reuses this waiter
+        # A valid wrapper in ONE snapshot is not finality: a stream can pause right after END and then
+        # continue below it. So done must be read twice, on consecutive polls, at the same length
+        # before anything is published. Stop-button independent (see _detect_js); costs one poll.
+        done_len = None
         while time.time() < deadline:
             try:
                 c.eval(_FORCE_RENDER_JS)  # materialize the virtualized answer node before reading
@@ -3815,9 +3871,12 @@ def cmd_wait(a) -> int:
                 # transient CDP/eval hiccup — log and keep waiting, don't die
                 sys.stderr.write(f"CGC_WAIT eval-retry: {e}\n")
                 sup_since = None
+                done_len = None
                 time.sleep(a.poll)
                 continue
             ticks += 1
+            if not st.get("done"):
+                done_len = None
             if ticks == 1 or ticks % 5 == 0:  # heartbeat so the .output shows it's alive + diagnosable
                 sys.stderr.write(f"CGC_WAIT alive: gen={st.get('generating')} node={st.get('node')} "
                                  f"len={st.get('len')} done={st.get('done')} begin={st.get('begin')} "
@@ -3834,7 +3893,7 @@ def cmd_wait(a) -> int:
                     return 3
                 sys.stderr.write(f"CGC_APPROVED {app!r}: {text[:120]!r}\n")
                 settle_start, last_len = None, -1   # a paused stretch is not a settled answer
-                sup_since = None
+                sup_since = done_len = None
                 time.sleep(2)
                 continue
             if st.get("blocker"):
@@ -3892,6 +3951,10 @@ def cmd_wait(a) -> int:
                 if not a.keep_tab:
                     c.close_tab()
                 return 4
+            if st.get("done") and st.get("len") != done_len:
+                done_len = st.get("len")      # first sighting at this length: confirm on the next poll
+                time.sleep(a.poll)
+                continue
             if st.get("done"):
                 ans = c.eval(_extract_js(rid, scoped=strict)) or ""
                 _write_answer(c, rid, a.out, ans, strict)  # answer file stays PURE — the follow-up recipe goes to stderr only
