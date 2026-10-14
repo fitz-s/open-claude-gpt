@@ -120,6 +120,22 @@ def test_cancel_and_refire_refusals(env):
     assert rc == 0 and rec["code"] == "ok" and rec["state"] == "failed"
 
 
+def test_a_refired_round_points_at_its_successor_and_refires_once(env):
+    """Live 2026-10-14: after a refire, diagnose on the old rid still said `refire` — a second run
+    would send the same request twice. The old round now names its successor, and refire is one-shot."""
+    _round(store_mod.FAILED, error="CGC_ERROR model_not_selectable: x", unsent=True)
+    rc, first = _run(env, "cgc_spool.py", "refire", "--rid", RID)
+    assert rc == 0 and first["rid"] != RID
+    succ = first["rid"]
+    rc, again = _run(env, "cgc_spool.py", "refire", "--rid", RID)
+    assert rc == 0 and again["rid"] == succ and again["next_command"].endswith(f"await --rid {succ}")
+    _, d = _run(env, "cgc_spool.py", "diagnose", "--rid", RID)
+    assert d["code"] == "ok" and d["next_command"].endswith(f"await --rid {succ}")
+    with store_mod.Store() as s:
+        n = s.db.execute("SELECT COUNT(*) FROM rounds WHERE rid<>?", (RID,)).fetchone()[0]
+    assert n == 1, "exactly one replacement round"
+
+
 # ---- await: non-success envelopes point at diagnose -----------------------------------------------
 
 @pytest.mark.parametrize("state,error,sent,code,want", [
