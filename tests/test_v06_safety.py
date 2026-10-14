@@ -215,7 +215,7 @@ def test_actual_composer_must_equal_approved_payload(monkeypatch):
     _verify(f"<p>{chip} review this</p>", "review this", ["WebCodex Demo"])          # the clean shape
     # the editor's own layout is not payload: CRLF, one block per line, an empty block (its placeholder
     # <br>) for a blank line, nbsp, U+FEFF padding, a trailing newline
-    _verify("<p>line one</p><p>line\u00a0two</p><p><br></p><p>\ufeffend</p>", "line one\r\nline two\n\nend\n")
+    _verify("<p>line one</p><p>line\u00a0two</p><p><br class='ProseMirror-trailingBreak'></p><p>\ufeffend</p>", "line one\r\nline two\n\nend\n")
     _verify("<p>a<br>b</p>", "a\nb")                                   # a hard break inside one block
     # a same-length substitution: the old length floor passed it
     with pytest.raises(CDP._PreClickFailure, match="not the approved prompt"):
@@ -456,11 +456,19 @@ def test_blank_lines_are_payload(monkeypatch):
     """A blank line inside a string literal is program text: `a\\n\\nb` is not `a\\nb`."""
     monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
     want = 's = """a\n\nb"""'
-    _verify('<p>s = """a</p><p><br></p><p>b"""</p>', want)
+    _verify('<p>s = """a</p><p><br class="ProseMirror-trailingBreak"></p><p>b"""</p>', want)
     with pytest.raises(CDP._PreClickFailure):
         _verify('<p>s = """a</p><p>b"""</p>', want)                  # the blank line dropped
     with pytest.raises(CDP._PreClickFailure):
-        _verify('<p>s = """a</p><p><br></p><p><br></p><p>b"""</p>', want)   # one added
+        _verify('<p>s = """a</p><p><br class="ProseMirror-trailingBreak"></p><p><br class="ProseMirror-trailingBreak"></p><p>b"""</p>', want)   # one added
+
+
+def test_a_real_break_in_code_is_never_taken_for_the_placeholder(monkeypatch):
+    """Sol: a code block's own last <br> is a line break; only the editor's trailingBreak is not."""
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    with pytest.raises(CDP._PreClickFailure):
+        _verify('<pre>```python\ns = """a<br></pre><pre>b"""\n```</pre>', '```python\ns = """a\nb"""\n```')
+    _verify('<p>a<br class="ProseMirror-trailingBreak"></p>', "a")
 
 
 def test_a_same_length_body_swap_between_done_polls_is_not_published(monkeypatch, tmp_path):

@@ -2757,9 +2757,11 @@ def _composer_text_js():
     own, never prose. Walks the live nodes rather than a detached clone, whose innerText degrades to
     textContent and would run block paragraphs together. The output has the inserted text's line
     structure: the editor turns each pasted line into a block, so ONE newline separates adjacent blocks
-    (and a block from an inline run), a <br> inside a block is a line break, and a block's last <br> is
-    the editor's placeholder that keeps an empty line open (ProseMirror-trailingBreak) — so an empty
-    block reads as an empty line, i.e. a blank line where the source had one."""
+    (and a block from an inline run), every <br> is a line break except the editor's own placeholder, the
+    <br class="ProseMirror-trailingBreak"> that keeps an empty or line-final block open — so an empty
+    block reads as an empty line, i.e. a blank line where the source had one, and a real <br> in code
+    is never dropped. A <br> the walker cannot prove is that placeholder stays payload: a wrong guess
+    refuses the send (pre-click), never passes an altered one."""
     return ("(function(){var d=" + _composer_get_js() + ";if(!d)return null;"
             "var B=/^(P|DIV|PRE|LI|UL|OL|BLOCKQUOTE|H[1-6])$/;"
             "function blk(n){return n.nodeType===1&&B.test(n.tagName);}"
@@ -2768,7 +2770,8 @@ def _composer_text_js():
             "var o='',k=n.childNodes,pb=false;for(var i=0;i<k.length;i++){var b=blk(k[i]);"
             "if(i>0&&(b||pb))o+='\\n';o+=__cgcPlain(k[i]);pb=b;}"
             "var l=k.length?k[k.length-1]:null;"
-            "if(blk(n)&&l&&l.nodeType===1&&l.tagName==='BR')o=o.slice(0,-1);return o;}"
+            "if(blk(n)&&l&&l.nodeType===1&&l.tagName==='BR'&&/(^|\\s)ProseMirror-trailingBreak(\\s|$)/"
+            ".test((l.getAttribute&&l.getAttribute('class'))||''))o=o.slice(0,-1);return o;}"
             "return __cgcPlain(d);})()")
 
 
