@@ -15,11 +15,13 @@ releases until it stabilizes.
 - The post-paste check required the composer to hold at least as many characters as the prompt, so a
   same-length substitution or foreign text around the paste was sent. The composer's typed text, with
   app chip nodes left out by structure, must now equal the prompt line for line, indentation included.
-  Only the editor's own layout is normalized: CRLF, NBSP, U+200B/U+FEFF, trailing spaces, blank lines.
+  Blank lines are payload too. Only the editor's own layout is normalized: CRLF, NBSP, U+200B/U+FEFF,
+  trailing spaces, and leading/trailing blank lines, so the first line's indentation is not bound.
   The attached apps must equal the requested ones, an empty request included. Any mismatch is a
   pre-click failure (exit 6).
 - A wrapper complete in one snapshot was published at once, though a stream can pause after END and
-  continue. A wrapped answer is now published verified only after two equal reads one poll apart. The
+  continue. A wrapped answer is now published verified only after two reads one poll apart return the
+  same body. The
   settle path no longer publishes one. At timeout a second read is taken, and if it differs the answer
   is delivered unverified. An empty extraction on a done poll is no longer a success.
 

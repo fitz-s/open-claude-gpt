@@ -831,7 +831,7 @@ def _detect_js(rid: str, *, scoped=False) -> str:
     only a bare standalone sentinel line does. This is NOT stop-button driven: the model writes
     END_RESPONSE only as its final line, so its presence == a complete wrapper in THIS snapshot —
     not finality, since a stream can pause after END and go on; cmd_wait publishes only once done
-    holds at the same len on two consecutive polls. Depending on
+    yields the same extracted body on two consecutive polls. Depending on
     the stop-button was fragile — if that UI selector ever persists, done would never fire and
     wait would only return on timeout. node/begin/end/ac are diagnostics for the heartbeat: node
     is 'found', 'none' (no assistant node in the interval yet) or 'source_unrendered' (the scoped
@@ -2755,16 +2755,21 @@ def _composer_text_js():
     """The composer's TYPED text, with every app mention chip ([app-mention-name], see
     _composer_mentions_js) left out by structure: a chip is a composer action, verified by name on its
     own, never prose. Walks the live nodes rather than a detached clone, whose innerText degrades to
-    textContent and would run block paragraphs together; a block or <br> boundary emits a newline,
-    which the canonical form below collapses like any other whitespace."""
+    textContent and would run block paragraphs together. The output has the inserted text's line
+    structure: the editor turns each pasted line into a block, so ONE newline separates adjacent blocks
+    (and a block from an inline run), a <br> inside a block is a line break, and a block's last <br> is
+    the editor's placeholder that keeps an empty line open (ProseMirror-trailingBreak) — so an empty
+    block reads as an empty line, i.e. a blank line where the source had one."""
     return ("(function(){var d=" + _composer_get_js() + ";if(!d)return null;"
             "var B=/^(P|DIV|PRE|LI|UL|OL|BLOCKQUOTE|H[1-6])$/;"
+            "function blk(n){return n.nodeType===1&&B.test(n.tagName);}"
             "function __cgcPlain(n){if(n.nodeType===3)return n.nodeValue||'';if(n.nodeType!==1)return '';"
             "if(n.hasAttribute&&n.hasAttribute('app-mention-name'))return '';if(n.tagName==='BR')return '\\n';"
-            "var o=__cgcKids(n);return B.test(n.tagName)?'\\n'+o+'\\n':o;}"
-            "function __cgcKids(n){var o='';for(var i=0;i<n.childNodes.length;i++)o+=__cgcPlain(n.childNodes[i]);"
-            "return o;}"
-            "return __cgcKids(d);})()")
+            "var o='',k=n.childNodes,pb=false;for(var i=0;i<k.length;i++){var b=blk(k[i]);"
+            "if(i>0&&(b||pb))o+='\\n';o+=__cgcPlain(k[i]);pb=b;}"
+            "var l=k.length?k[k.length-1]:null;"
+            "if(blk(n)&&l&&l.nodeType===1&&l.tagName==='BR')o=o.slice(0,-1);return o;}"
+            "return __cgcPlain(d);})()")
 
 
 # The zero-width characters the editor itself inserts (ProseMirror pads non-editable inline nodes with
@@ -2774,13 +2779,13 @@ _ZW_RE = re.compile("[\u200b\ufeff]")
 
 def _canonical_payload(text):
     """The payload with only the editor's own layout removed, both sides alike: CRLF/CR -> LF, NBSP ->
-    space (a contenteditable shows runs of spaces as NBSP), the zero-width padding above, trailing
-    whitespace per line, and blank lines (a pasted newline becomes a paragraph split, so their count is
-    the editor's; the text walk also brackets each block in newlines). Line boundaries and indentation
-    are payload and are kept, except the whitespace leading the whole text: the separator typed after
-    each @mention chip (tests/fixtures/mention_popup.json composer_after_pick, `</span>  </p>`)."""
+    space (a contenteditable shows runs of spaces as NBSP), the zero-width padding above, and trailing
+    whitespace per line. Every line, blank lines and indentation included, is payload — except what
+    the whole-text strip removes: leading and trailing blank lines, and so the leading indentation of
+    the FIRST line, which is not bound. That strip is for the separator typed after each @mention chip
+    (tests/fixtures/mention_popup.json composer_after_pick, `</span>  </p>`)."""
     t = _ZW_RE.sub("", (text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " "))
-    return "\n".join(ln for ln in (x.rstrip() for x in t.split("\n")) if ln).strip()
+    return "\n".join(x.rstrip() for x in t.split("\n")).strip()
 
 
 # ---- @mention (ChatGPT apps/plugins) ------------------------------------------------------------
@@ -3884,10 +3889,11 @@ def cmd_wait(a) -> int:
         idle_exit = getattr(a, "idle_exit", 0) or 0   # followup --watch reuses this waiter
         # A valid wrapper in ONE snapshot is not finality: a stream can pause right after END and then
         # continue below it. So done must be read twice, on consecutive polls, at the same length
-        # before anything is published verified — the ONE confirmation rule for a wrapped answer; the
-        # settle path defers to it and the timeout rescue applies it once more (_confirm_wrapped).
+        # before anything is published verified — the ONE confirmation rule for a wrapped answer: the
+        # same extracted body on two reads a poll apart (a length match would pass a same-length edit).
+        # The settle path defers to it and the timeout rescue applies it once more (_confirm_wrapped).
         # Stop-button independent (see _detect_js); costs one poll.
-        done_len = None
+        done_body = None
         while time.time() < deadline:
             try:
                 c.eval(_FORCE_RENDER_JS)  # materialize the virtualized answer node before reading
@@ -3899,12 +3905,12 @@ def cmd_wait(a) -> int:
                 # transient CDP/eval hiccup — log and keep waiting, don't die
                 sys.stderr.write(f"CGC_WAIT eval-retry: {e}\n")
                 sup_since = None
-                done_len = None
+                done_body = None
                 time.sleep(a.poll)
                 continue
             ticks += 1
             if not st.get("done"):
-                done_len = None
+                done_body = None
             if ticks == 1 or ticks % 5 == 0:  # heartbeat so the .output shows it's alive + diagnosable
                 sys.stderr.write(f"CGC_WAIT alive: gen={st.get('generating')} node={st.get('node')} "
                                  f"len={st.get('len')} done={st.get('done')} begin={st.get('begin')} "
@@ -3921,7 +3927,7 @@ def cmd_wait(a) -> int:
                     return 3
                 sys.stderr.write(f"CGC_APPROVED {app!r}: {text[:120]!r}\n")
                 settle_start, last_len = None, -1   # a paused stretch is not a settled answer
-                sup_since = done_len = None
+                sup_since = done_body = None
                 time.sleep(2)
                 continue
             if st.get("blocker"):
@@ -3979,13 +3985,13 @@ def cmd_wait(a) -> int:
                 if not a.keep_tab:
                     c.close_tab()
                 return 4
-            if st.get("done") and st.get("len") != done_len:
-                done_len = st.get("len")      # first sighting at this length: confirm on the next poll
+            ans = (c.eval(_extract_js(rid, scoped=strict)) or "") if st.get("done") else ""
+            if ans and ans != done_body:
+                done_body = ans               # first sighting of this body: confirm on the next poll
                 time.sleep(a.poll)
                 continue
-            ans = (c.eval(_extract_js(rid, scoped=strict)) or "") if st.get("done") else ""
             if st.get("done") and not ans:
-                done_len = None               # detect and extract disagree: nothing is published
+                done_body = None              # detect and extract disagree: nothing is published
             if ans:
                 _write_answer(c, rid, a.out, ans, strict)  # answer file stays PURE — the follow-up recipe goes to stderr only
                 # Attribution is read from the SAME scoped node that produced `ans`, and BEFORE the

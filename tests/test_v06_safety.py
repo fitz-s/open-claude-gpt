@@ -213,8 +213,10 @@ def test_actual_composer_must_equal_approved_payload(monkeypatch):
     monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
     chip = _chip("webcodex-demo", "WebCodex Demo")
     _verify(f"<p>{chip} review this</p>", "review this", ["WebCodex Demo"])          # the clean shape
-    # the editor's own layout is not payload: CRLF, paragraph splits, blank lines, nbsp, U+FEFF padding
-    _verify("<p>line one</p><p>line two</p><p><br></p><p>﻿end</p>", "line one\r\nline two\n\n\nend\n")
+    # the editor's own layout is not payload: CRLF, one block per line, an empty block (its placeholder
+    # <br>) for a blank line, nbsp, U+FEFF padding, a trailing newline
+    _verify("<p>line one</p><p>line\u00a0two</p><p><br></p><p>\ufeffend</p>", "line one\r\nline two\n\nend\n")
+    _verify("<p>a<br>b</p>", "a\nb")                                   # a hard break inside one block
     # a same-length substitution: the old length floor passed it
     with pytest.raises(CDP._PreClickFailure, match="not the approved prompt"):
         _verify("<p>review thiz</p>", "review this")
@@ -448,3 +450,26 @@ def test_zwj_and_zwnj_are_payload(monkeypatch):
         _verify("<p>a‍b</p>", "ab")
     _verify("<p>a‍b</p>", "a‍b")
     _verify("<p>a​b﻿</p>", "ab")
+
+
+def test_blank_lines_are_payload(monkeypatch):
+    """A blank line inside a string literal is program text: `a\\n\\nb` is not `a\\nb`."""
+    monkeypatch.setattr(CDP.time, "sleep", lambda s: None)
+    want = 's = """a\n\nb"""'
+    _verify('<p>s = """a</p><p><br></p><p>b"""</p>', want)
+    with pytest.raises(CDP._PreClickFailure):
+        _verify('<p>s = """a</p><p>b"""</p>', want)                  # the blank line dropped
+    with pytest.raises(CDP._PreClickFailure):
+        _verify('<p>s = """a</p><p><br></p><p><br></p><p>b"""</p>', want)   # one added
+
+
+def test_a_same_length_body_swap_between_done_polls_is_not_published(monkeypatch, tmp_path):
+    """Two done polls at the same length are not two reads of the same answer."""
+    allow = f"BEGIN_RESPONSE:{RID}\nAllow access.\nEND_RESPONSE:{RID}"
+    block = f"BEGIN_RESPONSE:{RID}\nBlock access.\nEND_RESPONSE:{RID}"
+    assert len(allow) == len(block)
+    tab = _StreamTab([allow, block, block])
+    out, ns = _wait_env(monkeypatch, tmp_path, tab, timeout=60)
+    assert CDP.cmd_wait(ns) == 0
+    assert out.read_text() == "Block access.", "the first body was published on the second's length"
+    assert tab.i == 3, "the swapped body needed its own confirming poll"
