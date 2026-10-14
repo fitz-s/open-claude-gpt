@@ -674,8 +674,12 @@ def test_sweep_spares_only_the_tab_of_an_uncertain_rounds_conversation(daemon, m
 
     monkeypatch.setattr(daemon.urllib.request, "urlopen", urlopen)
     monkeypatch.setattr(daemon.websocket, "create_connection", lambda *a, **k: FakeWS())
-    assert daemon._sweep_tabs({"6a684b38-bef4-83ea-83d4-134bf9610e05"}, []) == 2
-    assert closed == ["T2", "T3"], "the protected conversation's tab survives"
+    with daemon.store_mod.Store() as s:   # both conversations are the consult service's own
+        for i, conv in enumerate(("6a684b38-bef4-83ea-83d4-134bf9610e05",
+                                  "6a630a18-cbcc-83ea-a985-2fcd42a0a173")):
+            s.create_round(f"REQ-20260707-120000-00s00{i}", "followup", thread_id=conv)
+    assert daemon._sweep_tabs({"6a684b38-bef4-83ea-83d4-134bf9610e05"}, []) == 1
+    assert closed == ["T2"], "the protected conversation's tab survives; about:blank is not ours"
 
 
 def test_a_tab_whose_url_cannot_be_read_is_protected_not_swept(daemon, monkeypatch):

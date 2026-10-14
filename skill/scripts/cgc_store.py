@@ -609,8 +609,10 @@ class Store:
         self.db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         row = self.db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         if row is None:
+            # Idempotent (IF NOT EXISTS / OR IGNORE): two first opens racing on one fresh file both
+            # run this, and the loser must not die on the version row the winner inserted.
             self.db.executescript(_DDL)
-            self.db.execute("INSERT INTO meta(key,value) VALUES('schema_version',?)",
+            self.db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version',?)",
                             (str(SCHEMA_VERSION),))
             self.db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('store_uuid',?)",
                             (_new_id(),))
@@ -629,6 +631,14 @@ class Store:
         self._backup(f".v{have}.bak")
         for target in range(have + 1, SCHEMA_VERSION + 1):
             with self._tx():
+                # `have` was read outside any lock, so a concurrent open (the daemon and a CLI
+                # starting together after an upgrade) may have applied this step since. Re-read it
+                # under the write lock: a step already applied is skipped, never re-run — a second
+                # ALTER TABLE ADD COLUMN fails, and the loser's open would die on a migrated DB.
+                at = int(self.db.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"])
+                if at >= target:
+                    continue
                 for stmt in _MIGRATIONS[target]:
                     self.db.execute(stmt)
                 self.db.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(target),))
@@ -872,9 +882,15 @@ class Store:
         first round is still being answered from. Enforced here rather than by holding that lease
         longer, because refusing at claim time spawns no worker and therefore cannot spin: the round
         stays QUEUED and is picked up the moment the thread frees. Scoped to follow-ups — a `retrieve`
-        is read-only and IS the recovery path, so it must never be fenced out of a busy thread — and
-        to genuinely live states, since an unreconciled `possibly_accepted` would otherwise block its
-        thread forever.
+        is read-only and IS the recovery path, so it must never be fenced out of a busy thread.
+
+        "Live" starts at READY, not SENDING: two queued follow-ups claimed back to back are both
+        READY, and the composer lease serializes only their clicks — B would send the moment A's
+        landed, while A is being answered. And an uncertain send (`possibly_accepted`) may be
+        generating in that thread right now, so it holds the thread too — but only until its one-shot
+        auto-retrieve has run. That retrieve is automatic and bounded, and it either resolves the round
+        or leaves it for a human; an unreconciled round past that point would otherwise embargo its
+        thread forever, since possibly_accepted has no automatic exit.
 
         `not_before`: a round requeued with a backoff (cgc_backend._gate_requeue_or_block) is not
         eligible until that instant — this is the ONE place that fence has to be enforced, since it
@@ -908,9 +924,10 @@ class Store:
                 "AND ("
                 "  r.kind!='followup' OR r.thread_id IS NULL OR NOT EXISTS ("
                 "    SELECT 1 FROM rounds o WHERE o.thread_id=r.thread_id AND o.rid!=r.rid"
-                f"     AND o.state IN (?,?,?)))"
+                "     AND (o.state IN (?,?,?,?) OR (o.state=? AND NOT EXISTS ("
+                "       SELECT 1 FROM events e WHERE e.rid=o.rid AND e.kind='auto_retrieve')))))"
                 " ORDER BY r.created_at" + ("" if broken else " LIMIT 1"),
-                (QUEUED, now, SENDING, ACCEPTED, WAITING))
+                (QUEUED, now, READY, SENDING, ACCEPTED, WAITING, POSSIBLY_ACCEPTED))
             row = next((c for c in cur
                         if not broken & set(round_needs(c["kind"], c["spec_json"]))), None)
             cur.close()
@@ -1264,6 +1281,19 @@ class Store:
         row = self.db.execute("SELECT detail FROM events WHERE rid=? AND kind='auto_continue_result' "
                               "ORDER BY id DESC LIMIT 1", (rid,)).fetchone()
         return row["detail"] if row else "claimed"
+
+    def observation_deadline(self, rid: str, budget_s: float) -> float | None:
+        """The epoch instant past which nothing may keep watching this round: its CURRENT attempt's
+        begin_send (seconds before the click) plus the wait budget. Derived from the attempt row that
+        is already durable, so a worker restart, a reattach and the auto-continue's re-wait all spend
+        the one budget the send started, instead of each minting a fresh one. None when the round
+        never crossed begin_send (a retrieve, a pre-store migrated row) — there is no send to bound."""
+        row = self.db.execute(
+            "SELECT a.started_at s FROM rounds r JOIN attempts a ON a.attempt_id=r.current_attempt_id "
+            "WHERE r.rid=?", (rid,)).fetchone()
+        if row is None:
+            return None
+        return datetime.datetime.fromisoformat(row["s"]).timestamp() + budget_s
 
     def was_auto_retrieved(self, rid: str) -> bool:
         row = self.db.execute(

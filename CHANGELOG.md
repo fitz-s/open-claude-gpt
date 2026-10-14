@@ -24,6 +24,28 @@ releases until it stabilizes.
   same body. The
   settle path no longer publishes one. At timeout a second read is taken, and if it differs the answer
   is delivered unverified. An empty extraction on a done poll is no longer a success.
+### Fixed — control-plane safety (v0.6 review)
+
+- **One turn per conversation, from claim on.** A READY follow-up now holds its thread. Before
+  this fix, two claimed follow-ups could send back to back while the first was still being
+  answered. A `possibly_accepted` round holds its thread too, until its one-shot auto-retrieve
+  has run.
+- **Restart recovery passes admission.** A READY round left behind by a dead worker goes back to
+  `queued` while a UI probe holds sends or a capability it needs is broken. It is no longer
+  dispatched past either.
+- **Recovery sends nothing.** Only the worker that sent a round may send its automatic continue.
+  A reattach or auto-retrieve that finds a failed turn ends `failed` and says to re-fire with a
+  new key.
+- **One wait budget per send.** The budget runs from `begin_send` plus the round's timeout, and
+  resumes and the continue's re-wait use only what is left of it. The old 600 s floor is gone.
+  Past the deadline the round ends `possibly_accepted`. The one-shot auto-retrieve still gets one
+  idle-bounded look of 180 s.
+- **The tab sweep closes only consult tabs**: a chatgpt.com tab on a conversation the store
+  recorded, or on the consult landing page. Foreign sites, your own ChatGPT chats and unreadable
+  tabs stay open.
+- Answer files are written through a unique temp file, and a parallel first open of an
+  un-migrated DB re-reads the schema version under the write lock instead of running a migration
+  twice.
 
 ### Fixed — a note typed into a thread mid-round no longer hides the answer
 

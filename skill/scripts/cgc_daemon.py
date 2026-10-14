@@ -277,6 +277,20 @@ def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str,
         ready_orphans = _unowned(
             r["rid"] for r in (s.get_round(rid) for rid in rec["dispatchable"])
             if r and r["state"] == store_mod.READY)
+        # A ready-orphan is a SEND that has not happened yet, so it passes the same admission a fresh
+        # claim does: while a probe holds sends or a capability it needs is broken, it goes back to
+        # `queued` — where claim_ready's gate, probe hold and conversation fence all apply — instead of
+        # being dispatched past them. Nothing was sent, so requeueing it duplicates nothing.
+        held = []
+        for rid in ready_orphans:
+            r = s.get_round(rid)
+            if r["kind"] != "retrieve" and (not sends or s.gated_by(r)):
+                try:
+                    s.set_state(rid, store_mod.QUEUED, expect=store_mod.READY)
+                    held.append(rid)
+                except store_mod.IllegalTransition:
+                    held.append(rid)      # it moved under us — not ours to dispatch either way
+        ready_orphans = [rid for rid in ready_orphans if rid not in held]
     for rid in reattach:
         if len(children) >= concurrency:
             return
@@ -431,6 +445,34 @@ def _tab_conversation(url) -> str:
     return m.group(1) if m else ""
 
 
+def _owned_conversations():
+    """Every conversation the store has ever recorded for a round — the consult service's own threads.
+    None when the store cannot be read: ownership then cannot be proven, so nothing is swept."""
+    try:
+        with store_mod.Store() as s:
+            return {r["conversation_id"] for r in s.db.execute(
+                "SELECT conversation_id FROM threads WHERE conversation_id IS NOT NULL")}
+    except Exception as e:
+        sys.stderr.write(f"CGC_DAEMON owned-conversation read failed ({type(e).__name__}); "
+                         "sweeping nothing\n")
+        return None
+
+
+def _consult_tab(url, owned) -> bool:
+    """POSITIVE ownership: a chatgpt.com page that is either one of the store's conversations or the
+    landing a fresh consult opens (the configured project URL — where a submit killed before its
+    conversation existed leaves its tab). A foreign page, a ChatGPT conversation the store never
+    recorded (the human's own chat), and an unreadable URL are not ours, whatever the tab count."""
+    u = urllib.parse.urlparse(url or "")
+    if u.scheme != "https" or u.hostname != "chatgpt.com":
+        return False
+    conv = _tab_conversation(url)
+    if conv:
+        return conv in owned
+    landing = urllib.parse.urlparse(os.environ.get("CGC_PROJECT_URL", "https://chatgpt.com/"))
+    return u.path.rstrip("/") == landing.path.rstrip("/")
+
+
 def _browser_reachable() -> bool:
     """Cheap yes/no: can the daemon even ask Chrome for its tab list? Split out from `_sweep_tabs`
     (which keeps its own defensive except — it still has real sweeping work to do when reachable) so
@@ -460,7 +502,10 @@ def _sweep_tabs(protect_convs=(), hold=()) -> int:
     its cleanup at all, and its tab stays. Each one holds a renderer, and a browser carrying enough
     of them stops being able to start new ones, which is the failure that ends every consult (a
     freshly created tab that never answers Runtime.enable). One tab is kept, because the profile
-    with zero windows is a worse state to leave the browser in than one with a spare."""
+    with zero windows is a worse state to leave the browser in than one with a spare.
+
+    An idle controller is not evidence that every tab is disposable: the browser is the human's too.
+    Only a tab positively known to be a consult tab (_consult_tab) is ever closed."""
     if hold:
         sys.stderr.write(
             f"CGC_DAEMON tab sweep HELD: {len(hold)} uncertain round(s) with no conversation "
@@ -474,17 +519,13 @@ def _sweep_tabs(protect_convs=(), hold=()) -> int:
         pages = [t for t in info if t.get("type") == "page"]
         if len(pages) <= 1:
             return 0
+        owned = _owned_conversations()
+        if owned is None:
+            return 0
         # A tab whose URL cannot be read (mid-navigation, a target reporting about:blank) is
-        # UNIDENTIFIABLE, not unowned — sweeping it while any conversation is protected would
-        # destroy the very evidence the protection exists to keep. Every other decision here fails
-        # closed; so does this one. With nothing to protect, an unreadable tab is just litter.
-        def _protected(t):
-            url = t.get("url")
-            if not url:
-                return bool(protect_convs)
-            return _tab_conversation(url) in protect_convs
-
-        doomed = [t for t in pages[1:] if not _protected(t)]
+        # UNIDENTIFIABLE, not unowned — _consult_tab never claims it, so it is never closed.
+        doomed = [t for t in pages[1:] if _consult_tab(t.get("url"), owned)
+                  and _tab_conversation(t.get("url")) not in protect_convs]
         if not doomed:
             return 0
         ver = json.load(urllib.request.urlopen(f"{base}/json/version", timeout=5))
@@ -495,7 +536,8 @@ def _sweep_tabs(protect_convs=(), hold=()) -> int:
         bw.close()
         kept = len(pages) - 1 - len(doomed)
         sys.stderr.write(f"CGC_DAEMON swept {len(doomed)} unowned browser tab(s)"
-                         + (f"; kept {kept} holding an uncertain round's conversation" if kept else "")
+                         + (f"; kept {kept} (not ours, or holding an uncertain round's conversation)"
+                            if kept else "")
                          + "\n")
         return len(doomed)
     except Exception as e:
