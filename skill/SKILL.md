@@ -66,10 +66,8 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/consult.py fire --repo owner/re
   --title "<sharp headline>" --role "You are a <persona matched to the job>." --task "<the question>" \
   --request-key <stable-key-for-this-logical-request>
 
-# 2. Await DETACHED (run_in_background:true) — copy the exact line fire prints. It waits as long
-#    as the consult takes and wakes you with the answer path. NEVER `nohup … &` instead.
-#    The rid is the whole handle: the answer's path was chosen when the round was created and is
-#    recorded on it, so await reads it back and PRINTS it. You never pass or track a path.
+# 2. Await DETACHED (run_in_background:true): run fire's `next_command` verbatim. It waits as long
+#    as the consult takes and wakes you with `answer_path`. NEVER `nohup … &` instead.
 python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid>
 ```
 
@@ -102,24 +100,27 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid>
 
 ## Outcomes — read the envelope, not the prose
 
-The exit code only routes you (0 answer ready / 3 a human must act / 1 broken); the RETURN is an
-address. `await`'s LAST stdout line is a JSON envelope — `{schema:1, rid, parent_rid, state,
-retryable, human_action, next_command, answer_path, log_path, confidence, error}` — and every
-outcome names the artifact it produced. Act on the fields, never on the code alone:
+The exit code only routes you (0 answer ready / 3 a human must act / 1 broken). Every verb here
+(fire, await, status, cancel, refire, feedback, reconcile, diagnose) ENDS stdout with ONE JSON
+line, refusals included: `{schema, rid, state, code, next_command, human_action, answer_path,
+detail, ...}`; await adds `retryable, confidence, error, log_path`. Decide from it alone. `code` is the action class: `ok` · `invalid_request` (fix the flags) ·
+`policy_denied` (the gate refused the content) · `service_unavailable` (nothing sent; retry later) ·
+`human_required` · `ui_contract_broken` (the driver needs a fix) · `send_uncertain` (retrieve, never
+re-send) · `source_unresolved` · `remote_failed` · `observation_deadline` · `result_unverified` ·
+`not_found`. `next_command` is the controller's chosen move; when there is none, act on
+`human_action`:
 
-- `answer_path` set → Read it. `confidence:"unverified"` → a human verifies the answer is complete
-  and belongs to this round before you act on it; never auto-chain a follow-up on it.
-- Success carries `next_command:null` by design: a follow-up is a decision you make FROM the
-  answer, never a step the envelope proposes.
+- `answer_path` set → Read it. Success has `next_command:null`: a follow-up is your decision FROM
+  the answer. `result_unverified` → a human checks it is complete and this round's; never chain on it.
 - `human_action` set → relay exactly that to the user (login/captcha/rate-limit/safeguard
   refusal), then do `next_command` once it's cleared.
-- A `blocked` round marked `(pre-send)` (login, captcha, a `--mention` that could not be confirmed) was
-  proven never sent by the driver's own refusal. Fix the cause in `error`, then run its `next_command`,
-  `cgc_spool.py refire --rid <rid>` (a fresh rid, the same prompt and spec): nothing can duplicate. Never
-  retrieve it, there is no answer to find. Otherwise `retryable:true` → re-run the SAME fire (same
-  `--request-key`). `retryable:false` with state `possibly_accepted` (or a `(post-send)` blocker) → the
-  send may have landed: NEVER re-fire; follow `next_command` (retrieve by conversation).
-- Nothing useful → `log_path` is the full send+wait transcript; read it before guessing.
+- A pre-send `blocked` round (login, captcha, an unconfirmed `--mention`) provably never sent: fix
+  the cause in `detail`, then run `next_command` (`refire`: fresh rid, same prompt; nothing can
+  duplicate). `send_uncertain` or a post-send blocker → the send may have landed: NEVER re-fire;
+  `next_command` retrieves by conversation.
+- Stuck or unclear → run `cgc_spool.py diagnose --rid <rid>`: one line of ≤1.5 KB (paths are never
+  cut; `truncated:true` if they alone exceed it) with phases, the driver's last verdict, the UI
+  verdicts and the next command. Never read the log or the driver.
 - ChatGPT failing a turn ("Thinking failed") is handled for you: the daemon sends ONE "continue" in
   the same thread and the same rid keeps waiting. If that continue also fails, the round ends `failed`
   with `turn_failed` — re-fire with a NEW `--request-key` only if you still need the answer. If the
@@ -133,8 +134,7 @@ detached) — it is pure polling, safe to repeat, and returns the answer's addre
 landed a second ago or an hour ago. **Never substitute a shell wait loop** (`until [ -s <file> ];
 do sleep …`): it cannot terminate on `blocked` / `failed` / `possibly_accepted` — exactly the
 states that need a human, so it spins forever on them — and it reads an unverified salvage as
-success. If you want to know where things stand right now, `cgc_spool.py status --rid <rid>` gives
-you `state`, `out_path`, `answer_on_disk`, and `conversation` in one read.
+success. Where things stand right now: `cgc_spool.py diagnose --rid <rid>`.
 
 ## Repeat-safety (idempotency)
 
