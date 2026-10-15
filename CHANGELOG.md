@@ -109,9 +109,10 @@ releases until it stabilizes.
   outer URL (`.../cli/cli/https:/../../../other/private`), a link nested in a proxy or redirect URL is
   judged as its own URL, and a URL parser's habit of dropping TAB/CR/LF is accounted for: the link is
   judged alone and joined with the following text, and a bare `owner/repo` link that ends a line and
-  is followed directly by a word, digit or `-` is refused (it can read as `cli/cli-private-zz`;
-  end the link with a space or `/`, or leave a blank line). A new test checks the gate against node's
-  WHATWG parser on a generated corpus. Other hosts under GitHub domains (`github.io`, `ghcr.io`, signed
+  is followed, across any run of line breaks (a blank line joins too), by a word, digit or `-` is
+  refused (it can read as `cli/cli-private-zz`; end the link with a space or `/`). A new test checks
+  the gate against node's WHATWG parser on a generated corpus. The repo-root examples in
+  `references/injection-and-prompting.md` now end in `/`. Other hosts under GitHub domains (`github.io`, `ghcr.io`, signed
   `*.githubusercontent.com` downloads, assets) are refused; `api.github.com/repos/...` and
   `codeload.github.com/...` map to their repo and are visibility- and existence-checked; `/pull/N.diff`
   and `.patch` are PR N. Links to other sites remain the operator's free-text boundary.

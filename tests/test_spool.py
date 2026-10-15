@@ -522,7 +522,8 @@ def test_enqueue_reads_the_rid_from_the_prompt_when_none_is_passed(spool, tmp_pa
     import argparse
     rid = _rid("bb0001")
     pf = tmp_path / "p.md"
-    pf.write_text(f"review https://github.com/acme/widgets\n\nBEGIN_RESPONSE:{rid}\n...\nEND_RESPONSE:{rid}\n")
+    # the link ends in "/": a bare repo link directly before a line would read as part of the repo name
+    pf.write_text(f"review https://github.com/acme/widgets/\n\nBEGIN_RESPONSE:{rid}\n...\nEND_RESPONSE:{rid}\n")
     a = _enqueue_args(rid, str(pf))
     a.rid = None
     assert spool.cmd_enqueue(a) == 0
@@ -1034,7 +1035,9 @@ def test_e1_a_link_a_parser_would_read_differently_is_refused_before_any_probe(s
     ("pr link, line, word", f"see {_OWN}/pull/1\nthen explain"),
     ("repo link, space, line, word", f"see {_OWN} \nthen explain"),
     ("repo link, slash, line, word", f"see {_OWN}/\nthen explain"),
-    ("repo link, blank line, word", f"see {_OWN}\n\nthen explain"),
+    ("repo link, slash, blank line, word", f"see {_OWN}/\n\nthen explain"),
+    ("repo link, space, blank line, word", f"see {_OWN} \n\nthen explain"),
+    ("pr link, blank line, word", f"see {_OWN}/pull/1\n\nthen explain"),
     ("two urls, two lines", f"{_OWN}/pull/1\n{_OWN}/pull/2"),
     ("crlf then word", f"see {_OWN}/pull/1\r\nnext"),
     ("lf, header", f"see {_OWN}/pull/1\n\n# Header"),
@@ -1145,6 +1148,15 @@ _JOIN_REFUSED = [
     ("repo extension, CRLF", "review https://github.com/acme/widgets\r\nserver", "different repo"),
     ("repo extension after a period", "review https://github.com/acme/widgets.\nserver", "different repo"),
     ("repo extension, tab indent", "review https://github.com/acme/widgets\n\tserver", "different repo"),
+    # node: new URL("https://github.com/cli/cli\n\n-private-zz/blob/main/x").pathname == "/cli/cli-private-zz/blob/main/x"
+    ("blank line, -private-zz", "review https://github.com/acme/widgets\n\n-private-zz/blob/main/x", "different repo"),
+    ("blank line, plain word", "review https://github.com/acme/widgets\n\nFocus on the retry loop.", "different repo"),
+    ("four blank lines", "review https://github.com/acme/widgets\n\n\n\n-private-zz", "different repo"),
+    ("CRLF blank line", "review https://github.com/acme/widgets\r\n\r\n-private-zz", "different repo"),
+    ("blank lines then an owner extension", "review https://github.com/fitz-\n\nprivate/repo", "owner/repo"),
+    ("blank line, raw host", "review https://raw.githubusercontent.com/acme/widgets\n\nserver/main/x", "different repo"),
+    ("blank line, api host", "review https://api.github.com/repos/acme/widgets\n\nserver", "different repo"),
+    ("blank line, then dot segments", "review https://github.com/acme/widgets/pull/12\n\n/../../../priv/repo", "dot segment"),
     ("repo extension, digits", "review https://github.com/acme/widgets\n2", "different repo"),
     ("owner extension (fitz- + private/repo)", "review https://github.com/fitz-\nprivate/repo", "owner/repo"),
     ("host split", "review https://git\nhub.com/priv/repo", "different repo"),
@@ -1175,7 +1187,14 @@ def test_join_a_link_that_a_line_break_would_extend_into_another_repo_is_refused
     ("tree link, line, sentence", f"Review {_OWN}/tree/abc1234\nFocus on the retry loop."),
     ("trailing slash, line, sentence", f"Review {_OWN}/\nFocus on the retry loop."),
     ("repo, SPACE, line, sentence", f"Review {_OWN} \nFocus on the retry loop."),
-    ("repo, blank line, sentence", f"Review {_OWN}\n\nFocus on the retry loop."),
+    ("repo with slash, blank line, sentence", f"Review {_OWN}/\n\nFocus on the retry loop."),
+    ("repo, space, blank line, sentence", f"Review {_OWN} \n\nFocus on the retry loop."),
+    ("pr link, blank line, sentence", f"Review {_OWN}/pull/12\n\nFocus on the retry loop."),
+    ("repo in backticks, blank line, sentence", f"Review `{_OWN}`\n\nFocus on the retry loop."),
+    ("repo in angle brackets, blank line", f"Review <{_OWN}>\n\nFocus on the retry loop."),
+    ("repo in quotes, blank line", f"Review \"{_OWN}\"\n\nFocus on the retry loop."),
+    ("repo, blank line, header", f"Review {_OWN}\n\n# Notes"),
+    ("repo, blank line, indented", f"Review {_OWN}\n\n  Focus on the retry loop."),
     ("repo, indented sentence", f"Review {_OWN}\n  Focus on the retry loop."),
     ("repo, markdown header", f"Review {_OWN}\n# Notes"),
     ("repo in parens, line, sentence", f"Review ({_OWN})\nFocus on the retry loop."),

@@ -144,24 +144,21 @@ def default_out(rid: str) -> str:
 #   scheme https with `//`; host written exactly (no userinfo, port, escape, trailing dot or
 #   non-ASCII); no backslash; path with no `.`/`..` segment, no percent-escape and no empty segment
 #   (one trailing slash is the same page); owner [A-Za-z0-9-], repo [A-Za-z0-9._-].
-# A URL parser also drops TAB, CR and LF from anywhere inside the string it is handed, so the text a
-# link is followed by can be JOINED onto it. The link is judged alone and joined with the next run(s)
-# of text across line breaks (cumulatively, at most _MAX_HOPS). A gap holding a space is not a join (a
-# space is not dropped). Across a gap that is exactly ONE line break (LF or CRLF, indentation after it
-# included), which is how a hard-wrapped URL looks:
-#   - every joined reading must break no rule, carry no dot segment, escape or backslash, and name the
-#     SAME repo as the link alone: `https://github.com/cli/cli` + LF + `-private-zz/x` reaches
-#     cli/cli-private-zz, `.../fitz-` + LF + `private/repo` reaches fitz-private/repo, and a join that
-#     makes a GitHub link out of a non-GitHub one is the same thing. A joined reading that is not a
-#     repo name GitHub can hold (`widgets)Focus`) names nothing and is left alone;
-#   - so a bare `owner/repo` link that ends a line and is followed directly by a line starting with a
-#     word, a digit or a `-` is the ambiguous case, and is refused with the fix (end the link with a
-#     space or a trailing slash): no shape of the next line tells prose from a join. A link that ends
-#     in a path (`/pull/12`), ends in `/`, is followed by a space, or whose next line starts with its
-#     own `http(s):`, cannot change its repo and is left alone.
-# Across a blank line or several breaks (a paragraph break, which no reader joins) only the dangerous
-# forms count: a joined reading with a dot segment, an escape or a backslash is refused. A TAB or bare
-# CR next to a GitHub link is refused outright (it is neither a line end nor indentation).
+# A URL parser also drops EVERY TAB, CR and LF from the string it is handed (a blank line included, any
+# number of them), so the text a link is followed by can be JOINED onto it. The link is judged alone and
+# joined with the next run(s) of text across any gap made only of TAB/CR/LF (cumulatively, at most
+# _MAX_HOPS). A gap holding a space is not a join (a space is not dropped). Every joined reading must
+# break no rule, carry no dot segment, escape or backslash, and name the SAME repo as the link alone:
+# `https://github.com/cli/cli` + LF + `-private-zz/x` reaches cli/cli-private-zz, the same with a blank
+# line between, `.../fitz-` + LF + `private/repo` reaches fitz-private/repo, and a join that makes a
+# GitHub link out of a non-GitHub one is the same thing. A joined reading that is not a repo name
+# GitHub can hold (`widgets)Focus`) names nothing and is left alone. So a bare `owner/repo` link that
+# ends a line and is followed, across line breaks, by a line starting with a word, a digit or a `-` is
+# refused with the fix (end the link with a space or a trailing slash): no shape of the next line tells
+# prose from a join. A link that ends in a path (`/pull/12`), ends in `/`, is wrapped in brackets or
+# quotes, is followed by a space before the break, or whose next line starts with its own `http(s):`
+# or a `#`, cannot change its repo and is left alone. A TAB or bare CR right beside a GitHub link is
+# refused outright (it is neither a line end nor indentation).
 # Not the gate's business, and the operator's free-text boundary (docs/SECURITY.md): links to other
 # sites, and GitHub hosts written without a scheme.
 _GH_HOSTS = {"github.com": "repo", "www.github.com": "repo", "raw.githubusercontent.com": "raw",
@@ -249,10 +246,9 @@ def _url_tokens(text: str):
     `raw` runs from the scheme to the END of its whitespace-delimited run (an inner scheme never cuts
     it; each inner scheme is yielded as a token of its own). When that run is followed only by
     TAB/CR/LF and then more text, `tails` lists what a parser that drops those characters would join
-    onto it: the next run, then the next two runs, and so on (at most _MAX_HOPS), each as
-    (text, single) where `single` means every gap so far was exactly one line break. `glued` says a
-    gap held a TAB or bare CR before its first LF (not a line end). A next run that starts with its
-    own `http(s):` is a new link, not a continuation."""
+    onto it: the next run, then the next two runs, and so on (at most _MAX_HOPS), across gaps made
+    only of TAB/CR/LF. `glued` says a gap held a TAB or bare CR before its first LF (not a line end).
+    A next run that starts with its own `http(s):` is a new link, not a continuation."""
     runs = [(m.start(), m.end()) for m in _RUN_RE.finditer(text)]
     for i, (a, b) in enumerate(runs):
         run = text[a:b]
@@ -262,7 +258,7 @@ def _url_tokens(text: str):
         if len(offs) > _MAX_SCHEMES:
             raise _LawRefusal(f"refused: {len(offs)} `http(s):` links in one unbroken run of text "
                               f"({run[:60]!r}...); put whitespace between links")
-        tails, acc, glued, single, end = [], "", False, True, b
+        tails, acc, glued, end = [], "", False, b
         for j in range(i + 1, min(i + 1 + _MAX_HOPS, len(runs))):
             na, nb = runs[j]
             gap, nxt = text[end:na], text[na:nb]
@@ -271,16 +267,19 @@ def _url_tokens(text: str):
             head, lf, _ = gap.partition("\n")
             head = head[:-1] if lf and head.endswith("\r") else head
             glued = glued or not lf or "\t" in head or "\r" in head
-            single = single and gap.count("\n") == 1
             acc += nxt
-            tails.append((acc, single))
+            tails.append(acc)
             end = nb
         for o in offs:
             yield run[o:], tails, glued
 
 
-def _read(tok: str) -> tuple:
-    """Stage 1 of the URL law for one token. Returns (state, payload):
+def _read(tok: str, joined: bool = False) -> tuple:
+    """Stage 1 of the URL law for one token. `joined` marks a hypothetical reading made by joining the
+    text after a link onto it: such a reading is judged for the repo it reaches and for the dangerous
+    forms (dot segment, escape, backslash), not for path-detail rules that police a link as WRITTEN
+    (an empty segment is collapsed the way a lenient server would, a trailing `.` is ignored).
+    Returns (state, payload):
       ("other", None)    not a GitHub-family URL (the gate has no opinion)
       ("root", None)     a GitHub URL with no repo to verify (site root, or a reserved page)
       ("norepo", msg)    a GitHub URL whose owner/repo is missing or outside GitHub's character sets
@@ -316,13 +315,15 @@ def _read(tok: str) -> tuple:
     segs = u.path.split("/")[1:]
     if segs and segs[-1] == "":
         segs.pop()
+    if joined:
+        segs = [x for x in segs if x]
     if not segs:
         return "root", None
     if "" in segs:
         return bad("an empty path segment")
     if "." in segs or ".." in segs:
         return bad("a `.` or `..` path segment")
-    if segs[-1].endswith("."):
+    if segs[-1].endswith(".") and not joined:
         return bad("a path segment ending in `.`")
     if kind == "gist":
         return "ok", ("gist", "", [], host)
@@ -342,26 +343,24 @@ def _read(tok: str) -> tuple:
 def _check_joins(raw: str, state: str, payload, tails: list, glued: bool):
     """The refusal for the readings in which the text after `raw` is joined onto it, or None."""
     readings = []
-    for tail, single in tails:
+    for tail in tails:
         tok = _trim(raw + tail)
-        readings.append((tok, single, *_read(tok)))
-    if state == "other" and all(st == "other" for _, _, st, _ in readings):
+        readings.append((tok, *_read(tok, joined=True)))
+    if state == "other" and all(st == "other" for _, st, _ in readings):
         return None
     if glued:
-        return (f"refused: a TAB or bare CR inside or beside a GitHub link ({(raw + tails[-1][0])[:100]!r}); "
+        return (f"refused: a TAB or bare CR inside or beside a GitHub link ({(raw + tails[-1])[:100]!r}); "
                 "a browser drops it and joins the pieces. Put the link on one line")
-    for tok, single, st, pl in readings:
+    for tok, st, pl in readings:
         got = _split(tok)
         if st != "other" and got and _unsafe(tok, got[1]):
             return (f"refused: a line break lets a browser join a dot segment, escape or backslash onto "
                     f"the GitHub link {raw[:100]!r}. Put the link on one line")
-        if not single:
-            continue    # past a paragraph break nobody joins; only the dangerous forms above count
         if st == "bad":
             return pl
         if st == "ok" and not (state == "ok" and payload[0] == pl[0] and payload[1].lower() == pl[1].lower()):
-            return (f"refused: a line break lets a browser join the link {raw[:100]!r} with the next line "
-                    f"into {tok[:120]!r}, which is a different repo ({pl[1] or 'a gist'}). End the link "
+            return (f"refused: a line break lets a browser join the link {raw[:100]!r} with the text after "
+                    f"it into {tok[:120]!r}, which is a different repo ({pl[1] or 'a gist'}). End the link "
                     "with a space or a trailing slash")
     return None
 

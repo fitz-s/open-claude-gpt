@@ -1017,3 +1017,18 @@ def test_the_prep_rendered_refs_list_still_passes_the_gate(spool, tmp_path, monk
     text = open(st["prompt_file"], encoding="utf-8").read()
     ok, why = spool.validate_prompt(text)
     assert ok, why
+
+
+def test_a_bare_repo_link_as_the_only_ref_survives_both_templates(spool, tmp_path, monkeypatch):
+    """A refs file that is just `https://github.com/owner/repo` is followed by a blank line and the next
+    `# Header` in both templates. `#` starts a URL fragment, so the joined reading is the same repo and the
+    both-readings rule has nothing to refuse. If a template ever puts prose right after the link, this is
+    the test that says so."""
+    monkeypatch.setattr(consult, "CGC_STATE_DIR", str(tmp_path))
+    refs = tmp_path / "refs.md"
+    refs.write_text("https://github.com/acme/widgets\n", encoding="utf-8")
+    for followup in (False, True):
+        st = consult.cmd_prep(_fire_ns(None, no_code=False, refs_file=str(refs), followup=followup))
+        text = open(st["prompt_file"], encoding="utf-8").read()
+        ok, why = spool.validate_prompt(text)
+        assert ok, (followup, why)

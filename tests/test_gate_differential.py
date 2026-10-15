@@ -3,9 +3,9 @@
 # The oracle: if validate_prompt accepts a prompt, then every reading a URL parser could make of it (each
 # `http(s):` start, alone and joined with the following runs of text across TAB/CR/LF, which a parser
 # drops) that lands on a GitHub host must land on a repo the gate verified, or on no repo GitHub can
-# hold. Across a blank line or several breaks (a paragraph break, which no reader joins) only readings
-# that carry a dot segment, an escape or a backslash count. The gate and the oracle are written
-# independently, so a hole one of them has is found by the other.
+# hold. A URL parser drops EVERY TAB, CR and LF, so a blank line joins exactly like a single break and
+# the oracle makes no distinction. The gate and the oracle are written independently, so a hole one of
+# them has is found by the other.
 #
 # Skipped without node (CI has it), like the sentinel-parser parity tests.
 import importlib.util
@@ -28,7 +28,7 @@ HEADS = ["https://github.com/acme/widgets", "https://github.com/acme/widgets/", 
          "https:", "https://raw.githubusercontent.com/acme/widgets/main/x", "https://api.github.com/repos/acme/widgets",
          "https://github.com/ac", "https://github.com/acme/wid", "https://github.com/acme/widgets/tree/",
          "http://github.com/acme/widgets", "https://example.com/x"]
-SEPS = ["", "\n", "\r\n", "\t", " ", "\n\n", "\n ", "\n\t", " \n", "\r", "\n\r\n", "\t\n"]
+SEPS = ["", "\n", "\r\n", "\t", " ", "\n\n", "\n ", "\n\t", " \n", "\r", "\n\r\n", "\t\n", "\n\n\n\n", "\r\n\r\n"]
 TAILS = ["priv/repo", "-priv/x", "/priv/repo", "/../priv/repo", "../../priv/repo", "//github.com/priv/repo",
          "hub.com/priv/repo", "server", "2", "-", "# Notes", "- item", "Then explain.", "(x)", "%2e%2e/priv",
          "\\priv\\repo", ".git", "_x", "extra words here", "https://github.com/other/repo", "/pull/9", "main/x",
@@ -54,21 +54,21 @@ def _build(rng):
 
 
 def _readings(sp, text):
+    """Every string a URL parser could be handed for a link: it alone, and joined with the next runs of
+    text across gaps made only of TAB/CR/LF (any number of them: node drops them all)."""
     runs = [(m.start(), m.end()) for m in re.finditer(r"\S+", text)]
     out = []
     for i, (a, b) in enumerate(runs):
         for m in re.finditer(r"https?:", text[a:b], re.I):
             base = text[a + m.start():b]
-            out.append((sp._trim(base), True))
-            end, acc, single = b, base, True
+            out.append(sp._trim(base))
+            end, acc = b, base
             for j in range(i + 1, min(i + 4, len(runs))):
                 na, nb = runs[j]
-                gap = text[end:na]
-                if not re.fullmatch(r"[\t\r\n]+", gap) or re.match(r"https?:", text[na:nb], re.I):
+                if not re.fullmatch(r"[\t\r\n]+", text[end:na]) or re.match(r"https?:", text[na:nb], re.I):
                     break
-                single = single and gap.count("\n") == 1 and "\t" not in gap.replace("\r\n", "")
                 acc += text[na:nb]
-                out.append((sp._trim(acc), single))
+                out.append(sp._trim(acc))
                 end = nb
     return out
 
@@ -88,8 +88,10 @@ def test_no_accepted_prompt_reaches_a_repo_the_gate_did_not_verify(seed, monkeyp
         ok, _why = sp.validate_prompt(t)
         verdicts.append((ok, set(verified)))
     assert any(ok for ok, _ in verdicts) and not all(ok for ok, _ in verdicts), "the corpus must exercise both verdicts"
+    assert any(re.search(r"\n\s*\n", t) and ok for t, (ok, _) in zip(texts, verdicts)), \
+        "the corpus must include accepted prompts with a blank line, or the blank-line rule is untested"
 
-    urls = sorted({r for t, (ok, _) in zip(texts, verdicts) if ok for r, _ in _readings(sp, t)})
+    urls = sorted({r for t, (ok, _) in zip(texts, verdicts) if ok for r in _readings(sp, t)})
     js = ("const c=JSON.parse(require('fs').readFileSync(0,'utf8'));const o={};for(const u of c){try{const p=new URL(u);"
           "o[u]=[p.protocol,p.hostname,p.pathname]}catch(e){o[u]=null}}console.log(JSON.stringify(o))")
     res = json.loads(subprocess.run([NODE, "-e", js], input=json.dumps(urls), capture_output=True,
@@ -98,7 +100,7 @@ def test_no_accepted_prompt_reaches_a_repo_the_gate_did_not_verify(seed, monkeyp
     for t, (ok, ver) in zip(texts, verdicts):
         if not ok:
             continue
-        for r, single in _readings(sp, t):
+        for r in _readings(sp, t):
             got = res.get(r)
             if not got or got[1].lower() not in GH:
                 continue
@@ -110,9 +112,7 @@ def test_no_accepted_prompt_reaches_a_repo_the_gate_did_not_verify(seed, monkeyp
             if (not pair or not OWNER.fullmatch(pair[0]) or not REPO.fullmatch(pair[1])
                     or pair[0].lower() in sp._NON_REPO_OWNERS):
                 continue    # names no repo GitHub can hold
-            path = r.split("://", 1)[-1].partition("/")[2].split("?")[0].split("#")[0]
-            dangerous = any(seg in (".", "..") for seg in path.split("/")) or "%" in path or "\\" in r
-            if "/".join(pair).lower() not in ver and (single or dangerous):
+            if "/".join(pair).lower() not in ver:
                 bypasses.append((t, r, got[1:], sorted(ver)))
                 break
     assert not bypasses, bypasses[:3]
