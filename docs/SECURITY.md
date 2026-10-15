@@ -39,14 +39,46 @@ processes, do not run this tool on that machine.
 
 ## What the egress gate does and does not guarantee
 
-The daemon re-validates every prompt before sending, fail-closed: every cited
-repo must be gh-confirmed public (or user-allowlisted), cited PRs/refs must
-exist, and known secret shapes are refused. What it **cannot** do is vet
-arbitrary free-text prose: a `--task`, `--context-file`, or `--no-code` consult
-can carry any sentence the caller wrote, and no pattern scan proves a sentence
-is not sensitive. The guarantee is exactly "no recognized secret, no private
-repo link, no dead ref" — not "arbitrary-content safe". The skill contract
+The daemon re-validates every prompt before sending, fail-closed, over the exact bytes that leave
+(the click-owning process runs the same gate again, so a direct send cannot skip it). It checks:
+
+- **Repos.** Every `github.com` / `raw.githubusercontent.com` slug must be gh-confirmed public, and a
+  link that is not `https://` is refused. Gist links are refused.
+- **References.** Every PR link and every tree / blob / commit link on an admitted repo is checked to
+  exist, in prompt order. A ref containing `/` (the branch `feat/x`) is resolved as one ref, never cut
+  at its first segment. More than 32 distinct probes is refused as `partial verification`, so the
+  gate never says "refs exist" about a link it did not check. Compare, issue, raw and `/pulls` links
+  are not existence-checked.
+- **Secret shapes.** A fixed list of patterns: private-key blocks, AWS access key ids and secret-key
+  assignments, `sk-` keys, GitHub tokens (`ghp_`, `github_pat_`), Slack tokens, Google API keys, JWTs.
+
+**What the secret scan is.** A detector for those specified patterns, and nothing more. It does not
+prove that free text contains no secret. A `--task`, `--context-file` or `--no-code` consult can carry
+any sentence the caller wrote: a password in prose, a customer name, an internal hostname, a token
+in a format the list does not know. No pattern scan can prove a sentence is not sensitive. The
+guarantee is exactly "no recognized secret shape, no non-public repo link, no dead PR or ref, and no
+more references than the gate verified". It is not "arbitrary-content safe". The skill contract
 forbids putting secrets in those fields; the scan is a backstop, not a reader.
+
+### Operator opt-ins widen the boundary, on purpose
+
+- `CGC_GATE_PRIVATE_REPOS` names repos the gate may send although they are not public (`*` means any
+  repo your `gh` can resolve). `CGC_GATE_ALLOW_GIST=1` (also `true`, `yes`, `on`) accepts gist links.
+  Both are your policy, honoured only when set: unset, empty or any other value leaves them off.
+  Setting either replaces the "public repos only" guarantee with your own declaration, and the gate
+  cannot judge what is inside a private repo or a gist. The secret scan and the reference checks still
+  run. An allowlist entry that `gh` cannot reach at all (timeout, outage) is refused as `unverified`;
+  one that `gh` answers 404 for is admitted, because your ChatGPT connector may read it under another
+  account.
+- **A registered WebCodex workspace is a channel you opened.** `fire --workspace NAME --mention APP`
+  lets a round carry no public code link, because the remote model reads local files through the
+  app. The gate does not look inside the workspace, and the prompt is still only scanned for secret
+  shapes. The exemption from the public-source rule is granted by the round's recorded spec, checked
+  against `CGC_WORKSPACES` and `CGC_APPS` when the round is enqueued and again when it is sent. A
+  sentence in the prompt (`Source: local workspace ...`) exempts nothing, and a workspace you did not
+  register is refused. `CGC_WORKSPACES`, `CGC_APPS` and the store are files your user can write, so a
+  hostile process running as you can register a workspace: that is the same-user boundary above, not
+  something the gate can add.
 
 ## Local data retention
 
@@ -107,7 +139,9 @@ The skill is built to **not** exfiltrate private content, but you own the inputs
 
 - **No code source → no send.** `prep`/`submit` refuse a non-followup consult
   with no real code link (`CGC_ERROR no_code_source`). Prose about code is not a
-  substitute for the code.
+  substitute for the code. The two declared exceptions are a `--no-code` question and
+  a registered `--workspace` round (see above); the workspace one is read from the
+  stored round, never from the prompt text.
 - **Wrong model → no send.** `submit`/`followup` refuse to send if the target
   model tier can't be selected, rather than silently degrading (override only
   with an explicit `--allow-model-mismatch`).

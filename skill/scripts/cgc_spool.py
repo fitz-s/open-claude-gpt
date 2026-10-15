@@ -43,9 +43,11 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import subprocess
 import sys
 import time
+from urllib.parse import quote, unquote
 
 try:
     import fcntl  # advisory locking (POSIX) — degrade to best-effort if absent
@@ -100,9 +102,12 @@ POLL_S = 20
 
 # The three phrases that declare a LEGITIMATE reason a prompt carries no code LINK (compared against
 # the lowercased prompt): a follow-up, a self-contained no-code question, or a question whose evidence
-# lives in a local WebCodex workspace (`fire --workspace`, which requires a --mention). Honoured by
-# validate_prompt and cmd_enqueue here and by cdp_consult._has_sendable_source; tests/test_parity.py
-# pins all three together. None of them exempts any other rule.
+# lives in a local WebCodex workspace (`fire --workspace`, which requires a --mention). The first two
+# are prose declarations, and rule 1 is a quality guard, not a security boundary. The third is NOT
+# honoured on its text: a sentence anyone can type must not decide which prompts need a public source,
+# so validate_prompt exempts a prompt only when the round's recorded spec registers the workspace
+# (workspace_refusal). The phrase stays here to recognize a prompt that CLAIMS a workspace, for
+# enqueue's pre-check and for refusal wording. None of them exempts any other rule.
 _WORKSPACE_SENTINEL = "source: local workspace `"
 
 # rid shape must match cdp_consult.py exactly.
@@ -133,7 +138,10 @@ _CODE_URL_RE = re.compile(
 _SLUG_RE = re.compile(
     r"https://(?:www\.)?(?:github\.com|raw\.githubusercontent\.com)/"
     r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", re.IGNORECASE)
-_GIST_RE = re.compile(r"https://gist\.github\.com/\S+", re.IGNORECASE)
+_GIST_RE = re.compile(r"https?://gist\.github(?:usercontent)?\.com/\S+", re.IGNORECASE)
+# The recognizers above are https-only, so an http:// link would reach ChatGPT unvetted (it redirects
+# to https). The gate refuses it rather than widen what counts as a code link.
+_PLAINTEXT_GH_RE = re.compile(r"http://(?:www\.)?(?:github\.com|raw\.githubusercontent\.com)/", re.IGNORECASE)
 _CLEAN_SEG_RE = re.compile(r"[A-Za-z0-9_.-]+")
 
 
@@ -145,7 +153,7 @@ def _classify_code_urls(text: str):
     prompt was approved after verifying zero repos. Here the invariant is 1:1 — a recognized code URL
     that does not resolve to a clean owner/repo (unclassifiable, double-encoded, or non-repo path) is
     a hard refusal, never silently dropped from verification. Returns (slugs, refuse_reason)."""
-    from urllib.parse import urlsplit, unquote
+    from urllib.parse import urlsplit
     slugs = set()
     for url in _CODE_URL_RE.findall(text):
         u = url.rstrip('.,);]}"\'>')
@@ -511,6 +519,11 @@ def _private_allowlist() -> set:
     return {x.strip().lower() for x in raw.split(",") if x.strip()}
 
 
+def _gist_opt_in() -> bool:
+    """The operator's explicit `CGC_GATE_ALLOW_GIST=1` (also true/yes/on). Anything else is off."""
+    return os.environ.get("CGC_GATE_ALLOW_GIST", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _repo_is_public(slug: str) -> tuple:
     """Ask gh whether owner/repo is public. Returns (public: bool, detail: str).
 
@@ -553,9 +566,10 @@ def _repo_is_public(slug: str) -> tuple:
 _PR_URL_RE = re.compile(
     r"https://(?:www\.)?github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)", re.IGNORECASE)
 _REF_URL_RE = re.compile(
-    r"https://(?:www\.)?github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:tree|blob|commit)/([A-Za-z0-9_./-]+)",
+    r"https://(?:www\.)?github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:tree|blob|commit)/([A-Za-z0-9_./%-]+)",
     re.IGNORECASE)
-_EXISTENCE_CAP = 8  # dedup usually leaves 1-3; the cap bounds gh cost on a pathological prompt
+_EXISTENCE_CAP = 32   # distinct gh probes per prompt; dedup leaves a few, the cap bounds a pathological one
+_REF_SEGMENTS = 8     # a tree/blob ref may itself contain '/': try its first 1..8 segments as one ref
 
 
 def _gh_exists(path: str) -> tuple:
@@ -579,50 +593,134 @@ def _gh_exists(path: str) -> tuple:
         err = (r.stderr or "").strip()
         if "404" in err or "Not Found" in err:
             return False, "404"
+        if "No commit found for SHA" in err:
+            # The commits API answers an unresolvable ref with 422, not 404. That is gh ANSWERING
+            # "no such ref", so it must not read as an outage: unverified: requeues the round with
+            # backoff, and a dead ref never reaches the refusal that names it.
+            return False, "422"
         last = f"unverified: gh api {path} failed: {err[:120]}"
     return None, last
 
 
-def _verify_refs_exist(text: str, verified_slugs: set) -> str | None:
-    """Refuse dead references (nonexistent PR numbers / tree-blob-commit refs) on repos the gate
-    already vetted. Returns a refusal reason, or None when everything checked out. Fail-closed on a
-    gh outage the same way the visibility check is: `unverified:` → the caller requeues."""
-    checks = []
-    for slug, pr in set(_PR_URL_RE.findall(text)):
-        checks.append((f"repos/{slug}/pulls/{pr}", f"PR github.com/{slug}/pull/{pr}", slug))
-    for slug, ref in set(_REF_URL_RE.findall(text)):
-        ref = ref.split("/")[0]  # tree/<ref>/sub/path — only the ref segment names a commit
-        checks.append((f"repos/{slug}/commits/{ref}", f"ref {ref} of github.com/{slug}", slug))
+def _verify_refs_exist(text: str, verified_slugs: set) -> tuple:
+    """Refuse dead references on repos the gate already vetted. Returns (refusal | None, n): n is the
+    number of distinct PR / tree / blob / commit links verified to exist. Checked: github.com PR links
+    and tree, blob and commit links. NOT checked: compare, issue, raw and /pulls links.
+
+    Every such link is checked, in the order the prompt gives them (never "the first few"), each gh
+    path asked once. A tree/blob ref is first tried as a commit SHA (one probe); otherwise its first
+    1..8 path segments are tried as ONE ref, so branch `feat/x` resolves as `feat/x` and is not
+    split into `feat`. More than _EXISTENCE_CAP distinct probes is an explicit `refused: partial
+    verification` — never a pass that checked only some. A gh outage is `unverified:` (the caller
+    requeues), the same as the visibility check."""
     admitted = {s.lower() for s in (verified_slugs or set())}
-    seen = set()
-    for path, label, slug in checks:
-        if path in seen:
-            continue
-        seen.add(path)
-        if len(seen) > _EXISTENCE_CAP:
-            break  # bounded cost; the leading references are the load-bearing ones
-        if admitted and slug.lower() not in admitted:
-            continue  # only check repos the visibility pass actually admitted
-        ok, detail = _gh_exists(path)
-        if ok is False:
-            return (f"refused: {label} does not exist (404 — a dead link). ChatGPT would browse to "
-                    "nothing or answer around it. Fix the reference and re-fire.")
-        if ok is None:
-            return (f"unverified: could not check that {label} exists ({detail.split(':', 1)[1].strip()}). "
-                    "Nothing is known about it and nothing was sent. Re-enqueue to retry.")
+    found = [(m.start(), "pr", m.group(1), m.group(2)) for m in _PR_URL_RE.finditer(text)]
+    found += [(m.start(), "ref", m.group(1), unquote(m.group(2)).rstrip("./")) for m in _REF_URL_RE.finditer(text)]
+    asked = {}   # gh path -> (exists, detail)
+
+    def ask(path):
+        if path not in asked and len(asked) < _EXISTENCE_CAP:
+            asked[path] = _gh_exists(path)
+        return asked.get(path)   # None = over the cap, never asked
+
+    seen, n = set(), 0
+    for _, kind, slug, ident in sorted(found):
+        if (kind, slug.lower(), ident) in seen or slug.lower() not in admitted:
+            continue   # only repos the visibility pass admitted: this must not probe arbitrary repos
+        seen.add((kind, slug.lower(), ident))
+        if kind == "pr":
+            label, cands = f"PR github.com/{slug}/pull/{ident}", [f"repos/{slug}/pulls/{ident}"]
+        else:
+            segs = [x for x in ident.split("/") if x]
+            if not segs:
+                continue
+            refs = ["/".join(segs[:k]) for k in range(1, min(len(segs), _REF_SEGMENTS) + 1)]
+            label = f"ref {ident} of github.com/{slug}"
+            cands = [f"repos/{slug}/commits/{quote(r, safe='')}" for r in refs
+                     if not {".", ".."} & set(r.split("/"))]   # never let a link walk the API path
+        for path in cands:
+            got = ask(path)
+            if got is None:
+                return (f"refused: partial verification — this prompt links more than {_EXISTENCE_CAP} "
+                        "distinct GitHub PRs / refs and the gate will not vouch for all of them. "
+                        "Nothing was sent. Link fewer (one tree at a commit SHA covers a repo) and re-fire."), n
+            ok, detail = got
+            if ok is None:
+                return (f"unverified: could not check that {label} exists ({detail.split(':', 1)[1].strip()}). "
+                        "Nothing is known about it and nothing was sent. Re-enqueue to retry."), n
+            if ok:
+                n += 1
+                break
+        else:
+            return (f"refused: {label} does not exist (a dead link). ChatGPT would browse to nothing or "
+                    "answer around it. Fix the reference (a commit SHA is the safest) and re-fire."), n
+    return None, n
+
+
+# ---- workspace authority ----------------------------------------------------
+#
+# Rule 1 lets a `fire --workspace` round carry no code link, because its evidence is in a local
+# WebCodex workspace the remote model reaches through an app. That exemption is authority, so it is
+# granted by the round's structured spec and never by a sentence in the prompt: `fire` records the
+# workspace in the round (spec.consult_meta.workspace) beside its mentions, and the gate honours it
+# only when the workspace is in CGC_WORKSPACES and a mention is in CGC_APPS. The gate sees a bare
+# prompt (the daemon and the driver's send-time backstop both call validate_prompt(prompt)), so it
+# finds the round by the rid on the prompt's first line AND the sha256 of these exact bytes: a
+# prompt that merely quotes the sentinel, or another round's rid, matches no row and gets nothing.
+_HEAD_RID_RE = re.compile(r"CGC_RID:(REQ-\d{8}-\d{6}-[0-9a-f]{6})\n")
+
+
+def workspace_refusal(workspace, mentions) -> str | None:
+    """None when (workspace, mentions) is a registered evidence channel, else why it is not. One
+    predicate for enqueue's pre-check (which has the args) and the gate (which reads the stored
+    round), so the two cannot disagree on what registered means."""
+    import consult   # the single definition of the CGC_WORKSPACES / CGC_APPS registries
+    if not workspace:
+        return "no --workspace is recorded for this round (only `consult.py fire` records one)"
+    if workspace.lower() not in {w.lower() for w in consult.known_workspaces()}:
+        return f"workspace {workspace!r} is not in CGC_WORKSPACES"
+    apps = {x.lower() for x in consult.known_apps()}
+    if not any(str(m).lower() in apps for m in mentions or ()):
+        return "none of this round's --mention apps is in CGC_APPS"
     return None
+
+
+def _workspace_fix(bad: str) -> str:
+    return (f"the 'Source: local workspace' line is only text, and {bad}. A workspace source comes from "
+            "`consult.py fire --workspace NAME --mention APP` with NAME in CGC_WORKSPACES and APP in "
+            "CGC_APPS (register one with `cgc_config.py set CGC_WORKSPACES \"NAME\"`)")
+
+
+def _round_workspace(text: str) -> tuple:
+    """(workspace, mentions) of the stored round this exact prompt belongs to; (None, []) when no row
+    matches. A read-only connection: the gate must never create, migrate or write the store."""
+    m = _HEAD_RID_RE.match(text)
+    path = _store.db_path()
+    if not m or path == ":memory:":
+        return None, []
+    try:
+        db = sqlite3.connect("file:" + quote(os.path.abspath(path)) + "?mode=ro", uri=True, timeout=5)
+        try:
+            row = db.execute("SELECT spec_json FROM rounds WHERE rid=? AND prompt_sha256=?",
+                             (m.group(1), _store.sha256(text))).fetchone()
+        finally:
+            db.close()
+        spec = json.loads(row[0]) if row and row[0] else {}
+    except (sqlite3.Error, ValueError, OSError):
+        return None, []
+    return (spec.get("consult_meta") or {}).get("workspace"), spec.get("mentions") or []
 
 
 def validate_prompt(prompt_text: str) -> tuple:
     """The egress gate. Returns (ok: bool, reason: str). ok means: it is safe to send this prompt to
     the external ChatGPT session. Rules, all fail-closed:
       1. Must contain at least one real public-code link (github/gist/raw), UNLESS it is a follow-up
-         (the thread already holds the code) or a declared no-code consult — `prep --no-code`, for a
-         maths/research/writing question, renders "references no code" — or a `fire --workspace`
-         question, whose evidence is in a local WebCodex workspace, renders "Source: local
-         workspace `NAME`". Rules 2-4 still apply to all of them. Note what this rule is and isn't: it stops a *code* consult from going out as blind
-         prose, which is a quality guard; the security guarantees are rules 2-4 (nothing private,
-         nothing secret), and they are untouched by the exemption.
+         (the thread already holds the code), a declared no-code consult (`prep --no-code` renders
+         "references no code"), or a `fire --workspace` round whose evidence is in a registered local
+         WebCodex workspace. The first two are declared in the prompt text. The third is NOT: the
+         "Source: local workspace" line alone exempts nothing; the stored round must register the
+         workspace and a mention (see workspace_refusal). This rule is a quality guard against blind
+         prose about code; the security guarantees are rules 2-4, untouched by any exemption.
       2. Every github/raw repo slug in the prompt must be a gh-confirmed PUBLIC repo. Any private /
          unknown / unverifiable repo -> refuse. This is the independent re-check that makes the
          daemon a real gate rather than a blind relay of whatever the agent enqueued.
@@ -640,14 +738,25 @@ def validate_prompt(prompt_text: str) -> tuple:
         if rx.search(text):
             return False, f"refused: prompt contains what looks like a {label} — will not send it to an external service"
 
-    links = _CODE_URL_RE.findall(text)
-    if (not links and not is_followup and "references no code" not in low
-            and _WORKSPACE_SENTINEL not in low):
-        return False, "refused: no public code link (github/gist/raw URL) in the prompt — nothing safe to send"
+    if _PLAINTEXT_GH_RE.search(text):
+        return False, "refused: prompt links GitHub over http://, which the gate does not vet — use https://"
 
-    # 3. gists
-    if _GIST_RE.search(text) and os.environ.get("CGC_GATE_ALLOW_GIST", "0").strip().lower() in ("0", "false", "no", "off", ""):
-        return False, "refused: prompt contains a gist link and CGC_GATE_ALLOW_GIST is off — the gate cannot verify a gist is public"
+    links = _CODE_URL_RE.findall(text)
+    if not links and not is_followup and "references no code" not in low:
+        why = "nothing safe to send"
+        if _WORKSPACE_SENTINEL in low:
+            try:
+                bad = workspace_refusal(*_round_workspace(text))
+            except Exception as e:   # noqa: BLE001 — an authority that cannot be read grants nothing
+                bad = f"the registry could not be read ({type(e).__name__}: {e})"
+            why = None if bad is None else _workspace_fix(bad)
+        if why:
+            return False, f"refused: no public code link (github/gist/raw URL) in the prompt — {why}"
+
+    # 3. gists. The opt-in is honoured only when it is affirmatively set: any other value (a typo,
+    #    "disabled", "none") leaves it off, because a switch that opens on junk is not an opt-in.
+    if _GIST_RE.search(text) and not _gist_opt_in():
+        return False, "refused: prompt contains a gist link and CGC_GATE_ALLOW_GIST is not set to 1 — the gate cannot verify a gist is public"
 
     # 2. every recognized code URL must classify to a repo slug (fail closed on any that doesn't),
     #    and every slug must be gh-confirmed public.
@@ -674,11 +783,12 @@ def validate_prompt(prompt_text: str) -> tuple:
 
     # 5. dead references: a typo'd PR number or nonexistent ref would otherwise fail 25 minutes
     #    later at ChatGPT (or be silently answered around). The gate has gh anyway — check now.
-    dead = _verify_refs_exist(text, slugs)
+    dead, n_refs = _verify_refs_exist(text, slugs)
     if dead:
         return False, dead
 
-    return True, f"ok: {len(slugs)} public repo(s), refs exist, no secrets detected"
+    return True, (f"ok: {len(slugs)} public repo(s), {n_refs} PR/ref link(s) verified to exist, "
+                  "no recognized secret shape (free text is not vouched for)")
 
 
 # ---- CLI: enqueue -----------------------------------------------------------
@@ -758,12 +868,19 @@ def cmd_enqueue(a) -> int:
                              "as its source, but the round has no --mention to reach it. Use "
                              "`consult.py fire --workspace NAME --mention APP`.\n")
             return 2
-        if (not _CODE_URL_RE.search(prompt) and not is_followup and "references no code" not in low
-                and _WORKSPACE_SENTINEL not in low):
-            sys.stderr.write("CGC_ERROR no_code_source: prompt has no public code link — deliver "
-                             "a link first, render a no-code question with `prep --no-code`, or name "
-                             "a local workspace with `fire --workspace NAME --mention APP`.\n")
-            return 2
+        if (not _CODE_URL_RE.search(prompt) and not is_followup and "references no code" not in low):
+            if _WORKSPACE_SENTINEL not in low:
+                sys.stderr.write("CGC_ERROR no_code_source: prompt has no public code link — deliver "
+                                 "a link first, render a no-code question with `prep --no-code`, or name "
+                                 "a local workspace with `fire --workspace NAME --mention APP`.\n")
+                return 2
+            # The same authority test the daemon's gate applies, from the same inputs: the workspace
+            # `fire` recorded for this round, not the sentence in the text.
+            bad = workspace_refusal((getattr(a, "consult_meta", None) or {}).get("workspace"),
+                                    getattr(a, "mentions", None))
+            if bad:
+                sys.stderr.write(f"CGC_ERROR no_code_source: {_workspace_fix(bad)}. Nothing was queued.\n")
+                return 2
     return cgc_backend.enqueue_round(a, prompt, os.path.abspath(out))
 
 

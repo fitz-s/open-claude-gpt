@@ -143,12 +143,13 @@ Role: {role}
 
 
 # `fire --workspace NAME` declares that this question's evidence lives in a local WebCodex workspace,
-# reached through the --mention'd app. This is the sentence prep renders for it, and its opening is
-# the phrase every source gate keys on (compared lowercased) to accept a prompt that names a
-# workspace in place of a code link: cgc_spool.validate_prompt + cmd_enqueue, and
-# cdp_consult._has_sendable_source. It carries no URL, so every secret-shape and URL-provenance rule
-# still runs over the prompt unchanged. No "@" in the text: a literal @ pasted into the composer
-# could open the mention popup mid-paste; the app is attached by the driver, not by this prose.
+# reached through the --mention'd app. This is the sentence prep renders for it, so the model knows
+# where to look. It is a label, not authority: the public-source exemption is granted by the round's
+# recorded spec (consult_meta.workspace, set in cmd_fire) against CGC_WORKSPACES / CGC_APPS, and
+# cgc_spool.validate_prompt / cmd_enqueue use the phrase only to recognize a prompt that CLAIMS a
+# workspace. It carries no URL, so every secret-shape and URL-provenance rule still runs over the
+# prompt unchanged. No "@" in the text: a literal @ pasted into the composer could open the mention
+# popup mid-paste; the app is attached by the driver, not by this prose.
 WORKSPACE_SENTINEL = "Source: local workspace `"
 
 FOLLOWUP_TEMPLATE = RID_MARKER + """# {title}
@@ -834,6 +835,11 @@ def cmd_fire(a: argparse.Namespace) -> int:
     meta["policy_rev"] = policy_rev()
 
     workspace = getattr(a, "workspace", None)
+    if workspace:
+        # The round's structured source declaration. The gate exempts a link-less prompt from the
+        # public-source rule on THIS (checked against CGC_WORKSPACES / CGC_APPS), never on the
+        # "Source: local workspace" sentence prep renders for the model's benefit.
+        meta["workspace"] = workspace
     if workspace and not getattr(a, "mention", None):
         sys.stderr.write(
             "CGC_ERROR workspace_needs_mention: --workspace names where the evidence lives, but the "
@@ -1083,7 +1089,9 @@ def main() -> int:
                     help="the evidence for this question lives in a local WebCodex workspace of this "
                          "name (see `consult.py apps`), reached through --mention. It stands in for the "
                          "code link the source rule demands, so the round no longer has to claim "
-                         "--no-code; REQUIRES at least one --mention. Every secret and URL gate still runs.")
+                         "--no-code; REQUIRES at least one --mention, and both must be registered by "
+                         "the user (CGC_WORKSPACES, CGC_APPS) or the round is refused. Every secret "
+                         "and URL gate still runs.")
     pf.add_argument("--origin", choices=("agent", "user"),
                     help="who decided to fire this: the agent on its own initiative, or the user asked")
     pf.add_argument("--trigger", choices=("premise-conflict", "workspace-evidence", "design-fork",

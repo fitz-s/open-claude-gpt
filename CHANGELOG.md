@@ -83,6 +83,23 @@ releases until it stabilizes.
   three concurrent writers crash. Only a missing file is an empty config: an unreadable or non-UTF-8 file
   aborts the write and is left as it was (it used to be replaced by one line). `cgc doctor --deep` opens
   its CDP websocket on a socket of its own, so `HTTP_PROXY` can no longer tunnel the loopback connection.
+### Fixed — a sentence in a prompt no longer waives the public-source rule
+
+- `fire --workspace NAME` now records the workspace in the round (`consult_meta.workspace`). The
+  gate exempts a link-less prompt only for a stored round that records one, found by the rid on the
+  prompt's first line and the sha256 of the exact bytes, and only when `CGC_WORKSPACES` lists the
+  workspace and `CGC_APPS` lists a mention. Before, the line `Source: local workspace ...` anywhere
+  in the text was enough. A prompt that only contains it, a bare `enqueue`, or a workspace you did not
+  register is refused; **set `CGC_WORKSPACES` before using `--workspace`**. The enqueue pre-check and
+  the daemon's gate use one predicate, and the gate opens the store read-only.
+- Reference checks cover every PR and tree / blob / commit link, in prompt order (they stopped after
+  eight, in set order). A ref with `/` resolves as one ref (`feat/x` was cut to `feat`). Over 32
+  probes is refused as `partial verification`, and the success message now counts what it verified.
+  A commit the API answers with 422 is a dead link, not a gh outage that retried forever.
+- `CGC_GATE_ALLOW_GIST` opens only on `1`, `true`, `yes` or `on` (it opened on any junk value). The
+  raw-gist host counts as a gist, and an `http://` GitHub link is refused instead of passing unvetted.
+- `docs/SECURITY.md` says what the secret scan is: a detector for specified patterns, not proof
+  that free text is clean.
 
 ### Added — one UI contract, and a repair bundle when ChatGPT's page changes
 

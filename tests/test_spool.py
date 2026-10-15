@@ -653,3 +653,164 @@ def test_cmd_reconcile_unknown_rid_exits_nonzero_not_a_traceback(spool, capsys):
         _rid("rc9999"), not_sent=True, evidence="checked, nothing there"))
     assert code == 2
     assert "CGC_ERROR" in capsys.readouterr().err
+
+
+# ---- reference checks: every ref, slash refs whole, partial verification is a refusal -----------
+#
+# The gate used to stop after eight probes (in hash order, so WHICH eight varied by run) and cut
+# every tree/blob ref at its first '/', so branch `feat/x` was checked as `feat`. A dead link past the
+# eighth, or behind a slash, went out as "refs exist".
+
+def _probe_log(spool, monkeypatch, dead=(), known_refs=None):
+    """Stub _gh_exists with a recording fake. `dead` are path suffixes that 404; `known_refs`, when
+    given, are the only commit refs that exist (so a mis-split ref resolves to nothing)."""
+    asked = []
+
+    def fake(path):
+        asked.append(path)
+        if any(path.endswith(d) for d in dead):
+            return False, "404"
+        if known_refs is not None and "/commits/" in path:
+            ref = path.split("/commits/", 1)[1].replace("%2F", "/")
+            return (True, "exists") if ref in known_refs else (False, "422")
+        return True, "exists"
+    monkeypatch.setattr(spool, "_gh_exists", fake)
+    return asked
+
+
+def test_every_ref_is_checked_not_just_the_first_eight(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch, dead=("/pulls/12",))
+    links = " ".join(f"https://github.com/acme/widgets/pull/{i}" for i in range(1, 13))
+    ok, why = spool.validate_prompt("review " + links)
+    assert not ok and "pull/12" in why and "does not exist" in why
+    assert sorted(int(p.rsplit("/", 1)[1]) for p in asked) == list(range(1, 13)), \
+        "all twelve PRs were probed, none skipped"
+
+
+def test_a_dead_ref_is_found_wherever_it_sits(spool, monkeypatch):
+    for dead in range(1, 11):    # whichever position holds the dead one
+        _probe_log(spool, monkeypatch, dead=(f"/pulls/{dead}",))
+        links = " ".join(f"https://github.com/acme/widgets/pull/{i}" for i in range(1, 11))
+        ok, why = spool.validate_prompt("review " + links)
+        assert not ok and f"pull/{dead} " in why + " ", (dead, why)
+
+
+def test_a_slash_branch_resolves_as_one_ref(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch, known_refs={"feat/x"})
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/tree/feat/x/src/app.py")
+    assert ok, why
+    assert "repos/acme/widgets/commits/feat%2Fx" in asked, "feat/x was asked for as ONE encoded ref"
+
+
+def test_a_dead_slash_branch_is_refused_not_skipped(spool, monkeypatch):
+    _probe_log(spool, monkeypatch, known_refs=set())
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/tree/feat/gone")
+    assert not ok and "does not exist" in why
+
+
+def test_a_commit_sha_ref_still_resolves_on_its_first_probe(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/tree/0123abc456/src/a/b")
+    assert ok, why
+    assert asked == ["repos/acme/widgets/commits/0123abc456"], asked
+
+
+def test_percent_encoded_slash_in_a_ref_is_one_ref(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch, known_refs={"feat/x"})
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/tree/feat%2Fx")
+    assert ok, why
+    assert "repos/acme/widgets/commits/feat%2Fx" in asked
+
+
+def test_dotdot_in_a_ref_never_reaches_the_api_path(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    spool.validate_prompt("review https://github.com/acme/widgets/tree/a/../../../../user")
+    assert not any(".." in p for p in asked), asked
+
+
+def test_more_refs_than_the_cap_is_an_explicit_partial_verification_refusal(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    n = spool._EXISTENCE_CAP + 1
+    links = " ".join(f"https://github.com/acme/widgets/pull/{i}" for i in range(1, n + 1))
+    ok, why = spool.validate_prompt("review " + links)
+    assert not ok and why.startswith("refused:") and "partial verification" in why
+    assert "ok:" not in why and len(asked) == spool._EXISTENCE_CAP, \
+        "never a success message that claims refs exist when some were not checked"
+
+
+def test_exactly_the_cap_is_verified_in_full(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    links = " ".join(f"https://github.com/acme/widgets/pull/{i}" for i in range(1, spool._EXISTENCE_CAP + 1))
+    ok, why = spool.validate_prompt("review " + links)
+    assert ok, why
+    assert len(asked) == spool._EXISTENCE_CAP and f"{spool._EXISTENCE_CAP} PR/ref link(s) verified" in why
+
+
+def test_the_success_message_counts_what_it_verified_and_disclaims_free_text(spool, monkeypatch):
+    _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/pull/1 and "
+                                    "https://github.com/acme/widgets/tree/abc1234")
+    assert ok and "2 PR/ref link(s) verified" in why and "free text is not vouched for" in why
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets")
+    assert ok and "0 PR/ref link(s) verified" in why, "a bare repo link claims no ref check"
+
+
+_REAL_GH_EXISTS = _load()._gh_exists
+
+
+def test_an_unresolvable_ref_is_a_dead_link_not_a_gh_outage(spool, monkeypatch):
+    """The commits API answers a ref it cannot resolve with 422 'No commit found', not 404. That is
+    gh answering, so it must read as a dead link — an `unverified:` requeue would retry it forever."""
+    class _R:
+        returncode = 1
+        stdout = ""
+        stderr = "gh: No commit found for SHA: deadbeef00 (HTTP 422)"
+    monkeypatch.setattr(spool, "_gh_exists", _REAL_GH_EXISTS)
+    calls = []
+    monkeypatch.setattr(spool.subprocess, "run", lambda *a, **k: calls.append(1) or _R())
+    assert spool._gh_exists("repos/acme/widgets/commits/deadbeef00") == (False, "422")
+    assert len(calls) == 1, "an answer is not retried"
+
+
+# ---- opt-ins are honoured only when affirmatively set -------------------------------------------
+
+@pytest.mark.parametrize("val", ["", "0", "off", "no", "false", "disabled", "none", "maybe", " "])
+def test_gist_stays_refused_unless_the_opt_in_is_affirmative(spool, monkeypatch, val):
+    monkeypatch.setenv("CGC_GATE_ALLOW_GIST", val)
+    ok, why = spool.validate_prompt("see https://gist.github.com/someuser/abc123")
+    assert not ok and "gist" in why
+
+
+@pytest.mark.parametrize("val", ["1", "true", "YES", " on "])
+def test_gist_opt_in_values_that_mean_yes(spool, monkeypatch, val):
+    monkeypatch.setenv("CGC_GATE_ALLOW_GIST", val)
+    assert spool.validate_prompt("see https://gist.github.com/someuser/abc123")[0]
+
+
+def test_the_raw_gist_host_is_a_gist(spool, monkeypatch):
+    monkeypatch.delenv("CGC_GATE_ALLOW_GIST", raising=False)
+    ok, why = spool.validate_prompt("see https://github.com/acme/widgets and "
+                                    "https://gist.githubusercontent.com/u/abc/raw/f.py")
+    assert not ok and "gist" in why
+
+
+def test_a_plaintext_github_link_is_refused_not_silently_skipped(spool):
+    ok, why = spool.validate_prompt("see https://github.com/acme/widgets and http://github.com/acme/private")
+    assert not ok and "http://" in why
+
+
+@pytest.mark.parametrize("val", ["", " ", " , ", ",,"])
+def test_an_empty_private_allowlist_allows_nothing(spool, monkeypatch, val):
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", val)
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (False, "visibility=private"))
+    ok, why = spool.validate_prompt(_PRIV)
+    assert not ok and "not confirmed PUBLIC" in why
+
+
+def test_an_allowlisted_repo_still_gets_its_refs_checked(spool, monkeypatch):
+    """Allowlisting admits a private repo; it does not make a dead ref on it acceptable."""
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", "acme/secret-thing")
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (False, "visibility=private"))
+    _probe_log(spool, monkeypatch, known_refs=set())
+    ok, why = spool.validate_prompt("review https://github.com/acme/secret-thing/tree/main")
+    assert not ok and "does not exist" in why
