@@ -42,6 +42,7 @@ import argparse
 import json
 import os
 import re
+from bisect import bisect_right
 import secrets
 import sqlite3
 import subprocess
@@ -144,21 +145,28 @@ def default_out(rid: str) -> str:
 #   scheme https with `//`; host written exactly (no userinfo, port, escape, trailing dot or
 #   non-ASCII); no backslash; path with no `.`/`..` segment, no percent-escape and no empty segment
 #   (one trailing slash is the same page); owner [A-Za-z0-9-], repo [A-Za-z0-9._-].
-# A URL parser also drops EVERY TAB, CR and LF from the string it is handed (a blank line included, any
-# number of them), so the text a link is followed by can be JOINED onto it. The link is judged alone and
-# joined with the next run(s) of text across any gap made only of TAB/CR/LF (cumulatively, at most
-# _MAX_HOPS). A gap holding a space is not a join (a space is not dropped). Every joined reading must
-# break no rule, carry no dot segment, escape or backslash, and name the SAME repo as the link alone:
+# A URL parser also drops EVERY TAB, CR and LF from the string it is handed, so where a line ends does
+# not fix what a link says. The prompt is cut into whitespace-delimited runs; runs separated only by
+# TAB/CR/LF form a CHAIN (a space ends one: a parser keeps it). In each chain's joined text, at every
+# `http(s):` (the scheme itself may be split by a break), the gate judges every reading a parser could
+# be handed: the link alone, the link joined at EACH break, and the maximal join to the end of the
+# chain, exactly as a parser that strips every TAB/CR/LF sees it. A chain holding more than
+# _MAX_BREAKS breaks after a link is REFUSED, never judged on a prefix. Each joined reading must break
+# no rule, carry no dot segment, escape or backslash, and name the SAME repo as the link alone:
 # `https://github.com/cli/cli` + LF + `-private-zz/x` reaches cli/cli-private-zz, the same with a blank
-# line between, `.../fitz-` + LF + `private/repo` reaches fitz-private/repo, and a join that makes a
-# GitHub link out of a non-GitHub one is the same thing. A joined reading that is not a repo name
-# GitHub can hold (`widgets)Focus`) names nothing and is left alone. So a bare `owner/repo` link that
-# ends a line and is followed, across line breaks, by a line starting with a word, a digit or a `-` is
-# refused with the fix (end the link with a space or a trailing slash): no shape of the next line tells
-# prose from a join. A link that ends in a path (`/pull/12`), ends in `/`, is wrapped in brackets or
-# quotes, is followed by a space before the break, or whose next line starts with its own `http(s):`
-# or a `#`, cannot change its repo and is left alone. A TAB or bare CR right beside a GitHub link is
-# refused outright (it is neither a line end nor indentation).
+# line between, `.../fitz-` + LF + `private/repo` reaches fitz-private/repo, `https://git` + breaks +
+# `hub.com/private/repo` reaches github.com, and a join that makes a GitHub link out of a non-GitHub
+# one is the same thing. A joined reading that is not a repo name GitHub can hold (`widgets)Focus`)
+# names nothing and is left alone. So a bare `owner/repo` link that ends a line and is followed, across
+# line breaks, by a line starting with a word, a digit or a `-` is refused with the fix (end the link
+# with a space or a trailing slash): no shape of the next line tells prose from a join. A link that
+# ends in a path (`/pull/12`), ends in `/`, is wrapped in brackets or quotes, or is followed by a space
+# before the break, cannot change its repo and is left alone. A TAB or bare CR right beside a GitHub
+# link is refused outright (it is neither a line end nor indentation).
+# ASSUMPTION, stated so it is not mistaken for a guarantee: ONE final period after a link is read as the
+# end of the sentence and dropped (`see https://github.com/acme/widgets.`). `widgets.` is a legal repo
+# name, so a repo spelled that way exists in principle and is not what the sentence means; the gate does
+# not ask. Two final periods (`main..`) are not a sentence end and are refused by the dot rules.
 # Not the gate's business, and the operator's free-text boundary (docs/SECURITY.md): links to other
 # sites, and GitHub hosts written without a scheme.
 _GH_HOSTS = {"github.com": "repo", "www.github.com": "repo", "raw.githubusercontent.com": "raw",
@@ -167,12 +175,11 @@ _GH_HOSTS = {"github.com": "repo", "www.github.com": "repo", "raw.githubusercont
 _GH_DOMAINS = ("github.com", "githubusercontent.com", "github.io", "githubassets.com", "ghcr.io")
 _SCHEME_RE = re.compile(r"https?:", re.IGNORECASE)
 _RUN_RE = re.compile(r"\S+")
-_BREAK_ONLY_RE = re.compile(r"[\t\r\n]+")
-_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+_BREAK_GAP_RE = re.compile(r"[\t\r\n]+")
 _PR_RE = re.compile(r"([0-9]+)(?:\.(?:diff|patch))?")
 _TRAIL = ",;:!?)]}'\"*>|`"     # sentence punctuation and closing wrappers; an OPENING one stays and is refused
-_MAX_HOPS = 16        # consecutive line breaks followed into one joined reading
-_MAX_SCHEMES = 64     # `http(s):` occurrences in one unbroken run; more is refused, not sampled
+_MAX_BREAKS = 64      # breaks after a link within one chain; more is refused, never judged on a prefix
+_MAX_SCHEMES = 64     # `http(s):` occurrences in one chain; more is refused, not sampled
 _OWNER_RE = re.compile(r"[A-Za-z0-9-]+")
 _REPO_RE = re.compile(r"[A-Za-z0-9._-]+")
 # github.com/<one of these>/... is a page of the site, never a repo (GitHub reserves the names).
@@ -233,45 +240,70 @@ def _split(tok: str):
         return None
 
 
-def _unsafe(tok: str, u) -> bool:
-    """True when `tok` carries what lets a browser land elsewhere than it reads: a backslash, a
-    percent-escape, or a `.`/`..` path segment."""
-    return ("\\" in tok or _ESCAPE_RE.search(u.path) is not None
-            or any(seg in (".", "..") for seg in u.path.split("/")))
+_DOT_SEGMENTS = {".", "%2e", "..", ".%2e", "%2e.", "%2e%2e"}      # what a URL parser collapses
+_SEP_ESCAPE_RE = re.compile(r"%(?:2f|5c)", re.IGNORECASE)             # an escaped `/` or `\\`
+
+
+def _unsafe(u) -> bool:
+    """True when the PATH of a joined reading can send a parser or a server somewhere other than where
+    it reads: a dot segment (written plainly or as the `%2e` aliases a parser also collapses), or an
+    escaped separator. Any other percent-escape (`Caf%C3%A9`) is data and changes nothing. A backslash
+    needs no test of its own: `_split` has already turned it into the `/` a parser sees."""
+    return (any(seg.lower() in _DOT_SEGMENTS for seg in u.path.split("/"))
+            or _SEP_ESCAPE_RE.search(u.path) is not None)
+
+
+def _chains(text: str):
+    """Maximal groups of whitespace-delimited runs joined by gaps made only of TAB/CR/LF: (start, end)
+    spans, in order. A gap holding a space (or any other whitespace) ends a chain."""
+    chain = []
+    for m in _RUN_RE.finditer(text):
+        if chain and _BREAK_GAP_RE.fullmatch(text, chain[-1][1], m.start()):
+            chain.append((m.start(), m.end()))
+        else:
+            if chain:
+                yield chain
+            chain = [(m.start(), m.end())]
+    if chain:
+        yield chain
 
 
 def _url_tokens(text: str):
-    """(raw, tails, glued) for every `http(s):` in `text`.
+    """(first, rest, glued, spans) for every `http(s):` in `text`, scheme split by a break included.
 
-    `raw` runs from the scheme to the END of its whitespace-delimited run (an inner scheme never cuts
-    it; each inner scheme is yielded as a token of its own). When that run is followed only by
-    TAB/CR/LF and then more text, `tails` lists what a parser that drops those characters would join
-    onto it: the next run, then the next two runs, and so on (at most _MAX_HOPS), across gaps made
-    only of TAB/CR/LF. `glued` says a gap held a TAB or bare CR before its first LF (not a line end).
-    A next run that starts with its own `http(s):` is a new link, not a continuation."""
-    runs = [(m.start(), m.end()) for m in _RUN_RE.finditer(text)]
-    for i, (a, b) in enumerate(runs):
-        run = text[a:b]
-        offs = [m.start() for m in _SCHEME_RE.finditer(run)]
-        if not offs:
+    Within a chain (see _chains) with all breaks removed, `first` runs from the scheme to the end of
+    the piece it completes in, and `rest` is the same text extended to the end of each later piece:
+    every reading a parser that strips TAB/CR/LF could be handed, the maximal join last. `spans` says
+    the scheme itself straddles a break (so `first` is already a joined reading). `glued` says some gap
+    after the scheme held a TAB or bare CR before its first LF (not a line end, not indentation)."""
+    for chain in _chains(text):
+        pieces = [text[a:b] for a, b in chain]
+        joined = "".join(pieces)
+        found = list(_SCHEME_RE.finditer(joined))
+        if not found:
             continue
-        if len(offs) > _MAX_SCHEMES:
-            raise _LawRefusal(f"refused: {len(offs)} `http(s):` links in one unbroken run of text "
-                              f"({run[:60]!r}...); put whitespace between links")
-        tails, acc, glued, end = [], "", False, b
-        for j in range(i + 1, min(i + 1 + _MAX_HOPS, len(runs))):
-            na, nb = runs[j]
-            gap, nxt = text[end:na], text[na:nb]
-            if not _BREAK_ONLY_RE.fullmatch(gap) or _SCHEME_RE.match(nxt):
-                break
-            head, lf, _ = gap.partition("\n")
+        if len(found) > _MAX_SCHEMES:
+            raise _LawRefusal(f"refused: {len(found)} `http(s):` links in one unbroken run of text "
+                              f"({pieces[0][:60]!r}...); put whitespace between links")
+        ends, pos = [], 0
+        for piece in pieces:
+            pos += len(piece)
+            ends.append(pos)
+        glue = []       # glue[i]: the gap after piece i is not a plain line end
+        for i in range(len(chain) - 1):
+            head, lf, _ = text[chain[i][1]:chain[i + 1][0]].partition("\n")
             head = head[:-1] if lf and head.endswith("\r") else head
-            glued = glued or not lf or "\t" in head or "\r" in head
-            acc += nxt
-            tails.append(acc)
-            end = nb
-        for o in offs:
-            yield run[o:], tails, glued
+            glue.append(not lf or "\t" in head or "\r" in head)
+        for m in found:
+            p0 = bisect_right(ends, m.start())          # the piece the scheme starts in
+            i0 = bisect_right(ends, m.end() - 1)        # the piece that completes it
+            if len(ends) - 1 - p0 > _MAX_BREAKS:
+                raise _LawRefusal(
+                    f"refused: more than {_MAX_BREAKS} line breaks follow the link starting "
+                    f"{joined[m.start():m.start() + 60]!r}, with no space between the pieces, so what a "
+                    "browser would read as that link cannot be judged; put a space after the link")
+            reads = [joined[m.start():ends[k]] for k in range(i0, len(ends))]
+            yield reads[0], reads[1:], any(glue[p0:]), i0 > p0
 
 
 def _read(tok: str, joined: bool = False) -> tuple:
@@ -310,7 +342,7 @@ def _read(tok: str, joined: bool = False) -> tuple:
         return bad("a backslash")
     if u.netloc.lower() != host:
         return bad("userinfo, a port, an escape, a trailing dot or a non-ASCII character in the host")
-    if "%" in u.path:
+    if "%" in u.path and not joined:
         return bad("a percent-escape in the path")
     segs = u.path.split("/")[1:]
     if segs and segs[-1] == "":
@@ -340,26 +372,34 @@ def _read(tok: str, joined: bool = False) -> tuple:
     return "ok", (kind, f"{owner}/{repo}", rest, host)
 
 
-def _check_joins(raw: str, state: str, payload, tails: list, glued: bool):
-    """The refusal for the readings in which the text after `raw` is joined onto it, or None."""
-    readings = []
-    for tail in tails:
-        tok = _trim(raw + tail)
-        readings.append((tok, *_read(tok, joined=True)))
+def _check_joins(first: str, state: str, payload, reads: list, glued: bool, spans: bool):
+    """The refusal for the readings in which the text after a link is joined onto it, or None. `first`
+    is the link as written (a joined reading itself when `spans`), `reads` its later joins."""
+    seen, readings = set(), []
+    for r in ([first] if spans else []) + reads:
+        tok = _trim(r)
+        if tok not in seen:
+            seen.add(tok)
+            readings.append((tok, *_read(tok, joined=True)))
     if state == "other" and all(st == "other" for _, st, _ in readings):
-        return None
+        return None     # nothing GitHub-shaped on either side of any join
     if glued:
-        return (f"refused: a TAB or bare CR inside or beside a GitHub link ({(raw + tails[-1])[:100]!r}); "
+        return (f"refused: a TAB or bare CR inside or beside a GitHub link ({(first + ''.join(reads[-1:]))[:100]!r}); "
                 "a browser drops it and joins the pieces. Put the link on one line")
     for tok, st, pl in readings:
+        if st == "other":
+            continue
+        if spans:
+            return (f"refused: a line break splits the scheme of a link that a browser reads as {tok[:100]!r}. "
+                    "Put the link on one line")
         got = _split(tok)
-        if st != "other" and got and _unsafe(tok, got[1]):
+        if got and _unsafe(got[1]):
             return (f"refused: a line break lets a browser join a dot segment, escape or backslash onto "
-                    f"the GitHub link {raw[:100]!r}. Put the link on one line")
+                    f"the GitHub link {first[:100]!r}. Put the link on one line")
         if st == "bad":
             return pl
         if st == "ok" and not (state == "ok" and payload[0] == pl[0] and payload[1].lower() == pl[1].lower()):
-            return (f"refused: a line break lets a browser join the link {raw[:100]!r} with the text after "
+            return (f"refused: a line break lets a browser join the link {first[:100]!r} with the text after "
                     f"it into {tok[:120]!r}, which is a different repo ({pl[1] or 'a gist'}). End the link "
                     "with a space or a trailing slash")
     return None
@@ -373,13 +413,16 @@ def _parse_code_urls(text: str) -> tuple:
         tokens = list(_url_tokens(text))
     except _LawRefusal as e:
         return None, str(e)
-    for raw, tails, glued in tokens:
-        tok = _trim(raw)
-        state, payload = _read(tok)
-        if state in ("bad", "norepo"):
-            return None, payload
-        if tails:
-            why = _check_joins(raw, state, payload, tails, glued)
+    for first, reads, glued, spans in tokens:
+        tok = _trim(first)
+        if spans:
+            state, payload = "other", None      # no plain reading: the scheme is split by a break
+        else:
+            state, payload = _read(tok)
+            if state in ("bad", "norepo"):
+                return None, payload
+        if reads or spans:
+            why = _check_joins(first, state, payload, reads, glued, spans)
             if why:
                 return None, why
         if state != "ok":

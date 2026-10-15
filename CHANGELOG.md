@@ -110,8 +110,12 @@ releases until it stabilizes.
   judged as its own URL, and a URL parser's habit of dropping TAB/CR/LF is accounted for: the link is
   judged alone and joined with the following text, and a bare `owner/repo` link that ends a line and
   is followed, across any run of line breaks (a blank line joins too), by a word, digit or `-` is
-  refused (it can read as `cli/cli-private-zz`; end the link with a space or `/`). A new test checks
-  the gate against node's WHATWG parser on a generated corpus. The repo-root examples in
+  refused (it can read as `cli/cli-private-zz`; end the link with a space or `/`). The rule is exact
+  rather than a list of cases: every chain of text joined only by TAB/CR/LF is judged at each break and
+  at its maximal join, a chain with more than 64 breaks is refused instead of judged on a prefix (a host
+  spelled one character per line used to pass after 16), a scheme split by a break is refused, and
+  `%2e` spellings of `.`/`..` and escaped separators count as dot segments. A new test checks the gate
+  against node's WHATWG parser on a generated corpus. The repo-root examples in
   `references/injection-and-prompting.md` now end in `/`. Other hosts under GitHub domains (`github.io`, `ghcr.io`, signed
   `*.githubusercontent.com` downloads, assets) are refused; `api.github.com/repos/...` and
   `codeload.github.com/...` map to their repo and are visibility- and existence-checked; `/pull/N.diff`

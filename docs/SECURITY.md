@@ -57,16 +57,24 @@ The daemon re-validates every prompt before sending, fail-closed, over the exact
   `githubusercontent.com`, `github.io`, `githubassets.com` or `ghcr.io` (Pages, signed downloads,
   packages, assets) is refused outright, because the gate has no check for it.
 - **Line breaks.** A URL parser drops EVERY TAB, CR and LF from the string it is handed, a blank line
-  included, so the text after a link can be joined onto it: `new URL("https://github.com/cli/cli\n\n-private-zz/x")`
-  is `cli/cli-private-zz`. The gate judges the link alone and joined with what follows across any run
-  of TAB/CR/LF, and every reading must name the same repo. The consequence you will notice: **a bare
-  `owner/repo` link that ends a line and is followed, across line breaks, by a line starting with a
-  word, digit or `-` is refused**, because nothing distinguishes prose from a join; the refusal says
-  how to fix it. End the link with a space or a trailing slash. Links that end in a path (`/pull/12`),
-  links wrapped in brackets, quotes or backticks, links followed by a space, and links in the `prep`
-  refs list are unaffected, and so is a next line that starts with its own `http(s):` or a `#`. A TAB
-  or bare CR next to a link is refused always. `tests/test_gate_differential.py` checks all of this
-  against node's WHATWG URL parser on a generated corpus.
+  included, so where a line ends does not fix what a link says: `new URL("https://github.com/cli/cli\n\n-private-zz/x")`
+  is `cli/cli-private-zz`, and a host or even the `https:` can be spelled across breaks. Runs of text
+  separated only by TAB/CR/LF form a chain (a space ends one, because a parser keeps it). In each chain
+  the gate judges every reading a parser could be handed: the link alone, the link joined at **each**
+  break, and the **maximal** join to the end of the chain, exactly as a parser that strips every
+  TAB/CR/LF sees it. Every reading must name the same repo as the link alone, and none may carry a dot
+  segment (including the `%2e` spellings), an escaped separator, or a backslash. A chain with more than
+  64 breaks after a link is **refused**, never judged on a prefix, and a scheme split by a break is
+  refused. The consequence you will notice: **a bare `owner/repo` link that ends a line and is
+  followed, across line breaks, by a line starting with a word, digit or `-` is refused**, because
+  nothing distinguishes prose from a join; the refusal says how to fix it. End the link with a space or
+  a trailing slash. Links that end in a path (`/pull/12`), links wrapped in brackets, quotes or
+  backticks, and links followed by a space are unaffected, and so are the links in the `prep` refs list.
+  A TAB or bare CR next to a link is refused always. One assumption is stated rather than checked: a
+  single final period after a link is read as the end of a sentence (`widgets.` is a legal repo name,
+  and the gate does not ask whether it exists). `tests/test_gate_differential.py` checks all of this
+  against node's WHATWG URL parser on a generated corpus, with an oracle that follows unbounded joins
+  and shares no code or cap with the gate.
   **Links to other sites are outside the gate**: they are part of the operator's free-text boundary
   below, like any other sentence in a `--task`.
 - **Repos.** Every repo a link reaches must be gh-confirmed public. Gist links are refused.

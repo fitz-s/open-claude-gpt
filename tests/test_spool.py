@@ -1257,3 +1257,117 @@ def test_inner_scheme_a_nested_github_link_is_judged_as_its_own_url(spool, monke
 def test_inner_scheme_many_in_one_run_is_refused_not_sampled(spool):
     ok, why = spool.validate_prompt("review https://x.example/" + "https:" * 100 + "/a")
     assert not ok and "unbroken run" in why
+
+
+# ---- chains: every reading, the maximal join included, never a prefix ------------------------------
+#
+# The gate followed at most 16 joins and then stopped and yielded, so a host spelled one character per
+# line (`https://git` + 18 lines + `hub.com/private/repo`) was judged on its first sixteen pieces. The
+# rule is now exact: a chain of runs joined only by TAB/CR/LF is judged at every break and at its end,
+# and a chain with more breaks than the cap is refused outright.
+
+def _spelled_across_breaks(prefix, rest, sep="\n"):
+    return prefix + sep.join([""] + list(rest))
+
+
+@pytest.mark.parametrize("sep", ["\n", "\r\n", "\n\n"])
+def test_chain_the_lead_repro_host_spelled_across_twenty_breaks_is_refused(spool, monkeypatch, sep):
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (True, "stub")))
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (True, "exists"))
+    raw = _spelled_across_breaks("https://git", "hub.com/private/repo", sep)
+    ok, why = spool.validate_prompt("review https://github.com/cli/cli/ \n\n<" + raw + "> ")
+    assert not ok and why.startswith("refused:"), why
+    assert "private/repo" not in seen, "refused before any probe of the joined repo"
+
+
+def test_chain_a_host_spelled_across_more_breaks_than_the_cap_is_refused_not_judged_on_a_prefix(spool, monkeypatch):
+    n = spool._MAX_BREAKS + 20
+    raw = _spelled_across_breaks("https://git", "hub.com/" + "a" * n)
+    ok, why = spool.validate_prompt("review " + raw)
+    assert not ok and why.startswith("refused:") and str(spool._MAX_BREAKS) in why and "space" in why
+
+
+def test_chain_a_repo_name_extended_beyond_the_cap_is_refused(spool, monkeypatch):
+    _probe_log(spool, monkeypatch)
+    raw = _spelled_across_breaks(_OWN, "x" * (spool._MAX_BREAKS + 5))
+    ok, why = spool.validate_prompt("review " + raw)
+    assert not ok and why.startswith("refused:")
+
+
+def test_chain_just_under_the_cap_is_judged_on_every_reading(spool, monkeypatch):
+    _probe_log(spool, monkeypatch)
+    raw = _spelled_across_breaks(_OWN, "x" * (spool._MAX_BREAKS - 2))
+    ok, why = spool.validate_prompt("review " + raw)
+    assert not ok and "different repo" in why, why
+
+
+@pytest.mark.parametrize("name,prompt", [
+    ("scheme split once", "review ht\ntps://github.com/priv/repo"),
+    ("scheme split mid-word", "review xht\ntps://github.com/priv/repo"),
+    ("scheme split by a blank line", "review ht\n\ntps://github.com/priv/repo"),
+    ("scheme split across many", "review " + _spelled_across_breaks("h", "ttps://github.com/priv/repo")),
+])
+def test_chain_a_scheme_split_by_a_break_is_refused(spool, monkeypatch, name, prompt):
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (True, "stub")))
+    ok, why = spool.validate_prompt(prompt)
+    assert not ok and why.startswith("refused:") and seen == [], why
+
+
+def test_chain_a_join_through_a_scheme_run_is_judged(spool, monkeypatch):
+    """The next line starts with its own scheme, but a parser joins it all the same."""
+    _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(f"review {_OWN}/\nhttps:\n/../../priv/repo")
+    assert not ok and why.startswith("refused:")
+
+
+def test_chain_a_space_ends_a_chain(spool, monkeypatch):
+    """A space is not dropped by a URL parser, so text after `link space newline` is not joined."""
+    _probe_log(spool, monkeypatch)
+    assert spool.validate_prompt(f"review {_OWN} \n-private-zz/x")[0]
+    assert spool.validate_prompt(f"review {_OWN}/pull/1 \n\n\n-private-zz/x")[0]
+
+
+def test_chain_a_long_list_of_links_one_per_line_is_not_a_chain_problem(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt("\n".join(f"{_OWN}/pull/{i}" for i in range(1, 31)))
+    assert ok, why
+
+
+@pytest.mark.parametrize("later,ok_expected", [
+    ("https://en.wikipedia.org/wiki/Caf%C3%A9", True),            # an escape that is data
+    ("https://x.example/%2e%2e/%2e%2e/priv/repo", False),         # %2e aliases collapse as dot segments
+    ("https://x.example/a%2Fb", False),                           # an escaped separator
+    ("https://x.example/a%5Cb", False),
+])
+def test_chain_escapes_in_a_later_link_matter_only_when_they_can_move_the_path(spool, monkeypatch, later, ok_expected):
+    _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(f"{_OWN}/pull/1\n{later}")
+    assert ok == ok_expected, why
+
+
+def test_chain_percent_2e_dot_aliases_are_dot_segments_in_a_written_link(spool):
+    for seg in ("%2e%2e", ".%2e", "%2E.", "%2E%2e"):
+        ok, why = spool.validate_prompt(f"review {_OWN}/{seg}/{seg}/priv/repo")
+        assert not ok and why.startswith("refused:"), (seg, why)
+
+
+def test_chain_one_final_period_is_a_sentence_end_by_documented_assumption(spool, monkeypatch):
+    """`widgets.` is a legal repo name; the gate reads one trailing period as the end of a sentence
+    (docs/SECURITY.md), and two are refused by the dot rules."""
+    _probe_log(spool, monkeypatch)
+    assert spool.validate_prompt(f"see {_OWN}.")[0]
+    ok, why = spool.validate_prompt(f"see {_OWN}/tree/main..")
+    assert not ok and "ending in `.`" in why
+
+
+def test_chain_a_split_scheme_gets_its_own_clear_refusal(spool, monkeypatch):
+    """Not just 'a different repo': the scheme itself straddles a break, which is never ordinary text,
+    so even a split link that names no repo (a GitHub page) is refused, and says why."""
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (True, "stub")))
+    for prompt in ("review ht\ntps://github.com/priv/repo", "review ht\n\ntps://github.com/orgs/acme"):
+        ok, why = spool.validate_prompt(prompt)
+        assert not ok and "splits the scheme" in why, why
+    assert seen == []
