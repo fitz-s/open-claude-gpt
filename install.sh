@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # open-claude-gpt installer.
 # Copies (or symlinks) the skill into ~/.claude/skills/chatgpt-consult, checks
-# dependencies, and runs the doctor. Idempotent — safe to re-run to upgrade.
+# dependencies, and runs the doctor. Idempotent — safe to re-run to upgrade. An upgrade stops the
+# launchd egress daemon first and waits until it has exited, replaces the files, starts it again and
+# checks its heartbeat; nothing is replaced under a running daemon, and the consult store is never
+# touched.
+#
+# Everything is rooted at $HOME (skills dir, LaunchAgents, Claude settings, config) and launchctl is
+# found on PATH, so `HOME=/tmp/h PATH=/tmp/stubs:$PATH ./install.sh` is a complete dry environment.
 #
 #   ./install.sh                  # copy the skill into ~/.claude/skills
 #   ./install.sh --link           # symlink instead (dev: edits in the repo go live)
@@ -66,36 +72,96 @@ if ! python3 -c "$WSC_CHECK" 2>/dev/null; then
 fi
 command -v gh >/dev/null || echo "  ! gh CLI not found — install from https://cli.github.com (used by deliver)"
 
+# --- refuse to put older code over a newer store ----------------------------
+# The store refuses to open at a schema newer than the code understands, so an older checkout
+# installed over a newer journal would leave a daemon that can never start. Say so BEFORE anything is
+# stopped or replaced. The check is read-only: it neither creates nor migrates the store.
+if ! python3 "$REPO/skill/scripts/cgc_doctor.py" --check-store; then
+  if [ "$FORCE" = "1" ]; then
+    echo "  ! the consult store is not readable by this checkout — --force: continuing" >&2
+  else
+    echo "ERROR: the consult store cannot be read by this checkout (see above). Nothing was changed." >&2
+    echo "       Install from a checkout at least as new as the one that wrote it (or re-run with --force)." >&2
+    exit 1
+  fi
+fi
+
+# --- quiesce the egress daemon BEFORE touching any file ----------------------
+# A running daemon imports modules lazily, per round. Replacing the tree under it lets one process
+# execute old and new files together (the half-replaced tree), and a round claimed in that window runs
+# on a mixture. So the order is: stop, wait until it has really exited, replace, start, verify.
+# A daemon outside launchd (`cgc watch`, `cgc up`) is not ours to kill: refuse and say so.
+# The repo's own cgc does the stopping, so a first install (nothing installed yet) works too.
+CGC="$REPO/bin/cgc"
+STOPPED=0      # 1 while a daemon we stopped has not been started again
+STAGE="$SKILLS_DIR/.$NAME.new.$$"
+
+rc=0
+CGC_HOME="$REPO/skill" "$CGC" daemon-stop || rc=$?
+case "$rc" in
+  0)  echo "• stopped the egress daemon (it starts again on the new code)"; STOPPED=1 ;;
+  10) ;;                                  # not loaded: nothing to stop
+  *)  echo "ERROR: the egress daemon would not stop — not replacing files under a running daemon." >&2
+      echo "       Nothing was replaced. Its launchd job is unloaded; once the process has exited, run:" >&2
+      echo "         cgc daemon-start      (check: cgc daemon-pid)" >&2
+      exit 1 ;;
+esac
+
+on_exit() {
+  status=$?
+  rm -rf "$STAGE"
+  if [ "$STOPPED" = 1 ]; then
+    # Stopped by us and the swap below did not complete: put the previous tree back and restart it.
+    echo "• install did not finish — restoring the previous install and the daemon" >&2
+    if [ ! -e "$DEST" ] && [ ! -L "$DEST" ] && { [ -e "$DEST.bak" ] || [ -L "$DEST.bak" ]; }; then
+      mv "$DEST.bak" "$DEST"
+    fi
+    CGC_HOME="$DEST" "$CGC" daemon-start >/dev/null 2>&1 || echo "  ! could not restart the daemon: run cgc daemon-start" >&2
+  fi
+  exit "$status"
+}
+trap on_exit EXIT
+
+if live="$(CGC_HOME="$REPO/skill" "$CGC" daemon-pid 2>/dev/null)"; then
+  echo "ERROR: an egress daemon (pid $live) is running outside launchd and would execute the replaced files." >&2
+  echo "       Stop it (Ctrl-C the foreground \`cgc watch\`, or: kill $live), then re-run install.sh." >&2
+  exit 1
+fi
+
 # --- install the skill payload ------------------------------------------------
+# Build the new tree beside the old one and swap with renames, so a failed copy (disk full,
+# permissions) leaves the previous install untouched. The stage is a dot-directory so a skill scanner
+# never sees a second copy of SKILL.md.
 mkdir -p "$SKILLS_DIR"
+rm -rf "$STAGE"
+if [ "$MODE" = "link" ]; then
+  ln -s "$REPO/skill" "$STAGE"
+else
+  cp -R "$REPO/skill" "$STAGE"
+  chmod +x "$STAGE"/scripts/*.sh "$STAGE"/scripts/*.py 2>/dev/null || true
+fi
 if [ -e "$DEST" ] || [ -L "$DEST" ]; then
   echo "• existing install found — backing up to ${DEST}.bak"
   rm -rf "${DEST}.bak"
   mv "$DEST" "${DEST}.bak"
 fi
+mv "$STAGE" "$DEST"
 
-if [ "$MODE" = "link" ]; then
-  ln -s "$REPO/skill" "$DEST"
-else
-  cp -R "$REPO/skill" "$DEST"
-fi
-chmod +x "$DEST"/scripts/*.sh "$DEST"/scripts/*.py 2>/dev/null || true
-
-# --- restart the egress daemon so it picks up the new code -------------------
-# An upgrade that leaves the OLD daemon running is a version split-brain: the CLI
-# writes through new code while the daemon serves old code (observed live: the old
-# daemon rebuilt an empty pre-relocation store and consults silently stalled). So a
-# failed restart FAILS the upgrade — the daemon's heartbeat identity check would
-# refuse every enqueue anyway; better to say so now than per-consult later.
-DAEMON_LABEL="com.open-claude-gpt.daemon"
-if [ "$(uname -s)" = "Darwin" ] && launchctl print "gui/$(id -u)/$DAEMON_LABEL" >/dev/null 2>&1; then
-  echo "• restarting the egress daemon (picks up the upgraded code)"
-  if ! launchctl kickstart -k "gui/$(id -u)/$DAEMON_LABEL"; then
+# --- start the egress daemon on the new code ----------------------------------
+# An upgrade that leaves the OLD daemon running is a version split-brain: the CLI writes through new
+# code while the daemon serves old code (observed live: the old daemon rebuilt an empty pre-relocation
+# store and consults silently stalled). The daemon was stopped above, so this starts a fresh process
+# and then checks that its heartbeat names this install's store schema. A start that does not come up
+# FAILS the upgrade: the daemon's identity check would refuse every enqueue anyway, so say so now.
+if [ "$STOPPED" = 1 ]; then
+  STOPPED=0
+  echo "• starting the egress daemon"
+  if ! CGC_HOME="$DEST" "$CGC" daemon-start; then
     if [ "$FORCE" = "1" ]; then
-      echo "  ! could not restart the daemon — --force: continuing; run: cgc install-daemon" >&2
+      echo "  ! the daemon did not come up — --force: continuing; run: cgc daemon-start" >&2
     else
-      echo "ERROR: could not restart the egress daemon — the OLD code would keep serving consults." >&2
-      echo "       Fix: launchctl kickstart -k \"gui/\$(id -u)/$DAEMON_LABEL\"   (or: cgc install-daemon)" >&2
+      echo "ERROR: the egress daemon did not come up on the new code (log: ${CGC_STATE_DIR:-/tmp/cgc}/daemon.log)." >&2
+      echo "       Fix: cgc daemon-start   (or: cgc install-daemon)   — or re-run with --force" >&2
       exit 1
     fi
   fi
@@ -120,6 +186,8 @@ cat <<EOF
 Next steps
   1. Start the dedicated debug Chrome and log into ChatGPT once:
        bash "$DEST/scripts/cdp_launch.sh"
+     Then install the egress daemon once (it starts at login and respawns if it dies):
+       bin/cgc install-daemon
   2. (optional) Point consults at your own ChatGPT project:
        export CGC_PROJECT_URL="https://chatgpt.com/g/g-p-<id>-<slug>/project"
   3. In Claude Code the skill auto-activates ON DEMAND: Claude reads its SKILL.md
@@ -137,6 +205,13 @@ Next steps
 Config lives in the environment — see docs/CONFIGURATION.md and .env.example.
 EOF
 
+# Doctor exit: 0 ready; 3 installed but cannot send yet (no daemon / Chrome / login: the next steps
+# above); anything else = the install itself is incomplete.
+if [ "$DOCTOR_STATUS" -eq 3 ]; then
+  echo
+  echo "• installed. Consults cannot be sent yet — see can_send in the doctor output above."
+  exit 0
+fi
 if [ "$DOCTOR_STATUS" -ne 0 ]; then
   if [ "$FORCE" = "1" ]; then
     echo
