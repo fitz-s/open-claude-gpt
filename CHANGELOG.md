@@ -20,6 +20,13 @@ releases until it stabilizes.
   Older code is refused over a newer store before anything is stopped. New verbs: `cgc daemon-stop`,
   `daemon-start [--any]`, `daemon-pid`; `cgc uninstall-daemon` and `install-daemon` now wait for the
   process to exit (`uninstall-daemon` keeps the plist if it will not).
+- **Two Linux-only failures fixed.** `uninstall.sh --purge` identified a planned file by device and inode
+  alone; Linux hands a freed inode number to the next file created, so a file someone put in place of the
+  planned one could be deleted. The plan now carries a fingerprint (device, inode, size, nanosecond mtime,
+  SHA-256 of the first MiB) and the delete step requires all of it. The daemon-process probe read the
+  command line from `ps -o command=`, which procps truncates to `$COLUMNS`, so on CI a long interpreter
+  path hid the script name and a live daemon was reported as not running; it now reads `/proc` where
+  there is one, calls `ps -ww` otherwise, and treats a process it cannot inspect as running.
 - **A rename that lands in the wrong place is detected, and the recovery rename is signal-safe.** Every
   `mv` of the swap is `mv -n` after a free-target check and is then verified by file identity: the target
   path itself (not what a symlink planted there points at) must be the moved tree. If a tree went into a

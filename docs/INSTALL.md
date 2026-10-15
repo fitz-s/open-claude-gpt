@@ -125,7 +125,10 @@ are different claims:
 Overall **ready is `can_send`**: with no daemon there is no way to send, so it is not ready. Exit
 status: `0` ready, `3` installed but cannot send yet (start the daemon / Chrome / log in), `1` the
 install is incomplete (or a `--secure` advisory failed). A daemon process that is alive but has a stale
-heartbeat is reported as exactly that (hung, draining or starting), not as "not running". A fresh `install.sh` therefore ends "installed,
+heartbeat is reported as exactly that (hung, draining or starting), not as "not running". The process
+probe reads `/proc/<pid>/stat` and `/proc/<pid>/cmdline` where `/proc` exists and uses `ps -ww` otherwise
+(plain `ps` truncates the command to `$COLUMNS`, which cut the daemon's script name off the end of a long
+interpreter path on CI); a process that cannot be inspected at all counts as running. A fresh `install.sh` therefore ends "installed,
 cannot send yet" until you run `cgc install-daemon` once.
 
 ## Activation: on-demand vs. proactive
@@ -215,7 +218,10 @@ With `--purge` it prints exactly which paths it is about to delete, then deletes
 printed, one by one**: the delete step is handed the printed plan (with each file's identity) and
 re-checks only the listed paths (still a regular file, still the same file, still named the way the tool
 names it, and still not your config file: that last test is repeated at delete time, so a path that
-became a link to the config after the plan was shown is skipped too). It never scans again, so a file that appeared after the plan was shown, for example a
+became a link to the config after the plan was shown is skipped too). "The same file" is a fingerprint
+of device, inode, size, nanosecond mtime and a SHA-256 of the file's first MiB, never the inode alone:
+Linux filesystems hand a freed inode number to the next file created, so `rm x; echo y > x` leaves the
+same inode, and a plan that trusted it would delete the file someone put there. It never scans again, so a file that appeared after the plan was shown, for example a
 `chrome.log` written by something you restarted meanwhile, is not touched. What the plan contains
 is only files the tool wrote: the database and its `-wal`/`-shm`/`.v<n>.bak` (each a regular file, the database
 and backups with a valid SQLite header), lock files the daemon creates, drift bundles
