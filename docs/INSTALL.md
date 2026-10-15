@@ -128,7 +128,9 @@ install is incomplete (or a `--secure` advisory failed). A daemon process that i
 heartbeat is reported as exactly that (hung, draining or starting), not as "not running". The process
 probe reads `/proc/<pid>/stat` and `/proc/<pid>/cmdline` where `/proc` exists and uses `ps -ww` otherwise
 (plain `ps` truncates the command to `$COLUMNS`, which cut the daemon's script name off the end of a long
-interpreter path on CI); a process that cannot be inspected at all counts as running. A fresh `install.sh` therefore ends "installed,
+interpreter path on CI); a process that cannot be inspected at all counts as running. A pid in `daemon.json` that is not a
+positive integer (0, a negative number, a boolean) is treated as no process and never reaches `kill`:
+`kill(0, …)` and `kill(-n, …)` address whole process groups. A fresh `install.sh` therefore ends "installed,
 cannot send yet" until you run `cgc install-daemon` once.
 
 ## Activation: on-demand vs. proactive
@@ -219,9 +221,15 @@ printed, one by one**: the delete step is handed the printed plan (with each fil
 re-checks only the listed paths (still a regular file, still the same file, still named the way the tool
 names it, and still not your config file: that last test is repeated at delete time, so a path that
 became a link to the config after the plan was shown is skipped too). "The same file" is a fingerprint
-of device, inode, size, nanosecond mtime and a SHA-256 of the file's first MiB, never the inode alone:
-Linux filesystems hand a freed inode number to the next file created, so `rm x; echo y > x` leaves the
-same inode, and a plan that trusted it would delete the file someone put there. It never scans again, so a file that appeared after the plan was shown, for example a
+of device, inode, size, nanosecond mtime and a SHA-256 of the whole file, never the inode alone: Linux
+filesystems hand a freed inode number to the next file created, so `rm x; echo y > x` leaves the same
+inode, and a plan that trusted it would delete the file someone put there. The whole file is hashed
+because logs, answers and drift fixtures grow past any prefix, and a change after the first megabyte with
+the size and mtime put back must still show. The file is opened once (no symlink followed, no fifo read),
+`fstat` is taken on that descriptor before and after the read, and a file that changed while it was read
+is not planned. The fingerprint is **verification, not an atomic delete**: between the final check and the
+`unlink` a process of the same user could still swap the file. Closing that window would need the
+unlink to be conditional on the file, which POSIX does not offer, so it is documented and left. It never scans again, so a file that appeared after the plan was shown, for example a
 `chrome.log` written by something you restarted meanwhile, is not touched. What the plan contains
 is only files the tool wrote: the database and its `-wal`/`-shm`/`.v<n>.bak` (each a regular file, the database
 and backups with a valid SQLite header), lock files the daemon creates, drift bundles

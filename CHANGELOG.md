@@ -23,7 +23,11 @@ releases until it stabilizes.
 - **Two Linux-only failures fixed.** `uninstall.sh --purge` identified a planned file by device and inode
   alone; Linux hands a freed inode number to the next file created, so a file someone put in place of the
   planned one could be deleted. The plan now carries a fingerprint (device, inode, size, nanosecond mtime,
-  SHA-256 of the first MiB) and the delete step requires all of it. The daemon-process probe read the
+  SHA-256 of the whole file, read through one descriptor with `fstat` before and after) and the delete
+  step requires all of it. A file that changed while being read is not planned. This is verification, not
+  an atomic delete: a same-user swap between the final check and the unlink stays a documented residual.
+  A pid that is not a positive integer never reaches `kill` (`kill(0)` and `kill(-n)` mean process
+  groups), in the doctor, in `bin/cgc` and in the installer's stage cleanup. The daemon-process probe read the
   command line from `ps -o command=`, which procps truncates to `$COLUMNS`, so on CI a long interpreter
   path hid the script name and a live daemon was reported as not running; it now reads `/proc` where
   there is one, calls `ps -ww` otherwise, and treats a process it cannot inspect as running.
