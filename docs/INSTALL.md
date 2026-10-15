@@ -40,12 +40,25 @@ daemon restarted. Two rules make that hold when the failure lands in the middle 
 
 - **A signal never cuts between a rename and the bookkeeping for it.** The three renames (park an older
   `.bak`, move the current install to `.bak`, move the staged tree into place) run with signals deferred;
-  one that arrives meanwhile is acted on right after, so it always finds a state it can undo.
+  one that arrives meanwhile is acted on right after, so it always finds a state it can undo. The same
+  holds for the recovery rename below (`.bak` back to the install path) together with the note that the
+  daemon is owed a start.
 - **The rollback reads the disk, not its own variables.** It identifies the trees by file identity
   (device and inode, which a rename keeps): the old tree is wherever the old identity is, and it is moved
   back to `chatgpt-consult` only after whatever sits there (the new tree, or the `--link` symlink, removed
   as a link and never descended into) has been removed. Nothing is ever renamed onto an existing path, so
   a rollback cannot nest one tree inside another or write into your clone of the repo.
+
+Every rename is also **verified, not trusted**. Each one is `mv -n` (never overwrites) after a check that
+the target is free, and afterwards the target path itself (not what a symlink there would lead to) must
+carry the identity of the tree that was moved. If something appeared at the target between the check
+and the rename, so that the tree went *into* it, the install does not go on: it names both paths and the
+place the tree ended up, fails, and rolls back from there (the stray location is searched too). If even
+that cannot be put right it says where the old tree is and exits non-zero; it never reports success.
+
+**Out of scope:** another process of the same user writing into the skills directory while an install
+runs. The install detects the damage described above (a misplaced or missing tree) and stops; it does
+not try to out-race such a writer or to lock the directory against it.
 
 An existing `.bak` is a previous install, possibly the only intact one: it is parked, and deleted only
 after the new daemon has been verified. `--force` keeps a new install whose daemon did not come up, and
@@ -201,7 +214,8 @@ front instead of taking it along.
 With `--purge` it prints exactly which paths it is about to delete, then deletes **only those paths, as
 printed, one by one**: the delete step is handed the printed plan (with each file's identity) and
 re-checks only the listed paths (still a regular file, still the same file, still named the way the tool
-names it). It never scans again, so a file that appeared after the plan was shown, for example a
+names it, and still not your config file: that last test is repeated at delete time, so a path that
+became a link to the config after the plan was shown is skipped too). It never scans again, so a file that appeared after the plan was shown, for example a
 `chrome.log` written by something you restarted meanwhile, is not touched. What the plan contains
 is only files the tool wrote: the database and its `-wal`/`-shm`/`.v<n>.bak` (each a regular file, the database
 and backups with a valid SQLite header), lock files the daemon creates, drift bundles

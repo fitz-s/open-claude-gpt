@@ -20,6 +20,16 @@ releases until it stabilizes.
   Older code is refused over a newer store before anything is stopped. New verbs: `cgc daemon-stop`,
   `daemon-start [--any]`, `daemon-pid`; `cgc uninstall-daemon` and `install-daemon` now wait for the
   process to exit (`uninstall-daemon` keeps the plist if it will not).
+- **A rename that lands in the wrong place is detected, and the recovery rename is signal-safe.** Every
+  `mv` of the swap is `mv -n` after a free-target check and is then verified by file identity: the target
+  path itself (not what a symlink planted there points at) must be the moved tree. If a tree went into a
+  directory that appeared at the target, the install fails loudly with both paths and the stray location,
+  rolls back from where the tree really is, and reports where the old tree ended up if even that fails;
+  it never continues or reports success. The SIGKILL-recovery rename (`.bak` back to the install path) and
+  the record that the daemon is owed a start are one deferred step, so a TERM between them can no longer
+  leave the daemon unloaded. `uninstall.sh --purge` also re-tests, at delete time, that a planned path has
+  not become the config file. Another same-user process writing into the skills directory during an
+  install is out of scope beyond this detection.
 - **A signal can no longer strand an upgrade half way.** The renames of the swap run with signals
   deferred and a signal that arrives meanwhile is acted on right after them. The rollback reads the disk
   by file identity (device and inode) instead of trusting its progress variables, removes whatever occupies
