@@ -8,7 +8,20 @@
 #   cgc install-daemon                install the egress daemon as a launchd agent — RUN THIS ONCE.
 #                                     Starts at login, restarts if it dies, so neither you nor the
 #                                     agent ever has to start or check it again.
-#   cgc uninstall-daemon              remove that launchd agent and stop the daemon
+#   cgc uninstall-daemon              stop that launchd agent (waits until it has really exited), then
+#                                     remove its plist; keeps the plist if the daemon will not stop
+#   cgc daemon-stop                   stop the launchd daemon and wait until its PROCESS has exited and
+#                                     daemon.lock is free (heartbeat age is never consulted). Exit 0 =
+#                                     stopped, 10 = nothing running, 1 = a daemon process is still there
+#                                     (named by pid) or one runs outside launchd. install.sh calls this
+#                                     BEFORE it replaces any code.
+#   cgc daemon-start [--any]          load the installed plist, then wait for the daemon's heartbeat and
+#                                     check it runs THIS code's store and schema (--any: any live
+#                                     heartbeat will do, for restoring a previous install). Exit 1 on
+#                                     timeout/mismatch, 10 = no plist installed
+#   cgc daemon-pid                    print the pid(s) of a running daemon PROCESS, found by daemon.lock
+#                                     or the pid in daemon.json (however old), however it was started.
+#                                     Exit 0 = a process or the lock exists, 1 = none, 2 = cannot tell
 #   cgc watch   [--once]              run the egress daemon in the FOREGROUND (debugging / one-off)
 #   cgc up                            start the debug Chrome AND the daemon (detached) — ad-hoc setup
 #   cgc fire    <args…>               deliver+prep+enqueue in ONE call — the normal path
@@ -66,6 +79,94 @@ find_scripts() {
 S="$(find_scripts)"
 [ -z "$S" ] && { echo "cgc: cannot locate skill scripts (set CGC_HOME)" >&2; exit 1; }
 
+LABEL="com.open-claude-gpt.daemon"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+GUI="gui/$(id -u)"
+
+# "Is there a launchd to manage" is asked of PATH, not of uname: the same answer on a Mac, and a
+# launchctl stub on PATH is all a test needs.
+have_launchd() { command -v launchctl >/dev/null 2>&1; }
+loaded() { launchctl print "$GUI/$LABEL" >/dev/null 2>&1; }
+
+# A zombie answers kill -0 forever; only a process that has really gone counts as stopped. Only a positive
+# integer is a pid: kill -0 0 and kill -0 -N address a whole process group, so anything else is "not alive"
+# without ever reaching kill.
+alive() {
+  case "$1" in ''|*[!0-9]*|0*) return 1 ;; esac
+  kill -0 "$1" 2>/dev/null && [ "$(ps -o stat= -p "$1" 2>/dev/null | cut -c1)" != Z ]
+}
+any_alive() { local p; for p in "$@"; do alive "$p" && return 0; done; return 1; }
+
+# Is a daemon PROCESS there? Decided by the process and its lock, never by heartbeat freshness: a
+# daemon that is draining, wedged or restarting has a stale heartbeat and still executes the files.
+# A process counts if it holds daemon.lock, or is the pid recorded in daemon.json (read whatever its
+# age) and is alive and runs cgc_daemon.py. Prints the pids; exit 0 = a process or the held lock
+# exists, 1 = neither, 2 = could not tell (callers treat that as "running").
+procs() {
+  python3 - "$S" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+try:
+    import cgc_doctor
+    r = cgc_doctor.daemon_processes()
+except Exception as e:
+    sys.stderr.write(f"cgc: cannot inspect the daemon ({type(e).__name__}: {e})\n")
+    sys.exit(2)
+print(" ".join(map(str, r["pids"])))
+sys.exit(0 if (r["pids"] or r["lock_held"]) else 1)
+PYEOF
+}
+
+# Stop the launchd job and wait until the daemon is really gone: its pid no longer exists AND
+# daemon.lock can be taken. bootout can return while the daemon is still draining; replacing or
+# deleting its code before that is the failure this exists to prevent. Refuses (exit 1, pid named)
+# when a daemon runs outside launchd: that process is the user's own and is not ours to kill.
+# The fallback has no -w: that would mark the label disabled across logins.
+stop_job() {
+  local i n rc pre now limit="${CGC_STOP_WAIT_S:-60}"
+  rc=0; pre="$(procs)" || rc=$?
+  if [ "$rc" -ge 2 ]; then
+    echo "cgc: cannot tell whether a daemon is running — not touching its files." >&2
+    return 1
+  fi
+  if ! loaded; then
+    [ "$rc" = 1 ] && return 0
+    echo "cgc: a daemon process (pid ${pre:-unidentified; daemon.lock is held}) is running outside launchd —" >&2
+    echo "     stop it first (Ctrl-C a foreground \`cgc watch\`, or: kill ${pre:-<pid>})." >&2
+    return 1
+  fi
+  launchctl bootout "$GUI/$LABEL" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null || true
+  n=$((limit * 2))
+  for ((i = 0; i < n; i++)); do
+    rc=0; now="$(procs)" || rc=$?
+    if [ "$rc" = 1 ] && ! loaded && ! any_alive $pre; then return 0; fi
+    sleep 0.5
+  done
+  echo "cgc: daemon process ${now:-${pre:-unidentified (daemon.lock is held)}} is still running ${limit}s after the stop request — not touching its files." >&2
+  return 1
+}
+
+# Heartbeat of the live daemon: prints its pid, exit 1 when none is live. With --current it also exits
+# 3 (reason on stderr) unless the daemon serves THIS install's store and schema, the same test the
+# doctor applies: an old-code daemon that survived, or one the new code cannot talk to.
+heartbeat() {
+  python3 - "$S" "${1:-}" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import cgc_spool
+d = cgc_spool.daemon_identity()
+if d is None:
+    sys.exit(1)
+print(d.get("pid"))
+if sys.argv[2] == "--current":
+    import cgc_doctor      # only here: stopping a daemon must not depend on the doctor importing
+    bad = cgc_doctor.daemon_mismatch(d)
+    if bad:
+        sys.stderr.write(f"cgc: the live daemon (pid {d.get('pid')}) {bad}\n")
+        sys.exit(3)
+PYEOF
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
   doctor)   exec python3 "$S/cgc_doctor.py" "$@" ;;
@@ -78,13 +179,11 @@ case "$cmd" in
     # it burn tokens checking. launchd removes it: RunAtLoad + KeepAlive means the daemon is up at
     # login and respawns if it crashes. The daemon still runs as YOU (your login session, your gate,
     # your ChatGPT profile) — the agent never starts it, it just finds it already there.
-    case "$(uname -s)" in
-      Darwin) ;;
-      *) echo "cgc install-daemon: macOS/launchd only. On Linux, run the equivalent systemd --user" >&2
-         echo "  unit for: $(command -v python3) $S/cgc_daemon.py" >&2; exit 2 ;;
-    esac
-    label="com.open-claude-gpt.daemon"
-    plist="$HOME/Library/LaunchAgents/$label.plist"
+    have_launchd || {
+      echo "cgc install-daemon: needs launchd (macOS). On Linux, run the equivalent systemd --user" >&2
+      echo "  unit for: $(command -v python3) $S/cgc_daemon.py" >&2; exit 2; }
+    label="$LABEL"
+    plist="$PLIST"
     log="${CGC_STATE_DIR:-/tmp/cgc}/daemon.log"
     mkdir -p "$HOME/Library/LaunchAgents" "$(dirname "$log")"
     # Generate the plist with plistlib rather than hand-rolled XML (escaping is not our problem to
@@ -111,8 +210,8 @@ with open(plist_path, "wb") as f:
     }, f)
 print(f"cgc: wrote {plist_path}")
 PYEOF
-    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl load -w "$plist"
+    stop_job || exit 1
+    launchctl bootstrap "$GUI" "$plist" 2>/dev/null || launchctl load -w "$plist"
     sleep 1
     python3 "$S/cgc_spool.py" status
     echo
@@ -121,12 +220,41 @@ PYEOF
     echo "debug Chrome — run 'cgc launch', log in, done. The daemon opens Chrome itself after that."
     ;;
   uninstall-daemon)
-    label="com.open-claude-gpt.daemon"
-    plist="$HOME/Library/LaunchAgents/$label.plist"
-    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || launchctl unload -w "$plist" 2>/dev/null || true
-    rm -f "$plist"
-    echo "cgc: removed $plist and stopped the daemon."
+    # Stop first and wait; the plist goes only once the daemon process has really exited, so a daemon
+    # that will not stop is still addressable (and `cgc uninstall-daemon` can simply be re-run). A
+    # daemon running outside launchd (`cgc watch`) is refused here too, not left to run on deleted code.
+    stop_job || exit 1
+    if have_launchd && [ -e "$PLIST" ]; then rm -f "$PLIST"; echo "cgc: stopped the daemon and removed $PLIST."
+    else echo "cgc: no daemon service installed ($PLIST absent); no daemon process is running."; fi
     ;;
+  daemon-stop)
+    have_launchd || exit 10
+    if ! loaded; then
+      r=0; procs >/dev/null 2>&1 || r=$?
+      [ "$r" = 1 ] && exit 10                      # nothing loaded, nothing running
+    fi
+    stop_job || exit 1
+    echo "cgc: daemon stopped."
+    ;;
+  daemon-start)
+    have_launchd && [ -e "$PLIST" ] || exit 10
+    hb_mode="--current"; [ "${1:-}" = "--any" ] && hb_mode=""
+    loaded || launchctl bootstrap "$GUI" "$PLIST" 2>/dev/null || launchctl load -w "$PLIST"
+    n=$((${CGC_START_WAIT_S:-30} * 2)); rc=1
+    for ((i = 0; i < n; i++)); do
+      rc=0; heartbeat $hb_mode >/dev/null 2>&1 || rc=$?
+      [ "$rc" = 0 ] && { echo "cgc: daemon is up (heartbeat live${hb_mode:+, store schema current})."; exit 0; }
+      sleep 0.5
+    done
+    if [ "$rc" = 3 ]; then
+      heartbeat $hb_mode >/dev/null || true       # prints why the live daemon is not this install's
+    else
+      echo "cgc: no live daemon heartbeat ${CGC_START_WAIT_S:-30}s after loading $PLIST (log: ${CGC_STATE_DIR:-/tmp/cgc}/daemon.log)." >&2
+    fi
+    exit 1
+    ;;
+  daemon-pid)
+    procs ;;
   up)
     # Full setup in one command (USER-run, not the agent): ensure the debug Chrome is up, then
     # start the egress daemon DETACHED so it keeps running after this shell exits. The agent must

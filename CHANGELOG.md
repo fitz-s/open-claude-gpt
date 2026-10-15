@@ -6,6 +6,84 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — install, uninstall, doctor and config lifecycle (v0.6 review)
+
+- **Upgrade stops the daemon before replacing files.** `install.sh` used to copy the new tree over a
+  running daemon and restart it afterwards, so the daemon imported modules lazily from a half-replaced
+  tree. It now stops the launchd job, waits until the daemon process has exited and `daemon.lock` is
+  free, swaps in a staged copy, starts the daemon and checks its heartbeat names this install's store
+  schema. "Gone" is judged by the process and its lock, never by heartbeat age (a draining daemon has a
+  stale heartbeat and still runs the files). A daemon that will not stop, or one running outside launchd
+  (`cgc watch`), stops the install before anything changes. The swap is a transaction: any failure after
+  the old tree was moved aside (a rename, the new daemon not coming up, Ctrl-C) puts it back and restarts
+  the old daemon, and an existing `.bak` is parked, never deleted before the new daemon is verified.
+  Older code is refused over a newer store before anything is stopped. New verbs: `cgc daemon-stop`,
+  `daemon-start [--any]`, `daemon-pid`; `cgc uninstall-daemon` and `install-daemon` now wait for the
+  process to exit (`uninstall-daemon` keeps the plist if it will not).
+- **Two Linux-only failures fixed.** `uninstall.sh --purge` identified a planned file by device and inode
+  alone; Linux hands a freed inode number to the next file created, so a file someone put in place of the
+  planned one could be deleted. The plan now carries a fingerprint (device, inode, size, nanosecond mtime,
+  SHA-256 of the whole file, read through one descriptor with `fstat` before and after) and the delete
+  step requires all of it. A file that changed while being read is not planned. This is verification, not
+  an atomic delete: a same-user swap between the final check and the unlink stays a documented residual.
+  A pid that is not a positive integer never reaches `kill` (`kill(0)` and `kill(-n)` mean process
+  groups), in the doctor, in `bin/cgc` and in the installer's stage cleanup. The daemon-process probe read the
+  command line from `ps -o command=`, which procps truncates to `$COLUMNS`, so on CI a long interpreter
+  path hid the script name and a live daemon was reported as not running; it now reads `/proc` where
+  there is one, calls `ps -ww` otherwise, and treats a process it cannot inspect as running.
+- **A rename that lands in the wrong place is detected, and the recovery rename is signal-safe.** Every
+  `mv` of the swap is `mv -n` after a free-target check and is then verified by file identity: the target
+  path itself (not what a symlink planted there points at) must be the moved tree. If a tree went into a
+  directory that appeared at the target, the install fails loudly with both paths and the stray location,
+  rolls back from where the tree really is, and reports where the old tree ended up if even that fails;
+  it never continues or reports success. The SIGKILL-recovery rename (`.bak` back to the install path) and
+  the record that the daemon is owed a start are one deferred step, so a TERM between them can no longer
+  leave the daemon unloaded. `uninstall.sh --purge` also re-tests, at delete time, that a planned path has
+  not become the config file. Another same-user process writing into the skills directory during an
+  install is out of scope beyond this detection.
+- **A signal can no longer strand an upgrade half way.** The renames of the swap run with signals
+  deferred and a signal that arrives meanwhile is acted on right after them. The rollback reads the disk
+  by file identity (device and inode) instead of trusting its progress variables, removes whatever occupies
+  the install path (the new tree, or the `--link` symlink, as a link) before moving the old tree back, and
+  never renames onto an existing path, so it cannot nest a tree inside another or write into the repo a
+  `--link` install points at. Re-running `install.sh` after a SIGKILL that left the old tree only at
+  `.bak` now restores it first instead of reporting success over an empty install path.
+- **`uninstall.sh --purge` protects the config by identity and deletes the plan it showed.** Paths are
+  compared by device and inode, not by spelling: a case alias (`ACTIVE.JSON` for `active.json` on APFS), a
+  hard link or a symlink to the config file is the config file, and so is every "inside the tree being
+  deleted" test. The delete step is handed the printed plan and re-checks only those paths (regular file,
+  same inode, tool-shaped name); it never scans again, so a file created or swapped after the plan was
+  shown is left alone.
+- **`uninstall.sh` removes things in a safe order, keeps the journal, and deletes only what the tool
+  wrote.** Every path is resolved and checked before anything changes. The service is stopped (process and
+  lock, not heartbeat) and removed first, then our `SessionStart` entry leaves `settings.json` (JSON-aware;
+  other hooks untouched; `.bak` kept), then the code goes. `settings.json` fails closed: unreadable or
+  unsafe stops the uninstall, and only readable invalid JSON can be skipped, with `--force`. The consult
+  store (`control.db`, `-wal`, `-shm`, `control.db.v<n>.bak`) is kept unless `--purge`, which lists every
+  path and deletes regular files of the tool's own names one by one (database and backups must carry a
+  SQLite header), never a directory recursively and never because its name contains `cgc`. A store or
+  config file inside the tree being deleted is refused up front; the config file is never deleted. The
+  old purge ran `rm -rf` on `CGC_STORE_DB`'s directory and on a scratch dir picked by name, which could
+  take a user directory or the config with it, and its message pointed at `/tmp/cgc` although the store
+  lives in `~/.local/state/cgc`.
+- **`cgc doctor` reports three verdicts and is ready only when it can send.** `installed`, `can_send`
+  (daemon heartbeat live and serving this install's store and schema, debug Chrome port answering) and
+  `can_read` (store readable at a known schema). No daemon is not ready (exit 3); it used to be a
+  warning, so a machine that could not send printed "all checks passed". The required-file list now
+  matches what the code loads (`chatgpt_contract.json`, `fixture_dom.js`, `cgc_drift.py` and every
+  other module; `retrieval_window.js` is gone), and a test pins the list to `skill/scripts`.
+  `--json` gains `ready` and `verdicts`. The debug-port probe no longer goes through `http_proxy`.
+- **`cgc_config` validates and writes safely.** A key must be `CGC_` plus capitals, digits or `_`; a
+  key no script reads is stored with a warning (a typo); a value with any character `str.splitlines()`
+  treats as a line break (`\v \f \x1c-\x1e \x85 U+2028 U+2029` as well as `\n \r`) or NUL is refused,
+  because the reader would see a second line; `CGC_PORT`, `CGC_WEEKLY_BUDGET` and the on/off flags must
+  parse, and a hand-edited bad value is skipped at load with a message instead of crashing every
+  command. Writes take an exclusive lock, re-read the file under it and replace it through a unique
+  temp file, so concurrent `set`s all land; the old fixed `<config>.tmp` lost updates and made two of
+  three concurrent writers crash. Only a missing file is an empty config: an unreadable or non-UTF-8 file
+  aborts the write and is left as it was (it used to be replaced by one line). `cgc doctor --deep` opens
+  its CDP websocket on a socket of its own, so `HTTP_PROXY` can no longer tunnel the loopback connection.
+
 ### Added — one UI contract, and a repair bundle when ChatGPT's page changes
 
 - Every ChatGPT DOM fact the driver reads (turn schemas, answer body, composer, mention popup and
