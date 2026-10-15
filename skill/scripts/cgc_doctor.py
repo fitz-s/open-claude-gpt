@@ -322,29 +322,64 @@ def check_skill_files(r: "Report", here: str = HERE) -> None:
         r.fail("skill files", "; ".join(problems), "re-run install.sh from the repo", verdict="installed")
 
 
+def _proc_stat_state(pid):
+    """The process state letter from /proc/<pid>/stat (Linux), or None when /proc has no answer. The state
+    is the field after the command name, which is parenthesised and may itself hold spaces and parens, so
+    it is read after the LAST ')'."""
+    try:
+        with open(f"/proc/{int(pid)}/stat", "rb") as f:
+            raw = f.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+    tail = raw.rpartition(")")[2].split()
+    return tail[0] if tail else None
+
+
+def _ps_field(pid, field):
+    """`ps -ww -o <field>= -p <pid>` (macOS, BSD and procps-ng take it), or None when ps is absent, fails, or
+    prints nothing. -ww matters: procps truncates `command` to $COLUMNS (CI runners set it) when ps is not
+    writing to a terminal, and the daemon's script name is at the END of the line, so without it a long
+    interpreter path cuts the very word being looked for."""
+    for argv in (["ps", "-ww", "-o", f"{field}=", "-p", str(int(pid))],
+                 ["ps", "-o", f"{field}=", "-p", str(int(pid))]):     # a ps that rejects -ww
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        except Exception:
+            return None
+        out = r.stdout.strip()
+        if r.returncode == 0 and out:
+            return out
+    return None
+
+
 def _pid_running(pid) -> bool:
-    """A process that exists and is not a zombie: a zombie answers kill -0 until its parent reaps it,
-    and holds no lock, so it must not count as a daemon that is still running."""
+    """A process that exists and is not a zombie: a zombie answers kill -0 until its parent reaps it, and
+    holds no lock, so it must not count as a daemon that is still running. Fail-safe: when kill -0 says it
+    exists and nothing can say it is a zombie, it counts as running (a wrong "still there" blocks a
+    replace; a wrong "gone" would allow one under a live daemon)."""
     try:
         os.kill(int(pid), 0)
     except PermissionError:
         pass                                    # exists, owned by another user
     except (OSError, ValueError, TypeError):
         return False
-    try:
-        out = subprocess.run(["ps", "-o", "stat=", "-p", str(int(pid))], capture_output=True, text=True,
-                             timeout=5).stdout.strip()
-    except Exception:
-        return True                             # cannot tell: assume it is still there
-    return bool(out) and not out.startswith("Z")
+    state = _proc_stat_state(pid)               # Linux: no ps needed
+    if state is None:
+        state = _ps_field(pid, "stat")          # macOS/BSD, or a Linux without /proc
+    return not (state or "").startswith("Z")
 
 
 def _command_of(pid) -> str:
+    """The command line of `pid`, or "" when it cannot be read. /proc first (exact, not width-limited, no
+    ps needed), then ps."""
     try:
-        return subprocess.run(["ps", "-o", "command=", "-p", str(int(pid))], capture_output=True, text=True,
-                              timeout=5).stdout
-    except Exception:
-        return ""
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            raw = f.read()
+    except (OSError, ValueError):
+        raw = b""
+    if raw:
+        return raw.replace(b"\0", b" ").decode("utf-8", "replace")
+    return _ps_field(pid, "command") or ""
 
 
 def _lock_holders(lock_dir: str) -> list:

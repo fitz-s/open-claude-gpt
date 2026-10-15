@@ -228,3 +228,117 @@ def test_doctor_a_dead_pid_in_daemon_json_is_plain_not_running(doc_env, monkeypa
     with _FakeChrome() as ch:
         _, rep = _run_doctor(monkeypatch, ch.port)
     assert any("not running" in w for w in rep.why["can_send"])
+
+
+# ---- the process probe must not depend on how `ps` happens to print ------------------------------------
+# On the CI runners the interpreter lives under a long path (/opt/hostedtoolcache/Python/3.11.17/x64/bin/python)
+# and COLUMNS is set, so a plain `ps -o command=` cut the line before the script name at its end. The probe now
+# reads /proc/<pid>/cmdline first and calls `ps -ww` otherwise. These tests build that condition on any platform.
+
+def _long_path_python(tmp_path):
+    d = tmp_path / ("x" * 70) / "bin"
+    d.mkdir(parents=True)
+    link = d / "python"
+    link.symlink_to(sys.executable)
+    return str(link)
+
+
+def test_command_of_sees_the_script_name_behind_a_long_interpreter_path_and_narrow_columns(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "40")
+    d = _doctor()
+    p = subprocess.Popen([_long_path_python(tmp_path), "-c", "import time; time.sleep(30)", "cgc_daemon.py"])
+    try:
+        assert "cgc_daemon.py" in d._command_of(p.pid)
+        assert d._pid_running(p.pid)
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_command_of_falls_back_to_ps_when_there_is_no_proc(tmp_path, monkeypatch):
+    """No /proc (macOS, or a sandbox): the ps path must see the same name with a narrow COLUMNS."""
+    monkeypatch.setenv("COLUMNS", "40")
+    d = _doctor()
+    real_open = open
+
+    def no_proc(path, *a, **k):
+        if str(path).startswith("/proc/"):
+            raise FileNotFoundError(path)
+        return real_open(path, *a, **k)
+    monkeypatch.setattr("builtins.open", no_proc)
+    p = subprocess.Popen([_long_path_python(tmp_path), "-c", "import time; time.sleep(30)", "cgc_daemon.py"])
+    try:
+        assert "cgc_daemon.py" in d._command_of(p.pid)
+        assert d._pid_running(p.pid)
+    finally:
+        p.kill()
+        p.wait()
+
+
+def test_a_process_that_cannot_be_inspected_counts_as_running(monkeypatch):
+    """Fail safe: kill -0 says it exists, neither /proc nor ps can say more. Wrongly 'gone' would allow
+    replacing the code under a live daemon; wrongly 'still there' only delays a replace."""
+    d = _doctor()
+    monkeypatch.setattr(d, "_proc_stat_state", lambda pid: None)
+    monkeypatch.setattr(d, "_ps_field", lambda pid, field: None)
+    assert d._pid_running(os.getpid()) is True
+
+
+def test_a_zombie_is_not_running(monkeypatch):
+    d = _doctor()
+    monkeypatch.setattr(d, "_proc_stat_state", lambda pid: "Z")
+    assert d._pid_running(os.getpid()) is False
+    monkeypatch.setattr(d, "_proc_stat_state", lambda pid: None)
+    monkeypatch.setattr(d, "_ps_field", lambda pid, field: "Zs" if field == "stat" else None)
+    assert d._pid_running(os.getpid()) is False
+
+
+def test_proc_stat_state_reads_a_command_name_with_spaces_and_parens(tmp_path, monkeypatch):
+    """The state letter follows the LAST ')': a process called 'a) S (b' must not shift the field."""
+    d = _doctor()
+    real_open = open
+
+    def fake(path, *a, **k):
+        if str(path) == "/proc/4242/stat":
+            f = tmp_path / "stat"
+            f.write_bytes(b"4242 (a) S (b) R 1 1 1 0 -1 4194304\n")
+            return real_open(f, *a, **k)
+        return real_open(path, *a, **k)
+    monkeypatch.setattr("builtins.open", fake)
+    assert d._proc_stat_state(4242) == "R"
+
+
+def test_ps_fallback_asks_for_the_full_line_when_ps_truncates_to_columns(tmp_path, monkeypatch):
+    """The CI failure, on any platform: a procps-like `ps` that cuts `command` to $COLUMNS unless it is given
+    -ww (what procps-ng does when it is not writing to a terminal). With /proc hidden the doctor goes through
+    ps, and a plain `ps -o command=` would lose the script name at the end of a long line."""
+    shimdir = tmp_path / "psbin"
+    shimdir.mkdir()
+    ps = shimdir / "ps"
+    ps.write_text(
+        "#!/bin/bash\n"
+        'wide=0; for a in "$@"; do [ "$a" = "-ww" ] && wide=1; done\n'
+        'out="$(/bin/ps "$@")"\n'
+        '[ "$wide" = 1 ] || out="${out:0:${COLUMNS:-80}}"\n'
+        'printf "%s\\n" "$out"\n')
+    ps.chmod(0o755)
+    if not os.path.exists("/bin/ps"):
+        pytest.skip("needs /bin/ps to wrap")
+    monkeypatch.setenv("PATH", str(shimdir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("COLUMNS", "40")
+    d = _doctor()
+    real_open = open
+
+    def no_proc(path, *a, **k):
+        if str(path).startswith("/proc/"):
+            raise FileNotFoundError(path)
+        return real_open(path, *a, **k)
+    monkeypatch.setattr("builtins.open", no_proc)
+    p = subprocess.Popen([_long_path_python(tmp_path), "-c", "import time; time.sleep(30)", "cgc_daemon.py"])
+    try:
+        assert "cgc_daemon.py" in d._command_of(p.pid), "ps was asked for a width-limited line"
+        procs = d.daemon_processes()
+        assert isinstance(procs, dict)
+    finally:
+        p.kill()
+        p.wait()

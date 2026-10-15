@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import sys
 
+import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "skill", "scripts")
@@ -256,6 +257,7 @@ def test_install_refuses_a_daemon_that_will_not_stop_and_changes_nothing(sb):
     assert "bootstrap" not in sb.calls()
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a 0555 directory, so there is no failure to provoke")
 def test_install_failure_after_stop_restores_the_daemon_on_the_old_tree(sb):
     """A copy that fails (read-only skills root) must not leave the daemon stopped."""
     sb.old_install()
@@ -468,6 +470,7 @@ def test_uninstall_stops_before_deleting_anything_when_the_daemon_will_not_stop(
     assert sb.dest.exists() and sb.plist.exists() and "ACTIVATION" in sb.settings.read_text()
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes into a 0555 directory, so there is no failure to provoke")
 def test_uninstall_does_not_delete_code_when_the_hook_cannot_be_removed(sb):
     sb.old_install()
     _seed_settings(sb)

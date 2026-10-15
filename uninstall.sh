@@ -49,7 +49,12 @@ ctl() { CGC_HOME="$REPO/skill" "$REPO/bin/cgc" "$@"; }
 #   refuse   note = why the whole uninstall must stop before changing anything
 #   note     path = a directory left alone, note = why (shown under --purge)
 #   journal / lock / incident / scratch   a file the tool wrote and --purge would delete;
-#            note = its identity "device:inode", which the delete step must find again
+#            note = its fingerprint "device:inode:size:mtime_ns:sha256", which the delete step must find
+#            again. An inode alone does not identify a file: Linux filesystems hand a freed inode number
+#            to the next file created, so `rm x; echo y > x` leaves the same device:inode, and a plan
+#            that trusted it would delete the file someone put there. The size, the nanosecond mtime and a
+#            hash of the content (of the first 1 MiB plus the size, for a large file) are what tell the
+#            two files apart; a file that cannot be read has no fingerprint and is never planned.
 #   settings state (ok|absent|parse|blocked) in the note: what happened reading Claude's settings.json
 #   profile  path = the Chrome profile to offer for deletion ("-" if none), note = why not
 #   deleted / failed   (delete mode)
@@ -132,6 +137,27 @@ def within(p, d, strict=False):
         if parent == cur:
             return False
         cur, first = parent, False
+
+
+HASH_BYTES = 1 << 20
+
+
+def fingerprint(p, st=None):
+    """What a planned file is: "dev:ino:size:mtime_ns:sha256-of-its-head". The delete step compares it to the
+    one in the plan, so a different file that reuses the inode (or the same name, size and time) is not
+    mistaken for the planned one. None when the file cannot be read: it is then neither planned nor deleted."""
+    import hashlib
+    try:
+        st = st or os.lstat(p)
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            h.update(f.read(HASH_BYTES))
+        st2 = os.lstat(p)
+    except OSError:
+        return None
+    if (st2.st_dev, st2.st_ino, st2.st_size, st2.st_mtime_ns) != (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns):
+        return None                         # it changed while being read: not a stable file
+    return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}:{h.hexdigest()}"
 
 
 def tabbed(p):
@@ -236,8 +262,8 @@ if mode == "delete":
             # at plan time `p` was not the config file; it is now (a link or alias made since). The
             # config is never deleted, so the plan is not honoured for this path.
             print("failed\t" + p + "\tis your config file; left alone")
-        elif f"{st.st_dev}:{st.st_ino}" != ident:
-            print("failed\t" + p + "\tis not the file that was planned (replaced since); left alone")
+        elif fingerprint(p, st) != ident:
+            print("failed\t" + p + "\tis not the file that was planned (replaced or changed since); left alone")
         elif not name_ok(kind, p) or not allowed(os.path.dirname(p)) or not header_ok(kind, p):
             print("failed\t" + p + "\tno longer matches what the tool writes; left alone")
         else:
@@ -282,8 +308,13 @@ def plan_file(kind, p, seen):
     if tabbed(p):
         refuse_if_deleting(f"{p} has a tab or newline in its path and cannot be listed safely; remove it by hand.")
         return False
+    fp = fingerprint(p, st)
+    if fp is None:
+        refuse_if_deleting(f"{p} cannot be read or is changing, so it cannot be planned for deletion; "
+                           "remove it by hand if it is yours.")
+        return False
     seen.add(key)
-    todo.append((kind, p, f"{st.st_dev}:{st.st_ino}"))
+    todo.append((kind, p, fp))
     return True
 
 

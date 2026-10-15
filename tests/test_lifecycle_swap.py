@@ -291,6 +291,98 @@ def test_P3_a_planned_file_replaced_by_another_file_is_left_alone(sb):
     assert "not the file that was planned" in r.stderr
 
 
+# A freed inode number is handed to the next file created: on Linux filesystems `rm x; echo y > x` very often
+# gives the new file the old one's device:inode. A plan that identified a file by inode alone would then delete
+# the file somebody put there (the first CI run of this branch lost exactly the file that
+# test_P3_a_planned_file_replaced_by_another_file_is_left_alone protects, on Linux only). The fingerprint is
+# device:inode:size:mtime_ns:sha256(head), so these tests take the allocator out of the picture and build the
+# collisions by hand.
+
+def _with_bootout_hook(sb, body):
+    """Run shell `body` inside the launchctl stub's bootout: after the plan was shown, before the delete."""
+    stub = sb.stubs / "launchctl"
+    sb.cgc("install-daemon")
+    stub.write_text(stub.read_text().replace('case "$1" in\n  bootout|unload)',
+                                             'case "$1" in\n  bootout|unload)\n' + body, 1))
+
+
+def test_P3_same_inode_size_and_mtime_but_other_content_is_left_alone(sb):
+    """The worst case for an inode-only check: the planned file rewritten in place, same inode, same size, the
+    original mtime put back. Only the content hash tells it from the planned file."""
+    sb.old_install()
+    sb.state.mkdir()
+    victim = sb.state / "daemon.log"
+    victim.write_text("AAAAAAAA")
+    ns = victim.stat().st_mtime_ns
+    ino = victim.stat().st_ino
+    _with_bootout_hook(sb, (
+        "    python3 - \"%s\" %d <<'PY'\n"
+        "import os, sys\n"
+        "p, ns = sys.argv[1], int(sys.argv[2])\n"
+        "with open(p, 'r+b') as f:\n"
+        "    f.write(b'BBBBBBBB')\n"
+        "os.utime(p, ns=(ns, ns))\n"
+        "PY\n") % (victim, ns))
+    r = sb.uninstall("--purge")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert victim.read_text() == "BBBBBBBB", "a file with other content was deleted because its inode matched"
+    st = victim.stat()
+    assert (st.st_ino, st.st_size, st.st_mtime_ns) == (ino, 8, ns), "the collision was not actually built"
+    assert "not the file that was planned" in r.stderr
+
+
+def test_P3_a_replacement_that_took_over_the_planned_inode_is_left_alone(sb):
+    """The reviewer's Linux case, built so it does not depend on the filesystem's allocator: the planned
+    inode is held by a hard link while the name is removed, then the NAME comes back on that same inode with
+    different content and the planned mtime. Everything an inode check can see is identical."""
+    sb.old_install()
+    sb.state.mkdir()
+    victim = sb.state / "daemon.log"
+    victim.write_text("planned content")
+    ns = victim.stat().st_mtime_ns
+    ino = victim.stat().st_ino
+    _with_bootout_hook(sb, (
+        "    python3 - \"%s\" %d <<'PY'\n"
+        "import os, sys\n"
+        "p, ns = sys.argv[1], int(sys.argv[2])\n"
+        "keep = p + '.keep'\n"
+        "os.link(p, keep)\n"
+        "os.remove(p)\n"
+        "os.rename(keep, p)\n"
+        "with open(p, 'wb') as f:\n"
+        "    f.write(b'planned content')\n"                       # same size again: only the bytes differ below
+        "with open(p, 'r+b') as f:\n"
+        "    f.write(b'PLANNED')\n"
+        "os.utime(p, ns=(ns, ns))\n"
+        "PY\n") % (victim, ns))
+    r = sb.uninstall("--purge")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert victim.exists() and victim.read_bytes() == b"PLANNED content", \
+        "a different file holding the planned inode was deleted"
+    assert victim.stat().st_ino == ino
+    assert "not the file that was planned" in r.stderr
+
+
+def test_P3_an_unchanged_planned_file_is_still_deleted(sb):
+    """Guards the guard: the fingerprint must not make every deletion fail."""
+    sb.old_install()
+    sb.state.mkdir()
+    victim = sb.state / "daemon.log"
+    victim.write_text("planned")
+    r = sb.uninstall("--purge")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not victim.exists()
+
+
+def test_P3_a_plan_row_carries_a_content_fingerprint_not_just_an_inode(sb):
+    sb.old_install()
+    sb.state.mkdir()
+    (sb.state / "daemon.log").write_text("planned")
+    src = open(os.path.join(ROOT, "uninstall.sh"), encoding="utf-8").read()
+    assert 'f"{st.st_dev}:{st.st_ino}" != ident' not in src, "the delete step still trusts the inode alone"
+    assert "sha256" in src and "st_mtime_ns" in src and "st_size" in src
+
+
 def test_P3_a_planned_file_replaced_by_a_symlink_or_directory_is_left_alone(sb):
     sb.old_install()
     sb.state.mkdir()
