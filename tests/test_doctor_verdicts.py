@@ -199,3 +199,32 @@ def test_every_module_and_data_file_the_code_loads_is_required():
     for f in ("chatgpt_contract.json", "fixture_dom.js", "cdp_launch.sh"):
         assert f in text and f in d.REQUIRED
     assert "retrieval_window" not in text, "the MCP window script is gone; nothing may load it"
+
+
+def test_doctor_stale_heartbeat_with_a_live_daemon_process_is_not_reported_as_not_running(doc_env, monkeypatch):
+    """A draining or wedged daemon has an old heartbeat and a live process. 'Not running' would send the
+    user to start a second daemon; the truth is 'alive but cannot take a consult'."""
+    sys.path.insert(0, SCRIPTS)
+    import cgc_spool
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "cgc_daemon.py"])
+    try:
+        cgc_spool._atomic_write(cgc_spool.daemon_path(), {"pid": p.pid, "ts": 1.0})
+        with _FakeChrome() as ch:
+            _, rep = _run_doctor(monkeypatch, ch.port)
+    finally:
+        p.kill()
+        p.wait()
+    assert not rep.can_send and not rep.ready
+    why = " ".join(rep.why["can_send"])
+    assert f"pid {p.pid}" in why and "heartbeat is stale" in why and "not running" not in why
+
+
+def test_doctor_a_dead_pid_in_daemon_json_is_plain_not_running(doc_env, monkeypatch):
+    sys.path.insert(0, SCRIPTS)
+    import cgc_spool
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    cgc_spool._atomic_write(cgc_spool.daemon_path(), {"pid": dead.pid, "ts": 1.0})
+    with _FakeChrome() as ch:
+        _, rep = _run_doctor(monkeypatch, ch.port)
+    assert any("not running" in w for w in rep.why["can_send"])

@@ -2,14 +2,21 @@
 # Remove open-claude-gpt: the launchd daemon, the SessionStart hook entry, then the skill code.
 #   ./uninstall.sh          # stop+remove the daemon service, drop our hook entry, remove the skill.
 #                           # The consult store (control.db, its backups) is KEPT and listed.
-#   ./uninstall.sh --purge  # additionally delete the store files listed on screen, the scratch dir,
-#                           # and (after a prompt) the dedicated Chrome profile
+#   ./uninstall.sh --purge  # additionally delete the tool's own files listed on screen: the store files,
+#                           # lock files, drift bundles, scratch files; and (after a prompt) the dedicated
+#                           # Chrome profile. Never a whole directory because of its name.
 #   ./uninstall.sh --dir DIR   # skills root the skill was installed into (install.sh --dir)
+#   ./uninstall.sh --force     # carry on when settings.json is not valid JSON (the hook entry is then
+#                              # yours to delete by hand; the uninstall prints the step)
 #
-# Order matters and is fixed: (1) the daemon is stopped and its service removed, because a live daemon
-# imports from the tree being deleted; (2) our SessionStart entry leaves settings.json (other hooks
-# untouched, settings.json.bak kept); (3) only then is code deleted; (4) the send journal is deleted
-# ONLY under --purge, and the paths deleted are printed first.
+# Order matters and is fixed. (0) Every path is resolved and checked BEFORE anything changes; a refusal
+# there leaves the machine exactly as it was. (1) The daemon is stopped, judged by its process and its
+# lock, never by heartbeat age, and its launchd service removed, because a live daemon imports from the
+# tree being deleted. (2) Our SessionStart entry leaves settings.json (other hooks untouched,
+# settings.json.bak kept). (3) Only then is code deleted. (4) The send journal is deleted ONLY under
+# --purge, only as the exact files the tool writes, and the paths are printed first.
+#
+# Your config file is never deleted, purge or not.
 #
 # Everything is rooted at $HOME (skills dir, LaunchAgents, Claude settings, state) and launchctl is
 # found on PATH, so `HOME=/tmp/h PATH=/tmp/stubs:$PATH ./uninstall.sh` is a complete dry environment.
@@ -19,10 +26,12 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 SCRIPTS="$REPO/skill/scripts"
 SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
 PURGE=0
+FORCE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --purge) PURGE=1; shift ;;
+    --force) FORCE=1; shift ;;
     --dir)   SKILLS_DIR="${2:?--dir needs a directory}"; shift 2 ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -30,174 +39,389 @@ while [ $# -gt 0 ]; do
 done
 # Must match install.sh's NAME — the skill installs as "chatgpt-consult".
 DEST="$SKILLS_DIR/chatgpt-consult"
+ctl() { CGC_HOME="$REPO/skill" "$REPO/bin/cgc" "$@"; }
 
-# guard_rm_rf PATH KIND
-#   KIND is "scratch" or "profile" — both must additionally look like a
-#   dedicated cgc dir (basename contains "cgc", or the dir contains a tool
-#   marker file/dir) before they're eligible for deletion.
-# Refuses (prints a message, returns 1, does NOT abort the script) when the
-# resolved path is empty, "/", "$HOME", or "$HOME/", or doesn't look like a
-# dedicated cgc dir.
-guard_rm_rf() {
-  raw_path="$1"
-  kind="$2"
+# The planner. One program decides what may be deleted, so the listing and the deletion cannot
+# disagree. Modes: `plan` prints, `delete` deletes exactly the plan. Output is tab-separated
+# `kind<TAB>path<TAB>note` with "-" for an empty field:
+#   refuse   note = why the whole uninstall must stop before changing anything
+#   note     path = a directory left alone, note = why (shown under --purge)
+#   journal / lock / incident / scratch   a file the tool wrote and --purge would delete
+#   settings state (ok|absent|parse|blocked) in the note: what happened reading Claude's settings.json
+#   profile  path = the Chrome profile to offer for deletion ("-" if none), note = why not
+#   deleted / failed   (delete mode)
+# It resolves everything first (realpath), then applies, in order:
+#   - a journal file is only ever one of the exact names the store writes beside its database
+#     (db, -wal, -shm, .migrate.lock, .migrated, .v<n>.bak[.corrupt-*|.*.tmp], relocation leftovers),
+#     a regular file, and the database and its backups must carry a SQLite header;
+#   - locks/, incidents/ and spool/ are the tool's subdirectories: only files named the way the tool
+#     names them are touched, one by one; a foreign file is left alone and so is its directory;
+#   - nothing is ever removed because a directory's NAME looks like ours, and no directory is removed
+#     recursively here; an emptied directory goes only if it is one of the tool's own subdirectories
+#     (locks, incidents/I-*, spool and its subdirectories) or a default location (~/.local/state/cgc,
+#     /tmp/cgc); a custom directory such as ~/Documents is left in place even when it ends up empty;
+#   - a directory outside $HOME is touched only when it is the default (~/.local/state/cgc, /tmp/cgc);
+#     $HOME itself, anything above it, and / never;
+#   - the config file and the journal must not lie inside a tree this uninstall deletes.
+plan_py() {
+  python3 - "$SCRIPTS" "$1" "$DEST" "$PURGE" <<'PYEOF'
+import os, re, stat, sys
 
-  if [ -z "$raw_path" ]; then
-    echo "• refusing to delete: path is empty" >&2
-    return 1
-  fi
+scripts, mode, dest, purge = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+sys.path.insert(0, scripts)
+import cgc_activation, cgc_config, cgc_store      # noqa: E402  (importing applies the config file, as every script does)
 
-  # Resolve to an absolute path without requiring the path to exist.
-  resolved="$raw_path"
-  if [ -e "$raw_path" ]; then
-    resolved="$(cd "$raw_path" 2>/dev/null && pwd -P || echo "$raw_path")"
-  fi
+out, todo, owned, refusals = [], [], [], []
+DELETING = purge
 
-  # Strip a single trailing slash (but keep "/" itself as "/").
-  case "$resolved" in
-    */) [ "$resolved" != "/" ] && resolved="${resolved%/}" ;;
-  esac
 
-  home_resolved="$HOME"
-  case "$home_resolved" in
-    */) [ "$home_resolved" != "/" ] && home_resolved="${home_resolved%/}" ;;
-  esac
+def emit(kind, path="-", note="-"):
+    out.append((kind, path or "-", note or "-"))
 
-  if [ -z "$resolved" ] || [ "$resolved" = "/" ] || [ "$resolved" = "$home_resolved" ]; then
-    echo "• refusing to delete '$raw_path' (resolves to '$resolved') — looks like / or \$HOME" >&2
-    return 1
-  fi
 
-  if [ "$kind" = "scratch" ] || [ "$kind" = "profile" ]; then
-    base="$(basename "$resolved")"
-    has_marker=0
-    case "$base" in
-      *cgc*) has_marker=1 ;;
-    esac
-    if [ "$has_marker" != "1" ] && [ -e "$resolved/.cgc" ]; then
-      has_marker=1
-    fi
-    if [ "$has_marker" != "1" ]; then
-      echo "• refusing to delete '$resolved' — doesn't look like a dedicated cgc $kind dir (basename has no 'cgc' and no .cgc marker found)" >&2
-      return 1
-    fi
-  fi
+def refuse(msg):
+    refusals.append(msg)
+    emit("refuse", "-", msg)
 
-  echo "• will remove: $resolved"
-  rm -rf "$resolved"
-  return 0
-}
 
-# What the store layer itself resolves, so this can never disagree with the daemon about where the
-# journal is (config-file overrides included). Prints "dir<TAB>path" lines: `data` = the durable data
-# dir, `path` = each existing store file in it (control.db, -wal/-shm, pre-migration backups, locks,
-# drift bundles), `scratch` = the tool-owned scratch dir. Opens nothing, creates nothing.
-resolve_state() {
-  python3 - "$SCRIPTS" <<'PYEOF'
-import glob, os, sys
-sys.path.insert(0, sys.argv[1])
-import cgc_store
+def refuse_if_deleting(msg):
+    """Something that makes DELETING unsafe. Without --purge nothing in the store is deleted, so it is
+    only a note: it must not stop the service, hook and code from being removed."""
+    if DELETING:
+        refuse(msg)
+
+
+def real(p):
+    return os.path.realpath(p)
+
+
+def within(p, d, strict=False):
+    p, d = real(p), real(d)
+    if strict and p == d:
+        return False
+    return p == d or p.startswith(d.rstrip(os.sep) + os.sep)
+
+
+HOME = real(os.path.expanduser("~"))
+DEF_DATA = real(os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "cgc"))
+DEF_STATE = real("/tmp/cgc")
+
+
+def allowed(d, default):
+    """A directory this uninstall may delete tool files from: the default, or strictly below $HOME."""
+    return real(d) == real(default) or within(d, HOME, strict=True)
+
+
+def regular(p):
+    try:
+        return stat.S_ISREG(os.lstat(p).st_mode)
+    except OSError:
+        return False
+
+
+def sqlite_header(p):
+    try:
+        if os.path.getsize(p) == 0:
+            return True                                  # SQLite creates the file before its first write
+        with open(p, "rb") as f:
+            return f.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
+
+
+def journal_files(db, default_dir):
+    d, b = os.path.split(os.path.abspath(db))
+    d = real(d)
+    if not os.path.isdir(d):
+        return []
+    e = re.escape(b)
+    named = re.compile(e + r"(-wal|-shm|\.migrate\.lock|\.migrated|\.v\d+\.bak(\.corrupt-\d+|\.\w+\.tmp)?)?"
+                       r"|\.relocation\.lock|\.control\.db\.relocating-[0-9a-f]{32}|\.corrupt-[0-9a-f]{32}")
+    header = re.compile(e + r"(\.migrated|\.v\d+\.bak)?")
+    found = []
+    for n in sorted(os.listdir(d)):
+        if not named.fullmatch(n):
+            continue
+        p = os.path.join(d, n)
+        if not regular(p):
+            refuse_if_deleting(f"{p} is not a regular file; the store never writes it. Left alone.")
+        elif header.fullmatch(n) and not sqlite_header(p):
+            refuse_if_deleting(f"{p} does not start with a SQLite header, so it is not the store's "
+                               "database. Left alone.")
+        else:
+            found.append(p)
+    if found and not allowed(d, default_dir):
+        refuse_if_deleting(f"store files {found[0]} ... sit in {d}, which is $HOME, above it, or outside it "
+                           f"and not the default {default_dir}; this uninstall will not delete there. "
+                           "Remove them by hand.")
+        return []
+    return found
+
+
+def plan_dir(d, default_dir, ok, kind):
+    """Plan the tool-named files directly in `d` (one tool subdirectory). Returns the files planned."""
+    if not os.path.isdir(d) or os.path.islink(d):
+        return []
+    if not allowed(d, default_dir):
+        emit("note", d, "is $HOME, above it, or outside it and not the tool's default location; "
+                        "no files are deleted there")
+        return []
+    mine = []
+    for n in sorted(os.listdir(d)):
+        p = os.path.join(d, n)
+        if ok.fullmatch(n) and regular(p):
+            mine.append(p)
+    todo.extend((kind, p) for p in mine)
+    if mine:
+        owned.append(d)
+    return mine
+
+
+RID = r"REQ-\d{8}-\d{6}-[0-9a-f]{6}"
+LOCKS = re.compile(rf"daemon\.json(\.tmp-\d+-\d+)?|daemon\.lock|browser\.lock|lease\.{RID}|conv\.[0-9a-f-]{{36}}")
+SCRATCH = re.compile(rf"answer_({RID}|followup)\.txt(\.raw|\.\w+\.tmp)?|prompt_{RID}\.md|refs_\d{{8}}-\d{{6}}(-[0-9a-f]{{6}})?\.md"
+                     rf"|_wait_{RID}\.txt(\.raw)?|active\.json(\.lock|\.tmp-\d+)?|daemon\.log|chrome\.log|\.doctor_probe")
+SPOOLED = re.compile(r"REQ-[\w-]+\.(log|json)(\.tmp-[\d-]+)?")
+INCIDENT = re.compile(r"I-\d{8}-\d{6}-[a-z]+-[0-9a-f]{6}")
+INCIDENT_FILES = re.compile(r"fixture\.html|diagnosis\.json")
+
+config = cgc_config.config_path()
 db = cgc_store.db_path()
-print("scratch\t" + cgc_store.CGC_STATE_DIR)
+state = cgc_store.CGC_STATE_DIR
+data = cgc_store.data_dir()
+
+# ---- Claude's settings.json: what may happen to the hook entry ---------------------------------
+sp = cgc_activation.default_settings_path()
+try:
+    with open(sp, encoding="utf-8") as f:
+        raw = f.read()
+except FileNotFoundError:
+    emit("settings", sp, "absent")
+except UnicodeDecodeError as e:
+    emit("settings", sp, f"parse: not UTF-8 ({e.reason})")
+except OSError as e:
+    emit("settings", sp, f"blocked: cannot read it ({e.strerror or e})")
+else:
+    import json
+    try:
+        json.loads(raw)
+    except ValueError as e:
+        emit("settings", sp, f"parse: {e}")
+    else:
+        try:
+            cgc_activation.read_settings(sp)
+        except cgc_activation.SettingsError as e:
+            emit("settings", sp, f"blocked: {e}")
+        else:
+            emit("settings", sp, "ok")
+
+# ---- the journal (kept unless --purge) and the tool's files around it --------------------------
+journal = []
 if db != ":memory:":
-    d = os.path.dirname(os.path.abspath(db))
-    print("data\t" + d)
-    found = [db, db + "-wal", db + "-shm", db + ".migrate.lock", os.path.join(d, ".relocation.lock")]
-    # "locks" and "incidents" are generic names: only claim them in a directory that is the tool's own
-    # (an explicit CGC_STORE_DB can point the store into any directory).
-    if "cgc" in os.path.basename(d):
-        found += [os.path.join(d, "locks"), os.path.join(d, "incidents")]
-    found += sorted(glob.glob(glob.escape(db) + ".v*.bak*"))
-    found += sorted(glob.glob(os.path.join(glob.escape(d), ".control.db.relocating-*")))
-    for p in found:
-        if os.path.lexists(p):
-            print("path\t" + p)
+    journal += journal_files(db, DEF_DATA)
+legacy = os.path.join(state, "control.db")
+if real(legacy) != real(db):
+    journal += journal_files(legacy, DEF_STATE)
+journal = sorted(set(journal))
+for p in journal:
+    todo.append(("journal", p))
+    owned.append(os.path.dirname(p))
+
+if db != ":memory:":
+    plan_dir(os.path.join(real(os.path.dirname(os.path.abspath(db))), "locks"), DEF_DATA, LOCKS, "lock")
+for root, default in ((data, DEF_DATA), (state, DEF_STATE)):
+    inc = os.path.join(root, "incidents")
+    if os.path.isdir(inc) and not os.path.islink(inc) and allowed(inc, default):
+        for n in sorted(os.listdir(inc)):
+            sub = os.path.join(inc, n)
+            if INCIDENT.fullmatch(n) and os.path.isdir(sub) and not os.path.islink(sub):
+                if plan_dir(sub, default, INCIDENT_FILES, "incident"):
+                    owned.append(inc)
+spool = os.environ.get("CGC_SPOOL_DIR") or os.path.join(state, "spool")
+for sub in ("logs", "pending", "processing", "done", "status"):
+    plan_dir(os.path.join(spool, sub), os.path.join(DEF_STATE, "spool", sub), SPOOLED, "scratch")
+plan_dir(state, DEF_STATE, SCRATCH, "scratch")
+# directories the tool made: each is removed only if it is empty once its own files are gone
+dbdir = os.path.dirname(os.path.abspath(db)) if db != ":memory:" else data
+for sub in ("logs", "pending", "processing", "done", "status"):
+    owned.append(os.path.join(spool, sub))
+owned += [spool, state, dbdir, os.path.join(dbdir, "locks"), os.path.join(data, "incidents"),
+          os.path.join(state, "incidents")]
+# The config file is the user's, never the tool's scratch: whatever directory it sits in, it is not planned.
+todo = [(k, p) for k, p in todo if real(p) != real(config)]
+for kind, path in todo:
+    emit(kind, path)
+
+# ---- nothing protected may sit inside a tree this uninstall deletes -----------------------------
+trees = [t for t in (dest, dest + ".bak") if os.path.lexists(t) and not os.path.islink(t)]
+for t in trees:
+    if within(config, t):
+        refuse(f"your config file {config} lies inside {t}, which this uninstall deletes. Move the config first.")
+    if not purge:
+        for p in journal:
+            if within(p, t):
+                refuse(f"the store file {p} lies inside {t}, which this uninstall deletes, and no --purge was given. "
+                       "Move the store out first (or pass --purge to delete it).")
+
+# ---- the Chrome profile (offered only under --purge) --------------------------------------------
+profile = os.environ.get("CGC_PROFILE") or os.path.expanduser("~/.cgc-chrome")
+rp = real(profile)
+if not os.path.lexists(profile):
+    emit("profile", "-", "none present")
+elif not within(rp, HOME, strict=True):
+    emit("profile", "-", f"{rp} is not strictly inside $HOME; left alone")
+elif rp != real(os.path.expanduser("~/.cgc-chrome")) and not os.path.isfile(os.path.join(rp, "Local State")):
+    emit("profile", "-", f"{rp} is not the default profile and holds no Chrome 'Local State'; left alone")
+else:
+    held = [config, state, data, sp, dest] + journal
+    inside = [x for x in held if within(x, rp)]
+    if inside:
+        emit("profile", "-", f"{rp} contains {inside[0]}, which must not be deleted; left alone")
+    else:
+        emit("profile", rp, "ok")
+
+if mode == "plan":
+    for row in out:
+        print("\t".join(row))
+    sys.exit(0)
+
+# ---- delete mode: exactly the plan, file by file ------------------------------------------------
+if refusals:
+    sys.exit(1)
+gone = []
+for kind, p in todo:
+    if not os.path.lexists(p):
+        continue                       # already gone (e.g. it lay inside the code tree removed a step ago)
+    try:
+        if not regular(p):
+            raise OSError("no longer a regular file")
+        os.unlink(p)
+        gone.append(p)
+        print("deleted\t" + p + "\t" + kind)
+    except OSError as e:
+        print("failed\t" + p + "\t" + str(e))
+TOOL_DIRS = {"locks", "incidents", "spool", "logs", "pending", "processing", "done", "status"}
+for d in owned:
+    if not os.path.isdir(d) or os.path.islink(d) or real(d) == HOME or within(HOME, d):
+        continue
+    b = os.path.basename(d.rstrip(os.sep))
+    if real(d) not in (DEF_DATA, DEF_STATE) and b not in TOOL_DIRS and not INCIDENT.fullmatch(b):
+        continue
+    if any(real(g).startswith(real(d).rstrip(os.sep) + os.sep) for g in gone):
+        try:
+            os.rmdir(d)
+            print("deleted\t" + d + "\tempty directory")
+        except OSError:
+            pass
 PYEOF
 }
 
-# --- 1. the daemon: stop it, wait until it has exited, remove its launchd service ----------------
-# Before any file goes: a live daemon imports modules lazily from the tree about to be deleted.
-echo "• stopping the egress daemon service"
-if ! CGC_HOME="$REPO/skill" "$REPO/bin/cgc" uninstall-daemon; then
-  echo "ERROR: the egress daemon would not stop. Nothing else was removed; re-run when it has stopped." >&2
+# --- 0. resolve and check everything BEFORE any change ------------------------------------------
+if ! PLAN="$(plan_py plan)"; then
+  echo "ERROR: could not work out what to remove (see above). Nothing was changed." >&2
   exit 1
 fi
-# A daemon outside launchd (`cgc watch`, `cgc up`) is the user's own process: not ours to kill.
-if live="$(CGC_HOME="$REPO/skill" "$REPO/bin/cgc" daemon-pid 2>/dev/null)"; then
-  echo "ERROR: an egress daemon (pid $live) is still running outside launchd — it would run on deleted code." >&2
-  echo "       Stop it (Ctrl-C the foreground \`cgc watch\`, or: kill $live), then re-run uninstall.sh." >&2
+REFUSALS=(); JOURNAL=(); TODO=(); NOTES=()
+SETTINGS_NOTE="absent"; SETTINGS_PATH="-"; PROFILE_PATH="-"; PROFILE_NOTE="-"
+while IFS=$'\t' read -r kind path note; do
+  case "$kind" in
+    refuse)   REFUSALS+=("$note") ;;
+    note)     NOTES+=("$path: $note") ;;
+    journal)  JOURNAL+=("$path"); TODO+=("$path") ;;
+    lock|incident|scratch) TODO+=("$path") ;;
+    settings) SETTINGS_PATH="$path"; SETTINGS_NOTE="$note" ;;
+    profile)  PROFILE_PATH="$path"; PROFILE_NOTE="$note" ;;
+  esac
+done <<<"$PLAN"
+
+if [ "${#REFUSALS[@]}" -gt 0 ]; then
+  echo "ERROR: refusing to uninstall. Nothing was changed:" >&2
+  printf '  - %s\n' "${REFUSALS[@]}" >&2
+  exit 1
+fi
+case "$SETTINGS_NOTE" in
+  blocked*)
+    echo "ERROR: Claude settings.json ($SETTINGS_PATH) cannot be edited safely: ${SETTINGS_NOTE#blocked: }" >&2
+    echo "       Our SessionStart hook entry must leave it BEFORE the code goes, so nothing was changed." >&2
+    echo "       Fix the file (permissions, shape), then re-run uninstall.sh." >&2
+    exit 1 ;;
+  parse*)
+    if [ "$FORCE" != "1" ]; then
+      echo "ERROR: Claude settings.json ($SETTINGS_PATH) is not valid JSON (${SETTINGS_NOTE#parse: })." >&2
+      echo "       Claude Code ignores such a file, so no hook of ours can be firing from it, but it may hold" >&2
+      echo "       our entry. Fix or repair the file, or re-run with --force and delete the entry by hand." >&2
+      echo "       Nothing was changed." >&2
+      exit 1
+    fi ;;
+esac
+
+# --- 1. the daemon: stop it, wait until its process is gone, remove its launchd service -----------
+# Before any file goes: a live daemon imports modules lazily from the tree about to be deleted. The
+# test is the process and its lock (bin/cgc daemon-stop), not the heartbeat. A daemon outside launchd
+# (`cgc watch`, `cgc up`) is the user's own process: it is named and the uninstall stops.
+echo "• stopping the egress daemon service"
+if ! ctl uninstall-daemon; then
+  echo "ERROR: the egress daemon is still running (see above). Nothing else was removed; re-run when it has stopped." >&2
   exit 1
 fi
 
 # --- 2. the SessionStart hook: only the entry cgc_activation installed ---------------------------
 # JSON-aware (other hooks and settings are untouched; settings.json.bak keeps the previous file).
-# A settings.json that does not parse is ignored whole by Claude Code, so no hook of ours is firing
-# from it: say so and go on. Any other failure to edit a parseable file stops the uninstall, because
-# the live hook would then run on deleted code.
-echo "• removing our SessionStart hook entry"
-hook_state="$(python3 "$SCRIPTS/cgc_activation.py" status --json 2>/dev/null \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' 2>/dev/null)" || hook_state="unknown"
-if [ "$hook_state" = "unreadable" ]; then
-  echo "  ! Claude settings.json does not parse, so it was not edited. If it holds our hook (a command" >&2
-  echo "    mentioning ACTIVATION.md / cgc_activation.py), delete that entry by hand." >&2
-elif ! python3 "$SCRIPTS/cgc_activation.py" remove; then
-  echo "ERROR: could not edit Claude settings.json (see above). The skill was NOT removed." >&2
-  echo "       Fix it or remove the hook by hand, then re-run uninstall.sh." >&2
-  exit 1
+if [ "${SETTINGS_NOTE%%:*}" = "parse" ]; then
+  echo "  ! --force: $SETTINGS_PATH is not valid JSON, so it was not edited. If it holds our hook entry" >&2
+  echo "    (a command mentioning ACTIVATION.md / cgc_activation.py), delete that entry by hand." >&2
+else
+  echo "• removing our SessionStart hook entry"
+  if ! python3 "$SCRIPTS/cgc_activation.py" remove; then
+    echo "ERROR: could not edit Claude settings.json (see above). The skill was NOT removed." >&2
+    echo "       The daemon service is already gone. Fix settings.json, then re-run uninstall.sh." >&2
+    exit 1
+  fi
 fi
 
 # --- 3. the code --------------------------------------------------------------------------------
 if [ -e "$DEST" ] || [ -L "$DEST" ] || [ -e "${DEST}.bak" ] || [ -L "${DEST}.bak" ]; then
-  rm -rf "$DEST" "${DEST}.bak"
+  rm -rf -- "$DEST" "${DEST}.bak"
   echo "• removed $DEST (and ${DEST}.bak)"
 else
   echo "• nothing installed at $DEST"
 fi
 
 # --- 4. the send journal: kept unless --purge ---------------------------------------------------
-STATE="$(resolve_state)" || { echo "ERROR: could not resolve the store location; store left untouched." >&2; exit 1; }
-DATA_DIR=""; SCRATCH=""; JOURNAL=()
-while IFS=$'\t' read -r kind val; do
-  case "$kind" in
-    data)    DATA_DIR="$val" ;;
-    scratch) SCRATCH="$val" ;;
-    path)    JOURNAL+=("$val") ;;
-  esac
-done <<<"$STATE"
-
 if [ "$PURGE" != "1" ]; then
   if [ "${#JOURNAL[@]}" -gt 0 ]; then
-    echo "• KEPT — the consult store (send journal, round history, answers' index). Not deleted without --purge:"
+    echo "• KEPT — the consult store (send journal, round history). Not deleted without --purge:"
     printf '    %s\n' "${JOURNAL[@]}"
   fi
-  echo "• also kept: scratch ${SCRATCH:-/tmp/cgc}, the Chrome profile, and your config file. --purge deletes the first two."
+  echo "• also kept: scratch files, the Chrome profile, and your config file. --purge deletes the first two."
   echo "done."
   exit 0
 fi
 
-echo "• --purge: deleting EXACTLY these paths (there is no undo):"
-if [ "${#JOURNAL[@]}" -gt 0 ]; then
-  printf '    %s\n' "${JOURNAL[@]}"
+echo "• --purge: deleting EXACTLY these paths (files the tool wrote; there is no undo):"
+if [ "${#TODO[@]}" -gt 0 ]; then
+  printf '    %s\n' "${TODO[@]}"
 else
-  echo "    (no store files found)"
+  echo "    (no store or scratch files found)"
 fi
-echo "    $SCRATCH  (scratch: answer files, spool, daemon.log; only if it looks like a cgc dir)"
-for p in ${JOURNAL[@]+"${JOURNAL[@]}"}; do
-  rm -rf -- "$p"
-done
-# The data dir itself goes only if that left it empty: it may be shared with something else.
-[ -n "$DATA_DIR" ] && rmdir "$DATA_DIR" 2>/dev/null && echo "• removed empty $DATA_DIR" || true
+[ "${#NOTES[@]}" -gt 0 ] && printf '    left alone: %s\n' "${NOTES[@]}"
+echo "    (the code tree above is already gone; your config file is never deleted)"
+RESULT="$(plan_py delete)" || RESULT=""
+while IFS=$'\t' read -r kind path note; do
+  case "$kind" in
+    failed) echo "  ! could not delete $path: $note" >&2 ;;
+    deleted) [ "$note" = "empty directory" ] && echo "• removed empty directory $path" ;;
+  esac
+done <<<"$RESULT"
 
-if guard_rm_rf "$SCRATCH" "scratch"; then
-  echo "• removed scratch $SCRATCH"
-fi
-
-PROFILE="${CGC_PROFILE:-$HOME/.cgc-chrome}"
-a=""
-read -r -p "Delete the dedicated Chrome profile $PROFILE (logs you out of the consult session)? [y/N] " a || a=""
-if [ "$a" = "y" ]; then
-  if guard_rm_rf "$PROFILE" "profile"; then
-    echo "• removed $PROFILE"
+if [ "$PROFILE_PATH" != "-" ]; then
+  a=""
+  read -r -p "Delete the dedicated Chrome profile $PROFILE_PATH (logs you out of the consult session)? [y/N] " a || a=""
+  if [ "$a" = "y" ]; then
+    rm -rf -- "$PROFILE_PATH"
+    echo "• removed $PROFILE_PATH"
   fi
+elif [ "$PROFILE_NOTE" != "none present" ]; then
+  echo "• Chrome profile: $PROFILE_NOTE"
 fi
 echo "done."

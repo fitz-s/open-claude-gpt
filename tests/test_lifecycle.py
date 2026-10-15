@@ -9,13 +9,13 @@
 import importlib.util
 import json
 import os
+import shutil
 import signal
 import socket
 import sqlite3
 import subprocess
 import sys
 
-import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "skill", "scripts")
@@ -58,7 +58,17 @@ case "$1" in
     fi ;;
   bootstrap|load)
     [ -e "$d/loaded" ] && exit 5
-    sleep 120 >/dev/null 2>&1 </dev/null & pid=$!
+    # a process whose command line names cgc_daemon.py and that holds daemon.lock, as the real daemon does
+    python3 -c '
+import fcntl, os, sys, time
+sys.path.insert(0, sys.argv[1])
+import cgc_spool as s
+s.ensure_dirs()
+f = open(s.daemon_lock_path(), "a+")
+fcntl.flock(f, fcntl.LOCK_EX)
+open(os.path.join(os.environ["STUB_DIR"], "ready.%d" % os.getpid()), "w").close()
+time.sleep(120)' "$STUB_SCRIPTS" cgc_daemon.py >/dev/null 2>&1 </dev/null & pid=$!
+    for _ in $(seq 100); do [ -e "$d/ready.$pid" ] && break; sleep 0.05; done
     echo "$pid" > "$d/loaded"; echo "$pid" > "$d/lastpid"
     [ -n "${STUB_NO_HEARTBEAT:-}" ] || hb write "$pid" ;;
 esac
@@ -90,8 +100,8 @@ class Sandbox:
         for n in ("launchctl", "gh"):
             os.chmod(self.stubs / n, 0o755)
         self.dest = self.home / ".claude" / "skills" / "chatgpt-consult"
-        self.data = tmp / "cgc-data"
-        self.state = tmp / "cgc-state"
+        self.data = self.home / ".local" / "state" / "cgc"
+        self.state = self.home / "cgc-state"
         self.settings = self.home / ".claude" / "settings.json"
         self.plist = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
         self.env = {k: v for k, v in os.environ.items()
@@ -147,6 +157,9 @@ class Sandbox:
     def line(self, verb):
         return next(ln for ln in self.log() if ln.split()[0] == verb)
 
+    def lines(self, verb):
+        return [ln for ln in self.log() if ln.split()[0] == verb]
+
     def store(self, schema=None):
         """A control.db with the journal files uninstall must treat as the send journal."""
         self.data.mkdir(parents=True, exist_ok=True)
@@ -158,7 +171,8 @@ class Sandbox:
         c.execute("INSERT INTO lc_probe VALUES('REQ-1', 'sent')")
         c.commit()
         c.close()
-        for suffix in ("-wal", "-shm", ".v4.bak"):
+        shutil.copyfile(db, self.data / "control.db.v4.bak")
+        for suffix in ("-wal", "-shm"):
             (self.data / f"control.db{suffix}").write_text("journal\n")
         (self.data / "locks").mkdir(exist_ok=True)
         (self.data / "locks" / "daemon.json").write_text("{}")
@@ -185,11 +199,17 @@ def _schema():
     return m.SCHEMA_VERSION
 
 
-@pytest.fixture
-def sb(tmp_path):
-    s = Sandbox(tmp_path)
-    yield s
-    s.cleanup()
+def _beat_is_live(sb):
+    """Does the heartbeat read as a LIVE daemon (the freshness test the old stop relied on)?"""
+    r = sb.run([sys.executable, "-c",
+                "import sys; sys.path.insert(0, sys.argv[1]); import cgc_spool as s; "
+                "sys.exit(0 if s.daemon_alive() else 1)", SCRIPTS])
+    return r.returncode == 0
+
+
+def _fake_foreground_daemon():
+    """A process the way `cgc watch` looks to ps: a python whose command line names cgc_daemon.py."""
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "cgc_daemon.py"])
 
 
 def _tree_complete(root):
@@ -231,7 +251,7 @@ def test_install_refuses_a_daemon_that_will_not_stop_and_changes_nothing(sb):
     sb.daemon_up()
     r = sb.install(STUB_STUCK="1", CGC_STOP_WAIT_S="2")
     assert r.returncode == 1
-    assert "would not stop" in r.stderr
+    assert "is still running" in r.stderr and "daemon process" in r.stderr
     assert (sb.dest / "OLD_MARKER").exists() and not (sb.dest.parent / "chatgpt-consult.bak").exists()
     assert "bootstrap" not in sb.calls()
 
@@ -254,7 +274,7 @@ def test_install_failure_after_stop_restores_the_daemon_on_the_old_tree(sb):
 
 def test_install_refuses_a_daemon_running_outside_launchd(sb):
     sb.old_install()
-    p = subprocess.Popen(["sleep", "60"])
+    p = _fake_foreground_daemon()
     try:
         beat = sb.run([sys.executable, "-c",
                        "import sys;sys.path.insert(0,sys.argv[1]);import cgc_spool as s;s.heartbeat_write(int(sys.argv[2]))",
@@ -403,7 +423,8 @@ def test_uninstall_purge_names_and_deletes_exactly_the_journal_and_scratch(sb, t
     sb.old_install()
     sb.store()
     sb.state.mkdir()
-    (sb.state / "answer_REQ-1.txt").write_text("a")
+    (sb.state / "answer_REQ-20261014-120000-a1b2c3.txt").write_text("a")
+    (sb.state / "daemon.log").write_text("log")
     config = sb.home / ".config" / "cgc" / "config"
     config.parent.mkdir(parents=True)
     config.write_text("CGC_MODEL=Pro\n")
@@ -417,21 +438,25 @@ def test_uninstall_purge_names_and_deletes_exactly_the_journal_and_scratch(sb, t
     for name in ("control.db", "control.db-wal", "control.db-shm", "control.db.v4.bak", "locks"):
         assert str(sb.data / name) in listed, name
         assert not (sb.data / name).exists(), name
-    assert str(sb.state) in listed and not sb.state.exists()
+    assert str(sb.state / "answer_REQ-20261014-120000-a1b2c3.txt") in listed
+    assert sb.state.is_dir() and list(sb.state.iterdir()) == [], \
+        "a custom scratch directory is emptied of the tool's files but left in place"
     assert other.exists(), "an unrelated file in the data dir was deleted"
     assert config.exists() and profile.exists()              # answered n: the login survives
     gone = sb.uninstall("--purge", stdin="y\n")
     assert gone.returncode == 0 and not profile.exists()
 
 
-def test_uninstall_purge_refuses_a_scratch_dir_that_is_not_a_cgc_dir(sb, tmp_path):
+def test_uninstall_purge_never_touches_a_scratch_dir_outside_home(sb, tmp_path):
     sb.old_install()
-    plain = tmp_path / "work"
+    plain = tmp_path / "work"                                  # outside $HOME, not the default /tmp/cgc
     plain.mkdir()
     (plain / "mine.txt").write_text("x")
+    (plain / "daemon.log").write_text("tool-shaped, but the directory is not ours")
     r = sb.uninstall("--purge", CGC_STATE_DIR=str(plain))
-    assert r.returncode == 0
-    assert (plain / "mine.txt").exists() and "refusing to delete" in r.stderr
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (plain / "mine.txt").exists() and (plain / "daemon.log").exists()
+    assert f"left alone: {plain}" in r.stdout
 
 
 def test_uninstall_stops_before_deleting_anything_when_the_daemon_will_not_stop(sb):
@@ -456,19 +481,22 @@ def test_uninstall_does_not_delete_code_when_the_hook_cannot_be_removed(sb):
     assert "NOT removed" in r.stderr
 
 
-def test_uninstall_ignores_a_settings_file_that_does_not_parse(sb):
+def test_uninstall_stops_on_a_settings_file_that_does_not_parse_unless_forced(sb):
     sb.old_install()
     sb.settings.parent.mkdir(parents=True, exist_ok=True)
     sb.settings.write_text("{ not json")
     r = sb.uninstall()
-    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.returncode == 1 and "not valid JSON" in r.stderr and "--force" in r.stderr
+    assert sb.dest.exists(), "code was deleted although the hook entry could not be checked"
+    forced = sb.uninstall("--force")
+    assert forced.returncode == 0, forced.stdout + forced.stderr
     assert sb.settings.read_text() == "{ not json"           # never rewritten
-    assert "does not parse" in r.stderr and not sb.dest.exists()
+    assert "delete that entry by hand" in forced.stderr and not sb.dest.exists()
 
 
 def test_uninstall_leaves_a_foreground_daemon_alone_and_stops(sb):
     sb.old_install()
-    p = subprocess.Popen(["sleep", "60"])
+    p = _fake_foreground_daemon()
     try:
         sb.run([sys.executable, "-c",
                 "import sys;sys.path.insert(0,sys.argv[1]);import cgc_spool as s;s.heartbeat_write(int(sys.argv[2]))",

@@ -89,49 +89,77 @@ fi
 # --- quiesce the egress daemon BEFORE touching any file ----------------------
 # A running daemon imports modules lazily, per round. Replacing the tree under it lets one process
 # execute old and new files together (the half-replaced tree), and a round claimed in that window runs
-# on a mixture. So the order is: stop, wait until it has really exited, replace, start, verify.
-# A daemon outside launchd (`cgc watch`, `cgc up`) is not ours to kill: refuse and say so.
-# The repo's own cgc does the stopping, so a first install (nothing installed yet) works too.
+# on a mixture. So the order is: stop, wait until the PROCESS has exited and daemon.lock is free
+# (never judged by heartbeat age: a draining or wedged daemon has a stale heartbeat and still runs the
+# files), replace, start, verify. A daemon outside launchd (`cgc watch`, `cgc up`) is not ours to kill:
+# daemon-stop refuses and names its pid.
+# The repo's own cgc does all of this, so a first install and a half-replaced install both work.
 CGC="$REPO/bin/cgc"
-STOPPED=0      # 1 while a daemon we stopped has not been started again
+ctl() { CGC_HOME="$REPO/skill" "$CGC" "$@"; }
+
+STOPPED=0      # 1 while a daemon WE stopped has not been started again
+SWAP=none      # the swap is a transaction: none -> aside (old tree parked at .bak) -> placed (new tree
+               # in DEST) -> done. Anything that fails before `done` puts the old tree back.
+STARTED=0      # 1 once the new daemon was asked to start (so a rollback must stop it first)
+HAD_PREV=0     # 1 while an OLDER .bak is parked at $ASIDE; it is never deleted before the new daemon
+               # is verified, so the previous install always survives a failed upgrade
 STAGE="$SKILLS_DIR/.$NAME.new.$$"
+ASIDE="$DEST.bak.prev.$$"
 
 rc=0
-CGC_HOME="$REPO/skill" "$CGC" daemon-stop || rc=$?
+ctl daemon-stop || rc=$?
 case "$rc" in
   0)  echo "• stopped the egress daemon (it starts again on the new code)"; STOPPED=1 ;;
-  10) ;;                                  # not loaded: nothing to stop
-  *)  echo "ERROR: the egress daemon would not stop — not replacing files under a running daemon." >&2
-      echo "       Nothing was replaced. Its launchd job is unloaded; once the process has exited, run:" >&2
-      echo "         cgc daemon-start      (check: cgc daemon-pid)" >&2
+  10) ;;                                  # nothing loaded, nothing running
+  *)  echo "ERROR: cannot make sure no egress daemon is running (see above) — not replacing files under it." >&2
+      echo "       Nothing was replaced." >&2
       exit 1 ;;
 esac
 
+# Undo an unfinished swap: the previous install goes back exactly as it was.
+rollback() {
+  if [ "$STARTED" = 1 ]; then              # the new-code daemon must be gone before its tree is removed
+    rc=0; ctl daemon-stop || rc=$?
+    if [ "$rc" = 1 ]; then
+      echo "ERROR: the new daemon would not stop; leaving the trees as they are. Previous install: $DEST.bak" >&2
+      return 1
+    fi
+    STARTED=0
+  fi
+  if [ "$SWAP" = placed ]; then rm -rf "$DEST" && SWAP=aside; fi
+  if [ "$SWAP" = aside ]; then mv "$DEST.bak" "$DEST" && SWAP=none; fi
+  if [ "$SWAP" = none ] && [ "$HAD_PREV" = 1 ]; then mv "$ASIDE" "$DEST.bak" && HAD_PREV=0; fi
+  [ "$SWAP" = none ] && [ "$HAD_PREV" = 0 ]
+}
+
 on_exit() {
   status=$?
+  set +e
+  trap - EXIT INT TERM
   rm -rf "$STAGE"
-  if [ "$STOPPED" = 1 ]; then
-    # Stopped by us and the swap below did not complete: put the previous tree back and restart it.
-    echo "• install did not finish — restoring the previous install and the daemon" >&2
-    if [ ! -e "$DEST" ] && [ ! -L "$DEST" ] && { [ -e "$DEST.bak" ] || [ -L "$DEST.bak" ]; }; then
-      mv "$DEST.bak" "$DEST"
+  if [ "$status" -ne 0 ] && [ "$SWAP" != done ]; then
+    ok=1
+    if [ "$SWAP" != none ] || [ "$HAD_PREV" = 1 ] || [ "$STARTED" = 1 ]; then
+      echo "• install did not finish — restoring the previous install" >&2
+      rollback || { ok=0; echo "ERROR: could not restore the previous install; it is at $DEST.bak (older: $ASIDE)." >&2; }
     fi
-    CGC_HOME="$DEST" "$CGC" daemon-start >/dev/null 2>&1 || echo "  ! could not restart the daemon: run cgc daemon-start" >&2
+    if [ "$STOPPED" = 1 ] && [ "$ok" = 1 ]; then
+      echo "• restarting the egress daemon on the previous install" >&2
+      ctl daemon-start --any >/dev/null 2>&1 || echo "  ! could not restart the daemon: run cgc daemon-start" >&2
+    fi
   fi
   exit "$status"
 }
 trap on_exit EXIT
-
-if live="$(CGC_HOME="$REPO/skill" "$CGC" daemon-pid 2>/dev/null)"; then
-  echo "ERROR: an egress daemon (pid $live) is running outside launchd and would execute the replaced files." >&2
-  echo "       Stop it (Ctrl-C the foreground \`cgc watch\`, or: kill $live), then re-run install.sh." >&2
-  exit 1
-fi
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # --- install the skill payload ------------------------------------------------
-# Build the new tree beside the old one and swap with renames, so a failed copy (disk full,
-# permissions) leaves the previous install untouched. The stage is a dot-directory so a skill scanner
-# never sees a second copy of SKILL.md.
+# Build the new tree beside the old one, then swap with renames. A failed copy (disk full,
+# permissions) never touches the previous install, and a failure after the old tree is parked rolls
+# it back. The stage is a dot-directory so a skill scanner never sees a second copy of SKILL.md.
+# An existing .bak is a PREVIOUS install, possibly the only intact one (an earlier upgrade may have
+# failed): it is parked, not deleted, and dropped only once the new daemon is verified.
 mkdir -p "$SKILLS_DIR"
 rm -rf "$STAGE"
 if [ "$MODE" = "link" ]; then
@@ -141,29 +169,46 @@ else
   chmod +x "$STAGE"/scripts/*.sh "$STAGE"/scripts/*.py 2>/dev/null || true
 fi
 if [ -e "$DEST" ] || [ -L "$DEST" ]; then
-  echo "• existing install found — backing up to ${DEST}.bak"
-  rm -rf "${DEST}.bak"
-  mv "$DEST" "${DEST}.bak"
+  echo "• existing install found — keeping it as ${DEST}.bak"
+  if [ -e "$DEST.bak" ] || [ -L "$DEST.bak" ]; then
+    mv "$DEST.bak" "$ASIDE"
+    HAD_PREV=1
+  fi
+  mv "$DEST" "$DEST.bak"
+  SWAP=aside
 fi
 mv "$STAGE" "$DEST"
+SWAP=placed
 
 # --- start the egress daemon on the new code ----------------------------------
 # An upgrade that leaves the OLD daemon running is a version split-brain: the CLI writes through new
 # code while the daemon serves old code (observed live: the old daemon rebuilt an empty pre-relocation
 # store and consults silently stalled). The daemon was stopped above, so this starts a fresh process
 # and then checks that its heartbeat names this install's store schema. A start that does not come up
-# FAILS the upgrade: the daemon's identity check would refuse every enqueue anyway, so say so now.
+# FAILS the upgrade and rolls back to the previous install and daemon: the daemon's identity check
+# would refuse every enqueue anyway, so say so now.
+KEEP_PREV=0
 if [ "$STOPPED" = 1 ]; then
-  STOPPED=0
   echo "• starting the egress daemon"
-  if ! CGC_HOME="$DEST" "$CGC" daemon-start; then
+  STARTED=1
+  if ! ctl daemon-start; then
     if [ "$FORCE" = "1" ]; then
-      echo "  ! the daemon did not come up — --force: continuing; run: cgc daemon-start" >&2
+      echo "  ! the daemon did not come up — --force: keeping the new install; run: cgc daemon-start" >&2
+      KEEP_PREV=1
     else
       echo "ERROR: the egress daemon did not come up on the new code (log: ${CGC_STATE_DIR:-/tmp/cgc}/daemon.log)." >&2
-      echo "       Fix: cgc daemon-start   (or: cgc install-daemon)   — or re-run with --force" >&2
+      echo "       Rolling back to the previous install. Retry with --force to keep the new one anyway." >&2
       exit 1
     fi
+  fi
+  STOPPED=0
+fi
+SWAP=done
+if [ "$HAD_PREV" = 1 ]; then
+  if [ "$KEEP_PREV" = 1 ]; then
+    echo "• an older backup is kept at $ASIDE (the new daemon was not verified)"
+  else
+    rm -rf "$ASIDE"                        # the only place an old tree is ever deleted: after verification
   fi
 fi
 

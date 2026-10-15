@@ -22,9 +22,11 @@ Format: simple `KEY=value` lines (`#` comments allowed). Only `CGC_*` keys are l
 Writes: `set` takes an exclusive lock on <config>.lock, re-reads the file under it, and replaces it
 through a unique temp file + os.replace, so two concurrent `set`s both land and a reader never sees a
 partial file. A key must be a CGC_ name; a name the code does not read is stored with a warning (a
-typo is the usual cause); a value may not contain a newline, CR or NUL (it would write a second,
-unreviewed line); a few keys the scripts parse at import (CGC_PORT, CGC_WEEKLY_BUDGET, the on/off
-flags) must parse, because a bad one there fails every command.
+typo is the usual cause); a value may not contain any character the reader treats as a line break
+(`str.splitlines()`: \n \r \v \f \x1c-\x1e \x85 U+2028 U+2029) or NUL, because that would write a
+second, unreviewed line; a few keys the scripts parse at import (CGC_PORT, CGC_WEEKLY_BUDGET, the
+on/off flags) must parse, because a bad one there fails every command. Only a missing file counts as
+an empty config: any other read failure aborts the write and leaves the file as it was.
 
 CLI (used by `bin/cgc`):
   cgc_config.py set KEY VALUE   persist KEY=VALUE (atomic; replaces an existing key)
@@ -103,7 +105,7 @@ def load_config() -> None:
     try:
         with open(config_path(), encoding="utf-8") as f:
             text = f.read()
-    except OSError:
+    except (OSError, ValueError):     # missing, unreadable, or not UTF-8: no stored defaults
         return
     for k, v in _parse(text):
         try:
@@ -118,8 +120,9 @@ def check_pair(key: str, value: str) -> bool:
     """Raise ValueError for a pair that must not be stored; return True when `key` is a known one."""
     if not _KEY_RE.match(key):
         raise ValueError(f"refusing to store {key!r}: a config key is CGC_ followed by A-Z, 0-9 or _")
-    if any(c in value for c in "\n\r\0"):
-        raise ValueError(f"refusing to store {key}: the value contains a newline, carriage return or NUL")
+    if "\0" in value or len(("x" + value + "x").splitlines()) != 1:
+        raise ValueError(f"refusing to store {key}: the value contains a line break (newline, CR, VT, FF, "
+                         "FS/GS/RS, NEL, LS or PS) or NUL; the config reader would see a second line")
     check = KNOWN.get(key)
     if check is not None:
         try:
@@ -156,15 +159,17 @@ def set_key(key: str, value: str) -> str:
         out, found = [], False
         try:
             with open(p, encoding="utf-8") as f:
-                for line in f:
-                    s = line.strip()
-                    if s and not s.startswith("#") and "=" in s and s.split("=", 1)[0].strip() == key:
-                        out.append(f"{key}={value}\n")
-                        found = True
-                    else:
-                        out.append(line if line.endswith("\n") else line + "\n")
-        except OSError:
-            pass
+                text = f.read()
+        except FileNotFoundError:
+            text = ""          # the one read failure that means "no config yet"; any other OSError aborts
+        # Split exactly as _parse does (str.splitlines), so a line the reader sees as two is two here.
+        for line in text.splitlines():
+            s = line.strip()
+            if s and not s.startswith("#") and "=" in s and s.split("=", 1)[0].strip() == key:
+                out.append(f"{key}={value}\n")
+                found = True
+            else:
+                out.append(line + "\n")
         if not found:
             out.append(f"{key}={value}\n")
         fd, tmp = tempfile.mkstemp(dir=d, prefix=".config.")
@@ -197,6 +202,9 @@ def _main(argv) -> int:
         except ValueError as e:
             sys.stderr.write(f"CGC_ERROR {e}\n")
             return 2
+        except OSError as e:     # unreadable/unwritable config or lock: nothing was changed
+            sys.stderr.write(f"cgc_config: config not updated ({e}); the file was left as it was\n")
+            return 1
         print(f"set {argv[1]} in {p}")
         return 0
     if cmd == "get" and len(argv) == 2:

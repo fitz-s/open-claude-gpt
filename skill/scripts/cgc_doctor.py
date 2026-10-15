@@ -32,8 +32,10 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 
 GREEN, YELLOW, RED, DIM, RESET = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
@@ -55,6 +57,23 @@ except Exception:
 # driver already install a proxy-free opener for the same reason). A local opener, not a global one:
 # this module is imported by bin/cgc and by tests.
 _open = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+
+
+
+def ws_connect(url: str, timeout: float):
+    """A CDP websocket to the loopback debug Chrome, opened on a socket we connect ourselves.
+    websocket-client reads http_proxy/HTTPS_PROXY from the environment and would tunnel 127.0.0.1
+    through it (a local LLM router answers CONNECT with its own error page); a caller-supplied socket
+    is the one option that bypasses proxy resolution entirely, in every 1.x version."""
+    import websocket
+    u = urllib.parse.urlparse(url)
+    sock = socket.create_connection((u.hostname, u.port or 80), timeout=timeout)
+    try:
+        return websocket.create_connection(url, timeout=timeout, socket=sock)
+    except BaseException:
+        sock.close()
+        raise
+
 
 PORT = int(os.environ.get("CGC_PORT", "9333"))
 PROFILE = os.environ.get("CGC_PROFILE", os.path.expanduser("~/.cgc-chrome"))
@@ -303,6 +322,86 @@ def check_skill_files(r: "Report", here: str = HERE) -> None:
         r.fail("skill files", "; ".join(problems), "re-run install.sh from the repo", verdict="installed")
 
 
+def _pid_running(pid) -> bool:
+    """A process that exists and is not a zombie: a zombie answers kill -0 until its parent reaps it,
+    and holds no lock, so it must not count as a daemon that is still running."""
+    try:
+        os.kill(int(pid), 0)
+    except PermissionError:
+        pass                                    # exists, owned by another user
+    except (OSError, ValueError, TypeError):
+        return False
+    try:
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(int(pid))], capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+    except Exception:
+        return True                             # cannot tell: assume it is still there
+    return bool(out) and not out.startswith("Z")
+
+
+def _command_of(pid) -> str:
+    try:
+        return subprocess.run(["ps", "-o", "command=", "-p", str(int(pid))], capture_output=True, text=True,
+                              timeout=5).stdout
+    except Exception:
+        return ""
+
+
+def _lock_holders(lock_dir: str) -> list:
+    """Pids with any file under the lock directory open, per lsof (empty when lsof is absent). That
+    directory is the fencing namespace: the daemon holds daemon.lock for its whole life, and a worker
+    that outlived its daemon still holds its lease.<rid>. Every one of them is executing this tree."""
+    if not shutil.which("lsof") or not os.path.isdir(lock_dir):
+        return []
+    try:
+        out = subprocess.run(["lsof", "-t", "+D", lock_dir], capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return []
+    return [int(w) for w in out.split() if w.isdigit() and int(w) != os.getpid()]
+
+
+def _lock_held(path: str) -> bool:
+    """True when another open file description holds an flock on `path` right now."""
+    try:
+        import fcntl
+        fd = os.open(path, os.O_RDWR)
+    except (ImportError, OSError):
+        return False                            # no lock file (or no flock): nobody holds it
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def daemon_processes() -> dict:
+    """Is an egress daemon PROCESS still there, whatever its heartbeat says? {"pids": [...],
+    "lock_held": bool}. This decides whether code may be replaced or deleted under it, so it asks
+    about the process and its lock, never about freshness: a daemon that is draining, wedged or
+    mid-restart has a stale heartbeat and still executes the files. A process counts if it holds
+    anything in the lock directory (daemon.lock, held for the process lifetime; a surviving worker's
+    lease), or is the pid recorded in daemon.json (read regardless of age) and is alive and runs
+    cgc_daemon.py."""
+    import cgc_spool
+    pids = set()
+    try:
+        with open(cgc_spool.daemon_path(), encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        rec = None
+    pid = rec.get("pid") if isinstance(rec, dict) else None
+    if isinstance(pid, int) and pid != os.getpid() and _pid_running(pid):
+        cmd = _command_of(pid).strip()
+        if not cmd or "cgc_daemon.py" in cmd:   # an unreadable command line is not proof of a reused pid
+            pids.add(pid)
+    pids.update(p for p in _lock_holders(os.path.dirname(cgc_spool.daemon_lock_path())) if _pid_running(p))
+    return {"pids": sorted(pids), "lock_held": _lock_held(cgc_spool.daemon_lock_path())}
+
+
 def daemon_mismatch(ident: dict):
     """Why a live daemon is not serving this install, or "" when it is. Only the heartbeat is read:
     opening the store here would migrate it."""
@@ -462,8 +561,7 @@ def run(deep: bool, secure: bool = False) -> Report:
                 r.warn("ChatGPT login", "no page tab to probe",
                        "open chatgpt.com in the debug Chrome window")
             else:
-                import websocket
-                ws = websocket.create_connection(cgpt[0]["webSocketDebuggerUrl"], timeout=6)
+                ws = ws_connect(cgpt[0]["webSocketDebuggerUrl"], 6)
                 ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate", "params": {
                     "expression": "(!!document.querySelector('input[type=\"password\"]'))"
                                   "||/^\\/(auth|login)(\\/|$)/i.test(location.pathname)",
@@ -541,7 +639,14 @@ def run(deep: bool, secure: bool = False) -> Report:
     try:
         import cgc_spool
         ident = cgc_spool.daemon_identity()
-        if ident is None:
+        procs = daemon_processes() if ident is None else None
+        if ident is None and (procs["pids"] or procs["lock_held"]):
+            who = ", ".join(map(str, procs["pids"])) or "unidentified"
+            r.fail("daemon", f"a daemon process is alive (pid {who}) but its heartbeat is stale or missing; "
+                   "it is hung, draining or still starting, and cannot take a consult",
+                   "give it a minute; if this persists restart it: `launchctl kickstart -k gui/$(id -u)/"
+                   "com.open-claude-gpt.daemon`", verdict="can_send")
+        elif ident is None:
             r.fail("daemon", "egress daemon not running; consults would sit in the queue and never run",
                    "install it once (survives login and crashes): `cgc install-daemon`; "
                    "or run `cgc watch` / `cgc up`", verdict="can_send")
