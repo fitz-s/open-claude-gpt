@@ -974,3 +974,21 @@ def test_a_github_site_page_is_not_a_code_source(spool):
     zero repos, so a prompt could pass on one. They are pages of the site, not code: no link."""
     ok, why = spool.validate_prompt("review https://github.com/topics and https://github.com/orgs/acme/people")
     assert not ok and "no public code link" in why
+
+
+def test_a_ref_is_never_truncated_at_a_plus_or_other_url_character(spool, monkeypatch):
+    """`tree/main+dead` used to be cut at `+` and verified as `main`."""
+    asked = _probe_log(spool, monkeypatch, known_refs={"main"})
+    ok, why = spool.validate_prompt(f"review {_OWN}/tree/main+dead")
+    assert not ok and "does not exist" in why
+    assert "repos/acme/widgets/commits/main%2Bdead" in asked
+
+
+def test_a_blob_the_contents_api_calls_too_large_still_proves_the_path_exists(spool, monkeypatch):
+    class _R:
+        returncode = 1
+        stdout = ""
+        stderr = "gh: This API returns blobs up to 1 MB in size. The requested blob is too large to fetch via the API (HTTP 403)"
+    monkeypatch.setattr(spool, "_gh_exists", _REAL_GH_EXISTS)
+    monkeypatch.setattr(spool.subprocess, "run", lambda *a, **k: _R())
+    assert spool._gh_exists("repos/acme/widgets/contents/big.bin?ref=main") == (True, "exists")
