@@ -45,7 +45,7 @@ def test_a_percent_encoded_owner_is_refused_not_normalized():
     visibility): a link must be written plainly or it is refused."""
     spool = _load("cgc_spool.py")
     links, refuse = spool._parse_code_urls("see https://github.com/%66itz-s/repo for the code")
-    assert links is None and refuse.startswith("refused:") and "percent-escape" in refuse
+    assert links is None and refuse.startswith("refused:") and "not plain" in refuse
 
 
 def test_validate_refuses_double_encoded_owner_without_network():

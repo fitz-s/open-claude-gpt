@@ -42,44 +42,50 @@ processes, do not run this tool on that machine.
 The daemon re-validates every prompt before sending, fail-closed, over the exact bytes that leave
 (the click-owning process runs the same gate again, so a direct send cannot skip it). It checks:
 
-- **The URL law.** The gate judges the URL a browser would actually request. The prompt is cut into
-  whitespace-delimited runs, and every `http(s):` inside a run starts a token that runs to the end of
-  that run: an inner scheme never truncates the outer URL (`.../ok/ok/https:/../../../other/private`
-  is judged whole), and a link nested in a proxy or redirect URL is judged as its own URL. Quotes,
-  brackets and parentheses stay inside the token; only trailing sentence punctuation is dropped. Each
-  token is parsed once, and that one parse feeds the visibility check, the existence check and the
-  gist rule, so no check can look at a different repo than the link reaches. A GitHub link
-  (`github.com`, `raw.githubusercontent.com`, `gist.github.com`, `api.github.com`,
-  `codeload.github.com`) must be written plainly or it is **refused, not normalized**: `https://`
-  only; the host exactly, with no userinfo, port, escape, trailing dot or non-ASCII look-alike; no
-  backslash; no `.` or `..` path segment, no percent-escape and no empty segment; owner and repo in
-  GitHub's character sets; a path segment never ends in `.`. Any other host under `github.com`,
-  `githubusercontent.com`, `github.io`, `githubassets.com` or `ghcr.io` (Pages, signed downloads,
-  packages, assets) is refused outright, because the gate has no check for it.
+- **The URL law.** One judge, applied identically to every reading of a link, with no reading-specific
+  relaxations. A reading is a string a URL parser could be handed: the link as written, the link
+  joined with the text after it at each line break and at the end of its chain, and the readings in
+  which a final period belongs to the name (below). The prompt is cut into whitespace-delimited runs;
+  every `http(s):` inside a run starts a token that runs to the end of the run (an inner scheme never
+  truncates the outer URL: `.../ok/ok/https:/../../../other/private` is judged whole, and a link nested
+  in a proxy or redirect URL is judged as its own URL). Quotes, brackets and parentheses stay inside
+  the token; only trailing sentence punctuation is dropped. The judge refuses, for any
+  `github.com`, `raw.githubusercontent.com`, `gist.github.com`, `api.github.com` or
+  `codeload.github.com` URL: a scheme other than `https://`; a host not written exactly (userinfo,
+  port, escape, trailing dot, non-ASCII look-alike); a backslash; a `.` or `..` path segment, or a
+  `%2e` spelling of one; an escaped `/` or `\`; and an owner or repo (and the API's `/repos/OWNER/REPO`)
+  that is not plain. **Any `%` in an owner or repo refuses**, and so does a reading whose owner/repo
+  cannot be parsed at all, because GitHub decodes `cl%69` to `cli` (checked live) and a name the gate
+  cannot read is a name it cannot verify. A percent-escape in the segments after owner/repo and the
+  page kind (`Caf%C3%A9.md`) is data, decoded once before the existence probe. Any other host under
+  `github.com`, `githubusercontent.com`, `github.io`, `githubassets.com` or `ghcr.io` (Pages, signed
+  downloads, packages, assets) is refused outright, because the gate has no check for it. Links to
+  other sites are outside the gate.
 - **Line breaks.** A URL parser drops EVERY TAB, CR and LF from the string it is handed, a blank line
   included, so where a line ends does not fix what a link says: `new URL("https://github.com/cli/cli\n\n-private-zz/x")`
   is `cli/cli-private-zz`, and a host or even the `https:` can be spelled across breaks. Runs of text
   separated only by TAB/CR/LF form a chain (a space ends one, because a parser keeps it). In each chain
   the gate judges every reading a parser could be handed: the link alone, the link joined at **each**
   break, and the **maximal** join to the end of the chain, exactly as a parser that strips every
-  TAB/CR/LF sees it. Every reading must name the same repo as the link alone, and none may carry a dot
-  segment (including the `%2e` spellings), an escaped separator, or a backslash. A chain with more than
-  64 breaks after a link is **refused**, never judged on a prefix, and a scheme split by a break is
-  refused. The consequence you will notice: **a bare `owner/repo` link that ends a line and is
-  followed, across line breaks, by a line starting with a word, digit or `-` is refused**, because
-  nothing distinguishes prose from a join; the refusal says how to fix it. End the link with a space or
-  a trailing slash. Links that end in a path (`/pull/12`), links wrapped in brackets, quotes or
-  backticks, and links followed by a space are unaffected, and so are the links in the `prep` refs list.
-  A TAB or bare CR next to a link is refused always. A final period is judged both ways: `widgets.` is
-  a legal repo name, so `see https://github.com/acme/widgets.` can name `widgets` plus a full stop, or
+  TAB/CR/LF sees it, all by the one judge. Every reading must also name the same repo as the link
+  alone. A chain with more than 64 breaks after a link is **refused**, never judged on a prefix, and a
+  scheme split by a break is refused. The consequence you will notice: **a bare `owner/repo` link that
+  ends a line and is followed, across line breaks, by a line starting with a word, digit, `-` or `%`
+  is refused**, wrapped in brackets, quotes or backticks or not, because a reading the gate cannot name
+  is a reading it cannot verify (`widgets)Focus` is not a repo GitHub routes, but `cli-%70rivate` is) and
+  the one rule is applied to every reading. The refusal says how to fix it: put a space or a trailing
+  `/` right after the link. Links that end in a path (`/pull/12`), links ending in `/`, links followed
+  by a space, a next line starting with `#`, and the links in the `prep` refs list are unaffected. A TAB
+  or bare CR next to a link is refused always. A final period is judged both ways: `widgets.` is a
+  legal repo name, so `see https://github.com/acme/widgets.` can name `widgets` plus a full stop, or
   the repo `widgets.`. The gate verifies `acme/widgets` as usual and probes `acme/widgets.` once: a 404
   means the period was punctuation, a public `widgets.` passes, one that exists and is not public is
   refused (unless the operator allowlisted it), and a gh outage on it holds the round for a retry. A
   period after a path (`/pull/12.`) cannot change the repo and is not probed. The refusal's fix is to
   put the link in `<angle brackets>` or end the sentence before it. `tests/test_gate_differential.py`
-  checks all of this
-  against node's WHATWG URL parser on a generated corpus, with an oracle that follows unbounded joins
-  and shares no code or cap with the gate.
+  checks all of this against node's WHATWG URL parser on a generated corpus, with an oracle that
+  percent-decodes segments the way GitHub routes them, follows unbounded joins, and shares no code or
+  cap with the gate.
   **Links to other sites are outside the gate**: they are part of the operator's free-text boundary
   below, like any other sentence in a `--task`.
 - **Repos.** Every repo a link reaches must be gh-confirmed public. Gist links are refused.

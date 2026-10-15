@@ -130,49 +130,52 @@ def default_out(rid: str) -> str:
 
 # ---- the URL law ------------------------------------------------------------
 #
-# The gate judges the URL a browser would actually request. A prompt is cut into whitespace-delimited
-# runs, and every `http(s):` inside a run starts a token that runs to the END of that run: an inner
-# scheme never truncates the outer URL, so `https://github.com/ok/ok/https:/../../../other/private` is
-# judged whole (its dot segments are seen) and the inner `https:` is judged as one more URL. Delimiter
-# characters (`'`, `"`, `<`, `(`...) stay inside the token, where the rules below see them; only
-# trailing sentence punctuation is dropped. Each token is parsed ONCE, and that one parse feeds the
-# visibility check, the existence check and the gist rule, so no check can look at a different repo
-# than the link reaches. A token is a GitHub link when its host, after what a browser does before
-# connecting (drop userinfo and port, percent-decode, IDNA-fold fullwidth and ideographic-dot variants,
-# drop trailing dots, lowercase), is in _GH_HOSTS; any other host under a GitHub domain (_GH_DOMAINS:
-# Pages, signed downloads, packages, assets) is REFUSED, because the gate has no check for it. A
-# GitHub link must be written plainly or it is REFUSED, never normalized and accepted:
-#   scheme https with `//`; host written exactly (no userinfo, port, escape, trailing dot or
-#   non-ASCII); no backslash; path with no `.`/`..` segment, no percent-escape and no empty segment
-#   (one trailing slash is the same page); owner [A-Za-z0-9-], repo [A-Za-z0-9._-].
-# A URL parser also drops EVERY TAB, CR and LF from the string it is handed, so where a line ends does
-# not fix what a link says. The prompt is cut into whitespace-delimited runs; runs separated only by
-# TAB/CR/LF form a CHAIN (a space ends one: a parser keeps it). In each chain's joined text, at every
-# `http(s):` (the scheme itself may be split by a break), the gate judges every reading a parser could
-# be handed: the link alone, the link joined at EACH break, and the maximal join to the end of the
-# chain, exactly as a parser that strips every TAB/CR/LF sees it. A chain holding more than
-# _MAX_BREAKS breaks after a link is REFUSED, never judged on a prefix. Each joined reading must break
-# no rule, carry no dot segment, escape or backslash, and name the SAME repo as the link alone:
-# `https://github.com/cli/cli` + LF + `-private-zz/x` reaches cli/cli-private-zz, the same with a blank
-# line between, `.../fitz-` + LF + `private/repo` reaches fitz-private/repo, `https://git` + breaks +
-# `hub.com/private/repo` reaches github.com, and a join that makes a GitHub link out of a non-GitHub
-# one is the same thing. A joined reading that is not a repo name GitHub can hold (`widgets)Focus`)
-# names nothing and is left alone. So a bare `owner/repo` link that ends a line and is followed, across
-# line breaks, by a line starting with a word, a digit or a `-` is refused with the fix (end the link
-# with a space or a trailing slash): no shape of the next line tells prose from a join. A link that
-# ends in a path (`/pull/12`), ends in `/`, is wrapped in brackets or quotes, or is followed by a space
-# before the break, cannot change its repo and is left alone. A TAB or bare CR right beside a GitHub
-# link is refused outright (it is neither a line end nor indentation).
-# A sentence's final period is the same kind of ambiguity: `widgets.` is a legal repo name, so
-# `see https://github.com/acme/widgets.` can mean the repo `widgets` followed by a full stop, or the
-# repo `widgets.`. Both readings are judged. The period is dropped for the link itself (the repo
-# `widgets` is verified as usual) and the kept reading `owner/widgets.` is probed once. Together the
-# readings must satisfy: every reading that exists is public (unless the operator allowlisted it), and
-# at least one is. So a 404 on `widgets.` means the period was punctuation; a public `widgets.` passes
-# even when `widgets` does not exist (the link names the dotted repo); a `widgets.` that exists and is
-# not public is refused. A period after a path segment (`/pull/12.`) cannot
-# change the repo, and an owner cannot contain a period, so those need no probe. Two final periods
-# (`main..`) are not a sentence end and are refused by the dot rules.
+# ONE judge, applied identically to EVERY reading of a link. A reading is a string a URL parser could be
+# handed: the link as written, the link joined with the text after it at each line break and at the end
+# of its chain (a parser drops every TAB/CR/LF), and the readings in which a final period is part of the
+# name. There are no reading-specific relaxations: a joined reading that the judge would refuse if it
+# were written is refused, and the cost (a few false refusals, each with a fix hint) is accepted.
+#
+# Tokens. A prompt is cut into whitespace-delimited runs; every `http(s):` in a run starts a token that
+# runs to the END of the run (an inner scheme never cuts the outer URL, and is judged as one more URL).
+# Delimiters (`'`, `"`, `<`, `(`) stay inside the token; only trailing sentence punctuation is dropped.
+# Runs separated only by TAB/CR/LF form a chain (a space ends one: a parser keeps it); a scheme or host
+# may be split across its breaks; more than _MAX_BREAKS after a link is refused, never judged on a prefix.
+#
+# The judge (_judge) takes a string and returns one of:
+#   OTHER   not a GitHub-family URL (the gate has no opinion)
+#   ROOT    a GitHub URL that names no repo (the site root, a reserved page)
+#   REFUSE  with the reason
+#   OK      a GitHub URL, parsed once into kind, owner/repo and what follows, which feeds the
+#           visibility check, the existence check and the gist rule
+# and REFUSES: any other host under a GitHub domain (_GH_DOMAINS: Pages, signed downloads, packages,
+# assets); a scheme other than `https://`; a host not written exactly (userinfo, port, escape, trailing
+# dot, non-ASCII); a backslash; a `.` or `..` path segment, or a `%2e` spelling of one, ANYWHERE; an
+# escaped separator (`%2f`, `%5c`) anywhere in the path; and an owner or repo (and the API's
+# /repos/OWNER/REPO) that is not plain: any `%` there refuses, and so does a GitHub-host reading whose
+# owner/repo cannot be parsed at all, because GitHub decodes `cl%69` to `cli` and a name it cannot read
+# is a name it cannot verify. After owner/repo and the page kind (`pull`, `tree`...) a segment is data: a
+# percent-escape (`Caf%C3%A9.md`, decoded once before the existence probe) or an empty segment cannot
+# change which repo a link reaches. What the gate can VERIFY is a separate question, asked only of the link as
+# written (_parse_code_urls): an empty segment, a trailing `.`, a malformed PR number or compare range
+# is refused there, because the gate cannot check what it cannot read.
+#
+# The readings. All of them are judged by that one function and must agree:
+#   * a joined reading must name the SAME repo as the link alone (`https://github.com/cli/cli` + LF +
+#     `-private-zz/x` reaches cli/cli-private-zz; so does a blank line between), and a join that makes a
+#     GitHub link out of a non-GitHub one is the same thing; `https://git` + breaks + `hub.com/...`
+#     reaches github.com. So a bare `owner/repo` link that ends a line and is followed, across line
+#     breaks, by a line starting with a word, a digit, a `-` or a `%` is refused with the fix (end the
+#     link with a space or a trailing slash). A link that ends in a path (`/pull/12`), ends in `/`, is
+#     wrapped in brackets or quotes, or is followed by a space before the break, cannot change its repo;
+#   * a TAB or bare CR right beside a GitHub link is refused outright (neither a line end nor indentation);
+#   * a final period is judged both ways: `widgets.` is a legal repo name, so `see .../acme/widgets.` can
+#     mean the repo `widgets` plus a full stop, or the repo `widgets.`. The undotted repo is verified as
+#     usual and `owner/widgets.` is probed once: a 404 means the period was punctuation, a public one
+#     passes, one that exists and is not public is refused (unless the operator allowlisted it). Together
+#     the readings must satisfy: every one that exists is public, and at least one is. A period after a
+#     path segment cannot change the repo, an owner cannot contain a period, and two final periods
+#     (`main..`) are not a sentence end and are refused by the dot rules.
 # Not the gate's business, and the operator's free-text boundary (docs/SECURITY.md): links to other
 # sites, and GitHub hosts written without a scheme.
 _GH_HOSTS = {"github.com": "repo", "www.github.com": "repo", "raw.githubusercontent.com": "raw",
@@ -186,8 +189,8 @@ _PR_RE = re.compile(r"([0-9]+)(?:\.(?:diff|patch))?")
 _TRAIL = ",;:!?)]}'\"*>|`"     # sentence punctuation and closing wrappers; an OPENING one stays and is refused
 _MAX_BREAKS = 64      # breaks after a link within one chain; more is refused, never judged on a prefix
 _MAX_SCHEMES = 64     # `http(s):` occurrences in one chain; more is refused, not sampled
-_OWNER_RE = re.compile(r"[A-Za-z0-9-]+")
-_REPO_RE = re.compile(r"[A-Za-z0-9._-]+")
+_OWNER_RE = re.compile(r"[A-Za-z0-9-]+")        # a GitHub account name: no `%`, no period, no underscore
+_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")      # a repo name, plain: no `%`, nothing else
 # github.com/<one of these>/... is a page of the site, never a repo (GitHub reserves the names).
 _NON_REPO_OWNERS = ("orgs", "sponsors", "settings", "features", "about", "topics", "trending", "marketplace")
 _REF_SEGMENTS = 8     # a ref may itself contain '/': at most this many leading segments form it
@@ -234,10 +237,10 @@ def _dot_alt(raw: str, slug: str) -> str:
     """The repo a link names when its single final period is PART of the name, if that differs from
     `slug` (the repo it names with the period dropped); else ""."""
     dotted = _keep_dot(raw)
-    if not dotted.endswith(".") or dotted.endswith(".."):
+    if not dotted.endswith("."):
         return ""
-    st, pl = _read(dotted, joined=True)
-    return pl[1] if st == "ok" and pl[1] and pl[1].lower() != slug.lower() else ""
+    st, pl = _judge(dotted)
+    return pl[1] if st == OK and pl[1] and pl[1].lower() != slug.lower() else ""
 
 
 def _gh_host(authority: str) -> str:
@@ -269,13 +272,6 @@ _DOT_SEGMENTS = {".", "%2e", "..", ".%2e", "%2e.", "%2e%2e"}      # what a URL p
 _SEP_ESCAPE_RE = re.compile(r"%(?:2f|5c)", re.IGNORECASE)             # an escaped `/` or `\\`
 
 
-def _unsafe(u) -> bool:
-    """True when the PATH of a joined reading can send a parser or a server somewhere other than where
-    it reads: a dot segment (written plainly or as the `%2e` aliases a parser also collapses), or an
-    escaped separator. Any other percent-escape (`Caf%C3%A9`) is data and changes nothing. A backslash
-    needs no test of its own: `_split` has already turned it into the `/` a parser sees."""
-    return (any(seg.lower() in _DOT_SEGMENTS for seg in u.path.split("/"))
-            or _SEP_ESCAPE_RE.search(u.path) is not None)
 
 
 def _chains(text: str):
@@ -331,104 +327,94 @@ def _url_tokens(text: str):
             yield reads[0], reads[1:], any(glue[p0:]), i0 > p0
 
 
-def _read(tok: str, joined: bool = False) -> tuple:
-    """Stage 1 of the URL law for one token. `joined` marks a hypothetical reading made by joining the
-    text after a link onto it: such a reading is judged for the repo it reaches and for the dangerous
-    forms (dot segment, escape, backslash), not for path-detail rules that police a link as WRITTEN
-    (an empty segment is collapsed the way a lenient server would, a trailing `.` is ignored).
-    Returns (state, payload):
-      ("other", None)    not a GitHub-family URL (the gate has no opinion)
-      ("root", None)     a GitHub URL with no repo to verify (site root, or a reserved page)
-      ("norepo", msg)    a GitHub URL whose owner/repo is missing or outside GitHub's character sets
-      ("bad", msg)       breaks the law (msg is the refusal)
-      ("ok", (kind, slug, rest_segs, host))   `slug` is "" for a gist."""
+OTHER, ROOT, REFUSE, OK = "other", "root", "refuse", "ok"
+
+
+def _judge(tok: str) -> tuple:
+    """THE judge of one reading (see the URL law above). Returns (state, payload):
+      (OTHER, None)   not a GitHub-family URL
+      (ROOT, None)    a GitHub URL that names no repo
+      (REFUSE, msg)   the refusal
+      (OK, (kind, slug, rest_segs, host))   `slug` is "" for a gist, else "owner/repo".
+    No argument changes what it enforces."""
     got = _split(tok)
     if got is None:
-        return "other", None
+        return OTHER, None
     scheme, u = got
     host = _gh_host(u.netloc)
     if not _is_gh(host):
-        return "other", None
+        return OTHER, None
     kind = _GH_HOSTS.get(host)
     if kind is None:
-        return "bad", (f"refused: {host} is a GitHub-hosted domain the gate has no check for (Pages, "
-                       f"signed downloads, packages, assets) in {tok[:120]!r} — drop it, or link the "
-                       "repository on github.com instead")
+        return REFUSE, (f"refused: {host} is a GitHub-hosted domain the gate has no check for (Pages, "
+                        f"signed downloads, packages, assets) in {tok[:120]!r} — drop it, or link the "
+                        "repository on github.com instead")
 
-    def bad(why, state="bad"):
-        return state, (f"refused: {why} in GitHub link {tok[:120]!r} — write it as https://{host}/... "
-                       "(and put whitespace between links)")
+    def no(why):
+        return REFUSE, (f"refused: {why} in GitHub link {tok[:120]!r} — write it as https://{host}/... "
+                        "(and put whitespace between links)")
 
     if scheme.lower() != "https":
-        return bad("a non-https scheme")
+        return no("a non-https scheme")
     if not re.match(r"https://[^/]", tok, re.IGNORECASE):
-        return bad("a malformed scheme separator")
+        return no("a malformed scheme separator")
     if "\\" in tok:
-        return bad("a backslash")
+        return no("a backslash")
     if u.netloc.lower() != host:
-        return bad("userinfo, a port, an escape, a trailing dot or a non-ASCII character in the host")
-    if "%" in u.path and not joined:
-        return bad("a percent-escape in the path")
+        return no("userinfo, a port, an escape, a trailing dot or a non-ASCII character in the host")
     segs = u.path.split("/")[1:]
     if segs and segs[-1] == "":
         segs.pop()
-    if joined:
-        segs = [x for x in segs if x]
     if not segs:
-        return "root", None
-    if "" in segs:
-        return bad("an empty path segment")
-    if "." in segs or ".." in segs:
-        return bad("a `.` or `..` path segment")
-    if segs[-1].endswith(".") and not joined:
-        return bad("a path segment ending in `.`")
+        return ROOT, None
+    if any(seg.lower() in _DOT_SEGMENTS for seg in segs):
+        return no("a `.` or `..` path segment")
+    if _SEP_ESCAPE_RE.search(u.path):
+        return no("an escaped `/` or `\\` in the path")
     if kind == "gist":
-        return "ok", ("gist", "", [], host)
+        return OK, ("gist", "", [], host)
     if kind == "api":
         if segs[0] != "repos" or len(segs) < 3:
-            return bad("an api.github.com path that is not /repos/OWNER/REPO/...")
-        owner, repo, rest = segs[1], segs[2], []
+            return no("an api.github.com path that is not /repos/OWNER/REPO/...")
+        owner, repo, rest = segs[1], segs[2], segs[3:]
     else:
         owner, repo, rest = segs[0], (segs[1] if len(segs) > 1 else ""), segs[2:]
     if kind == "repo" and owner.lower() in _NON_REPO_OWNERS:
-        return "root", None     # reserved names no account can hold: a site page, whatever follows
-    if not repo or not _OWNER_RE.fullmatch(owner) or not _REPO_RE.fullmatch(repo):
-        return bad("no verifiable owner/repo", "norepo")
-    return "ok", (kind, f"{owner}/{repo}", rest, host)
+        return ROOT, None       # reserved names no account can hold: a site page, whatever follows
+    if not (_OWNER_RE.fullmatch(owner) and repo and _NAME_RE.fullmatch(repo)):
+        return no("an owner/repo that is not plain (a `%` escape, or something GitHub cannot name)")
+    return OK, (kind, f"{owner}/{repo}", rest, host)
 
 
 def _check_joins(first: str, state: str, payload, reads: list, glued: bool, spans: bool, alts: set):
-    """The refusal for the readings in which the text after a link is joined onto it, or None. `first`
-    is the link as written (a joined reading itself when `spans`), `reads` its later joins. A joined
-    reading that names the same repo adds to `alts` the repo its final period could make it name."""
+    """The refusal for the joined readings of a link, or None. Every reading goes through _judge; a
+    reading must come out as the same repo as the link alone (or as nothing the gate looks at)."""
     seen, readings = set(), []
     for r in ([first] if spans else []) + reads:
         if r not in seen:
             seen.add(r)
             tok = _trim(r)
-            readings.append((tok, r, *_read(tok, joined=True)))
-    if state == "other" and all(st == "other" for _, _, st, _ in readings):
+            readings.append((tok, r, *_judge(tok)))
+    if state == OTHER and all(st == OTHER for _, _, st, _ in readings):
         return None     # nothing GitHub-shaped on either side of any join
     if glued:
         return (f"refused: a TAB or bare CR inside or beside a GitHub link ({(first + ''.join(reads[-1:]))[:100]!r}); "
                 "a browser drops it and joins the pieces. Put the link on one line")
     for tok, r, st, pl in readings:
-        if st == "other":
+        if st == OTHER:
             continue
         if spans:
             return (f"refused: a line break splits the scheme of a link that a browser reads as {tok[:100]!r}. "
                     "Put the link on one line")
-        got = _split(tok)
-        if got and _unsafe(got[1]):
-            return (f"refused: a line break lets a browser join a dot segment, escape or backslash onto "
-                    f"the GitHub link {first[:100]!r}. Put the link on one line")
-        if st == "bad":
-            return pl
-        if st == "ok" and not (state == "ok" and payload[0] == pl[0] and payload[1].lower() == pl[1].lower()):
+        if st == REFUSE:
+            return (f"refused: a line break lets a browser join the link {first[:100]!r} with the text after it "
+                    f"into {tok[:120]!r}, which the gate refuses ({pl.split(' in GitHub link')[0].replace('refused: ', '')}). "
+                    "Put a space or a trailing `/` right after the link, before the line break, or put it on one line")
+        if st == OK and not (state == OK and payload[0] == pl[0] and payload[1].lower() == pl[1].lower()):
             return (f"refused: a line break lets a browser join the link {first[:100]!r} with the text after "
-                    f"it into {tok[:120]!r}, which is a different repo ({pl[1] or 'a gist'}). End the link "
-                    "with a space or a trailing slash")
-        if st == "ok":
+                    f"it into {tok[:120]!r}, which is a different repo ({pl[1] or 'a gist'}). Put a space or a "
+                    "trailing `/` right after the link, before the line break")
+        if st == OK:
             alt = _dot_alt(r, pl[1])
             if alt:
                 alts.add(alt)
@@ -446,13 +432,13 @@ def _parse_code_urls(text: str) -> tuple:
     for first, reads, glued, spans in tokens:
         tok = _trim(first)
         if spans:
-            state, payload = "other", None      # no plain reading: the scheme is split by a break
+            state, payload = OTHER, None        # no plain reading: the scheme is split by a break
         else:
-            state, payload = _read(tok)
-            if state in ("bad", "norepo"):
+            state, payload = _judge(tok)
+            if state == REFUSE:
                 return None, payload
         alts = set()
-        if state == "ok" and not spans:
+        if state == OK and not spans:
             alt = _dot_alt(first, payload[1])
             if alt:
                 alts.add(alt)
@@ -460,7 +446,7 @@ def _parse_code_urls(text: str) -> tuple:
             why = _check_joins(first, state, payload, reads, glued, spans, alts)
             if why:
                 return None, why
-        if state != "ok":
+        if state != OK:
             continue
         kind, slug, rest_segs, host = payload
 
@@ -471,6 +457,19 @@ def _parse_code_urls(text: str) -> tuple:
         if kind == "gist":
             links.append(Link("gist", "", ()))
             continue
+        # What follows is checked of the link AS WRITTEN, because it decides what the gate can VERIFY (the
+        # judge already decided what the link can REACH): no empty segment, no escape in the page kind
+        # (`%70ull`), segments after it decoded once as GitHub does, no control character, and no segment
+        # ending in `.` (git forbids a ref that does; the repo itself is judged both ways, see _dot_alt).
+        if "" in rest_segs:
+            return no("an empty path segment")
+        if rest_segs and "%" in rest_segs[0]:
+            return no("a percent-escape in the page kind (write `pull`, `tree`, `blob`...)")
+        rest_segs = rest_segs[:1] + [unquote(x) for x in rest_segs[1:]]
+        if any(c < " " or c == "\x7f" for x in rest_segs for c in x):
+            return no("a control character in the path")
+        if (rest_segs[-1] if rest_segs else slug.split("/", 1)[1]).endswith("."):
+            return no("a path segment ending in `.`")
         target = ()
         if kind == "raw" and rest_segs:
             target = ("raw", tuple(rest_segs))

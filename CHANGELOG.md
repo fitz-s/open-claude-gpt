@@ -114,7 +114,14 @@ releases until it stabilizes.
   rather than a list of cases: every chain of text joined only by TAB/CR/LF is judged at each break and
   at its maximal join, a chain with more than 64 breaks is refused instead of judged on a prefix (a host
   spelled one character per line used to pass after 16), a scheme split by a break is refused, and
-  `%2e` spellings of `.`/`..` and escaped separators count as dot segments. A final period after a
+  `%2e` spellings of `.`/`..` and escaped separators count as dot segments. The gate now has one judge
+  for every reading (as written, each join, the maximal join, both period readings) with no per-reading
+  relaxation: a joined reading used to skip the percent-escape rule and let an unparseable owner/repo
+  through, so `https://github.com/cli/cli` + LF + `-%70rivate` (GitHub routes it to `cli/cli-private`)
+  passed with only `cli/cli` verified. Any `%` in an owner or repo (and the API's `/repos/O/R`) now
+  refuses; a reading whose owner/repo cannot be parsed refuses; escapes after owner/repo/kind are data.
+  The cost: a bare `owner/repo` link directly followed by another line is refused even when wrapped in
+  `<>`, backticks or parentheses. A final period after a
   link is judged both ways (`widgets.` is a legal repo name): `owner/widgets.` is probed once, a 404
   means the period was punctuation, a non-public one is refused. A new test checks the gate against
   node's WHATWG parser on a generated corpus. The repo-root examples in

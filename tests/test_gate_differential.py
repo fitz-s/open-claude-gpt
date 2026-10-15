@@ -12,8 +12,12 @@
 #     assumes nothing about which one the writer meant: a reading that lands on a repo must land on one
 #     the gate verified.
 # A reading that lands on a GitHub host and names a repo GitHub can hold must name a repo the gate
-# verified. The gate and the oracle are written independently, so a hole one of them has is found by the
-# other. A prompt the gate REFUSED is never a bypass, so a gate that refuses what it cannot judge passes.
+# verified. The repo is taken the way GitHub's router takes it: each WHATWG pathname segment is
+# percent-decoded before it is read as an owner or a repo (`cli-%70rivate` is `cli-private`, which
+# GitHub serves: `curl -I https://github.com/cli/cl%69` answers 200). An owner or repo that still does not
+# parse after decoding names no repo: GitHub answers 404 for every spelling checked live (`cli/cli*`,
+# `cli/cli>`, `cli/cli)`, `cli/cli%2F`...), while the ones that DO route all decode to a nameable
+# segment (`cl%69`, `%63li`, `%2D`), which is why decoding comes first.
 #
 # Skipped without node (CI has it), like the sentinel-parser parity tests.
 import importlib.util
@@ -23,6 +27,7 @@ import random
 import re
 import shutil
 import subprocess
+from urllib.parse import unquote
 
 import pytest
 
@@ -35,14 +40,19 @@ HEADS = ["https://github.com/acme/widgets", "https://github.com/acme/widgets/", 
          "https://github.com/acme", "https://github.com/", "https://github.com", "https://github", "https://git",
          "https:", "https://raw.githubusercontent.com/acme/widgets/main/x", "https://api.github.com/repos/acme/widgets",
          "https://github.com/ac", "https://github.com/acme/wid", "https://github.com/acme/widgets/tree/",
-         "http://github.com/acme/widgets", "https://example.com/x", "ht", "https", "https://github.com/acme/widgets/https:"]
+         "http://github.com/acme/widgets", "https://example.com/x", "ht", "https", "https://github.com/acme/widgets/https:",
+         "https://github.com/cli/cli", "https://github.com/%61cme/widgets", "https://github.com/acme/wid%67ets",
+         "https://api.github.com/repos/acme/wid", "https://api.github.com/repos/%61cme/widgets",
+         "https://api.github.com/repos/acme/widgets/pulls/1", "https://github.com/acme/widgets/blob/main/docs/Caf%C3%A9.md"]
 SEPS = ["", "\n", "\r\n", "\t", " ", "\n\n", "\n ", "\n\t", " \n", "\r", "\n\r\n", "\t\n", "\n\n\n\n", "\r\n\r\n"]
 TAILS = ["priv/repo", "-priv/x", "/priv/repo", "/../priv/repo", "../../priv/repo", "//github.com/priv/repo",
          "hub.com/priv/repo", "server", "2", "-", "# Notes", "- item", "Then explain.", "(x)", "%2e%2e/priv",
          "\\priv\\repo", ".git", "_x", "extra words here", "https://github.com/other/repo", "/pull/9", "main/x",
-         "gadgets", "'/../priv/repo", "<x>", "*", "tps://github.com/priv/repo", "%2E./priv", "Caf%C3%A9"]
+         "gadgets", "'/../priv/repo", "<x>", "*", "tps://github.com/priv/repo", "%2E./priv", "Caf%C3%A9",
+         "-%70rivate", "%2dprivate", "%2eprivate", "%2Dprivate", "%70", "rivate", "%61cme/widgets", "wid%67ets",
+         "%2567", "/%70ull/1", "%2f", "%5c"]
 PUNCT = ["", ".", ",", ")", ">", "'", "`", '"']
-OWNER, REPO = re.compile(r"[A-Za-z0-9-]+"), re.compile(r"[A-Za-z0-9._-]+")
+OWNER, REPO = re.compile(r"[A-Za-z0-9-]+"), re.compile(r"[A-Za-z0-9._-]+")   # what GitHub can name
 GH = ("github.com", "raw.githubusercontent.com", "api.github.com", "codeload.github.com", "www.github.com")
 NON_REPO_OWNERS = ("orgs", "sponsors", "settings", "features", "about", "topics", "trending", "marketplace")
 
@@ -114,17 +124,19 @@ def _readings(text):
 
 
 def _lands_on(res, r):
+    """The repo a reading reaches, the way GitHub's router reads it (each pathname segment percent-decoded
+    first), or None when it reaches no repo GitHub can hold."""
     got = res.get(r)
     if not got or got[1].lower() not in GH:
         return None
-    segs = [x for x in got[2].split("/") if x]
+    segs = [unquote(x) for x in got[2].split("/") if x]
     if got[1].lower() == "api.github.com":
         pair = segs[1:3] if len(segs) >= 3 and segs[0] == "repos" else None
     else:
         pair = segs[:2] if len(segs) >= 2 else None
     if (not pair or not OWNER.fullmatch(pair[0]) or not REPO.fullmatch(pair[1])
-            or pair[0].lower() in NON_REPO_OWNERS):
-        return None     # names no repo GitHub can hold
+            or (pair[0].lower() in NON_REPO_OWNERS and got[1].lower() != "api.github.com")):
+        return None
     return "/".join(pair).lower()
 
 
@@ -206,3 +218,27 @@ def test_the_lead_repro_host_spelled_across_twenty_breaks_is_refused(monkeypatch
     stripped = re.sub(r"[\t\r\n]", "", spelled)       # the oracle keys readings by their break-free text
     assert stripped in _readings(text)
     assert _lands_on(_whatwg(_readings(text)), stripped) == "private/repo"
+
+
+def test_the_oracle_decodes_segments_before_it_names_a_repo():
+    """Without this the oracle shares the gate's blind spot: it must see `cli-%70rivate` as cli-private."""
+    res = _whatwg({"https://github.com/cli/cli-%70rivate", "https://github.com/%61cme/widgets",
+                   "https://api.github.com/repos/acme/wid%67ets", "https://github.com/acme/widgets/blob/main/Caf%C3%A9.md",
+                   "https://github.com/orgs/acme", "https://github.com/acme/wid)get", "https://github.com/acme/wid%2Aget"})
+    assert _lands_on(res, "https://github.com/cli/cli-%70rivate") == "cli/cli-private"
+    assert _lands_on(res, "https://github.com/%61cme/widgets") == "acme/widgets"
+    assert _lands_on(res, "https://api.github.com/repos/acme/wid%67ets") == "acme/widgets"
+    assert _lands_on(res, "https://github.com/acme/widgets/blob/main/Caf%C3%A9.md") == "acme/widgets"
+    assert _lands_on(res, "https://github.com/orgs/acme") is None
+    assert _lands_on(res, "https://github.com/acme/wid)get") is None, "not a name GitHub can hold: 404"
+    assert _lands_on(res, "https://github.com/acme/wid%2Aget") is None
+
+
+def test_the_lead_repro_escaped_repo_name_joined_across_a_break_is_refused(monkeypatch, tmp_path):
+    monkeypatch.setenv("CGC_CONFIG", str(tmp_path / "absent"))
+    sp = _spool()
+    text = "review <https://github.com/cli/cli\n-%70rivate> "
+    verdicts, bypasses = _run(sp, [text], monkeypatch)
+    assert not verdicts[0][0] and not bypasses
+    res = _whatwg(_readings(text))
+    assert _lands_on(res, "https://github.com/cli/cli-%70rivate") == "cli/cli-private"

@@ -21,7 +21,9 @@ import cdp_consult as c  # noqa: E402
 
 R1, R2 = "REQ-20260924-103001-127adc", "REQ-20260924-161402-ddaec7"
 CONV = "00000000-0000-4000-8000-000000000001"
-CODE = "https://github.com/acme/widgets"
+# ends in "/": a bare repo link that ends a line is refused by the egress gate (a parser joins the next
+# line onto it), and deliver never renders one
+CODE = "https://github.com/acme/widgets/"
 
 
 def _consult():
