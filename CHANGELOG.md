@@ -10,18 +10,28 @@ releases until it stabilizes.
 
 - **Upgrade stops the daemon before replacing files.** `install.sh` used to copy the new tree over a
   running daemon and restart it afterwards, so the daemon imported modules lazily from a half-replaced
-  tree. It now stops the launchd job, waits until the daemon process has exited, swaps in a staged
-  copy, starts the daemon and checks its heartbeat names this install's store schema. A daemon that will
-  not stop, or one running outside launchd (`cgc watch`), stops the install before anything changes. A
-  failure after the stop puts the previous tree back and restarts the daemon. Older code is refused
-  over a newer store before anything is stopped. New verbs: `cgc daemon-stop`, `daemon-start`,
-  `daemon-pid`; `cgc uninstall-daemon` and `install-daemon` now wait for the process to exit
-  (`uninstall-daemon` keeps the plist if it will not).
-- **`uninstall.sh` removes things in a safe order and keeps the journal.** The service is stopped and
-  removed first, then our `SessionStart` entry leaves `settings.json` (JSON-aware; other hooks
-  untouched; `.bak` kept), then the code goes. The consult store (`control.db`, `-wal`, `-shm`,
-  `control.db.v<n>.bak`) is kept unless `--purge`, which lists every path it deletes. Its old purge
-  message pointed at `/tmp/cgc`, where the store has not lived since it moved to `~/.local/state/cgc`.
+  tree. It now stops the launchd job, waits until the daemon process has exited and `daemon.lock` is
+  free, swaps in a staged copy, starts the daemon and checks its heartbeat names this install's store
+  schema. "Gone" is judged by the process and its lock, never by heartbeat age (a draining daemon has a
+  stale heartbeat and still runs the files). A daemon that will not stop, or one running outside launchd
+  (`cgc watch`), stops the install before anything changes. The swap is a transaction: any failure after
+  the old tree was moved aside (a rename, the new daemon not coming up, Ctrl-C) puts it back and restarts
+  the old daemon, and an existing `.bak` is parked, never deleted before the new daemon is verified.
+  Older code is refused over a newer store before anything is stopped. New verbs: `cgc daemon-stop`,
+  `daemon-start [--any]`, `daemon-pid`; `cgc uninstall-daemon` and `install-daemon` now wait for the
+  process to exit (`uninstall-daemon` keeps the plist if it will not).
+- **`uninstall.sh` removes things in a safe order, keeps the journal, and deletes only what the tool
+  wrote.** Every path is resolved and checked before anything changes. The service is stopped (process and
+  lock, not heartbeat) and removed first, then our `SessionStart` entry leaves `settings.json` (JSON-aware;
+  other hooks untouched; `.bak` kept), then the code goes. `settings.json` fails closed: unreadable or
+  unsafe stops the uninstall, and only readable invalid JSON can be skipped, with `--force`. The consult
+  store (`control.db`, `-wal`, `-shm`, `control.db.v<n>.bak`) is kept unless `--purge`, which lists every
+  path and deletes regular files of the tool's own names one by one (database and backups must carry a
+  SQLite header), never a directory recursively and never because its name contains `cgc`. A store or
+  config file inside the tree being deleted is refused up front; the config file is never deleted. The
+  old purge ran `rm -rf` on `CGC_STORE_DB`'s directory and on a scratch dir picked by name, which could
+  take a user directory or the config with it, and its message pointed at `/tmp/cgc` although the store
+  lives in `~/.local/state/cgc`.
 - **`cgc doctor` reports three verdicts and is ready only when it can send.** `installed`, `can_send`
   (daemon heartbeat live and serving this install's store and schema, debug Chrome port answering) and
   `can_read` (store readable at a known schema). No daemon is not ready (exit 3); it used to be a
@@ -30,12 +40,15 @@ releases until it stabilizes.
   other module; `retrieval_window.js` is gone), and a test pins the list to `skill/scripts`.
   `--json` gains `ready` and `verdicts`. The debug-port probe no longer goes through `http_proxy`.
 - **`cgc_config` validates and writes safely.** A key must be `CGC_` plus capitals, digits or `_`; a
-  key no script reads is stored with a warning (a typo); a value with a newline, CR or NUL is refused
-  (it would write a second line); `CGC_PORT`, `CGC_WEEKLY_BUDGET` and the on/off flags must parse, and a
-  hand-edited bad value is skipped at load with a message instead of crashing every command. Writes
-  take an exclusive lock, re-read the file under it and replace it through a unique temp file, so
-  concurrent `set`s all land. The old fixed `<config>.tmp` lost updates and made two of three
-  concurrent writers crash.
+  key no script reads is stored with a warning (a typo); a value with any character `str.splitlines()`
+  treats as a line break (`\v \f \x1c-\x1e \x85 U+2028 U+2029` as well as `\n \r`) or NUL is refused,
+  because the reader would see a second line; `CGC_PORT`, `CGC_WEEKLY_BUDGET` and the on/off flags must
+  parse, and a hand-edited bad value is skipped at load with a message instead of crashing every
+  command. Writes take an exclusive lock, re-read the file under it and replace it through a unique
+  temp file, so concurrent `set`s all land; the old fixed `<config>.tmp` lost updates and made two of
+  three concurrent writers crash. Only a missing file is an empty config: an unreadable or non-UTF-8 file
+  aborts the write and is left as it was (it used to be replaced by one line). `cgc doctor --deep` opens
+  its CDP websocket on a socket of its own, so `HTTP_PROXY` can no longer tunnel the loopback connection.
 
 ### Added — one UI contract, and a repair bundle when ChatGPT's page changes
 

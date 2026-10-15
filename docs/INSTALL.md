@@ -21,21 +21,29 @@ cd open-claude-gpt
 1. checks `python3` + auto-installs `websocket-client` if missing,
 2. refuses (before changing anything) if the consult store was written by a newer schema than this
    checkout understands,
-3. **stops the launchd egress daemon and waits until its process has exited**,
-4. copies `skill/` to a staging directory and swaps it into `~/.claude/skills/chatgpt-consult`
-   (the prior install is kept as `.bak`; a failed copy leaves it untouched),
+3. **stops the launchd egress daemon and waits until its process has exited and `daemon.lock` is
+   free**,
+4. copies `skill/` to a staging directory, parks the current install as `.bak` and moves the staged
+   tree into `~/.claude/skills/chatgpt-consult`,
 5. **starts the daemon again and checks its heartbeat** names this install's store and schema,
 6. runs `cgc doctor`.
 
-Nothing is replaced under a running daemon, so no process ever executes a half-old, half-new tree. If
-the daemon will not stop, `install.sh` changes nothing and says so. A daemon you started yourself
-(`cgc watch`, `cgc up`) is not under launchd; `install.sh` refuses to continue while one is running
-and names its pid. If the install fails after the daemon was stopped, the previous tree is put back
-and the daemon is restarted. `install.sh` never touches the consult store (`control.db`).
+Nothing is replaced under a running daemon, so no process ever executes a half-old, half-new tree.
+"Is the daemon gone" is decided by the process and its lock, never by how old its heartbeat is: a
+daemon that is draining or wedged has a stale heartbeat and is still executing the files. If a daemon
+process will not go away, `install.sh` changes nothing and names its pid. A daemon you started
+yourself (`cgc watch`, `cgc up`) is not under launchd; `install.sh` refuses to continue while one runs.
 
-If the daemon does not come up on the new code the upgrade fails (`--force` continues anyway); run
-`cgc daemon-start` to retry. The daemon verbs are `cgc daemon-stop`, `cgc daemon-start`,
-`cgc daemon-pid`, and (first install) `cgc install-daemon`.
+The swap is a transaction. If anything fails after the old tree was moved aside (the copy, a rename, the
+new daemon not coming up, Ctrl-C), the old tree is put back and the old daemon restarted. An existing
+`.bak` is a previous install, possibly the only intact one: it is parked, and deleted only after the new
+daemon has been verified. `--force` keeps a new install whose daemon did not come up, and then keeps
+that older backup too, at `chatgpt-consult.bak.prev.<pid>`. `install.sh` never touches the consult
+store (`control.db`).
+
+If the daemon does not come up on the new code the upgrade fails and rolls back (`--force` keeps the new
+install anyway); run `cgc daemon-start` to retry. The daemon verbs are `cgc daemon-stop`,
+`cgc daemon-start [--any]`, `cgc daemon-pid`, and (first install) `cgc install-daemon`.
 
 Every path is rooted at `$HOME` (skills dir, `~/Library/LaunchAgents`, `~/.claude/settings.json`,
 `~/.config/cgc`, `~/.local/state/cgc`) and `launchctl` is looked up on `PATH`, so
@@ -85,7 +93,8 @@ are different claims:
 
 Overall **ready is `can_send`**: with no daemon there is no way to send, so it is not ready. Exit
 status: `0` ready, `3` installed but cannot send yet (start the daemon / Chrome / log in), `1` the
-install is incomplete (or a `--secure` advisory failed). A fresh `install.sh` therefore ends "installed,
+install is incomplete (or a `--secure` advisory failed). A daemon process that is alive but has a stale
+heartbeat is reported as exactly that (hung, draining or starting), not as "not running". A fresh `install.sh` therefore ends "installed,
 cannot send yet" until you run `cgc install-daemon` once.
 
 ## Activation: on-demand vs. proactive
@@ -152,20 +161,37 @@ prior install is kept as `~/.claude/skills/chatgpt-consult.bak`.
 
 In this order:
 
-1. the launchd service is stopped (waiting for the process to exit) and its plist removed,
+0. every path is resolved and checked first (a refusal here changes nothing),
+1. the launchd service is stopped (waiting until the daemon process has exited and `daemon.lock` is
+   free) and its plist removed; a daemon running outside launchd is named and stops the uninstall,
 2. our `SessionStart` entry is removed from `settings.json` (every other hook and setting is left
-   as it was; `settings.json.bak` keeps the previous file; an unparseable `settings.json` is not
-   touched),
+   as it was; `settings.json.bak` keeps the previous file),
 3. only then is the code deleted.
+
+`settings.json` fails closed. If it is unreadable (permissions), has a shape the editor will not touch,
+or any other read error occurs, the uninstall stops before changing anything. Only a file that is
+readable but not valid JSON can be skipped, and only with `--force`: Claude Code ignores such a file, so
+no hook of ours can be firing from it, and the uninstall prints the manual step.
 
 The **send journal is kept** unless you pass `--purge`: `control.db` records which prompts were sent,
 and deleting it forgets that, so a resend of an uncertain round can no longer be recognised. Without
 `--purge` the uninstall prints the paths it kept (`control.db`, `-wal`, `-shm`, the
-`control.db.v<n>.bak` pre-migration backups under `~/.local/state/cgc` or `$CGC_DATA_DIR`). With
-`--purge` it prints exactly which paths it is about to delete (those files, the `locks/` and
-`incidents/` directories of the tool's own data dir, and the scratch dir `$CGC_STATE_DIR`), then
-deletes them; a data dir that holds anything else is left in place. Your config file
-(`~/.config/cgc/config`) is never removed. The Chrome profile is deleted only if you answer `y`.
+`control.db.v<n>.bak` pre-migration backups under `~/.local/state/cgc` or `$CGC_DATA_DIR`). If the
+store, or your config file, lies inside the code tree about to be deleted, the uninstall refuses up
+front instead of taking it along.
+
+With `--purge` it prints exactly which paths it is about to delete, then deletes **only files the tool
+wrote, one by one**: the database and its `-wal`/`-shm`/`.v<n>.bak` (each a regular file, the database
+and backups with a valid SQLite header), lock files the daemon creates, drift bundles
+(`incidents/I-*/diagnosis.json`, `fixture.html`) and scratch files (`answer_*`, `prompt_*`, `refs_*`,
+`daemon.log`, `chrome.log`, `active.json`, spool logs). It never runs `rm -rf` on a directory because
+of its name, and it leaves a directory alone unless it is a default location (`~/.local/state/cgc`,
+`/tmp/cgc`) or strictly inside `$HOME`. A foreign file in any of these directories survives, and so
+does the directory. A directory is removed only if it is one of the tool's own (`locks`, `incidents`,
+`spool`) or a default location, and only when it ends up empty; a custom `CGC_DATA_DIR`/`CGC_STATE_DIR`
+you chose stays in place. Your config file is never removed, in any mode. The Chrome profile is offered
+for deletion only if it is `~/.cgc-chrome` (or a directory with a Chrome `Local State`) strictly inside
+`$HOME` and contains none of your config, store, scratch or settings; you must answer `y`.
 
 To stop only the daemon: `cgc uninstall-daemon` (also waits for the process to exit and keeps the
 plist if it will not).
