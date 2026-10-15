@@ -247,7 +247,12 @@ if [ "$STOPPED" = 1 ]; then echo "• stopped the egress daemon (it starts again
 # failed): it is parked, not deleted, and dropped only once the new daemon is verified.
 mkdir -p "$SKILLS_DIR"
 for s in "$SKILLS_DIR/.$NAME.new."*; do   # stages of installs that died (SIGKILL cannot be trapped)
-  if [ -e "$s" ] || [ -L "$s" ]; then kill -0 "${s##*.new.}" 2>/dev/null || rm -rf -- "$s"; fi
+  [ -e "$s" ] || [ -L "$s" ] || continue
+  spid="${s##*.new.}"
+  case "$spid" in
+    ''|*[!0-9]*|0*) continue ;;                    # not a pid: not a stage of ours, leave it alone
+  esac
+  kill -0 "$spid" 2>/dev/null || rm -rf -- "$s"    # its run is gone
 done
 # An install killed (SIGKILL) between "old tree set aside" and "new tree in place" leaves the old tree
 # only at .bak and nothing at DEST. Put it back first, so this run is an ordinary upgrade and a failure

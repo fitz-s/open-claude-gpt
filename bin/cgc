@@ -88,8 +88,13 @@ GUI="gui/$(id -u)"
 have_launchd() { command -v launchctl >/dev/null 2>&1; }
 loaded() { launchctl print "$GUI/$LABEL" >/dev/null 2>&1; }
 
-# A zombie answers kill -0 forever; only a process that has really gone counts as stopped.
-alive() { kill -0 "$1" 2>/dev/null && [ "$(ps -o stat= -p "$1" 2>/dev/null | cut -c1)" != Z ]; }
+# A zombie answers kill -0 forever; only a process that has really gone counts as stopped. Only a positive
+# integer is a pid: kill -0 0 and kill -0 -N address a whole process group, so anything else is "not alive"
+# without ever reaching kill.
+alive() {
+  case "$1" in ''|*[!0-9]*|0*) return 1 ;; esac
+  kill -0 "$1" 2>/dev/null && [ "$(ps -o stat= -p "$1" 2>/dev/null | cut -c1)" != Z ]
+}
 any_alive() { local p; for p in "$@"; do alive "$p" && return 0; done; return 1; }
 
 # Is a daemon PROCESS there? Decided by the process and its lock, never by heartbeat freshness: a

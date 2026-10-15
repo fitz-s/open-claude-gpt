@@ -374,6 +374,119 @@ def test_P3_an_unchanged_planned_file_is_still_deleted(sb):
     assert not victim.exists()
 
 
+def test_P3_a_change_after_the_first_megabyte_with_size_and_mtime_preserved_is_left_alone(sb):
+    """A prefix hash cannot see this: a >1 MiB log whose TAIL was rewritten in place, same inode, same size,
+    the original mtime put back. The fingerprint covers the whole file."""
+    sb.old_install()
+    sb.state.mkdir()
+    victim = sb.state / "daemon.log"
+    size = (1 << 20) + 4096                                  # past the old 1 MiB prefix
+    victim.write_bytes(b"A" * size)
+    st = victim.stat()
+    _with_bootout_hook(sb, (
+        "    python3 - \"%s\" %d <<'PY'\n"
+        "import os, sys\n"
+        "p, ns = sys.argv[1], int(sys.argv[2])\n"
+        "with open(p, 'r+b') as f:\n"
+        "    f.seek(-16, 2)\n"
+        "    f.write(b'B' * 16)\n"                           # the last 16 bytes, far past the first MiB
+        "os.utime(p, ns=(ns, ns))\n"
+        "PY\n") % (victim, st.st_mtime_ns))
+    r = sb.uninstall("--purge")
+    assert r.returncode == 0, r.stdout + r.stderr
+    after = victim.stat()
+    assert victim.exists(), "a >1 MiB file changed after its first MiB was deleted"
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (st.st_ino, size, st.st_mtime_ns), \
+        "the collision was not actually built"
+    assert victim.read_bytes()[-16:] == b"B" * 16
+    assert "not the file that was planned" in r.stderr
+
+
+def test_P3_a_large_unchanged_file_is_still_deleted_whole(sb):
+    sb.old_install()
+    sb.state.mkdir()
+    victim = sb.state / "daemon.log"
+    victim.write_bytes(os.urandom(3 * (1 << 20) + 17))       # several chunks and a ragged tail
+    r = sb.uninstall("--purge")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not victim.exists()
+
+
+def test_P3_fingerprint_changes_when_any_byte_does_and_is_stable_otherwise(tmp_path):
+    """Unit test of the fingerprint itself, loaded from the planner source: every byte position matters,
+    including one past the first MiB and the very last."""
+    ns = _load_planner_functions()
+    f = tmp_path / "x"
+    size = (2 << 20) + 5
+    f.write_bytes(b"\0" * size)
+    base = ns["fingerprint"](str(f))
+    assert base and ns["fingerprint"](str(f)) == base, "not stable across two reads"
+    st = f.stat()
+    for pos in (0, (1 << 20) - 1, 1 << 20, (1 << 20) + 1, size - 1):
+        with open(f, "r+b") as fh:
+            fh.seek(pos)
+            fh.write(b"\1")
+        os.utime(f, ns=(st.st_mtime_ns, st.st_mtime_ns))
+        assert ns["fingerprint"](str(f)) != base, f"a change at byte {pos} went unseen"
+        with open(f, "r+b") as fh:
+            fh.seek(pos)
+            fh.write(b"\0")
+        os.utime(f, ns=(st.st_mtime_ns, st.st_mtime_ns))
+        assert ns["fingerprint"](str(f)) == base
+
+
+def test_P3_fingerprint_refuses_what_is_not_a_plain_stable_regular_file(tmp_path):
+    ns = _load_planner_functions()
+    target = tmp_path / "target"
+    target.write_text("t")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    assert ns["fingerprint"](str(link)) is None, "a symlink must not be read through"
+    d = tmp_path / "dir"
+    d.mkdir()
+    assert ns["fingerprint"](str(d)) is None
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    assert ns["fingerprint"](str(fifo)) is None, "a fifo must neither block nor be planned"
+    assert ns["fingerprint"](str(tmp_path / "missing")) is None
+    other = tmp_path / "other"
+    other.write_text("o")
+    assert ns["fingerprint"](str(other), os.lstat(target)) is None, \
+        "the caller's lstat names another file than the one opened: the name was swapped"
+
+
+def test_P3_fingerprint_refuses_a_file_that_changes_while_it_is_read(tmp_path, monkeypatch):
+    ns = _load_planner_functions()
+    f = tmp_path / "grow"
+    f.write_bytes(b"x" * (3 << 20))
+    real_read = os.read
+    state = {"n": 0}
+
+    def growing(fd, n):
+        out = real_read(fd, n)
+        state["n"] += 1
+        if state["n"] == 1:                                  # after the first chunk, something appends
+            with open(f, "ab") as fh:
+                fh.write(b"more")
+        return out
+    monkeypatch.setattr(os, "read", growing)
+    assert ns["fingerprint"](str(f)) is None, "a file that grew during the read was fingerprinted"
+
+
+def _load_planner_functions():
+    """The fingerprint function out of uninstall.sh's embedded planner (it is Python in a heredoc), so the
+    test runs the shipped code and not a copy."""
+    import re
+    import stat as stat_mod
+    src = open(os.path.join(ROOT, "uninstall.sh"), encoding="utf-8").read()
+    body = src.split("<<'PYEOF'\n", 1)[1].split("\nPYEOF", 1)[0]
+    m = re.search(r"CHUNK = 1 << 20\n\n\ndef fingerprint\(.*?\n(?=\n\ndef tabbed)", body, re.S)
+    assert m, "fingerprint() not found in the planner"
+    ns = {"os": os, "stat": stat_mod}
+    exec(m.group(0), ns)
+    return ns
+
+
 def test_P3_a_plan_row_carries_a_content_fingerprint_not_just_an_inode(sb):
     sb.old_install()
     sb.state.mkdir()
@@ -381,6 +494,7 @@ def test_P3_a_plan_row_carries_a_content_fingerprint_not_just_an_inode(sb):
     src = open(os.path.join(ROOT, "uninstall.sh"), encoding="utf-8").read()
     assert 'f"{st.st_dev}:{st.st_ino}" != ident' not in src, "the delete step still trusts the inode alone"
     assert "sha256" in src and "st_mtime_ns" in src and "st_size" in src
+    assert "HASH_BYTES" not in src and "f.read(HASH" not in src, "the hash must cover the whole file, not a prefix"
 
 
 def test_P3_a_planned_file_replaced_by_a_symlink_or_directory_is_left_alone(sb):

@@ -342,3 +342,33 @@ def test_ps_fallback_asks_for_the_full_line_when_ps_truncates_to_columns(tmp_pat
     finally:
         p.kill()
         p.wait()
+
+
+# ---- a pid that is not a positive int never reaches os.kill ----------------------------------------------
+# kill(0, sig) addresses the caller's whole process group, kill(-n, sig) the group n, kill(-1, sig) everything
+# the caller may signal. daemon.json is a file anyone with the user's rights can edit.
+
+@pytest.mark.parametrize("bad", [0, -1, -4242, True, False, None, "12", 1.5, [], {}])
+def test_a_pid_that_is_not_a_positive_int_never_reaches_os_kill(bad, monkeypatch):
+    d = _doctor()
+    calls = []
+    monkeypatch.setattr(d.os, "kill", lambda pid, sig: calls.append((pid, sig)))
+    assert d._pid_running(bad) is False
+    assert d._command_of(bad) == ""
+    assert d._proc_stat_state(bad) is None
+    assert d._ps_field(bad, "stat") is None
+    assert calls == [], f"os.kill was called with {calls}"
+
+
+@pytest.mark.parametrize("bad", [0, -1, -4242, True])
+def test_daemon_processes_ignores_a_bad_pid_in_daemon_json(doc_env, monkeypatch, bad):
+    sys.path.insert(0, SCRIPTS)
+    import cgc_spool
+    d = _doctor()
+    calls = []
+    real_kill = os.kill
+    monkeypatch.setattr(d.os, "kill", lambda pid, sig: (calls.append((pid, sig)), real_kill(pid, sig))[1])
+    cgc_spool._atomic_write(cgc_spool.daemon_path(), {"pid": bad, "ts": 1.0})
+    procs = d.daemon_processes()
+    assert procs["pids"] == [] and not procs["lock_held"]
+    assert [c for c in calls if c[0] in (0, -1, -4242, True) and c[0] is not os.getpid()] == [], calls

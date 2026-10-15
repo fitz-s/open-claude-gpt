@@ -53,8 +53,12 @@ ctl() { CGC_HOME="$REPO/skill" "$REPO/bin/cgc" "$@"; }
 #            again. An inode alone does not identify a file: Linux filesystems hand a freed inode number
 #            to the next file created, so `rm x; echo y > x` leaves the same device:inode, and a plan
 #            that trusted it would delete the file someone put there. The size, the nanosecond mtime and a
-#            hash of the content (of the first 1 MiB plus the size, for a large file) are what tell the
-#            two files apart; a file that cannot be read has no fingerprint and is never planned.
+#            SHA-256 of the WHOLE content (logs, answers and fixtures grow past any prefix: a change after
+#            the first megabyte must still show) are what tell the two files apart. The file is opened
+#            once, fstat'ed before and after the read on that same descriptor, and a file that changed
+#            while it was read, or cannot be read, has no fingerprint and is never planned. This verifies;
+#            it is not an atomic delete: a same-user process that swaps the file between the final check
+#            and the unlink can still win that race, which is out of scope.
 #   settings state (ok|absent|parse|blocked) in the note: what happened reading Claude's settings.json
 #   profile  path = the Chrome profile to offer for deletion ("-" if none), note = why not
 #   deleted / failed   (delete mode)
@@ -139,25 +143,48 @@ def within(p, d, strict=False):
         cur, first = parent, False
 
 
-HASH_BYTES = 1 << 20
+CHUNK = 1 << 20
 
 
 def fingerprint(p, st=None):
-    """What a planned file is: "dev:ino:size:mtime_ns:sha256-of-its-head". The delete step compares it to the
-    one in the plan, so a different file that reuses the inode (or the same name, size and time) is not
-    mistaken for the planned one. None when the file cannot be read: it is then neither planned nor deleted."""
+    """What a planned file is: "dev:ino:size:mtime_ns:sha256-of-all-of-it". The delete step compares it to the
+    one in the plan, so a different file that reuses the inode, or the same file with other content under an
+    unchanged size and mtime, is not mistaken for the planned one.
+
+    The file is opened ONCE (never following a symlink, never blocking on a fifo), and the stat taken before
+    and after the read is the fstat of that descriptor, so the numbers and the bytes describe one file even
+    if the name is swapped meanwhile. None when it is not a regular file, cannot be read, or changed while it
+    was read: it is then neither planned nor deleted. `st` (an lstat the caller already holds) must agree
+    with the descriptor, or the name was swapped between the caller's look and ours."""
     import hashlib
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        st = st or os.lstat(p)
-        h = hashlib.sha256()
-        with open(p, "rb") as f:
-            h.update(f.read(HASH_BYTES))
-        st2 = os.lstat(p)
+        fd = os.open(p, flags)
     except OSError:
         return None
-    if (st2.st_dev, st2.st_ino, st2.st_size, st2.st_mtime_ns) != (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns):
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            return None
+        if st is not None and (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino):
+            return None
+        h = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(fd, CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+            total += len(chunk)
+        after = os.fstat(fd)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    key = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)      # noqa: E731
+    if key(before) != key(after) or total != before.st_size:
         return None                         # it changed while being read: not a stable file
-    return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}:{h.hexdigest()}"
+    return f"{before.st_dev}:{before.st_ino}:{before.st_size}:{before.st_mtime_ns}:{h.hexdigest()}"
 
 
 def tabbed(p):

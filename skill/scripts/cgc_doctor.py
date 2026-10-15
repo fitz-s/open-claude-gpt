@@ -322,10 +322,19 @@ def check_skill_files(r: "Report", here: str = HERE) -> None:
         r.fail("skill files", "; ".join(problems), "re-run install.sh from the repo", verdict="installed")
 
 
+def _valid_pid(pid) -> bool:
+    """A real process id: a positive int. kill(0, sig) addresses the caller's whole process group and
+    kill(-n, sig) the group n (and -1 every process the caller may signal), so a 0 or negative pid from a
+    hand-edited or corrupt daemon.json must never reach os.kill. bool is an int subclass: True would be pid 1."""
+    return isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+
+
 def _proc_stat_state(pid):
     """The process state letter from /proc/<pid>/stat (Linux), or None when /proc has no answer. The state
     is the field after the command name, which is parenthesised and may itself hold spaces and parens, so
     it is read after the LAST ')'."""
+    if not _valid_pid(pid):
+        return None
     try:
         with open(f"/proc/{int(pid)}/stat", "rb") as f:
             raw = f.read().decode("utf-8", "replace")
@@ -340,6 +349,8 @@ def _ps_field(pid, field):
     prints nothing. -ww matters: procps truncates `command` to $COLUMNS (CI runners set it) when ps is not
     writing to a terminal, and the daemon's script name is at the END of the line, so without it a long
     interpreter path cuts the very word being looked for."""
+    if not _valid_pid(pid):
+        return None
     for argv in (["ps", "-ww", "-o", f"{field}=", "-p", str(int(pid))],
                  ["ps", "-o", f"{field}=", "-p", str(int(pid))]):     # a ps that rejects -ww
         try:
@@ -356,7 +367,10 @@ def _pid_running(pid) -> bool:
     """A process that exists and is not a zombie: a zombie answers kill -0 until its parent reaps it, and
     holds no lock, so it must not count as a daemon that is still running. Fail-safe: when kill -0 says it
     exists and nothing can say it is a zombie, it counts as running (a wrong "still there" blocks a
-    replace; a wrong "gone" would allow one under a live daemon)."""
+    replace; a wrong "gone" would allow one under a live daemon). A pid that is not a positive int is no
+    process at all (see _valid_pid): it never reaches os.kill."""
+    if not _valid_pid(pid):
+        return False
     try:
         os.kill(int(pid), 0)
     except PermissionError:
@@ -372,6 +386,8 @@ def _pid_running(pid) -> bool:
 def _command_of(pid) -> str:
     """The command line of `pid`, or "" when it cannot be read. /proc first (exact, not width-limited, no
     ps needed), then ps."""
+    if not _valid_pid(pid):
+        return ""
     try:
         with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
             raw = f.read()
@@ -429,7 +445,7 @@ def daemon_processes() -> dict:
     except (OSError, ValueError):
         rec = None
     pid = rec.get("pid") if isinstance(rec, dict) else None
-    if isinstance(pid, int) and pid != os.getpid() and _pid_running(pid):
+    if _valid_pid(pid) and pid != os.getpid() and _pid_running(pid):
         cmd = _command_of(pid).strip()
         if not cmd or "cgc_daemon.py" in cmd:   # an unreadable command line is not proof of a reused pid
             pids.add(pid)
