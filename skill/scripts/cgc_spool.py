@@ -129,23 +129,39 @@ def default_out(rid: str) -> str:
 
 # ---- the URL law ------------------------------------------------------------
 #
-# The gate judges the URL a browser would actually request. Every `http(s):` token in the prompt is
-# parsed ONCE, and that one parse feeds the visibility check, the existence check and the gist rule,
-# so no check can look at a different repo than the link reaches. A token is a GitHub URL when its
-# host, after what a browser does before connecting (drop userinfo and port, percent-decode, IDNA-fold
-# fullwidth and ideographic-dot variants, drop trailing dots, lowercase), is one of _GH_HOSTS. A
-# GitHub URL must then be written plainly or it is REFUSED, never normalized and accepted:
+# The gate judges the URL a browser would actually request. Every `http(s):` in the prompt starts a
+# token that runs to the next whitespace, or to the next `http(s):` (which starts its own token, so a
+# link nested in a proxy or redirect URL is judged too). A delimiter character never ends a link
+# early: `'`, `"`, `<`, `(` and the like stay INSIDE the token, where the rules below see them, and
+# only trailing sentence punctuation is dropped. Each token is parsed ONCE, and that one parse feeds
+# the visibility check, the existence check and the gist rule, so no check can look at a different repo
+# than the link reaches. A token is a GitHub link when its host, after what a browser does before
+# connecting (drop userinfo and port, percent-decode, IDNA-fold fullwidth and ideographic-dot variants,
+# drop trailing dots, lowercase), is in _GH_HOSTS; any other host under a GitHub domain (_GH_DOMAINS:
+# Pages, signed downloads, packages, assets) is REFUSED, because the gate has no check for it. A
+# GitHub link must be written plainly or it is REFUSED, never normalized and accepted:
 #   scheme https with `//`; host written exactly (no userinfo, port, escape, trailing dot or
 #   non-ASCII); no backslash; path with no `.`/`..` segment, no percent-escape and no empty segment
 #   (one trailing slash is the same page); owner [A-Za-z0-9-], repo [A-Za-z0-9._-].
-# A URL that is not a GitHub URL is none of the gate's business (a docs link, an arXiv link).
+# A browser also drops TAB, CR and LF from anywhere inside a URL it is handed, so a link split by one
+# can be joined into a different one. A TAB or bare CR next to a GitHub link is therefore refused, and
+# a line break is refused when the text it would join carries a dot segment, an escape or a backslash
+# (a URL that merely ends its line is the ordinary case and is left alone).
+# Not the gate's business, and the operator's free-text boundary (docs/SECURITY.md): links to other
+# sites, and GitHub hosts written without a scheme.
 _GH_HOSTS = {"github.com": "repo", "www.github.com": "repo", "raw.githubusercontent.com": "raw",
-             "gist.github.com": "gist", "gist.githubusercontent.com": "gist"}
-_URL_TOKEN_RE = re.compile(r"https?:[^\s<>\"'`]+", re.IGNORECASE)
+             "gist.github.com": "gist", "gist.githubusercontent.com": "gist",
+             "api.github.com": "api", "codeload.github.com": "codeload"}
+_GH_DOMAINS = ("github.com", "githubusercontent.com", "github.io", "githubassets.com", "ghcr.io")
+_SCHEME_RE = re.compile(r"https?:", re.IGNORECASE)
+_WS_RE = re.compile(r"\s")
+_BREAK_RE = re.compile(r"[\t\r\n]+")
+_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+_PR_RE = re.compile(r"([0-9]+)(?:\.(?:diff|patch))?")
+_TRAIL = ",;:!?)]}'\"*>|`"     # sentence punctuation and closing wrappers; an OPENING one stays and is refused
+_MAX_HOPS = 16
 _OWNER_RE = re.compile(r"[A-Za-z0-9-]+")
 _REPO_RE = re.compile(r"[A-Za-z0-9._-]+")
-_DIGITS_RE = re.compile(r"[0-9]+")
-_SHA_RE = re.compile(r"[0-9a-fA-F]{7,40}")
 # github.com/<one of these>/... is a page of the site, never a repo (GitHub reserves the names).
 _NON_REPO_OWNERS = ("orgs", "sponsors", "settings", "features", "about", "topics", "trending", "marketplace")
 _REF_SEGMENTS = 8     # a ref may itself contain '/': at most this many leading segments form it
@@ -154,18 +170,19 @@ _REF_PATH_KINDS = ("tree", "blob", "blame", "raw", "commits", "find", "edit")
 
 
 class Link(NamedTuple):
-    host: str       # "repo" | "raw" | "gist"
+    host: str       # "repo" | "raw" | "gist" | "api" | "codeload"
     slug: str       # "owner/repo"; "" for a gist
-    target: tuple   # () | ("pull", "12") | ("commit", "<ref>") | ("tree"|"blob", ("seg", ...))
+    target: tuple   # () | ("pull", "12") | ("commit", "<ref>") | ("tree"|"blob"|..., ("seg", ...))
 
 
 def _trim(tok: str) -> str:
-    """Drop what ends a sentence rather than a URL: trailing `,;:!?)]}` and ONE `.`. Nothing else is
-    removed or rewritten; a segment that still ends in `.` (`main..`, `repo..`) is refused by the
-    parser, because git forbids a ref ending in `.` and a link must be checked as written."""
+    """Drop what ends a sentence or wraps a link rather than belonging to it: trailing _TRAIL
+    characters and ONE `.`. Nothing else is removed or rewritten; a segment that still ends in `.`
+    (`main..`, `repo..`) is refused by the parser, because git forbids a ref ending in `.` and a link
+    must be checked as written."""
     dot = False
     while tok:
-        if tok[-1] in ",;:!?)]}":
+        if tok[-1] in _TRAIL:
             tok = tok[:-1]
         elif tok[-1] == "." and not dot:
             tok, dot = tok[:-1], True
@@ -185,21 +202,93 @@ def _gh_host(authority: str) -> str:
         return ""
 
 
+def _is_gh(host: str) -> bool:
+    return host in _GH_HOSTS or any(host == d or host.endswith("." + d) for d in _GH_DOMAINS)
+
+
+def _split(tok: str):
+    """(scheme, SplitResult) of a token read the way a browser reads it (a backslash is a slash), or
+    None when it does not parse."""
+    scheme, _, rest = tok.partition(":")
+    try:
+        return scheme, urlsplit("https://" + rest.replace("\\", "/").lstrip("/"))
+    except ValueError:
+        return None
+
+
+def _unsafe(tok: str, u) -> bool:
+    """True when `tok` carries what lets a browser land elsewhere than it reads: a backslash, a
+    percent-escape, or a `.`/`..` path segment."""
+    return ("\\" in tok or _ESCAPE_RE.search(u.path) is not None
+            or any(seg in (".", "..") for seg in u.path.split("/")))
+
+
+def _url_tokens(text: str):
+    """(token, tail, tabbed) for every `http(s):` in `text`. `token` runs from the scheme to the next
+    whitespace or next scheme, minus trailing punctuation. When it ended at whitespace made only of
+    TAB/CR/LF, `tail` is what a parser that drops those characters would join onto it (the following
+    non-space runs, at most _MAX_HOPS gaps), and `tabbed` says some gap held a TAB or bare CR, so it cannot have
+    been a line end."""
+    starts = [m.start() for m in _SCHEME_RE.finditer(text)]
+    for i, p in enumerate(starts):
+        ws = _WS_RE.search(text, p)
+        run_end = ws.start() if ws else len(text)
+        nxt = starts[i + 1] if i + 1 < len(starts) else len(text)
+        end = min(run_end, nxt)
+        tail, tabbed = "", False
+        if end == run_end:
+            pos = end
+            for _ in range(_MAX_HOPS):
+                gap = _BREAK_RE.match(text, pos)
+                if not gap:
+                    break
+                pos = gap.end()
+                if pos >= len(text) or text[pos].isspace() or _SCHEME_RE.match(text, pos):
+                    break    # the gap ends at a space, the end, or a new link: a real boundary
+                ws = _WS_RE.search(text, pos)
+                ws_stop = ws.start() if ws else len(text)
+                inner = _SCHEME_RE.search(text, pos)
+                stop = min(ws_stop, inner.start() if inner else len(text))
+                tail += text[pos:stop]
+                # A gap is "glued" when a TAB or bare CR sits before its first LF: that is not a line end
+                # and not indentation, so it is never ordinary text. (`\n\t` is indentation after a
+                # line break: the same case as any other line join, judged by what the join carries.)
+                head, lf, _ = gap.group().partition("\n")
+                head = head[:-1] if lf and head.endswith("\r") else head
+                tabbed = tabbed or "\t" in head or "\r" in head
+                if stop < ws_stop:
+                    break
+                pos = stop
+        yield _trim(text[p:end]), tail, tabbed
+
+
 def _parse_code_urls(text: str) -> tuple:
-    """Every GitHub URL in `text` as a Link, in prompt order, or (None, refusal) on the first one that
+    """Every GitHub link in `text` as a Link, in prompt order, or (None, refusal) on the first one that
     breaks the URL law. Returns (links | None, refusal | None)."""
     links = []
-    for m in _URL_TOKEN_RE.finditer(text):
-        tok = _trim(m.group(0))
-        scheme, _, rest = tok.partition(":")
-        try:
-            u = urlsplit("https://" + rest.replace("\\", "/").lstrip("/"))
-        except ValueError:
+    for tok, tail, tabbed in _url_tokens(text):
+        got = _split(tok)
+        if got is None:
             continue    # a browser rejects it too: not a request to GitHub
+        scheme, u = got
         host = _gh_host(u.netloc)
+        if tail:
+            joined = _split(tok + tail)
+            if _is_gh(host) or (joined and _is_gh(_gh_host(joined[1].netloc))):
+                if tabbed:
+                    return None, (f"refused: a TAB or bare CR inside or beside a GitHub link "
+                                  f"({(tok + tail)[:100]!r}); a browser drops it and joins the pieces. "
+                                  "Put the link on one line")
+                if joined and _unsafe(tok + tail, joined[1]):
+                    return None, (f"refused: a line break lets a browser join a dot segment, escape or "
+                                  f"backslash onto the GitHub link {tok[:100]!r}. Put the link on one line")
+        if not _is_gh(host):
+            continue
         kind = _GH_HOSTS.get(host)
         if kind is None:
-            continue
+            return None, (f"refused: {host} is a GitHub-hosted domain the gate has no check for (Pages, "
+                          f"signed downloads, packages, assets) in {tok[:120]!r} — drop it, or link the "
+                          "repository on github.com instead")
 
         def no(why, tok=tok, host=host):
             return None, f"refused: {why} in GitHub link {tok[:120]!r} — write it as https://{host}/..."
@@ -228,18 +317,26 @@ def _parse_code_urls(text: str) -> tuple:
         if kind == "gist":
             links.append(Link("gist", "", ()))
             continue
-        owner, repo = segs[0], (segs[1] if len(segs) > 1 else "")
+        if kind == "api":
+            if segs[0] != "repos" or len(segs) < 3:
+                return no("an api.github.com path that is not /repos/OWNER/REPO/...")
+            owner, repo, rest_segs = segs[1], segs[2], []
+        else:
+            owner, repo, rest_segs = segs[0], (segs[1] if len(segs) > 1 else ""), segs[2:]
         if kind == "repo" and owner.lower() in _NON_REPO_OWNERS:
             continue    # reserved names no account can hold: a site page, whatever follows
         if not repo or not _OWNER_RE.fullmatch(owner) or not _REPO_RE.fullmatch(repo):
             return no("no verifiable owner/repo")
-        rest_segs, target = segs[2:], ()
+        target = ()
         if kind == "raw" and rest_segs:
             target = ("raw", tuple(rest_segs))
         elif kind == "repo" and rest_segs:
             what = rest_segs[0]
-            if what == "pull" and len(rest_segs) > 1 and _DIGITS_RE.fullmatch(rest_segs[1]):
-                target = ("pull", str(int(rest_segs[1])))          # 012 and 12 are one PR
+            if what == "pull" and len(rest_segs) > 1:
+                pr = _PR_RE.fullmatch(rest_segs[1])
+                if not pr:
+                    return no("a malformed pull-request number")
+                target = ("pull", str(int(pr.group(1))))          # 012, 12, 12.diff, 12.patch: PR 12
             elif what == "commit":
                 if len(rest_segs) != 2:
                     return no("a commit link that is not exactly one SHA or ref")
@@ -247,10 +344,11 @@ def _parse_code_urls(text: str) -> tuple:
             elif what in _REF_PATH_KINDS and len(rest_segs) > 1:
                 target = (what, tuple(rest_segs[1:]))
             elif what == "compare" and len(rest_segs) > 1:
-                a_, dots, b_ = "/".join(rest_segs[1:]).partition("...")
+                spec = re.sub(r"\.(?:patch|diff)$", "", "/".join(rest_segs[1:]))
+                a_, dots, b_ = spec.partition("...")
                 if not a_ or not dots or not b_ or "..." in b_:
                     return no("a compare link that is not A...B (three dots)")
-                target = ("compare", "/".join(rest_segs[1:]))
+                target = ("compare", spec)
         links.append(Link(kind, f"{owner}/{repo}", target))
     return links, None
 
@@ -762,34 +860,42 @@ def _verify_refs_exist(links) -> tuple:
 _HEAD_RID_RE = re.compile(r"CGC_RID:(REQ-\d{8}-\d{6}-[0-9a-f]{6})\n")
 
 
-def _live_registry(key: str):
-    """`key` as the CONFIG FILE holds it now, or None when the file does not set it. A daemon loaded the
-    file once, at import, and `load_config` only fills what the environment lacks, so a registry the
-    user has since edited would read stale there forever. The gate therefore asks the file again and
-    lets it win over the daemon's remembered value (same first-occurrence rule as load_config)."""
+class _RegistryUnreadable(Exception):
+    """The config file is there but could not be read just now: a transient fact, never a verdict."""
+
+
+def _registry(key: str, default: str) -> str:
+    """The value of `key` the gate acts on. When the config file exists and is readable it IS the
+    registry: a key absent from it reads as `default` (nothing registered; for CGC_APPS, the documented
+    default), whatever this process's environment remembers. The environment is consulted only when
+    there is no config file at all. A daemon loaded the file once, at import, and `load_config` fills
+    only what the environment lacks, so an environment copy goes stale the moment the user edits the
+    file; letting it outvote the file would keep a revoked workspace authorized. A file that cannot be
+    read raises _RegistryUnreadable: the question is open, not answered no."""
     try:
         with open(_cfg.config_path(), encoding="utf-8") as f:
-            for k, v in _cfg._parse(f.read()):
-                if k == key:
-                    return v
-    except OSError:
-        pass
-    return None
+            text = f.read()
+    except FileNotFoundError:
+        return os.environ.get(key, default)
+    except (OSError, ValueError) as e:     # unreadable, a directory, not UTF-8
+        raise _RegistryUnreadable(f"{type(e).__name__}: {e}") from e
+    for k, v in _cfg._parse(text):
+        if k == key:
+            return v
+    return default
 
 
 def workspace_refusal(workspace, mentions) -> str | None:
     """None when (workspace, mentions) is a registered evidence channel, else why it is not. One
     predicate for enqueue's pre-check and the gate, so the two cannot disagree on what registered
-    means. CGC_WORKSPACES and CGC_APPS are read from the config file as it is NOW when it sets them,
-    else from the environment (unlike every other CGC_* key, where the environment wins: a daemon's
-    environment is a stale copy of the file, and these two are the authority for an exemption)."""
+    means (see _registry for where the lists come from). Raises _RegistryUnreadable."""
     import consult   # the single definition of how CGC_WORKSPACES / CGC_APPS are parsed
     if not workspace:
         return "no --workspace is recorded for this round (only `consult.py fire` records one)"
-    known_ws = consult.known_workspaces(_live_registry("CGC_WORKSPACES"))
+    known_ws = consult.known_workspaces(_registry("CGC_WORKSPACES", ""))
     if workspace.lower() not in {w.lower() for w in known_ws}:
         return f"workspace {workspace!r} is not in CGC_WORKSPACES"
-    apps = {x.lower() for x in consult.known_apps(_live_registry("CGC_APPS"))}
+    apps = {x.lower() for x in consult.known_apps(_registry("CGC_APPS", consult.DEFAULT_APPS))}
     if not any(str(m).lower() in apps for m in mentions or ()):
         return "none of this round's --mention apps is in CGC_APPS"
     return None
@@ -841,7 +947,11 @@ def _workspace_verdict(text: str) -> str | None:
     except _StoreUnreadable as e:
         return (f"unverified: the store could not be read to confirm this round's workspace ({e}). "
                 "Nothing was sent. Re-enqueue to retry.")
-    bad = workspace_refusal(workspace, mentions)
+    try:
+        bad = workspace_refusal(workspace, mentions)
+    except _RegistryUnreadable as e:
+        return (f"unverified: the config file that registers workspaces could not be read ({e}). "
+                "Nothing was sent. Re-enqueue to retry.")
     if bad is None:
         return None
     if workspace:
@@ -1015,8 +1125,11 @@ def cmd_enqueue(a) -> int:
                 return 2
             # The same authority test the daemon's gate applies, from the same inputs: the workspace
             # `fire` recorded for this round, not the sentence in the text.
-            bad = workspace_refusal((getattr(a, "consult_meta", None) or {}).get("workspace"),
-                                    getattr(a, "mentions", None))
+            try:
+                bad = workspace_refusal((getattr(a, "consult_meta", None) or {}).get("workspace"),
+                                        getattr(a, "mentions", None))
+            except _RegistryUnreadable as e:
+                bad = f"the config file that registers workspaces could not be read ({e})"
             if bad:
                 sys.stderr.write(f"CGC_ERROR no_code_source: {_workspace_fix(bad)}. Nothing was queued.\n")
                 return 2

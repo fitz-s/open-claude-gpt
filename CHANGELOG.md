@@ -104,9 +104,17 @@ releases until it stabilizes.
   exactly one ref; PR numbers are canonical. Over 48 distinct probes is refused as `partial
   verification`, and the success message counts what it verified. A commit the API answers with 422 is
   a dead link, not a gh outage that retried forever.
-- The workspace registry is read from the config file at send time, so a long-running daemon honours an
-  edited `CGC_WORKSPACES` / `CGC_APPS`; a registry or store that cannot confirm a recorded workspace
-  holds the round for a retry (`unverified:`), where it used to reject it for good.
+- The gate's token now contains every character a URL can hold (a `'` in a path used to end it, so
+  `.../cli/cli/'/../../../other/private` was judged as `cli/cli`), a link nested in a proxy or redirect
+  URL is judged too, and a TAB, bare CR or a line break that would join a dot segment, escape or
+  backslash onto a link is refused. Other hosts under GitHub domains (`github.io`, `ghcr.io`, signed
+  `*.githubusercontent.com` downloads, assets) are refused; `api.github.com/repos/...` and
+  `codeload.github.com/...` map to their repo and are visibility- and existence-checked; `/pull/N.diff`
+  and `.patch` are PR N. Links to other sites remain the operator's free-text boundary.
+- The workspace registry is the config file when there is one: a key removed from it revokes the
+  workspace even if the long-running daemon still remembers it, an unreadable file holds the round for a
+  retry (`unverified:`) instead of granting from the daemon's memory, and a store or registry that
+  cannot confirm a recorded workspace holds the round where it used to reject it for good.
 - `CGC_GATE_ALLOW_GIST` opens only on `1`, `true`, `yes` or `on` (it opened on any junk value). The
   raw-gist host counts as a gist. A GitHub site page (`/topics`, `/orgs/...`) no longer counts as "a
   code link" for the source rule.

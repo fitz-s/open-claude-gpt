@@ -879,3 +879,115 @@ def test_the_child_process_refuses_the_quoted_sentinel(fire):
     _ws_prompt(fire)    # a registered round exists; this is some OTHER prompt quoting its sentence
     sendable, ok, why = _run_child(_SENTINEL_PROSE)
     assert sendable and not ok and "only text" in why, "the backstop recognizes the claim, the gate refuses it"
+
+
+# ---- E3: the registry fails closed -----------------------------------------------------------------
+#
+# CGC_WORKSPACES / CGC_APPS used to be read from the config file only when the file set the key, and
+# fell back to the daemon's import-time environment otherwise. A key the user REMOVED (revoking a
+# workspace), a missing file, or a file that could not be opened all fell through to the stale copy
+# and kept the workspace authorized. The file, when there is one, is the registry.
+
+def _cfg_file(monkeypatch, tmp_path, text):
+    path = tmp_path / "cgc.conf"
+    if text is not None:
+        path.write_text(text, encoding="utf-8")
+    monkeypatch.setenv("CGC_CONFIG", str(path))
+    return path
+
+
+def _drive_gate(fire, spool):
+    r, _ = _ws_prompt(fire)
+    return spool.validate_prompt(r["rendered_prompt"]), r
+
+
+def test_e3_a_key_removed_from_the_file_revokes_the_workspace_despite_the_daemons_env(fire, spool, monkeypatch, tmp_path):
+    cfg = _cfg_file(monkeypatch, tmp_path, "CGC_WORKSPACES=my repo\n")
+    (ok, why), r = _drive_gate(fire, spool)
+    assert ok, why
+    monkeypatch.setenv("CGC_WORKSPACES", "my repo")          # what the daemon remembers from its start
+    cfg.write_text("CGC_PROJECT_URL=https://chatgpt.com/\n", encoding="utf-8")   # the key is gone
+    ok, why = spool.validate_prompt(r["rendered_prompt"])
+    assert not ok and why.startswith("unverified:") and "not in CGC_WORKSPACES" in why
+
+
+def test_e3_an_empty_value_in_the_file_revokes_everything(fire, spool, monkeypatch, tmp_path):
+    cfg = _cfg_file(monkeypatch, tmp_path, "CGC_WORKSPACES=my repo\n")
+    (ok, why), r = _drive_gate(fire, spool)
+    assert ok, why
+    monkeypatch.setenv("CGC_WORKSPACES", "my repo")
+    cfg.write_text("CGC_WORKSPACES=\n", encoding="utf-8")
+    ok, why = spool.validate_prompt(r["rendered_prompt"])
+    assert not ok and "not in CGC_WORKSPACES" in why
+
+
+def test_e3_a_removed_apps_key_means_the_documented_default_not_the_stale_env(fire, spool, monkeypatch, tmp_path):
+    """No CGC_APPS in the file = the documented default (WebCodex Demo), so the round still passes; a
+    stale env that lists a DIFFERENT app does not outvote that default."""
+    _cfg_file(monkeypatch, tmp_path, "CGC_WORKSPACES=my repo\n")
+    monkeypatch.setenv("CGC_APPS", "Some Other App")
+    (ok, why), r = _drive_gate(fire, spool)
+    assert ok, why
+    (tmp_path / "cgc.conf").write_text("CGC_WORKSPACES=my repo\nCGC_APPS=Not The App\n", encoding="utf-8")
+    ok, why = spool.validate_prompt(r["rendered_prompt"])
+    assert not ok and "CGC_APPS" in why
+
+
+def test_e3_with_no_config_file_the_environment_is_the_registry(fire, spool, monkeypatch, tmp_path):
+    _cfg_file(monkeypatch, tmp_path, None)                    # the file does not exist
+    (ok, why), r = _drive_gate(fire, spool)                   # autouse fixture: CGC_WORKSPACES=my repo
+    assert ok, why
+    monkeypatch.setenv("CGC_WORKSPACES", "")
+    ok, why = spool.validate_prompt(r["rendered_prompt"])
+    assert not ok and "not in CGC_WORKSPACES" in why
+
+
+def test_e3_an_unreadable_file_is_unverified_never_granted_from_the_environment(fire, spool, monkeypatch, tmp_path):
+    cfg = _cfg_file(monkeypatch, tmp_path, "CGC_WORKSPACES=my repo\n")
+    (ok, why), r = _drive_gate(fire, spool)
+    assert ok, why
+    cfg.chmod(0o000)
+    try:
+        if os.access(cfg, os.R_OK):
+            pytest.skip("running as a user that ignores file modes")
+        ok, why = spool.validate_prompt(r["rendered_prompt"])
+        assert not ok and why.startswith("unverified:") and "could not be read" in why, why
+    finally:
+        cfg.chmod(0o600)
+
+
+def test_e3_a_config_path_that_is_a_directory_is_unverified(fire, spool, monkeypatch, tmp_path):
+    r, _ = _ws_prompt(fire)
+    d = tmp_path / "confdir"
+    d.mkdir()
+    monkeypatch.setenv("CGC_CONFIG", str(d))
+    ok, why = spool.validate_prompt(r["rendered_prompt"])
+    assert not ok and why.startswith("unverified:") and "could not be read" in why
+
+
+def test_e3_an_unreadable_registry_requeues_with_backoff_and_never_reaches_the_driver(fire, spool, monkeypatch, tmp_path):
+    cfg = _cfg_file(monkeypatch, tmp_path, "CGC_WORKSPACES=my repo\n")
+    r, _ = _ws_prompt(fire)
+    with store_mod.Store() as s:
+        s.db.execute("UPDATE rounds SET not_before=NULL WHERE rid=?", (r["rid"],))
+        s.claim_ready("d")
+    monkeypatch.setattr(spool.os.path, "exists", spool.os.path.exists)    # no-op: keep the real one
+    cfg.chmod(0o000)
+    try:
+        if os.access(cfg, os.R_OK):
+            pytest.skip("running as a user that ignores file modes")
+        final, calls = _drive(r, spool.validate_prompt)
+    finally:
+        cfg.chmod(0o600)
+    assert final == store_mod.QUEUED and calls == []
+    with store_mod.Store() as s:
+        row = s.get_round(r["rid"])
+    assert row["error_code"].startswith("unverified:") and row["gate_retry_count"] == 1
+
+
+def test_e3_enqueue_precheck_reads_the_same_registry(fire, spool, monkeypatch, tmp_path, capsys):
+    """fire is refused at enqueue when the FILE does not list the workspace, even if this process's
+    environment does, so the pre-check cannot grant what the gate will later refuse."""
+    _cfg_file(monkeypatch, tmp_path, "CGC_WORKSPACES=somewhere else\n")
+    assert fire(no_code=False, workspace="my repo", mention=["WebCodex Demo"]) == 2
+    assert "not in CGC_WORKSPACES" in capsys.readouterr().err

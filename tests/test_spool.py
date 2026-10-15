@@ -992,3 +992,139 @@ def test_a_blob_the_contents_api_calls_too_large_still_proves_the_path_exists(sp
     monkeypatch.setattr(spool, "_gh_exists", _REAL_GH_EXISTS)
     monkeypatch.setattr(spool.subprocess, "run", lambda *a, **k: _R())
     assert spool._gh_exists("repos/acme/widgets/contents/big.bin?ref=main") == (True, "exists")
+
+
+# ---- E1: the gate's token contains every URL a parser would read ---------------------------------
+#
+# The tokenizer used to stop at `'`, so `https://github.com/cli/cli/'/../../../private-owner/repo`
+# was judged as `https://github.com/cli/cli/`, while a browser requests /private-owner/repo. It also
+# ignored that a browser drops TAB, CR and LF from inside a URL.
+
+_E1_REFUSED = [
+    ("quote in path", f"<{_OWN}/'/../../../private-owner/private-repo>", "`.` or `..`"),
+    ("double quote in path", f'{_OWN}/"/../../../private-owner/private-repo', "`.` or `..`"),
+    ("paren in path", f"{_OWN}/(/../../../private-owner/private-repo", "`.` or `..`"),
+    ("star in path", f"{_OWN}/*/../../../private-owner/private-repo", "`.` or `..`"),
+    ("bang in path", f"{_OWN}/!/../../../private-owner/private-repo", "`.` or `..`"),
+    ("tab then dots", f"{_OWN}/tree/main/\t../../../private-owner/private-repo", "TAB or bare CR"),
+    ("tab inside the host", "https://git\thub.com/private-owner/private-repo", "TAB or bare CR"),
+    ("tab before the path", "https://github.com\t/private-owner/private-repo", "TAB or bare CR"),
+    ("bare CR then dots", f"{_OWN}/tree/main/\r../../../private-owner/private-repo", "TAB or bare CR"),
+    ("quote then tab", f"{_OWN}/'\t/../../private-owner/private-repo", "TAB or bare CR"),
+    ("LF then dots", f"{_OWN}/tree/main/\n../../../private-owner/private-repo", "line break"),
+    ("CRLF then dots", f"{_OWN}/tree/main/\r\n../../../private-owner/private-repo", "line break"),
+    ("two LFs then dots", f"{_OWN}/tree/main/\n\n../../../private-owner/private-repo", "line break"),
+    ("LF then escape", f"{_OWN}/tree/main/\n%2e%2e/%2e%2e/private-owner/private-repo", "line break"),
+    ("LF then backslash", f"{_OWN}/tree/main/\n..\\..\\private-owner/private-repo", "line break"),
+    ("chained gaps", f"{_OWN}/tree/main/\n.\n./../private-owner/private-repo", "line break"),
+]
+
+
+@pytest.mark.parametrize("name,link,why_has", _E1_REFUSED, ids=[c[0] for c in _E1_REFUSED])
+def test_e1_a_link_a_parser_would_read_differently_is_refused_before_any_probe(spool, monkeypatch, name, link, why_has):
+    probes = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (probes.append(("vis", s)) or (True, "stub")))
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (probes.append(("ex", p)) or (True, "exists")))
+    ok, why = spool.validate_prompt("review " + link)
+    assert not ok and why.startswith("refused:") and why_has in why, why
+    assert probes == [], "the whole URL was judged, so nothing was probed on a half-read link"
+
+
+@pytest.mark.parametrize("name,prompt", [
+    ("url, line, word", f"see {_OWN}\nthen explain"),
+    ("two urls, two lines", f"{_OWN}/pull/1\n{_OWN}/pull/2"),
+    ("crlf then word", f"see {_OWN}/pull/1\r\nnext"),
+    ("lf, header", f"see {_OWN}/pull/1\n\n# Header"),
+    ("lf, bullet", f"see {_OWN}/pull/1\n- b"),
+    ("lf, indented", f"see {_OWN}/pull/1\n   more"),
+    ("lf, tab-indented", f"see {_OWN}/pull/1\n\tmore"),
+    ("space, tab", f"see {_OWN}/pull/1 \tmore"),
+    ("tab-indented bullets", f"\t- {_OWN}/pull/1\n\t- {_OWN}/pull/2"),
+    ("wrapped in quotes", f"'{_OWN}/pull/1' and \"{_OWN}/pull/2\" and `{_OWN}/pull/3`"),
+    ("wrapped in markdown", f"**{_OWN}/pull/1** and [x]({_OWN}/pull/2) and <{_OWN}/pull/3>"),
+    ("blob name with parens", f"{_OWN}/blob/abc1234/src/a(1).py"),
+])
+def test_e1_ordinary_line_ends_and_wrappers_still_pass(spool, monkeypatch, name, prompt):
+    _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(prompt)
+    assert ok, (name, why)
+
+
+def test_e1_a_link_nested_in_a_proxy_or_redirect_is_judged_too(spool, monkeypatch):
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (s == "acme/widgets", "stub")))
+    for prompt in ("references no code\nhttps://r.jina.ai/https://github.com/priv/repo",
+                   "references no code\nhttps://www.google.com/url?q=https://github.com/priv/repo",
+                   "references no code\nhttps://web.archive.org/web/2020/https://github.com/priv/repo"):
+        seen.clear()
+        ok, why = spool.validate_prompt(prompt)
+        assert not ok and "priv/repo" in why and seen == ["priv/repo"], (prompt, why)
+
+
+# ---- E2: every GitHub-family host is checked or refused ------------------------------------------
+
+def test_e2_api_and_codeload_map_to_their_repo_and_are_visibility_checked(spool, monkeypatch):
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public",
+                        lambda s: (seen.append(s) or (s == "acme/widgets", "visibility=private")))
+    for url in ("https://api.github.com/repos/private-owner/private-repo/contents/x",
+                "https://codeload.github.com/private-owner/private-repo/zip/main",
+                "https://codeload.github.com/private-owner/private-repo/tar.gz/refs/heads/main"):
+        seen.clear()
+        ok, why = spool.validate_prompt(f"review {_OWN} and {url}")
+        assert not ok and "private-owner/private-repo" in why and "not confirmed PUBLIC" in why, (url, why)
+        assert "private-owner/private-repo" in seen
+
+
+def test_e2_a_public_repo_through_api_or_codeload_passes(spool, monkeypatch):
+    _probe_log(spool, monkeypatch)
+    assert spool.validate_prompt("review https://api.github.com/repos/acme/widgets/pulls/3")[0]
+    assert spool.validate_prompt("review https://codeload.github.com/acme/widgets/zip/main")[0]
+
+
+@pytest.mark.parametrize("url", [
+    "https://objects.githubusercontent.com/github-production-repository-file-5c1aeb/1/2?X-Amz-Signature=x",
+    "https://acme.github.io/site/", "https://ghcr.io/private-owner/img:latest",
+    "https://github.githubassets.com/x.js", "https://user-images.githubusercontent.com/1/x.png",
+    "https://avatars.githubusercontent.com/u/1", "https://pkg.github.com/x",
+    "https://GITHUB.IO./x", "https://Objects.GitHubUserContent.com./x",
+])
+def test_e2_every_other_github_family_host_is_refused_outright(spool, monkeypatch, url):
+    probes = _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(f"review {_OWN} and {url}")
+    assert not ok and why.startswith("refused:") and "GitHub-hosted domain" in why, why
+    assert probes == []
+
+
+def test_e2_an_api_path_that_is_not_a_repo_is_refused(spool):
+    ok, why = spool.validate_prompt("review https://api.github.com/user/repos")
+    assert not ok and "/repos/OWNER/REPO" in why
+
+
+def test_e2_lookalikes_and_other_sites_are_outside_the_gates_scope(spool, monkeypatch):
+    probes = _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(
+        f"review {_OWN} and https://github.com.evil.example/x and https://notgithub.com/a/b "
+        "and https://arxiv.org/abs/1")
+    assert ok and probes == [], "bare repo link, no refs; the other hosts were never the gate's business"
+
+
+# ---- E4: PR export forms -------------------------------------------------------------------------
+
+@pytest.mark.parametrize("form", ["{n}.diff", "{n}.patch", "{n}"])
+def test_e4_pr_export_forms_are_existence_checked_as_the_pr(spool, monkeypatch, form):
+    asked = _probe_log(spool, monkeypatch, dead=("/pulls/999999999",))
+    ok, why = spool.validate_prompt(f"review {_OWN}/pull/{form.format(n=999999999)}")
+    assert not ok and "does not exist" in why and "pull/999999999" in why
+    assert asked == ["repos/acme/widgets/pulls/999999999"]
+
+
+def test_e4_diff_patch_and_plain_are_one_probe(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(f"review {_OWN}/pull/12 {_OWN}/pull/12.diff {_OWN}/pull/012.patch")
+    assert ok and asked == ["repos/acme/widgets/pulls/12"], (why, asked)
+
+
+def test_e4_a_malformed_pr_suffix_is_refused(spool):
+    ok, why = spool.validate_prompt(f"review {_OWN}/pull/12.zip")
+    assert not ok and "pull-request number" in why
