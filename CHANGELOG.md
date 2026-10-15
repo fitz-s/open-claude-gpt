@@ -114,8 +114,10 @@ releases until it stabilizes.
   rather than a list of cases: every chain of text joined only by TAB/CR/LF is judged at each break and
   at its maximal join, a chain with more than 64 breaks is refused instead of judged on a prefix (a host
   spelled one character per line used to pass after 16), a scheme split by a break is refused, and
-  `%2e` spellings of `.`/`..` and escaped separators count as dot segments. A new test checks the gate
-  against node's WHATWG parser on a generated corpus. The repo-root examples in
+  `%2e` spellings of `.`/`..` and escaped separators count as dot segments. A final period after a
+  link is judged both ways (`widgets.` is a legal repo name): `owner/widgets.` is probed once, a 404
+  means the period was punctuation, a non-public one is refused. A new test checks the gate against
+  node's WHATWG parser on a generated corpus. The repo-root examples in
   `references/injection-and-prompting.md` now end in `/`. Other hosts under GitHub domains (`github.io`, `ghcr.io`, signed
   `*.githubusercontent.com` downloads, assets) are refused; `api.github.com/repos/...` and
   `codeload.github.com/...` map to their repo and are visibility- and existence-checked; `/pull/N.diff`

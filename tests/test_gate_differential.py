@@ -7,9 +7,10 @@
 #     runs joined only by TAB/CR/LF (a space ends a chain), so a scheme or host split by breaks is found;
 #   * from each such start, the text cut at EVERY later piece boundary (every prefix join) and at the end
 #     of the chain (the maximal join), however many breaks there are: unbounded, no cap to copy;
-#   * each of those with trailing sentence punctuation stripped, and not. One final period is read as the
-#     end of a sentence, the single assumption the gate documents (a repo named `widgets.` is legal but
-#     is not what "see <link>." means); two final periods are not.
+#   * each of those with trailing sentence punctuation stripped, and not; and, for a single final
+#     period, both with it (the repo `widgets.` is legal) and without it (a sentence end). The oracle
+#     assumes nothing about which one the writer meant: a reading that lands on a repo must land on one
+#     the gate verified.
 # A reading that lands on a GitHub host and names a repo GitHub can hold must name a repo the gate
 # verified. The gate and the oracle are written independently, so a hole one of them has is found by the
 # other. A prompt the gate REFUSED is never a bypass, so a gate that refuses what it cannot judge passes.
@@ -105,11 +106,10 @@ def _readings(text):
             for e in [x for x in ends if x > m.start()]:
                 raw = joined[m.start():e]
                 for cand in (raw, re.sub(r"[,;:!?)\]}'\"*>|`]+$", "", raw)):
-                    # The ONE assumption the gate documents: a single final period is a sentence end.
-                    # (`widgets.` is a legal repo name; the gate does not ask. `main..` is not a sentence end.)
-                    if cand.endswith(".") and not cand.endswith(".."):
-                        cand = cand[:-1]
+                    # Both readings of a final period: it belongs to the name, or it ends a sentence.
                     out.add(cand)
+                    if cand.endswith(".") and not cand.endswith(".."):
+                        out.add(cand[:-1])
     return out
 
 
@@ -137,7 +137,13 @@ def _whatwg(urls):
 
 def _run(sp, texts, monkeypatch):
     verified = set()
-    monkeypatch.setattr(sp, "_repo_is_public", lambda slug: (verified.add(slug.lower()) or (True, "stub")))
+
+    def vis(slug):
+        verified.add(slug.lower())      # every repo the gate ASKED about; an unasked one is the bypass
+        if slug.endswith("."):          # a name ending in a period: no such repo, so the period was punctuation
+            return False, sp._INVISIBLE + " to your gh token (404 - private or nonexistent)"
+        return True, "visibility=public"
+    monkeypatch.setattr(sp, "_repo_is_public", vis)
     monkeypatch.setattr(sp, "_gh_exists", lambda p: (True, "exists"))
     verdicts = []
     for t in texts:

@@ -1371,3 +1371,176 @@ def test_chain_a_split_scheme_gets_its_own_clear_refusal(spool, monkeypatch):
         ok, why = spool.validate_prompt(prompt)
         assert not ok and "splits the scheme" in why, why
     assert seen == []
+
+
+# ---- a final period that may be part of the repo name: both readings, one probe --------------------
+#
+# `widgets.` is a legal repo name (GitHub accepts a trailing dot), so `see .../acme/widgets.` can mean the
+# repo `widgets` plus a full stop, or the repo `widgets.`. The link is verified as `widgets` as usual and
+# `acme/widgets.` is probed once. gh is mocked everywhere in these tests.
+
+def _dot_gate(spool, monkeypatch, dotted):
+    """acme/widgets is public; `acme/widgets.` answers as `dotted` says."""
+    asked = []
+    answers = {
+        "404": (False, spool._INVISIBLE + " to your gh token (404 — private or nonexistent)"),
+        "public": (True, "visibility=public"),
+        "private": (False, "visibility=private"),
+        "outage": (False, "unverified: gh timed out after 25s"),
+    }
+
+    def vis(slug):
+        asked.append(slug)
+        return answers[dotted] if slug.endswith(".") else (True, "visibility=public")
+    monkeypatch.setattr(spool, "_repo_is_public", vis)
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (True, "exists"))
+    return asked
+
+
+def test_dot_a_sentence_period_whose_dotted_repo_does_not_exist_passes(spool, monkeypatch):
+    asked = _dot_gate(spool, monkeypatch, "404")
+    ok, why = spool.validate_prompt(f"see {_OWN}.")
+    assert ok, why
+    assert asked == ["acme/widgets", "acme/widgets."], "both readings were looked at, the dotted one once"
+
+
+def test_dot_a_dotted_repo_that_exists_and_is_public_passes(spool, monkeypatch):
+    _dot_gate(spool, monkeypatch, "public")
+    assert spool.validate_prompt(f"see {_OWN}.")[0]
+
+
+def test_dot_a_dotted_repo_that_exists_and_is_not_public_is_refused(spool, monkeypatch):
+    _dot_gate(spool, monkeypatch, "private")
+    ok, why = spool.validate_prompt(f"see {_OWN}.")
+    assert not ok and why.startswith("refused:") and "acme/widgets." in why and "not confirmed PUBLIC" in why
+    assert "angle brackets" in why, "the refusal names the fix"
+
+
+def test_dot_a_gh_outage_on_the_dotted_reading_is_unverified_and_retryable(spool, monkeypatch):
+    _dot_gate(spool, monkeypatch, "outage")
+    ok, why = spool.validate_prompt(f"see {_OWN}.")
+    assert not ok and why.startswith("unverified:") and "acme/widgets." in why
+
+
+def test_dot_the_operator_allowlist_admits_a_private_dotted_repo(spool, monkeypatch):
+    _dot_gate(spool, monkeypatch, "private")
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", "acme/widgets.")
+    assert spool.validate_prompt(f"see {_OWN}.")[0]
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", "acme/widgets")      # the undotted one does not admit it
+    assert not spool.validate_prompt(f"see {_OWN}.")[0]
+
+
+@pytest.mark.parametrize("name,text", [
+    ("no period", f"see {_OWN}"),
+    ("period after a path", f"see {_OWN}/pull/12."),
+    ("period after a tree link", f"see {_OWN}/tree/abc1234."),
+    ("wrapped, period outside", f"see <{_OWN}>."),
+    ("paren, period outside", f"(see {_OWN})."),
+])
+def test_dot_no_second_reading_means_no_extra_probe(spool, monkeypatch, name, text):
+    asked = _dot_gate(spool, monkeypatch, "private")
+    _probe_log(spool, monkeypatch)      # existence stub only
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (asked.append(s) or (not s.endswith("."), "visibility=private")))
+    ok, why = spool.validate_prompt(text)
+    assert ok, (name, why)
+    assert not any(a.endswith(".") for a in asked), asked
+
+
+@pytest.mark.parametrize("name,text", [
+    ("brackets, period inside", f"see <{_OWN}.>"),
+    ("period at the end of the line before text", f"see {_OWN}. "),
+    ("period then a sentence on the same line", f"see {_OWN}. Then explain."),
+])
+def test_dot_a_period_that_ends_the_token_gets_the_second_reading(spool, monkeypatch, name, text):
+    asked = _dot_gate(spool, monkeypatch, "private")
+    ok, why = spool.validate_prompt(text)
+    assert not ok and "acme/widgets." in why, (name, why)
+
+
+def test_dot_the_second_reading_also_comes_from_a_joined_link(spool, monkeypatch):
+    """A link that ends a line with its sentence period, joined with the following text, is the same
+    link: the dotted reading is probed through the join too."""
+    asked = _dot_gate(spool, monkeypatch, "private")
+    ok, why = spool.validate_prompt(f"see {_OWN}/\n\nThen explain.")
+    assert ok, why      # a trailing slash: no period, no second reading
+    asked.clear()
+    ok, why = spool.validate_prompt(f"see {_OWN}.\n\nThen explain.")
+    assert not ok, "a bare link + period + line break is refused by the join rule before any probe"
+
+
+def test_dot_two_final_periods_are_never_a_sentence_end(spool, monkeypatch):
+    asked = _dot_gate(spool, monkeypatch, "404")
+    ok, why = spool.validate_prompt(f"see {_OWN}..")
+    assert not ok and "ending in `.`" in why and asked == []
+
+
+def test_dot_an_owner_cannot_hold_a_period_so_no_second_reading_exists(spool, monkeypatch):
+    asked = _dot_gate(spool, monkeypatch, "404")
+    for text in ("see https://github.com/acme.", "see https://github.com/acme./widgets",
+                 "see https://github.com/acme./widgets."):
+        ok, why = spool.validate_prompt(text)
+        assert not ok and why.startswith("refused:") and "owner/repo" in why, (text, why)
+    assert asked == [], "refused at the parse, before any gh call"
+
+
+def test_dot_a_dotted_repo_inside_a_longer_link_is_just_a_repo(spool, monkeypatch):
+    """`.../acme/widgets./pull/3` names the repo `widgets.` as written: verified directly, no second reading."""
+    asked = _dot_gate(spool, monkeypatch, "private")
+    ok, why = spool.validate_prompt("see https://github.com/acme/widgets./pull/3")
+    assert not ok and "acme/widgets." in why and "not confirmed PUBLIC" in why
+    assert asked == ["acme/widgets."]
+
+
+@pytest.mark.parametrize("text", [f"see {_OWN}\n.", f"see {_OWN}\n.\n", f"see {_OWN}\n\n."])
+def test_dot_a_period_that_arrives_only_after_a_line_break_gets_the_second_reading_too(spool, monkeypatch, text):
+    """A parser joins `widgets` + LF + `.` into the repo `widgets.`: the dotted reading comes from the
+    JOIN, not from the link as written, and is probed all the same."""
+    asked = _dot_gate(spool, monkeypatch, "private")
+    ok, why = spool.validate_prompt(text)
+    assert not ok and "acme/widgets." in why and "not confirmed PUBLIC" in why, why
+    assert "acme/widgets." in asked
+
+
+# ---- the readings of a trailing period must satisfy: all that exist are public, and one is -------------
+
+def _readings_gate(spool, monkeypatch, plain, dotted):
+    """`acme/widgets` answers as `plain`, `acme/widgets.` as `dotted` (each: 404 / public / private)."""
+    answers = {"404": (False, spool._INVISIBLE + " to your gh token (404 — private or nonexistent)"),
+               "public": (True, "visibility=public"), "private": (False, "visibility=private")}
+    asked = []
+
+    def vis(slug):
+        asked.append(slug)
+        return answers[dotted if slug.endswith(".") else plain]
+    monkeypatch.setattr(spool, "_repo_is_public", vis)
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (True, "exists"))
+    return asked
+
+
+@pytest.mark.parametrize("plain,dotted,passes", [
+    ("public", "public", True),
+    ("public", "404", True),
+    ("404", "public", True),      # the dotted repo is the real one: `widgets` does not exist
+    ("public", "private", False),
+    ("404", "private", False),
+    ("404", "404", False),        # neither reading is a public repo
+    ("private", "public", False),
+    ("private", "404", False),
+])
+def test_dot_the_two_readings_together(spool, monkeypatch, plain, dotted, passes):
+    asked = _readings_gate(spool, monkeypatch, plain, dotted)
+    ok, why = spool.validate_prompt(f"see {_OWN}.")
+    assert ok == passes, (plain, dotted, why)
+    assert len(asked) == len(set(asked)), f"one gh question per repo: {asked}"
+
+
+def test_dot_a_link_to_a_dotted_public_repo_without_a_sentence_still_works(spool, monkeypatch):
+    """`https://github.com/acme/widgets./` or followed by a path: the dotted repo is named as written."""
+    _readings_gate(spool, monkeypatch, "404", "public")
+    assert spool.validate_prompt("see https://github.com/acme/widgets./pull/3")[0]
+
+
+def test_dot_the_undotted_link_alone_is_unchanged_when_that_repo_does_not_exist(spool, monkeypatch):
+    _readings_gate(spool, monkeypatch, "404", "public")
+    ok, why = spool.validate_prompt(f"see {_OWN}")
+    assert not ok and "not confirmed PUBLIC" in why

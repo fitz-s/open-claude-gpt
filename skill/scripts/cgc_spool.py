@@ -163,10 +163,16 @@ def default_out(rid: str) -> str:
 # ends in a path (`/pull/12`), ends in `/`, is wrapped in brackets or quotes, or is followed by a space
 # before the break, cannot change its repo and is left alone. A TAB or bare CR right beside a GitHub
 # link is refused outright (it is neither a line end nor indentation).
-# ASSUMPTION, stated so it is not mistaken for a guarantee: ONE final period after a link is read as the
-# end of the sentence and dropped (`see https://github.com/acme/widgets.`). `widgets.` is a legal repo
-# name, so a repo spelled that way exists in principle and is not what the sentence means; the gate does
-# not ask. Two final periods (`main..`) are not a sentence end and are refused by the dot rules.
+# A sentence's final period is the same kind of ambiguity: `widgets.` is a legal repo name, so
+# `see https://github.com/acme/widgets.` can mean the repo `widgets` followed by a full stop, or the
+# repo `widgets.`. Both readings are judged. The period is dropped for the link itself (the repo
+# `widgets` is verified as usual) and the kept reading `owner/widgets.` is probed once. Together the
+# readings must satisfy: every reading that exists is public (unless the operator allowlisted it), and
+# at least one is. So a 404 on `widgets.` means the period was punctuation; a public `widgets.` passes
+# even when `widgets` does not exist (the link names the dotted repo); a `widgets.` that exists and is
+# not public is refused. A period after a path segment (`/pull/12.`) cannot
+# change the repo, and an owner cannot contain a period, so those need no probe. Two final periods
+# (`main..`) are not a sentence end and are refused by the dot rules.
 # Not the gate's business, and the operator's free-text boundary (docs/SECURITY.md): links to other
 # sites, and GitHub hosts written without a scheme.
 _GH_HOSTS = {"github.com": "repo", "www.github.com": "repo", "raw.githubusercontent.com": "raw",
@@ -193,6 +199,7 @@ class Link(NamedTuple):
     host: str       # "repo" | "raw" | "gist" | "api" | "codeload"
     slug: str       # "owner/repo"; "" for a gist
     target: tuple   # () | ("pull", "12") | ("commit", "<ref>") | ("tree"|"blob"|..., ("seg", ...))
+    alts: tuple = ()    # other repos a final period could make this link name ("owner/repo.")
 
 
 class _LawRefusal(Exception):
@@ -213,6 +220,24 @@ def _trim(tok: str) -> str:
         else:
             break
     return tok
+
+
+def _keep_dot(tok: str) -> str:
+    """`tok` with trailing wrapper/punctuation characters stripped but its dots kept: the reading in
+    which a final period belongs to the name (see the period paragraph above)."""
+    while tok and tok[-1] in _TRAIL:
+        tok = tok[:-1]
+    return tok
+
+
+def _dot_alt(raw: str, slug: str) -> str:
+    """The repo a link names when its single final period is PART of the name, if that differs from
+    `slug` (the repo it names with the period dropped); else ""."""
+    dotted = _keep_dot(raw)
+    if not dotted.endswith(".") or dotted.endswith(".."):
+        return ""
+    st, pl = _read(dotted, joined=True)
+    return pl[1] if st == "ok" and pl[1] and pl[1].lower() != slug.lower() else ""
 
 
 def _gh_host(authority: str) -> str:
@@ -372,21 +397,22 @@ def _read(tok: str, joined: bool = False) -> tuple:
     return "ok", (kind, f"{owner}/{repo}", rest, host)
 
 
-def _check_joins(first: str, state: str, payload, reads: list, glued: bool, spans: bool):
+def _check_joins(first: str, state: str, payload, reads: list, glued: bool, spans: bool, alts: set):
     """The refusal for the readings in which the text after a link is joined onto it, or None. `first`
-    is the link as written (a joined reading itself when `spans`), `reads` its later joins."""
+    is the link as written (a joined reading itself when `spans`), `reads` its later joins. A joined
+    reading that names the same repo adds to `alts` the repo its final period could make it name."""
     seen, readings = set(), []
     for r in ([first] if spans else []) + reads:
-        tok = _trim(r)
-        if tok not in seen:
-            seen.add(tok)
-            readings.append((tok, *_read(tok, joined=True)))
-    if state == "other" and all(st == "other" for _, st, _ in readings):
+        if r not in seen:
+            seen.add(r)
+            tok = _trim(r)
+            readings.append((tok, r, *_read(tok, joined=True)))
+    if state == "other" and all(st == "other" for _, _, st, _ in readings):
         return None     # nothing GitHub-shaped on either side of any join
     if glued:
         return (f"refused: a TAB or bare CR inside or beside a GitHub link ({(first + ''.join(reads[-1:]))[:100]!r}); "
                 "a browser drops it and joins the pieces. Put the link on one line")
-    for tok, st, pl in readings:
+    for tok, r, st, pl in readings:
         if st == "other":
             continue
         if spans:
@@ -402,6 +428,10 @@ def _check_joins(first: str, state: str, payload, reads: list, glued: bool, span
             return (f"refused: a line break lets a browser join the link {first[:100]!r} with the text after "
                     f"it into {tok[:120]!r}, which is a different repo ({pl[1] or 'a gist'}). End the link "
                     "with a space or a trailing slash")
+        if st == "ok":
+            alt = _dot_alt(r, pl[1])
+            if alt:
+                alts.add(alt)
     return None
 
 
@@ -421,8 +451,13 @@ def _parse_code_urls(text: str) -> tuple:
             state, payload = _read(tok)
             if state in ("bad", "norepo"):
                 return None, payload
+        alts = set()
+        if state == "ok" and not spans:
+            alt = _dot_alt(first, payload[1])
+            if alt:
+                alts.add(alt)
         if reads or spans:
-            why = _check_joins(first, state, payload, reads, glued, spans)
+            why = _check_joins(first, state, payload, reads, glued, spans, alts)
             if why:
                 return None, why
         if state != "ok":
@@ -458,7 +493,7 @@ def _parse_code_urls(text: str) -> tuple:
                 if not a_ or not dots or not b_ or "..." in b_:
                     return no("a compare link that is not A...B (three dots)")
                 target = ("compare", spec)
-        links.append(Link(kind, slug, target))
+        links.append(Link(kind, slug, target, tuple(sorted(alts))))
     return links, None
 
 
@@ -787,6 +822,7 @@ def acquire_conversation_lease(conversation):
 # attempt at 20s cost a real consult its whole 25-minute budget, so: a wider window, and one retry.
 _GH_TIMEOUT_S = 25
 _GH_ATTEMPTS = 2
+_INVISIBLE = "visibility=invisible"   # _repo_is_public's detail for a 404: an answer (no such repo, to this token)
 
 
 def _private_allowlist() -> set:
@@ -834,7 +870,7 @@ def _repo_is_public(slug: str) -> tuple:
             err = (r.stderr or "").strip()
             # 404 IS an answer: this token cannot see the repo, so it is private or absent. Terminal.
             if "404" in err or "Not Found" in err:
-                return False, "visibility=invisible to your gh token (404 — private or nonexistent)"
+                return False, _INVISIBLE + " to your gh token (404 — private or nonexistent)"
             last = f"unverified: gh api repos/{slug} failed: {err[:120]}"
             continue
         vis = (r.stdout or "").strip()
@@ -1118,8 +1154,20 @@ def validate_prompt(prompt_text: str) -> tuple:
     # 2. every repo the links reach must be gh-confirmed public (or named by the operator).
     slugs = {link.slug for link in links if link.slug}
     allowed = _private_allowlist()
+    probed = {}
+
+    def vis(slug):      # one gh question per repo, whichever rule asks it
+        if slug not in probed:
+            probed[slug] = _repo_is_public(slug)
+        return probed[slug]
+    alts_of = {}
+    for link in links:
+        if link.slug and link.alts:
+            alts_of.setdefault(link.slug, set()).update(link.alts)
     for slug in sorted(slugs):
-        ok, detail = _repo_is_public(slug)
+        ok, detail = vis(slug)
+        if not ok and detail.startswith(_INVISIBLE) and any(vis(a)[0] for a in alts_of.get(slug, ())):
+            continue    # `widgets` does not exist but `widgets.` is public: the link names the dotted repo
         if not ok and ("*" in allowed or slug.lower() in allowed):
             # Declared sendable by the user. Still fail closed on a repo gh could not resolve AT
             # ALL — an allowlist entry says "this repo of mine may go", not "skip the check".
@@ -1134,6 +1182,23 @@ def validate_prompt(prompt_text: str) -> tuple:
                                f"repo is private — the check itself failed, so nothing was sent. "
                                f"Re-enqueue to retry.")
             return False, f"refused: repo {slug} is not confirmed PUBLIC ({detail}) — will not send its link to an external service"
+
+    # 2b. a final period that may be part of a repo name: `owner/name.` is probed once. A 404 (no such
+    #     repo, to this token) means the period was punctuation; public passes; anything else that
+    #     exists must be named by the operator, like any other non-public repo.
+    for alt in sorted({a for link in links for a in link.alts}):
+        ok, detail = vis(alt)
+        if ok or detail.startswith(_INVISIBLE):
+            continue
+        if detail.startswith("unverified:"):
+            return False, (f"unverified: a link ends in a period that may be part of the repo name {alt}, "
+                           f"and gh could not say whether that repo exists ({detail.split(':', 1)[1].strip()}). "
+                           "Nothing was sent. Re-enqueue to retry.")
+        if "*" in allowed or alt.lower() in allowed:
+            continue
+        return False, (f"refused: a link ends in a period that may be part of the repo name {alt}, which "
+                       f"exists and is not confirmed PUBLIC ({detail}). Put the link in <angle brackets> or "
+                       "end the sentence before it")
 
     # 5. dead references: a typo'd PR number or nonexistent ref would otherwise fail 25 minutes
     #    later at ChatGPT (or be silently answered around). The gate has gh anyway — check now.

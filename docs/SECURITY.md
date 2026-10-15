@@ -70,9 +70,14 @@ The daemon re-validates every prompt before sending, fail-closed, over the exact
   nothing distinguishes prose from a join; the refusal says how to fix it. End the link with a space or
   a trailing slash. Links that end in a path (`/pull/12`), links wrapped in brackets, quotes or
   backticks, and links followed by a space are unaffected, and so are the links in the `prep` refs list.
-  A TAB or bare CR next to a link is refused always. One assumption is stated rather than checked: a
-  single final period after a link is read as the end of a sentence (`widgets.` is a legal repo name,
-  and the gate does not ask whether it exists). `tests/test_gate_differential.py` checks all of this
+  A TAB or bare CR next to a link is refused always. A final period is judged both ways: `widgets.` is
+  a legal repo name, so `see https://github.com/acme/widgets.` can name `widgets` plus a full stop, or
+  the repo `widgets.`. The gate verifies `acme/widgets` as usual and probes `acme/widgets.` once: a 404
+  means the period was punctuation, a public `widgets.` passes, one that exists and is not public is
+  refused (unless the operator allowlisted it), and a gh outage on it holds the round for a retry. A
+  period after a path (`/pull/12.`) cannot change the repo and is not probed. The refusal's fix is to
+  put the link in `<angle brackets>` or end the sentence before it. `tests/test_gate_differential.py`
+  checks all of this
   against node's WHATWG URL parser on a generated corpus, with an oracle that follows unbounded joins
   and shares no code or cap with the gate.
   **Links to other sites are outside the gate**: they are part of the operator's free-text boundary
