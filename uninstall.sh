@@ -42,15 +42,20 @@ DEST="$SKILLS_DIR/chatgpt-consult"
 ctl() { CGC_HOME="$REPO/skill" "$REPO/bin/cgc" "$@"; }
 
 # The planner. One program decides what may be deleted, so the listing and the deletion cannot
-# disagree. Modes: `plan` prints, `delete` deletes exactly the plan. Output is tab-separated
-# `kind<TAB>path<TAB>note` with "-" for an empty field:
+# disagree. `plan` scans and prints the plan; `delete PLANFILE` executes exactly that plan: it re-checks
+# each listed path (still a regular file, still the same file, still named the way the tool names it)
+# and deletes it, and it NEVER scans again, so a file that appeared after the plan was shown is not
+# touched. Rows are tab-separated `kind<TAB>path<TAB>note` with "-" for an empty field:
 #   refuse   note = why the whole uninstall must stop before changing anything
 #   note     path = a directory left alone, note = why (shown under --purge)
-#   journal / lock / incident / scratch   a file the tool wrote and --purge would delete
+#   journal / lock / incident / scratch   a file the tool wrote and --purge would delete;
+#            note = its identity "device:inode", which the delete step must find again
 #   settings state (ok|absent|parse|blocked) in the note: what happened reading Claude's settings.json
 #   profile  path = the Chrome profile to offer for deletion ("-" if none), note = why not
 #   deleted / failed   (delete mode)
-# It resolves everything first (realpath), then applies, in order:
+# Paths are compared by FILE IDENTITY (device and inode), never by their spelling: on a case-insensitive
+# filesystem ACTIVE.JSON and active.json are one file, and a hard link or a symlink is the same file under
+# another name. Then it applies, in order:
 #   - a journal file is only ever one of the exact names the store writes beside its database
 #     (db, -wal, -shm, .migrate.lock, .migrated, .v<n>.bak[.corrupt-*|.*.tmp], relocation leftovers),
 #     a regular file, and the database and its backups must carry a SQLite header;
@@ -60,19 +65,21 @@ ctl() { CGC_HOME="$REPO/skill" "$REPO/bin/cgc" "$@"; }
 #     recursively here; an emptied directory goes only if it is one of the tool's own subdirectories
 #     (locks, incidents/I-*, spool and its subdirectories) or a default location (~/.local/state/cgc,
 #     /tmp/cgc); a custom directory such as ~/Documents is left in place even when it ends up empty;
-#   - a directory outside $HOME is touched only when it is the default (~/.local/state/cgc, /tmp/cgc);
-#     $HOME itself, anything above it, and / never;
-#   - the config file and the journal must not lie inside a tree this uninstall deletes.
+#   - files are touched only in the default locations (~/.local/state/cgc, /tmp/cgc, and below them) or
+#     strictly below $HOME; $HOME itself, anything above it, and / never;
+#   - the config file is never planned, and neither it nor the journal may lie inside a tree this
+#     uninstall deletes.
 plan_py() {
-  python3 - "$SCRIPTS" "$1" "$DEST" "$PURGE" <<'PYEOF'
+  python3 - "$SCRIPTS" "$1" "$DEST" "$PURGE" "${2:-}" <<'PYEOF'
 import os, re, stat, sys
 
 scripts, mode, dest, purge = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+planfile = sys.argv[5]
 sys.path.insert(0, scripts)
 import cgc_activation, cgc_config, cgc_store      # noqa: E402  (importing applies the config file, as every script does)
 
-out, todo, owned, refusals = [], [], [], []
-DELETING = purge
+out, todo, refusals = [], [], []
+FILE_KINDS = ("journal", "lock", "incident", "scratch")
 
 
 def emit(kind, path="-", note="-"):
@@ -87,7 +94,7 @@ def refuse(msg):
 def refuse_if_deleting(msg):
     """Something that makes DELETING unsafe. Without --purge nothing in the store is deleted, so it is
     only a note: it must not stop the service, hook and code from being removed."""
-    if DELETING:
+    if purge:
         refuse(msg)
 
 
@@ -95,11 +102,40 @@ def real(p):
     return os.path.realpath(p)
 
 
+def fid(p):
+    """(st_dev, st_ino) of what `p` names, following symlinks; None when it does not exist."""
+    try:
+        st = os.stat(p)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def same(a, b):
+    """Do two paths name the same file or directory? By identity, so a case alias (APFS), a hard link or
+    a symlink counts. Only when one of them does not exist does it fall back to the resolved spelling."""
+    ia, ib = fid(a), fid(b)
+    if ia is not None and ib is not None:
+        return ia == ib
+    return real(a) == real(b)
+
+
 def within(p, d, strict=False):
-    p, d = real(p), real(d)
-    if strict and p == d:
-        return False
-    return p == d or p.startswith(d.rstrip(os.sep) + os.sep)
+    """Is `p` inside directory `d` (or `d` itself, unless strict)? Walks p's ancestors, from p itself up
+    to /, and compares each to d by identity, so `Documents/x` is inside `documents`."""
+    did, rd = fid(d), real(d)
+    cur, first = real(p), True
+    while True:
+        if (did is not None and fid(cur) == did) or (did is None and cur == rd):
+            return not (strict and first)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return False
+        cur, first = parent, False
+
+
+def tabbed(p):
+    return "\t" in p or "\n" in p
 
 
 HOME = real(os.path.expanduser("~"))
@@ -107,16 +143,19 @@ DEF_DATA = real(os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expandu
 DEF_STATE = real("/tmp/cgc")
 
 
-def allowed(d, default):
-    """A directory this uninstall may delete tool files from: the default, or strictly below $HOME."""
-    return real(d) == real(default) or within(d, HOME, strict=True)
+def allowed(d):
+    """A directory this uninstall may delete tool files from: a default location or below one, or strictly
+    below $HOME. Never $HOME itself, a directory above it, or / (an unrelated directory elsewhere)."""
+    return within(d, DEF_DATA) or within(d, DEF_STATE) or within(d, HOME, strict=True)
 
 
-def regular(p):
+def lstat_regular(p):
+    """The lstat of `p` if it is a regular file (a symlink or a directory is not), else None."""
     try:
-        return stat.S_ISREG(os.lstat(p).st_mode)
+        st = os.lstat(p)
     except OSError:
-        return False
+        return None
+    return st if stat.S_ISREG(st.st_mode) else None
 
 
 def sqlite_header(p):
@@ -129,52 +168,12 @@ def sqlite_header(p):
         return False
 
 
-def journal_files(db, default_dir):
-    d, b = os.path.split(os.path.abspath(db))
-    d = real(d)
-    if not os.path.isdir(d):
-        return []
+def journal_rx(b):
     e = re.escape(b)
     named = re.compile(e + r"(-wal|-shm|\.migrate\.lock|\.migrated|\.v\d+\.bak(\.corrupt-\d+|\.\w+\.tmp)?)?"
                        r"|\.relocation\.lock|\.control\.db\.relocating-[0-9a-f]{32}|\.corrupt-[0-9a-f]{32}")
     header = re.compile(e + r"(\.migrated|\.v\d+\.bak)?")
-    found = []
-    for n in sorted(os.listdir(d)):
-        if not named.fullmatch(n):
-            continue
-        p = os.path.join(d, n)
-        if not regular(p):
-            refuse_if_deleting(f"{p} is not a regular file; the store never writes it. Left alone.")
-        elif header.fullmatch(n) and not sqlite_header(p):
-            refuse_if_deleting(f"{p} does not start with a SQLite header, so it is not the store's "
-                               "database. Left alone.")
-        else:
-            found.append(p)
-    if found and not allowed(d, default_dir):
-        refuse_if_deleting(f"store files {found[0]} ... sit in {d}, which is $HOME, above it, or outside it "
-                           f"and not the default {default_dir}; this uninstall will not delete there. "
-                           "Remove them by hand.")
-        return []
-    return found
-
-
-def plan_dir(d, default_dir, ok, kind):
-    """Plan the tool-named files directly in `d` (one tool subdirectory). Returns the files planned."""
-    if not os.path.isdir(d) or os.path.islink(d):
-        return []
-    if not allowed(d, default_dir):
-        emit("note", d, "is $HOME, above it, or outside it and not the tool's default location; "
-                        "no files are deleted there")
-        return []
-    mine = []
-    for n in sorted(os.listdir(d)):
-        p = os.path.join(d, n)
-        if ok.fullmatch(n) and regular(p):
-            mine.append(p)
-    todo.extend((kind, p) for p in mine)
-    if mine:
-        owned.append(d)
-    return mine
+    return named, header
 
 
 RID = r"REQ-\d{8}-\d{6}-[0-9a-f]{6}"
@@ -184,11 +183,144 @@ SCRATCH = re.compile(rf"answer_({RID}|followup)\.txt(\.raw|\.\w+\.tmp)?|prompt_{
 SPOOLED = re.compile(r"REQ-[\w-]+\.(log|json)(\.tmp-[\d-]+)?")
 INCIDENT = re.compile(r"I-\d{8}-\d{6}-[a-z]+-[0-9a-f]{6}")
 INCIDENT_FILES = re.compile(r"fixture\.html|diagnosis\.json")
+TOOL_DIRS = {"locks", "incidents", "spool", "logs", "pending", "processing", "done", "status"}
 
 config = cgc_config.config_path()
 db = cgc_store.db_path()
 state = cgc_store.CGC_STATE_DIR
 data = cgc_store.data_dir()
+legacy = os.path.join(state, "control.db")
+DBNAMES = {os.path.basename(db), "control.db"} if db != ":memory:" else {"control.db"}
+
+
+def name_ok(kind, p):
+    """Is `p` named the way the tool names a file of this kind? (Used by the plan and again by the delete.)"""
+    b = os.path.basename(p)
+    parent = os.path.basename(os.path.dirname(p))
+    if kind == "journal":
+        return any(journal_rx(n)[0].fullmatch(b) for n in DBNAMES)
+    if kind == "lock":
+        return parent == "locks" and bool(LOCKS.fullmatch(b))
+    if kind == "incident":
+        return bool(INCIDENT.fullmatch(parent)) and bool(INCIDENT_FILES.fullmatch(b))
+    if kind == "scratch":
+        return bool(SCRATCH.fullmatch(b) or (parent in TOOL_DIRS and SPOOLED.fullmatch(b)))
+    return False
+
+
+def header_ok(kind, p):
+    """The database and its backups must be SQLite files; every other journal name is not checked."""
+    if kind != "journal":
+        return True
+    b = os.path.basename(p)
+    return not any(journal_rx(n)[1].fullmatch(b) for n in DBNAMES) or sqlite_header(p)
+
+
+# ================================================================================ delete: the plan only
+if mode == "delete":
+    with open(planfile, encoding="utf-8") as f:
+        rows = [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
+    if any(r[0] == "refuse" for r in rows):
+        sys.exit(1)
+    gone = []
+    for row in rows:
+        if len(row) != 3 or row[0] not in FILE_KINDS:
+            continue
+        kind, p, ident = row
+        st = lstat_regular(p)
+        if st is None:
+            if os.path.lexists(p):
+                print("failed\t" + p + "\tno longer a regular file; left alone")
+            continue                       # already gone (e.g. it lay inside the code tree removed a step ago)
+        if f"{st.st_dev}:{st.st_ino}" != ident:
+            print("failed\t" + p + "\tis not the file that was planned (replaced since); left alone")
+        elif not name_ok(kind, p) or not allowed(os.path.dirname(p)) or not header_ok(kind, p):
+            print("failed\t" + p + "\tno longer matches what the tool writes; left alone")
+        else:
+            try:
+                os.unlink(p)
+                gone.append(p)
+                print("deleted\t" + p + "\t" + kind)
+            except OSError as e:
+                print("failed\t" + p + "\t" + str(e))
+    # directories the tool made: each goes only if empty once its own files are gone, never recursively
+    dirs = set()
+    for p in gone:
+        d = os.path.dirname(p)
+        while d and not same(d, HOME) and not within(HOME, d):
+            dirs.add(d)
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    for d in sorted(dirs, key=len, reverse=True):
+        if not os.path.isdir(d) or os.path.islink(d) or not allowed(d):
+            continue
+        b = os.path.basename(d.rstrip(os.sep))
+        if not (same(d, DEF_DATA) or same(d, DEF_STATE) or b in TOOL_DIRS or INCIDENT.fullmatch(b)):
+            continue
+        try:
+            os.rmdir(d)
+            print("deleted\t" + d + "\tempty directory")
+        except OSError:
+            pass
+    sys.exit(0)
+
+
+# ================================================================================ plan: scan, then print
+def plan_file(kind, p, seen):
+    st = lstat_regular(p)
+    if st is None or not name_ok(kind, p):
+        return False
+    key = (st.st_dev, st.st_ino, os.path.basename(p))
+    if key in seen:
+        return False
+    if tabbed(p):
+        refuse_if_deleting(f"{p} has a tab or newline in its path and cannot be listed safely; remove it by hand.")
+        return False
+    seen.add(key)
+    todo.append((kind, p, f"{st.st_dev}:{st.st_ino}"))
+    return True
+
+
+def plan_dir(d, ok, kind, seen):
+    """Plan the tool-named files directly in `d` (one tool subdirectory)."""
+    if not os.path.isdir(d) or os.path.islink(d):
+        return
+    if not allowed(d):
+        emit("note", d, "is $HOME, above it, or outside it and not the tool's default location; "
+                        "no files are deleted there")
+        return
+    for n in sorted(os.listdir(d)):
+        if ok.fullmatch(n):
+            plan_file(kind, os.path.join(d, n), seen)
+
+
+def plan_journal(dbpath, seen):
+    d = real(os.path.dirname(os.path.abspath(dbpath)))
+    if not os.path.isdir(d):
+        return
+    named, header = journal_rx(os.path.basename(dbpath))
+    found = []
+    for n in sorted(os.listdir(d)):
+        if not named.fullmatch(n):
+            continue
+        p = os.path.join(d, n)
+        if lstat_regular(p) is None:
+            refuse_if_deleting(f"{p} is not a regular file; the store never writes it. Left alone.")
+        elif header.fullmatch(n) and not sqlite_header(p):
+            refuse_if_deleting(f"{p} does not start with a SQLite header, so it is not the store's "
+                               "database. Left alone.")
+        else:
+            found.append(p)
+    if found and not allowed(d):
+        refuse_if_deleting(f"store files {found[0]} ... sit in {d}, which is $HOME, above it, or outside it "
+                           "and not a default location; this uninstall will not delete there. "
+                           "Remove them by hand.")
+        return
+    for p in found:
+        plan_file("journal", p, seen)
+
 
 # ---- Claude's settings.json: what may happen to the hook entry ---------------------------------
 sp = cgc_activation.default_settings_path()
@@ -216,41 +348,36 @@ else:
             emit("settings", sp, "ok")
 
 # ---- the journal (kept unless --purge) and the tool's files around it --------------------------
-journal = []
+seen = set()
 if db != ":memory:":
-    journal += journal_files(db, DEF_DATA)
-legacy = os.path.join(state, "control.db")
-if real(legacy) != real(db):
-    journal += journal_files(legacy, DEF_STATE)
-journal = sorted(set(journal))
-for p in journal:
-    todo.append(("journal", p))
-    owned.append(os.path.dirname(p))
+    plan_journal(db, seen)
+if not same(legacy, db):
+    plan_journal(legacy, seen)
+journal = [p for k, p, _ in todo if k == "journal"]
 
-if db != ":memory:":
-    plan_dir(os.path.join(real(os.path.dirname(os.path.abspath(db))), "locks"), DEF_DATA, LOCKS, "lock")
-for root, default in ((data, DEF_DATA), (state, DEF_STATE)):
+dbdir = real(os.path.dirname(os.path.abspath(db))) if db != ":memory:" else data
+plan_dir(os.path.join(dbdir, "locks"), LOCKS, "lock", seen)
+for root in (data, state):
     inc = os.path.join(root, "incidents")
-    if os.path.isdir(inc) and not os.path.islink(inc) and allowed(inc, default):
+    if os.path.isdir(inc) and not os.path.islink(inc) and allowed(inc):
         for n in sorted(os.listdir(inc)):
             sub = os.path.join(inc, n)
             if INCIDENT.fullmatch(n) and os.path.isdir(sub) and not os.path.islink(sub):
-                if plan_dir(sub, default, INCIDENT_FILES, "incident"):
-                    owned.append(inc)
+                plan_dir(sub, INCIDENT_FILES, "incident", seen)
 spool = os.environ.get("CGC_SPOOL_DIR") or os.path.join(state, "spool")
 for sub in ("logs", "pending", "processing", "done", "status"):
-    plan_dir(os.path.join(spool, sub), os.path.join(DEF_STATE, "spool", sub), SPOOLED, "scratch")
-plan_dir(state, DEF_STATE, SCRATCH, "scratch")
-# directories the tool made: each is removed only if it is empty once its own files are gone
-dbdir = os.path.dirname(os.path.abspath(db)) if db != ":memory:" else data
-for sub in ("logs", "pending", "processing", "done", "status"):
-    owned.append(os.path.join(spool, sub))
-owned += [spool, state, dbdir, os.path.join(dbdir, "locks"), os.path.join(data, "incidents"),
-          os.path.join(state, "incidents")]
-# The config file is the user's, never the tool's scratch: whatever directory it sits in, it is not planned.
-todo = [(k, p) for k, p in todo if real(p) != real(config)]
-for kind, path in todo:
-    emit(kind, path)
+    plan_dir(os.path.join(spool, sub), SPOOLED, "scratch", seen)
+plan_dir(state, SCRATCH, "scratch", seen)
+
+# The config file is the user's, never the tool's scratch. It is recognised by IDENTITY: on a
+# case-insensitive filesystem CGC_CONFIG=.../ACTIVE.JSON is the file the scan listed as active.json, and a
+# hard link is the same file again; neither may be deleted.
+kept = [(k, p, i) for k, p, i in todo if same(p, config)]
+todo = [t for t in todo if t not in kept]
+for _, p, _ in kept:
+    emit("note", p, "is your config file; it is never deleted")
+for kind, path, ident in todo:
+    emit(kind, path, ident)
 
 # ---- nothing protected may sit inside a tree this uninstall deletes -----------------------------
 trees = [t for t in (dest, dest + ".bak") if os.path.lexists(t) and not os.path.islink(t)]
@@ -270,57 +397,31 @@ if not os.path.lexists(profile):
     emit("profile", "-", "none present")
 elif not within(rp, HOME, strict=True):
     emit("profile", "-", f"{rp} is not strictly inside $HOME; left alone")
-elif rp != real(os.path.expanduser("~/.cgc-chrome")) and not os.path.isfile(os.path.join(rp, "Local State")):
+elif not same(rp, os.path.expanduser("~/.cgc-chrome")) and not os.path.isfile(os.path.join(rp, "Local State")):
     emit("profile", "-", f"{rp} is not the default profile and holds no Chrome 'Local State'; left alone")
 else:
     held = [config, state, data, sp, dest] + journal
     inside = [x for x in held if within(x, rp)]
     if inside:
         emit("profile", "-", f"{rp} contains {inside[0]}, which must not be deleted; left alone")
+    elif tabbed(rp):
+        emit("profile", "-", f"{rp} has a tab or newline in its path; left alone")
     else:
         emit("profile", rp, "ok")
 
-if mode == "plan":
-    for row in out:
-        print("\t".join(row))
-    sys.exit(0)
-
-# ---- delete mode: exactly the plan, file by file ------------------------------------------------
-if refusals:
-    sys.exit(1)
-gone = []
-for kind, p in todo:
-    if not os.path.lexists(p):
-        continue                       # already gone (e.g. it lay inside the code tree removed a step ago)
-    try:
-        if not regular(p):
-            raise OSError("no longer a regular file")
-        os.unlink(p)
-        gone.append(p)
-        print("deleted\t" + p + "\t" + kind)
-    except OSError as e:
-        print("failed\t" + p + "\t" + str(e))
-TOOL_DIRS = {"locks", "incidents", "spool", "logs", "pending", "processing", "done", "status"}
-for d in owned:
-    if not os.path.isdir(d) or os.path.islink(d) or real(d) == HOME or within(HOME, d):
-        continue
-    b = os.path.basename(d.rstrip(os.sep))
-    if real(d) not in (DEF_DATA, DEF_STATE) and b not in TOOL_DIRS and not INCIDENT.fullmatch(b):
-        continue
-    if any(real(g).startswith(real(d).rstrip(os.sep) + os.sep) for g in gone):
-        try:
-            os.rmdir(d)
-            print("deleted\t" + d + "\tempty directory")
-        except OSError:
-            pass
+for row in out:
+    print("\t".join(row))
 PYEOF
 }
 
 # --- 0. resolve and check everything BEFORE any change ------------------------------------------
+PLAN_FILE="$(mktemp "${TMPDIR:-/tmp}/cgc-uninstall-plan.XXXXXX")"
+trap 'rm -f -- "$PLAN_FILE"' EXIT
 if ! PLAN="$(plan_py plan)"; then
   echo "ERROR: could not work out what to remove (see above). Nothing was changed." >&2
   exit 1
 fi
+printf '%s\n' "$PLAN" > "$PLAN_FILE"
 REFUSALS=(); JOURNAL=(); TODO=(); NOTES=()
 SETTINGS_NOTE="absent"; SETTINGS_PATH="-"; PROFILE_PATH="-"; PROFILE_NOTE="-"
 while IFS=$'\t' read -r kind path note; do
@@ -406,10 +507,12 @@ else
 fi
 [ "${#NOTES[@]}" -gt 0 ] && printf '    left alone: %s\n' "${NOTES[@]}"
 echo "    (the code tree above is already gone; your config file is never deleted)"
-RESULT="$(plan_py delete)" || RESULT=""
+# The delete step is handed the plan that was just shown and nothing else: it re-checks each listed path
+# and deletes only those, so a file created since (a new chrome.log) or swapped since is not touched.
+RESULT="$(plan_py delete "$PLAN_FILE")" || RESULT=""
 while IFS=$'\t' read -r kind path note; do
   case "$kind" in
-    failed) echo "  ! could not delete $path: $note" >&2 ;;
+    failed) echo "  ! not deleted: $path: $note" >&2 ;;
     deleted) [ "$note" = "empty directory" ] && echo "• removed empty directory $path" ;;
   esac
 done <<<"$RESULT"

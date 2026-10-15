@@ -98,50 +98,91 @@ CGC="$REPO/bin/cgc"
 ctl() { CGC_HOME="$REPO/skill" "$CGC" "$@"; }
 
 STOPPED=0      # 1 while a daemon WE stopped has not been started again
-SWAP=none      # the swap is a transaction: none -> aside (old tree parked at .bak) -> placed (new tree
-               # in DEST) -> done. Anything that fails before `done` puts the old tree back.
-STARTED=0      # 1 once the new daemon was asked to start (so a rollback must stop it first)
-HAD_PREV=0     # 1 while an OLDER .bak is parked at $ASIDE; it is never deleted before the new daemon
-               # is verified, so the previous install always survives a failed upgrade
+STARTED=0      # 1 once the new daemon was asked to start (a rollback must stop it first)
+SWAPPING=0     # 1 from just before the first rename of the swap
+DONE=0         # 1 once the new daemon is verified: from there on nothing is rolled back
 STAGE="$SKILLS_DIR/.$NAME.new.$$"
 ASIDE="$DEST.bak.prev.$$"
+OLD_ID=""      # identity (device:inode) of the trees the swap moves: the install being replaced,
+PREV_ID=""     # the older backup parked beside it, and the new tree.
+NEW_ID=""      # A rollback looks for them on disk by identity; it never trusts a progress variable.
 
-rc=0
-ctl daemon-stop || rc=$?
-case "$rc" in
-  0)  echo "• stopped the egress daemon (it starts again on the new code)"; STOPPED=1 ;;
-  10) ;;                                  # nothing loaded, nothing running
-  *)  echo "ERROR: cannot make sure no egress daemon is running (see above) — not replacing files under it." >&2
-      echo "       Nothing was replaced." >&2
-      exit 1 ;;
-esac
+# The identity of a path ITSELF (a symlink is not followed), "device:inode"; empty when it is absent.
+# A rename keeps it, so it says which tree is which wherever the renames got to.
+ident() {
+  python3 -c 'import os, sys
+try:
+    s = os.lstat(sys.argv[1])
+except OSError:
+    sys.exit(0)
+print("%d:%d" % (s.st_dev, s.st_ino))' "$1" 2>/dev/null || true
+}
 
-# Undo an unfinished swap: the previous install goes back exactly as it was.
+# holder ID PATH...: the first PATH whose own identity is ID (prints nothing if none).
+holder() {
+  local id="$1" p
+  shift
+  [ -n "$id" ] || return 0
+  for p in "$@"; do
+    if [ "$(ident "$p")" = "$id" ]; then printf '%s' "$p"; return 0; fi
+  done
+  return 0
+}
+
+# Rename SRC to DST only if DST is free. A bare mv would move SRC INTO an existing directory, or
+# through a symlink to one, into whatever that points at (the repo, for a --link install).
+place() {
+  if [ -e "$2" ] || [ -L "$2" ]; then
+    echo "ERROR: refusing to move $1 onto $2: it already exists." >&2
+    return 1
+  fi
+  mv -- "$1" "$2"
+}
+
+# Signals are exit requests everywhere except where they must not cut in. While deferred, one is only
+# noted; allow_signals restores the handlers and then acts on a noted one, so the work between the two
+# is never interrupted by a signal and a signal is never lost. The rollback runs deferred as well: a
+# second Ctrl-C must not stop it half way.
+PENDING=""
+defer_signals() { PENDING=""; trap 'PENDING=130' INT; trap 'PENDING=143' TERM; trap 'PENDING=129' HUP; }
+allow_signals() {
+  trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+  if [ -n "$PENDING" ]; then exit "$PENDING"; fi
+}
+
+# Put everything back as it was before the swap. It reads the state from the disk: the new tree is
+# whatever carries the new tree's identity, the old tree is wherever the old identity is, and nothing is
+# ever renamed onto an existing path. Exits non-zero (and says where the old tree is) if it cannot.
 rollback() {
+  local old new prev
   if [ "$STARTED" = 1 ]; then              # the new-code daemon must be gone before its tree is removed
     rc=0; ctl daemon-stop || rc=$?
     if [ "$rc" = 1 ]; then
-      echo "ERROR: the new daemon would not stop; leaving the trees as they are. Previous install: $DEST.bak" >&2
+      echo "ERROR: the new daemon would not stop; leaving the trees as they are." >&2
       return 1
     fi
     STARTED=0
   fi
-  if [ "$SWAP" = placed ]; then rm -rf "$DEST" && SWAP=aside; fi
-  if [ "$SWAP" = aside ]; then mv "$DEST.bak" "$DEST" && SWAP=none; fi
-  if [ "$SWAP" = none ] && [ "$HAD_PREV" = 1 ]; then mv "$ASIDE" "$DEST.bak" && HAD_PREV=0; fi
-  [ "$SWAP" = none ] && [ "$HAD_PREV" = 0 ]
+  old="$(holder "$OLD_ID" "$DEST" "$DEST.bak" "$ASIDE" "$STAGE")"
+  new="$(holder "$NEW_ID" "$DEST" "$DEST.bak" "$ASIDE" "$STAGE")"
+  prev="$(holder "$PREV_ID" "$DEST" "$DEST.bak" "$ASIDE" "$STAGE")"
+  if [ -n "$new" ] && [ "$new" = "$DEST" ]; then rm -rf -- "$DEST" || return 1; fi
+  if [ -n "$old" ] && [ "$old" != "$DEST" ]; then place "$old" "$DEST" || return 1; fi
+  if [ -n "$prev" ] && [ "$prev" != "$DEST.bak" ]; then place "$prev" "$DEST.bak" || return 1; fi
+  [ -z "$OLD_ID" ] || [ "$(ident "$DEST")" = "$OLD_ID" ]
 }
 
 on_exit() {
   status=$?
   set +e
-  trap - EXIT INT TERM
-  rm -rf "$STAGE"
-  if [ "$status" -ne 0 ] && [ "$SWAP" != done ]; then
+  trap - EXIT
+  defer_signals
+  rm -rf -- "$STAGE"
+  if [ "$status" -ne 0 ] && [ "$DONE" != 1 ]; then
     ok=1
-    if [ "$SWAP" != none ] || [ "$HAD_PREV" = 1 ] || [ "$STARTED" = 1 ]; then
+    if [ "$SWAPPING" = 1 ] || [ "$STARTED" = 1 ]; then
       echo "• install did not finish — restoring the previous install" >&2
-      rollback || { ok=0; echo "ERROR: could not restore the previous install; it is at $DEST.bak (older: $ASIDE)." >&2; }
+      rollback || { ok=0; echo "ERROR: could not restore the previous install (see above); the old tree is at $DEST.bak, an older backup at $ASIDE." >&2; }
     fi
     if [ "$STOPPED" = 1 ] && [ "$ok" = 1 ]; then
       echo "• restarting the egress daemon on the previous install" >&2
@@ -153,6 +194,22 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# Stop the daemon. A signal that arrives while it is being stopped must not leave it stopped with nobody
+# to start it again, so the stop and the note that it happened are one deferred step.
+defer_signals
+rc=0
+ctl daemon-stop || rc=$?
+case "$rc" in
+  0)  STOPPED=1 ;;
+  10) ;;                                  # nothing loaded, nothing running
+  *)  echo "ERROR: cannot make sure no egress daemon is running (see above) — not replacing files under it." >&2
+      echo "       Nothing was replaced." >&2
+      exit 1 ;;
+esac
+allow_signals
+if [ "$STOPPED" = 1 ]; then echo "• stopped the egress daemon (it starts again on the new code)"; fi
 
 # --- install the skill payload ------------------------------------------------
 # Build the new tree beside the old one, then swap with renames. A failed copy (disk full,
@@ -161,24 +218,37 @@ trap 'exit 143' TERM
 # An existing .bak is a PREVIOUS install, possibly the only intact one (an earlier upgrade may have
 # failed): it is parked, not deleted, and dropped only once the new daemon is verified.
 mkdir -p "$SKILLS_DIR"
-rm -rf "$STAGE"
+for s in "$SKILLS_DIR/.$NAME.new."*; do   # stages of installs that died (SIGKILL cannot be trapped)
+  if [ -e "$s" ] || [ -L "$s" ]; then kill -0 "${s##*.new.}" 2>/dev/null || rm -rf -- "$s"; fi
+done
+# An install killed (SIGKILL) between "old tree set aside" and "new tree in place" leaves the old tree
+# only at .bak and nothing at DEST. Put it back first, so this run is an ordinary upgrade and a failure
+# of it restores a working install. That run also stopped the daemon: this one starts it again.
+if [ ! -e "$DEST" ] && [ ! -L "$DEST" ] && { [ -e "$DEST.bak" ] || [ -L "$DEST.bak" ]; }; then
+  echo "• an earlier install was interrupted (the old tree is at $DEST.bak, nothing at $DEST) — restoring it first"
+  place "$DEST.bak" "$DEST"
+  # that run had stopped the daemon before it died; this one starts it again if there is a service to start
+  if [ -e "$HOME/Library/LaunchAgents/com.open-claude-gpt.daemon.plist" ]; then STOPPED=1; fi
+fi
+OLD_ID="$(ident "$DEST")"
+PREV_ID="$(ident "$DEST.bak")"
+rm -rf -- "$STAGE"
 if [ "$MODE" = "link" ]; then
   ln -s "$REPO/skill" "$STAGE"
 else
   cp -R "$REPO/skill" "$STAGE"
   chmod +x "$STAGE"/scripts/*.sh "$STAGE"/scripts/*.py 2>/dev/null || true
 fi
-if [ -e "$DEST" ] || [ -L "$DEST" ]; then
-  echo "• existing install found — keeping it as ${DEST}.bak"
-  if [ -e "$DEST.bak" ] || [ -L "$DEST.bak" ]; then
-    mv "$DEST.bak" "$ASIDE"
-    HAD_PREV=1
-  fi
-  mv "$DEST" "$DEST.bak"
-  SWAP=aside
+NEW_ID="$(ident "$STAGE")"
+[ -z "$OLD_ID" ] || echo "• existing install found — keeping it as ${DEST}.bak"
+SWAPPING=1
+defer_signals                              # the three renames are not interrupted; a signal waits for them
+if [ -n "$OLD_ID" ]; then
+  if [ -n "$PREV_ID" ]; then place "$DEST.bak" "$ASIDE"; fi
+  place "$DEST" "$DEST.bak"
 fi
-mv "$STAGE" "$DEST"
-SWAP=placed
+place "$STAGE" "$DEST"
+allow_signals                              # a signal that came meanwhile acts now: on_exit rolls the swap back
 
 # --- start the egress daemon on the new code ----------------------------------
 # An upgrade that leaves the OLD daemon running is a version split-brain: the CLI writes through new
@@ -203,12 +273,12 @@ if [ "$STOPPED" = 1 ]; then
   fi
   STOPPED=0
 fi
-SWAP=done
-if [ "$HAD_PREV" = 1 ]; then
+DONE=1
+if [ -n "$PREV_ID" ]; then
   if [ "$KEEP_PREV" = 1 ]; then
     echo "• an older backup is kept at $ASIDE (the new daemon was not verified)"
-  else
-    rm -rf "$ASIDE"                        # the only place an old tree is ever deleted: after verification
+  elif [ "$(ident "$ASIDE")" = "$PREV_ID" ]; then
+    rm -rf -- "$ASIDE"                     # the only place an old tree is ever deleted: after verification
   fi
 fi
 
