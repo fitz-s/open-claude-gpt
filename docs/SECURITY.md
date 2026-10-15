@@ -42,13 +42,22 @@ processes, do not run this tool on that machine.
 The daemon re-validates every prompt before sending, fail-closed, over the exact bytes that leave
 (the click-owning process runs the same gate again, so a direct send cannot skip it). It checks:
 
-- **Repos.** Every `github.com` / `raw.githubusercontent.com` slug must be gh-confirmed public, and a
-  link that is not `https://` is refused. Gist links are refused.
-- **References.** Every PR link and every tree / blob / commit link on an admitted repo is checked to
-  exist, in prompt order. A ref containing `/` (the branch `feat/x`) is resolved as one ref, never cut
-  at its first segment. More than 32 distinct probes is refused as `partial verification`, so the
-  gate never says "refs exist" about a link it did not check. Compare, issue, raw and `/pulls` links
-  are not existence-checked.
+- **The URL law.** The gate judges the URL a browser would actually request. Every `http(s):` token
+  in the prompt is parsed once, and that one parse feeds the visibility check, the existence check
+  and the gist rule, so no check can look at a different repo than the link reaches. A GitHub link
+  (`github.com`, `raw.githubusercontent.com`, `gist.github.com`) must be written plainly or it is
+  **refused, not normalized**: `https://` only; the host exactly, with no userinfo, port, escape,
+  trailing dot or non-ASCII look-alike; no backslash; no `.` or `..` path segment, no percent-escape
+  and no empty segment; owner and repo in GitHub's character sets; a path segment never ends in `.`.
+  Links to other sites are not the gate's business.
+- **Repos.** Every repo a link reaches must be gh-confirmed public. Gist links are refused.
+- **References.** Every PR link and every tree / blob / commit / compare / raw link on an admitted
+  repo is checked to exist, in prompt order, each gh path asked once. A ref containing `/` (the
+  branch `feat/x`) is one ref: the shortest leading prefix that resolves and under which the rest of
+  the link exists as a path is taken, so `/blob/main/missing.py` does not verify as `main`. A commit
+  link is exactly one ref. PR numbers are canonicalized (`0012` is `12`). More than 48 distinct gh
+  probes is refused as `partial verification`, so the gate never says "refs exist" about a link it
+  did not check. Issue and `/pulls` links and the sub-pages of a PR are not existence-checked.
 - **Secret shapes.** A fixed list of patterns: private-key blocks, AWS access key ids and secret-key
   assignments, `sk-` keys, GitHub tokens (`ghp_`, `github_pat_`), Slack tokens, Google API keys, JWTs.
 
@@ -74,7 +83,9 @@ forbids putting secrets in those fields; the scan is a backstop, not a reader.
   lets a round carry no public code link, because the remote model reads local files through the
   app. The gate does not look inside the workspace, and the prompt is still only scanned for secret
   shapes. The exemption from the public-source rule is granted by the round's recorded spec, checked
-  against `CGC_WORKSPACES` and `CGC_APPS` when the round is enqueued and again when it is sent. A
+  against `CGC_WORKSPACES` and `CGC_APPS` when the round is enqueued and again when it is sent (the
+  gate reads the config file as it is at that moment; a registry the daemon cannot confirm holds the
+  round for a retry instead of rejecting it for good). A
   sentence in the prompt (`Source: local workspace ...`) exempts nothing, and a workspace you did not
   register is refused. `CGC_WORKSPACES`, `CGC_APPS` and the store are files your user can write, so a
   hostile process running as you can register a workspace: that is the same-user boundary above, not

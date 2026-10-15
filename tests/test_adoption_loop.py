@@ -747,16 +747,46 @@ def test_an_unregistered_app_is_refused_at_enqueue(fire, monkeypatch, capsys):
     assert "none of this round's --mention apps is in CGC_APPS" in capsys.readouterr().err
 
 
-def test_deregistering_the_workspace_after_enqueue_stops_the_send(fire, spool, monkeypatch):
+def test_deregistering_the_workspace_after_enqueue_holds_the_send_and_requeues(fire, spool, monkeypatch):
+    """The round DOES record a workspace; only the registry cannot confirm it now. That is a fact about
+    the registry, fixable without re-firing, so it is `unverified:` (requeued with backoff), not a
+    terminal rejection that a re-registration could never undo."""
     r, _ = _ws_prompt(fire)
     with store_mod.Store() as s:
         s.db.execute("UPDATE rounds SET not_before=NULL WHERE rid=?", (r["rid"],))
         s.claim_ready("d")
     monkeypatch.setenv("CGC_WORKSPACES", "")
     final, calls = _drive(r, spool.validate_prompt)
-    assert final == store_mod.GATE_REJECTED and calls == [], "nothing may reach the driver"
+    assert final == store_mod.QUEUED and calls == [], "nothing may reach the driver"
     with store_mod.Store() as s:
-        assert "not in CGC_WORKSPACES" in s.get_round(r["rid"])["error_code"]
+        row = s.get_round(r["rid"])
+    assert row["error_code"].startswith("unverified:") and "not in CGC_WORKSPACES" in row["error_code"]
+    assert row["gate_retry_count"] == 1 and row["not_before"], "a real backoff, not a hot loop"
+
+
+def test_a_registry_edited_after_the_daemon_started_is_honoured(fire, spool, monkeypatch, tmp_path):
+    """The daemon loaded the config once, at import; the user then edited CGC_WORKSPACES. A value the
+    daemon remembers (os.environ, from the first load) must not outvote the file the user just saved."""
+    cfg = tmp_path / "cgc.conf"
+    monkeypatch.setenv("CGC_CONFIG", str(cfg))
+    cfg.write_text("CGC_WORKSPACES=my repo\n", encoding="utf-8")
+    r, _ = _ws_prompt(fire)                              # enqueued while the registry lists it
+    monkeypatch.setenv("CGC_WORKSPACES", "stale value the daemon remembers")
+    assert spool.validate_prompt(r["rendered_prompt"])[0], "the file, not the daemon's copy, decides"
+    cfg.write_text("CGC_WORKSPACES=my repo, another\nCGC_APPS=WebCodex Demo\n", encoding="utf-8")
+    assert spool.validate_prompt(r["rendered_prompt"])[0], "an UPDATED registry that still lists it passes"
+    cfg.write_text("CGC_WORKSPACES=another\n", encoding="utf-8")
+    ok, why = spool.validate_prompt(r["rendered_prompt"])
+    assert not ok and why.startswith("unverified:"), "removed from the file: held, not terminal"
+
+
+def test_an_unreadable_store_for_a_workspace_round_is_transient(fire, spool, monkeypatch):
+    r, _ = _ws_prompt(fire)
+    def boom(*a, **k):
+        raise spool.sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(spool.sqlite3, "connect", boom)
+    ok, why = spool.validate_prompt(r["rendered_prompt"])
+    assert not ok and why.startswith("unverified:") and "database is locked" in why
 
 
 def test_the_exemption_belongs_to_exact_bytes_not_to_a_rid(fire, spool):
@@ -814,3 +844,38 @@ def test_refire_keeps_the_workspace_authority(fire, spool, monkeypatch):
 def test_the_parity_pin_still_binds_the_three_sentinel_spellings(fire, spool):
     cdp = _load("cdp_consult")
     assert consult.WORKSPACE_SENTINEL.lower() == spool._WORKSPACE_SENTINEL == cdp._WORKSPACE_SENTINEL
+
+
+# ---- the real send-time child path: same bytes, same store, same verdict -------------------------
+#
+# The daemon hands the prompt to cdp_consult over stdin (`--prompt-file -`), and that child process runs
+# the gate again on what it read. A workspace round is found by sha256 of the exact bytes, so any
+# translation of the bytes between the stored prompt and the child's stdin would turn a registered
+# round into a refused one at the last step. This runs the child for real (no browser: only the two
+# functions cmd_submit calls before it touches Chrome).
+
+_CHILD = ("import sys; sys.path.insert(0, %r); import cdp_consult as c; p = c._read_prompt('-'); "
+          "print(c._has_sendable_source(p)); ok, why = c._egress_gate(p); print(ok); print(why)")
+
+
+def _run_child(prompt):
+    import subprocess
+    scripts = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skill", "scripts")
+    r = subprocess.run([sys.executable, "-c", _CHILD % scripts], input=prompt, capture_output=True,
+                       text=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    sendable, ok, *why = r.stdout.splitlines()
+    return sendable == "True", ok == "True", " ".join(why)
+
+
+@pytest.mark.parametrize("task", ["plain task", "CRLF task\r\nsecond line\r\n", "bare CR\rhere", "tab\there  trailing  "])
+def test_the_child_process_admits_a_registered_workspace_round_on_the_bytes_it_reads(fire, task):
+    r, _ = _ws_prompt(fire, task=task)
+    sendable, ok, why = _run_child(r["rendered_prompt"])
+    assert sendable and ok, why
+
+
+def test_the_child_process_refuses_the_quoted_sentinel(fire):
+    _ws_prompt(fire)    # a registered round exists; this is some OTHER prompt quoting its sentence
+    sendable, ok, why = _run_child(_SENTINEL_PROSE)
+    assert sendable and not ok and "only text" in why, "the backstop recognizes the claim, the gate refuses it"

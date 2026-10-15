@@ -92,12 +92,24 @@ releases until it stabilizes.
   in the text was enough. A prompt that only contains it, a bare `enqueue`, or a workspace you did not
   register is refused; **set `CGC_WORKSPACES` before using `--workspace`**. The enqueue pre-check and
   the daemon's gate use one predicate, and the gate opens the store read-only.
-- Reference checks cover every PR and tree / blob / commit link, in prompt order (they stopped after
-  eight, in set order). A ref with `/` resolves as one ref (`feat/x` was cut to `feat`). Over 32
-  probes is refused as `partial verification`, and the success message now counts what it verified.
-  A commit the API answers with 422 is a dead link, not a gh outage that retried forever.
+- **The gate now judges the URL a browser will request.** One parse of every GitHub link feeds the
+  visibility, existence and gist checks. Refused (not normalized and accepted): a `.`/`..` segment
+  (`github.com/ok/ok/tree/main/../../../../other/private` reached a repo the gate never vetted),
+  percent-escapes (`%66itz-s/...` skipped every existence probe), userinfo, ports, `http://`, a
+  trailing-dot / non-ASCII / escaped host, backslashes, empty segments, and a segment ending in `.`
+  (`main..` was silently checked as `main`).
+- Reference checks cover every PR and tree / blob / commit / compare / raw link, in prompt order (they
+  stopped after eight, in set order). A ref with `/` is one ref (`feat/x` was cut to `feat`) and the
+  rest of the link must exist under it (`/blob/main/missing.py` verified as `main`); `/commit/` is
+  exactly one ref; PR numbers are canonical. Over 48 distinct probes is refused as `partial
+  verification`, and the success message counts what it verified. A commit the API answers with 422 is
+  a dead link, not a gh outage that retried forever.
+- The workspace registry is read from the config file at send time, so a long-running daemon honours an
+  edited `CGC_WORKSPACES` / `CGC_APPS`; a registry or store that cannot confirm a recorded workspace
+  holds the round for a retry (`unverified:`), where it used to reject it for good.
 - `CGC_GATE_ALLOW_GIST` opens only on `1`, `true`, `yes` or `on` (it opened on any junk value). The
-  raw-gist host counts as a gist, and an `http://` GitHub link is refused instead of passing unvetted.
+  raw-gist host counts as a gist. A GitHub site page (`/topics`, `/orgs/...`) no longer counts as "a
+  code link" for the source rule.
 - `docs/SECURITY.md` says what the secret scan is: a detector for specified patterns, not proof
   that free text is clean.
 

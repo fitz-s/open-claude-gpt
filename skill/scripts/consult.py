@@ -931,10 +931,11 @@ _MARKER_NAME_WHY = ("an app name may not contain 'CGC_RID': the label is pasted 
                     "would put a foreign rid marker first, so the turn would read as another request")
 
 
-def known_apps() -> list:
+def known_apps(raw: str | None = None) -> list:
     """The ChatGPT apps this user has told us about (CGC_APPS, comma-separated) — the list an agent
-    reads with `consult.py apps` instead of reasoning about what exists."""
-    raw = os.environ.get("CGC_APPS", DEFAULT_APPS)
+    reads with `consult.py apps` instead of reasoning about what exists. `raw` is a caller-supplied
+    value (the gate passes the config file's current one) in place of this process's environment."""
+    raw = os.environ.get("CGC_APPS", DEFAULT_APPS) if raw is None else raw
     return [x for x in (" ".join(p.split()).lstrip("@").strip() for p in raw.split(",")) if x and not _MARKER_NAME_RE.search(x)]
 
 
@@ -953,11 +954,11 @@ def _mention_name(v: str) -> str:
     return exact[0] if exact else (pref[0] if len(pref) == 1 else v)
 
 
-def known_workspaces() -> list:
+def known_workspaces(raw: str | None = None) -> list:
     """The local WebCodex workspaces the user registered (CGC_WORKSPACES, comma-separated, default
     none) — read like CGC_APPS. An agent cannot see that registry, so this list is how it knows
     when the --workspace route applies."""
-    raw = os.environ.get("CGC_WORKSPACES", "")
+    raw = os.environ.get("CGC_WORKSPACES", "") if raw is None else raw
     return [x for x in (" ".join(p.split()) for p in raw.split(",")) if x]
 
 

@@ -59,7 +59,9 @@ re-validates every prompt (public repos, every PR/ref link exists, no recognized
 refuses fail-closed. The secret scan matches known patterns only; it does not prove prose is clean,
 so what you write into `--task` is on you. A prompt that merely says "Source: local workspace" gets
 no exemption: `--workspace` counts only when the user registered it (`CGC_WORKSPACES`) and the app
-(`CGC_APPS`), and you never register either. Link a commit SHA, not a branch, so the ref check is exact.
+(`CGC_APPS`), and you never register either. Write every GitHub link plainly (`https://github.com/owner/repo/...`;
+no `..`, `%`-escapes, ports or `user@`): the gate refuses a link a browser would resolve differently from how
+it reads. Link a commit SHA, not a branch, so the ref check is exact.
 
 ## The whole path — two commands
 
