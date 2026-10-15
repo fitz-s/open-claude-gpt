@@ -1031,7 +1031,10 @@ def test_e1_a_link_a_parser_would_read_differently_is_refused_before_any_probe(s
 
 
 @pytest.mark.parametrize("name,prompt", [
-    ("url, line, word", f"see {_OWN}\nthen explain"),
+    ("pr link, line, word", f"see {_OWN}/pull/1\nthen explain"),
+    ("repo link, space, line, word", f"see {_OWN} \nthen explain"),
+    ("repo link, slash, line, word", f"see {_OWN}/\nthen explain"),
+    ("repo link, blank line, word", f"see {_OWN}\n\nthen explain"),
     ("two urls, two lines", f"{_OWN}/pull/1\n{_OWN}/pull/2"),
     ("crlf then word", f"see {_OWN}/pull/1\r\nnext"),
     ("lf, header", f"see {_OWN}/pull/1\n\n# Header"),
@@ -1128,3 +1131,110 @@ def test_e4_diff_patch_and_plain_are_one_probe(spool, monkeypatch):
 def test_e4_a_malformed_pr_suffix_is_refused(spool):
     ok, why = spool.validate_prompt(f"review {_OWN}/pull/12.zip")
     assert not ok and "pull-request number" in why
+
+
+# ---- both readings of a link followed by a line break --------------------------------------------
+#
+# A URL parser drops TAB, CR and LF from the string it is handed, so a bare owner/repo link that ends a
+# line can be JOINED with the next line into another repo: `.../cli/cli` + LF + `-private-zz/x` reads as
+# cli/cli-private-zz. Both readings are judged; the joined one must name the same repo or none.
+
+_JOIN_REFUSED = [
+    ("repo extension (-private-zz)", "review https://github.com/acme/widgets\n-private-zz/blob/main/x", "different repo"),
+    ("repo extension, plain word", "review https://github.com/acme/widgets\nserver is internal", "different repo"),
+    ("repo extension, CRLF", "review https://github.com/acme/widgets\r\nserver", "different repo"),
+    ("repo extension after a period", "review https://github.com/acme/widgets.\nserver", "different repo"),
+    ("repo extension, tab indent", "review https://github.com/acme/widgets\n\tserver", "different repo"),
+    ("repo extension, digits", "review https://github.com/acme/widgets\n2", "different repo"),
+    ("owner extension (fitz- + private/repo)", "review https://github.com/fitz-\nprivate/repo", "owner/repo"),
+    ("host split", "review https://git\nhub.com/priv/repo", "different repo"),
+    ("scheme split", "review https:\n//github.com/priv/repo", "different repo"),
+    ("slash then repo", "review https://github.com/\npriv/repo", "different repo"),
+    ("root then repo", "review https://github.com\n/priv/repo", "different repo"),
+    ("raw host extension", "review https://raw.githubusercontent.com/acme/widgets\nserver/main/x", "different repo"),
+    ("api host extension", "review https://api.github.com/repos/acme/widgets\nserver", "different repo"),
+    # node: new URL(".../acme/widgets/pull/12\n/../../../priv/repo").pathname == "/acme/priv/repo"
+    ("path then dot segments", f"review {_OWN}/pull/12\n/../../../priv/repo", "dot segment"),
+    # node: new URL(".../acme/widgets\n/../../priv/repo").pathname == "/priv/repo"
+    ("a bare link whose join leaves the owner", f"review {_OWN}\n/../../priv/repo", "dot segment"),
+]
+
+
+@pytest.mark.parametrize("name,prompt,why_has", _JOIN_REFUSED, ids=[c[0] for c in _JOIN_REFUSED])
+def test_join_a_link_that_a_line_break_would_extend_into_another_repo_is_refused(spool, monkeypatch, name, prompt, why_has):
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (True, "stub")))
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (True, "exists"))
+    ok, why = spool.validate_prompt(prompt)
+    assert not ok and why.startswith("refused:") and why_has in why, why
+    assert seen == [], "refused at the parse, before any gh call"
+
+
+@pytest.mark.parametrize("name,prompt", [
+    ("path link, line, sentence", f"Review {_OWN}/pull/12\nFocus on the retry loop."),
+    ("tree link, line, sentence", f"Review {_OWN}/tree/abc1234\nFocus on the retry loop."),
+    ("trailing slash, line, sentence", f"Review {_OWN}/\nFocus on the retry loop."),
+    ("repo, SPACE, line, sentence", f"Review {_OWN} \nFocus on the retry loop."),
+    ("repo, blank line, sentence", f"Review {_OWN}\n\nFocus on the retry loop."),
+    ("repo, indented sentence", f"Review {_OWN}\n  Focus on the retry loop."),
+    ("repo, markdown header", f"Review {_OWN}\n# Notes"),
+    ("repo in parens, line, sentence", f"Review ({_OWN})\nFocus on the retry loop."),
+    ("repo in a markdown link", f"Review [x]({_OWN})\nFocus on the retry loop."),
+    ("repo in angle brackets", f"Review <{_OWN}>\nFocus on the retry loop."),
+    ("repo in backticks", f"Review `{_OWN}`\nFocus on the retry loop."),
+    ("repo, then its own link line", f"Review {_OWN}\nhttps://github.com/acme/widgets/pull/2"),
+    ("deliver-style list", f"- {_OWN}/pull/12  — PR\n- {_OWN}/pull/12/files  — diff\n"),
+])
+def test_join_ordinary_prose_next_to_a_link_still_passes(spool, monkeypatch, name, prompt):
+    _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(prompt)
+    assert ok, (name, why)
+
+
+def test_join_the_refusal_names_the_fix(spool):
+    ok, why = spool.validate_prompt(f"Review {_OWN}\nFocus on the retry loop.")
+    assert not ok and "End the link with a space or a trailing slash" in why
+
+
+def test_join_a_nonsense_join_names_no_repo_and_is_left_alone(spool, monkeypatch):
+    """`widgets)` + `Focus` is not a URL at all: the closing paren ends the link on the same line."""
+    _probe_log(spool, monkeypatch)
+    assert spool.validate_prompt(f"(see {_OWN})\nFocus on this")[0]
+
+
+# ---- an inner scheme never truncates the outer URL ------------------------------------------------
+
+@pytest.mark.parametrize("name,link", [
+    ("inner https:/", f"{_OWN}/https:/../../../private-owner/private-repo"),
+    ("inner http:/", f"{_OWN}/http:/../../../private-owner/private-repo"),
+    ("inner https://", f"{_OWN}/https://../../../private-owner/private-repo"),
+    ("inner scheme after a path", f"{_OWN}/tree/main/https:/../../../../private-owner/private-repo"),
+])
+def test_inner_scheme_the_outer_url_is_judged_whole(spool, monkeypatch, name, link):
+    probes = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (probes.append(s) or (True, "stub")))
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (probes.append(p) or (True, "exists")))
+    ok, why = spool.validate_prompt("review " + link)
+    assert not ok and why.startswith("refused:") and ("`.` or `..`" in why or "empty path segment" in why), why
+    assert probes == []
+
+
+def test_inner_scheme_without_a_traversal_is_an_ordinary_link(spool, monkeypatch):
+    """A `..` in the QUERY is data: node new URL(".../pull/1?u=https:/../../../x").pathname is still
+    /acme/widgets/pull/1, so there is no second reading to refuse."""
+    _probe_log(spool, monkeypatch)
+    assert spool.validate_prompt(f"review {_OWN}/pull/1?u=https:/../../../private-owner/private-repo")[0]
+    assert spool.validate_prompt(f"review {_OWN}/blob/main/docs/http:notes.md")[0]
+    assert spool.validate_prompt(f"review {_OWN}?next=https://example.com/x")[0]
+
+
+def test_inner_scheme_a_nested_github_link_is_judged_as_its_own_url(spool, monkeypatch):
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (s == "acme/widgets", "stub")))
+    ok, why = spool.validate_prompt("references no code\nhttps://r.jina.ai/https://github.com/priv/repo")
+    assert not ok and seen == ["priv/repo"] and "priv/repo" in why
+
+
+def test_inner_scheme_many_in_one_run_is_refused_not_sampled(spool):
+    ok, why = spool.validate_prompt("review https://x.example/" + "https:" * 100 + "/a")
+    assert not ok and "unbroken run" in why

@@ -42,20 +42,32 @@ processes, do not run this tool on that machine.
 The daemon re-validates every prompt before sending, fail-closed, over the exact bytes that leave
 (the click-owning process runs the same gate again, so a direct send cannot skip it). It checks:
 
-- **The URL law.** The gate judges the URL a browser would actually request. Every `http(s):` in the
-  prompt starts a token that runs to the next whitespace or the next `http(s):`, so a link nested in
-  a proxy or redirect URL is judged too; quotes, brackets and parentheses stay inside the token, and
-  only trailing sentence punctuation is dropped. Each token is parsed once, and that one parse feeds
-  the visibility check, the existence check and the gist rule, so no check can look at a different
-  repo than the link reaches. A GitHub link (`github.com`, `raw.githubusercontent.com`,
-  `gist.github.com`, `api.github.com`, `codeload.github.com`) must be written plainly or it is
-  **refused, not normalized**: `https://` only; the host exactly, with no userinfo, port, escape,
-  trailing dot or non-ASCII look-alike; no backslash; no `.` or `..` path segment, no percent-escape
-  and no empty segment; owner and repo in GitHub's character sets; a path segment never ends in `.`.
-  A browser also drops TAB, CR and LF from inside a URL, so a TAB or bare CR next to a link is refused,
-  and so is a line break whose joined text would carry a dot segment, an escape or a backslash. Any
-  other host under `github.com`, `githubusercontent.com`, `github.io`, `githubassets.com` or `ghcr.io`
-  (Pages, signed downloads, packages, assets) is refused outright, because the gate has no check for it.
+- **The URL law.** The gate judges the URL a browser would actually request. The prompt is cut into
+  whitespace-delimited runs, and every `http(s):` inside a run starts a token that runs to the end of
+  that run: an inner scheme never truncates the outer URL (`.../ok/ok/https:/../../../other/private`
+  is judged whole), and a link nested in a proxy or redirect URL is judged as its own URL. Quotes,
+  brackets and parentheses stay inside the token; only trailing sentence punctuation is dropped. Each
+  token is parsed once, and that one parse feeds the visibility check, the existence check and the
+  gist rule, so no check can look at a different repo than the link reaches. A GitHub link
+  (`github.com`, `raw.githubusercontent.com`, `gist.github.com`, `api.github.com`,
+  `codeload.github.com`) must be written plainly or it is **refused, not normalized**: `https://`
+  only; the host exactly, with no userinfo, port, escape, trailing dot or non-ASCII look-alike; no
+  backslash; no `.` or `..` path segment, no percent-escape and no empty segment; owner and repo in
+  GitHub's character sets; a path segment never ends in `.`. Any other host under `github.com`,
+  `githubusercontent.com`, `github.io`, `githubassets.com` or `ghcr.io` (Pages, signed downloads,
+  packages, assets) is refused outright, because the gate has no check for it.
+- **Line breaks.** A URL parser drops TAB, CR and LF from anywhere in the string it is handed, so the
+  text after a link can be joined onto it. The gate judges the link alone and joined with what
+  follows. Across one line break, the joined reading must name the same repo as the link alone:
+  `https://github.com/cli/cli` followed by a line `-private-zz/x` reaches `cli/cli-private-zz`, and
+  is refused. The consequence you will notice: **a bare `owner/repo` link that ends a line and is
+  followed directly by a line starting with a word, digit or `-` is refused**, because nothing
+  distinguishes prose from a join. End the link with a space or a trailing slash, or leave a blank
+  line. Links that end in a path (`/pull/12`), links followed by a space, and links in the `prep`
+  refs list are unaffected. Across a blank line (a paragraph break nobody joins) only a joined
+  reading with a dot segment, an escape or a backslash is refused, and a TAB or bare CR next to a
+  link is refused always. `tests/test_gate_differential.py` checks all of this against node's WHATWG
+  URL parser on a generated corpus.
   **Links to other sites are outside the gate**: they are part of the operator's free-text boundary
   below, like any other sentence in a `--task`.
 - **Repos.** Every repo a link reaches must be gh-confirmed public. Gist links are refused.

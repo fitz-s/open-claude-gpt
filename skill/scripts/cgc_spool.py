@@ -129,12 +129,13 @@ def default_out(rid: str) -> str:
 
 # ---- the URL law ------------------------------------------------------------
 #
-# The gate judges the URL a browser would actually request. Every `http(s):` in the prompt starts a
-# token that runs to the next whitespace, or to the next `http(s):` (which starts its own token, so a
-# link nested in a proxy or redirect URL is judged too). A delimiter character never ends a link
-# early: `'`, `"`, `<`, `(` and the like stay INSIDE the token, where the rules below see them, and
-# only trailing sentence punctuation is dropped. Each token is parsed ONCE, and that one parse feeds
-# the visibility check, the existence check and the gist rule, so no check can look at a different repo
+# The gate judges the URL a browser would actually request. A prompt is cut into whitespace-delimited
+# runs, and every `http(s):` inside a run starts a token that runs to the END of that run: an inner
+# scheme never truncates the outer URL, so `https://github.com/ok/ok/https:/../../../other/private` is
+# judged whole (its dot segments are seen) and the inner `https:` is judged as one more URL. Delimiter
+# characters (`'`, `"`, `<`, `(`...) stay inside the token, where the rules below see them; only
+# trailing sentence punctuation is dropped. Each token is parsed ONCE, and that one parse feeds the
+# visibility check, the existence check and the gist rule, so no check can look at a different repo
 # than the link reaches. A token is a GitHub link when its host, after what a browser does before
 # connecting (drop userinfo and port, percent-decode, IDNA-fold fullwidth and ideographic-dot variants,
 # drop trailing dots, lowercase), is in _GH_HOSTS; any other host under a GitHub domain (_GH_DOMAINS:
@@ -143,10 +144,24 @@ def default_out(rid: str) -> str:
 #   scheme https with `//`; host written exactly (no userinfo, port, escape, trailing dot or
 #   non-ASCII); no backslash; path with no `.`/`..` segment, no percent-escape and no empty segment
 #   (one trailing slash is the same page); owner [A-Za-z0-9-], repo [A-Za-z0-9._-].
-# A browser also drops TAB, CR and LF from anywhere inside a URL it is handed, so a link split by one
-# can be joined into a different one. A TAB or bare CR next to a GitHub link is therefore refused, and
-# a line break is refused when the text it would join carries a dot segment, an escape or a backslash
-# (a URL that merely ends its line is the ordinary case and is left alone).
+# A URL parser also drops TAB, CR and LF from anywhere inside the string it is handed, so the text a
+# link is followed by can be JOINED onto it. The link is judged alone and joined with the next run(s)
+# of text across line breaks (cumulatively, at most _MAX_HOPS). A gap holding a space is not a join (a
+# space is not dropped). Across a gap that is exactly ONE line break (LF or CRLF, indentation after it
+# included), which is how a hard-wrapped URL looks:
+#   - every joined reading must break no rule, carry no dot segment, escape or backslash, and name the
+#     SAME repo as the link alone: `https://github.com/cli/cli` + LF + `-private-zz/x` reaches
+#     cli/cli-private-zz, `.../fitz-` + LF + `private/repo` reaches fitz-private/repo, and a join that
+#     makes a GitHub link out of a non-GitHub one is the same thing. A joined reading that is not a
+#     repo name GitHub can hold (`widgets)Focus`) names nothing and is left alone;
+#   - so a bare `owner/repo` link that ends a line and is followed directly by a line starting with a
+#     word, a digit or a `-` is the ambiguous case, and is refused with the fix (end the link with a
+#     space or a trailing slash): no shape of the next line tells prose from a join. A link that ends
+#     in a path (`/pull/12`), ends in `/`, is followed by a space, or whose next line starts with its
+#     own `http(s):`, cannot change its repo and is left alone.
+# Across a blank line or several breaks (a paragraph break, which no reader joins) only the dangerous
+# forms count: a joined reading with a dot segment, an escape or a backslash is refused. A TAB or bare
+# CR next to a GitHub link is refused outright (it is neither a line end nor indentation).
 # Not the gate's business, and the operator's free-text boundary (docs/SECURITY.md): links to other
 # sites, and GitHub hosts written without a scheme.
 _GH_HOSTS = {"github.com": "repo", "www.github.com": "repo", "raw.githubusercontent.com": "raw",
@@ -154,12 +169,13 @@ _GH_HOSTS = {"github.com": "repo", "www.github.com": "repo", "raw.githubusercont
              "api.github.com": "api", "codeload.github.com": "codeload"}
 _GH_DOMAINS = ("github.com", "githubusercontent.com", "github.io", "githubassets.com", "ghcr.io")
 _SCHEME_RE = re.compile(r"https?:", re.IGNORECASE)
-_WS_RE = re.compile(r"\s")
-_BREAK_RE = re.compile(r"[\t\r\n]+")
+_RUN_RE = re.compile(r"\S+")
+_BREAK_ONLY_RE = re.compile(r"[\t\r\n]+")
 _ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
 _PR_RE = re.compile(r"([0-9]+)(?:\.(?:diff|patch))?")
 _TRAIL = ",;:!?)]}'\"*>|`"     # sentence punctuation and closing wrappers; an OPENING one stays and is refused
-_MAX_HOPS = 16
+_MAX_HOPS = 16        # consecutive line breaks followed into one joined reading
+_MAX_SCHEMES = 64     # `http(s):` occurrences in one unbroken run; more is refused, not sampled
 _OWNER_RE = re.compile(r"[A-Za-z0-9-]+")
 _REPO_RE = re.compile(r"[A-Za-z0-9._-]+")
 # github.com/<one of these>/... is a page of the site, never a repo (GitHub reserves the names).
@@ -173,6 +189,10 @@ class Link(NamedTuple):
     host: str       # "repo" | "raw" | "gist" | "api" | "codeload"
     slug: str       # "owner/repo"; "" for a gist
     target: tuple   # () | ("pull", "12") | ("commit", "<ref>") | ("tree"|"blob"|..., ("seg", ...))
+
+
+class _LawRefusal(Exception):
+    """A prompt-wide refusal raised while tokenizing."""
 
 
 def _trim(tok: str) -> str:
@@ -224,109 +244,156 @@ def _unsafe(tok: str, u) -> bool:
 
 
 def _url_tokens(text: str):
-    """(token, tail, tabbed) for every `http(s):` in `text`. `token` runs from the scheme to the next
-    whitespace or next scheme, minus trailing punctuation. When it ended at whitespace made only of
-    TAB/CR/LF, `tail` is what a parser that drops those characters would join onto it (the following
-    non-space runs, at most _MAX_HOPS gaps), and `tabbed` says some gap held a TAB or bare CR, so it cannot have
-    been a line end."""
-    starts = [m.start() for m in _SCHEME_RE.finditer(text)]
-    for i, p in enumerate(starts):
-        ws = _WS_RE.search(text, p)
-        run_end = ws.start() if ws else len(text)
-        nxt = starts[i + 1] if i + 1 < len(starts) else len(text)
-        end = min(run_end, nxt)
-        tail, tabbed = "", False
-        if end == run_end:
-            pos = end
-            for _ in range(_MAX_HOPS):
-                gap = _BREAK_RE.match(text, pos)
-                if not gap:
-                    break
-                pos = gap.end()
-                if pos >= len(text) or text[pos].isspace() or _SCHEME_RE.match(text, pos):
-                    break    # the gap ends at a space, the end, or a new link: a real boundary
-                ws = _WS_RE.search(text, pos)
-                ws_stop = ws.start() if ws else len(text)
-                inner = _SCHEME_RE.search(text, pos)
-                stop = min(ws_stop, inner.start() if inner else len(text))
-                tail += text[pos:stop]
-                # A gap is "glued" when a TAB or bare CR sits before its first LF: that is not a line end
-                # and not indentation, so it is never ordinary text. (`\n\t` is indentation after a
-                # line break: the same case as any other line join, judged by what the join carries.)
-                head, lf, _ = gap.group().partition("\n")
-                head = head[:-1] if lf and head.endswith("\r") else head
-                tabbed = tabbed or "\t" in head or "\r" in head
-                if stop < ws_stop:
-                    break
-                pos = stop
-        yield _trim(text[p:end]), tail, tabbed
+    """(raw, tails, glued) for every `http(s):` in `text`.
+
+    `raw` runs from the scheme to the END of its whitespace-delimited run (an inner scheme never cuts
+    it; each inner scheme is yielded as a token of its own). When that run is followed only by
+    TAB/CR/LF and then more text, `tails` lists what a parser that drops those characters would join
+    onto it: the next run, then the next two runs, and so on (at most _MAX_HOPS), each as
+    (text, single) where `single` means every gap so far was exactly one line break. `glued` says a
+    gap held a TAB or bare CR before its first LF (not a line end). A next run that starts with its
+    own `http(s):` is a new link, not a continuation."""
+    runs = [(m.start(), m.end()) for m in _RUN_RE.finditer(text)]
+    for i, (a, b) in enumerate(runs):
+        run = text[a:b]
+        offs = [m.start() for m in _SCHEME_RE.finditer(run)]
+        if not offs:
+            continue
+        if len(offs) > _MAX_SCHEMES:
+            raise _LawRefusal(f"refused: {len(offs)} `http(s):` links in one unbroken run of text "
+                              f"({run[:60]!r}...); put whitespace between links")
+        tails, acc, glued, single, end = [], "", False, True, b
+        for j in range(i + 1, min(i + 1 + _MAX_HOPS, len(runs))):
+            na, nb = runs[j]
+            gap, nxt = text[end:na], text[na:nb]
+            if not _BREAK_ONLY_RE.fullmatch(gap) or _SCHEME_RE.match(nxt):
+                break
+            head, lf, _ = gap.partition("\n")
+            head = head[:-1] if lf and head.endswith("\r") else head
+            glued = glued or not lf or "\t" in head or "\r" in head
+            single = single and gap.count("\n") == 1
+            acc += nxt
+            tails.append((acc, single))
+            end = nb
+        for o in offs:
+            yield run[o:], tails, glued
+
+
+def _read(tok: str) -> tuple:
+    """Stage 1 of the URL law for one token. Returns (state, payload):
+      ("other", None)    not a GitHub-family URL (the gate has no opinion)
+      ("root", None)     a GitHub URL with no repo to verify (site root, or a reserved page)
+      ("norepo", msg)    a GitHub URL whose owner/repo is missing or outside GitHub's character sets
+      ("bad", msg)       breaks the law (msg is the refusal)
+      ("ok", (kind, slug, rest_segs, host))   `slug` is "" for a gist."""
+    got = _split(tok)
+    if got is None:
+        return "other", None
+    scheme, u = got
+    host = _gh_host(u.netloc)
+    if not _is_gh(host):
+        return "other", None
+    kind = _GH_HOSTS.get(host)
+    if kind is None:
+        return "bad", (f"refused: {host} is a GitHub-hosted domain the gate has no check for (Pages, "
+                       f"signed downloads, packages, assets) in {tok[:120]!r} — drop it, or link the "
+                       "repository on github.com instead")
+
+    def bad(why, state="bad"):
+        return state, (f"refused: {why} in GitHub link {tok[:120]!r} — write it as https://{host}/... "
+                       "(and put whitespace between links)")
+
+    if scheme.lower() != "https":
+        return bad("a non-https scheme")
+    if not re.match(r"https://[^/]", tok, re.IGNORECASE):
+        return bad("a malformed scheme separator")
+    if "\\" in tok:
+        return bad("a backslash")
+    if u.netloc.lower() != host:
+        return bad("userinfo, a port, an escape, a trailing dot or a non-ASCII character in the host")
+    if "%" in u.path:
+        return bad("a percent-escape in the path")
+    segs = u.path.split("/")[1:]
+    if segs and segs[-1] == "":
+        segs.pop()
+    if not segs:
+        return "root", None
+    if "" in segs:
+        return bad("an empty path segment")
+    if "." in segs or ".." in segs:
+        return bad("a `.` or `..` path segment")
+    if segs[-1].endswith("."):
+        return bad("a path segment ending in `.`")
+    if kind == "gist":
+        return "ok", ("gist", "", [], host)
+    if kind == "api":
+        if segs[0] != "repos" or len(segs) < 3:
+            return bad("an api.github.com path that is not /repos/OWNER/REPO/...")
+        owner, repo, rest = segs[1], segs[2], []
+    else:
+        owner, repo, rest = segs[0], (segs[1] if len(segs) > 1 else ""), segs[2:]
+    if kind == "repo" and owner.lower() in _NON_REPO_OWNERS:
+        return "root", None     # reserved names no account can hold: a site page, whatever follows
+    if not repo or not _OWNER_RE.fullmatch(owner) or not _REPO_RE.fullmatch(repo):
+        return bad("no verifiable owner/repo", "norepo")
+    return "ok", (kind, f"{owner}/{repo}", rest, host)
+
+
+def _check_joins(raw: str, state: str, payload, tails: list, glued: bool):
+    """The refusal for the readings in which the text after `raw` is joined onto it, or None."""
+    readings = []
+    for tail, single in tails:
+        tok = _trim(raw + tail)
+        readings.append((tok, single, *_read(tok)))
+    if state == "other" and all(st == "other" for _, _, st, _ in readings):
+        return None
+    if glued:
+        return (f"refused: a TAB or bare CR inside or beside a GitHub link ({(raw + tails[-1][0])[:100]!r}); "
+                "a browser drops it and joins the pieces. Put the link on one line")
+    for tok, single, st, pl in readings:
+        got = _split(tok)
+        if st != "other" and got and _unsafe(tok, got[1]):
+            return (f"refused: a line break lets a browser join a dot segment, escape or backslash onto "
+                    f"the GitHub link {raw[:100]!r}. Put the link on one line")
+        if not single:
+            continue    # past a paragraph break nobody joins; only the dangerous forms above count
+        if st == "bad":
+            return pl
+        if st == "ok" and not (state == "ok" and payload[0] == pl[0] and payload[1].lower() == pl[1].lower()):
+            return (f"refused: a line break lets a browser join the link {raw[:100]!r} with the next line "
+                    f"into {tok[:120]!r}, which is a different repo ({pl[1] or 'a gist'}). End the link "
+                    "with a space or a trailing slash")
+    return None
 
 
 def _parse_code_urls(text: str) -> tuple:
     """Every GitHub link in `text` as a Link, in prompt order, or (None, refusal) on the first one that
     breaks the URL law. Returns (links | None, refusal | None)."""
     links = []
-    for tok, tail, tabbed in _url_tokens(text):
-        got = _split(tok)
-        if got is None:
-            continue    # a browser rejects it too: not a request to GitHub
-        scheme, u = got
-        host = _gh_host(u.netloc)
-        if tail:
-            joined = _split(tok + tail)
-            if _is_gh(host) or (joined and _is_gh(_gh_host(joined[1].netloc))):
-                if tabbed:
-                    return None, (f"refused: a TAB or bare CR inside or beside a GitHub link "
-                                  f"({(tok + tail)[:100]!r}); a browser drops it and joins the pieces. "
-                                  "Put the link on one line")
-                if joined and _unsafe(tok + tail, joined[1]):
-                    return None, (f"refused: a line break lets a browser join a dot segment, escape or "
-                                  f"backslash onto the GitHub link {tok[:100]!r}. Put the link on one line")
-        if not _is_gh(host):
+    try:
+        tokens = list(_url_tokens(text))
+    except _LawRefusal as e:
+        return None, str(e)
+    for raw, tails, glued in tokens:
+        tok = _trim(raw)
+        state, payload = _read(tok)
+        if state in ("bad", "norepo"):
+            return None, payload
+        if tails:
+            why = _check_joins(raw, state, payload, tails, glued)
+            if why:
+                return None, why
+        if state != "ok":
             continue
-        kind = _GH_HOSTS.get(host)
-        if kind is None:
-            return None, (f"refused: {host} is a GitHub-hosted domain the gate has no check for (Pages, "
-                          f"signed downloads, packages, assets) in {tok[:120]!r} — drop it, or link the "
-                          "repository on github.com instead")
+        kind, slug, rest_segs, host = payload
 
         def no(why, tok=tok, host=host):
-            return None, f"refused: {why} in GitHub link {tok[:120]!r} — write it as https://{host}/..."
+            return None, (f"refused: {why} in GitHub link {tok[:120]!r} — write it as "
+                          f"https://{host}/...")
 
-        if scheme.lower() != "https":
-            return no("a non-https scheme")
-        if not re.match(r"https://[^/]", tok, re.IGNORECASE):
-            return no("a malformed scheme separator")
-        if "\\" in tok:
-            return no("a backslash")
-        if u.netloc.lower() != host:
-            return no("userinfo, a port, an escape, a trailing dot or a non-ASCII character in the host")
-        if "%" in u.path:
-            return no("a percent-escape in the path")
-        segs = u.path.split("/")[1:]
-        if segs and segs[-1] == "":
-            segs.pop()
-        if not segs:
-            continue    # the site root: no repo, nothing to fetch
-        if "" in segs:
-            return no("an empty path segment")
-        if "." in segs or ".." in segs:
-            return no("a `.` or `..` path segment")
-        if segs[-1].endswith("."):
-            return no("a path segment ending in `.`")
         if kind == "gist":
             links.append(Link("gist", "", ()))
             continue
-        if kind == "api":
-            if segs[0] != "repos" or len(segs) < 3:
-                return no("an api.github.com path that is not /repos/OWNER/REPO/...")
-            owner, repo, rest_segs = segs[1], segs[2], []
-        else:
-            owner, repo, rest_segs = segs[0], (segs[1] if len(segs) > 1 else ""), segs[2:]
-        if kind == "repo" and owner.lower() in _NON_REPO_OWNERS:
-            continue    # reserved names no account can hold: a site page, whatever follows
-        if not repo or not _OWNER_RE.fullmatch(owner) or not _REPO_RE.fullmatch(repo):
-            return no("no verifiable owner/repo")
         target = ()
         if kind == "raw" and rest_segs:
             target = ("raw", tuple(rest_segs))
@@ -349,7 +416,7 @@ def _parse_code_urls(text: str) -> tuple:
                 if not a_ or not dots or not b_ or "..." in b_:
                     return no("a compare link that is not A...B (three dots)")
                 target = ("compare", spec)
-        links.append(Link(kind, f"{owner}/{repo}", target))
+        links.append(Link(kind, slug, target))
     return links, None
 
 

@@ -991,3 +991,29 @@ def test_e3_enqueue_precheck_reads_the_same_registry(fire, spool, monkeypatch, t
     _cfg_file(monkeypatch, tmp_path, "CGC_WORKSPACES=somewhere else\n")
     assert fire(no_code=False, workspace="my repo", mention=["WebCodex Demo"]) == 2
     assert "not in CGC_WORKSPACES" in capsys.readouterr().err
+
+
+# ---- the prep-rendered refs list passes the line-break rule ----------------------------------------
+#
+# deliver writes one bullet per link, each ending in a path or followed by two spaces and a dash, and the
+# template puts a blank line or a header after the list. None of that may trip the both-readings rule.
+
+@pytest.mark.parametrize("followup", [False, True])
+def test_the_prep_rendered_refs_list_still_passes_the_gate(spool, tmp_path, monkeypatch, followup):
+    monkeypatch.setattr(consult, "CGC_STATE_DIR", str(tmp_path))
+    base = "https://github.com/acme/widgets"
+    refs = tmp_path / "refs.md"
+    refs.write_text(
+        "### Intent / discussion (read first)\n"
+        f"- {base}/pull/12  — PR description, discussion, CI/review context\n\n"
+        "### Change set (the diff under review)\n"
+        f"- {base}/pull/12/files  — the changed-file diff\n\n"
+        "### Stable source snapshot\n"
+        f"- {base}/tree/{'a' * 40}  — source snapshot\n"
+        f"- {base}/blob/{'a' * 40}/src/app.py  — file for close reading\n"
+        f"- {base}/compare/{'a' * 40}...{'b' * 40}  — full change set\n"
+        f"- {base}\n", encoding="utf-8")
+    st = consult.cmd_prep(_fire_ns(None, no_code=False, refs_file=str(refs), followup=followup))
+    text = open(st["prompt_file"], encoding="utf-8").read()
+    ok, why = spool.validate_prompt(text)
+    assert ok, why

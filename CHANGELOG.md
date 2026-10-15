@@ -105,9 +105,13 @@ releases until it stabilizes.
   verification`, and the success message counts what it verified. A commit the API answers with 422 is
   a dead link, not a gh outage that retried forever.
 - The gate's token now contains every character a URL can hold (a `'` in a path used to end it, so
-  `.../cli/cli/'/../../../other/private` was judged as `cli/cli`), a link nested in a proxy or redirect
-  URL is judged too, and a TAB, bare CR or a line break that would join a dot segment, escape or
-  backslash onto a link is refused. Other hosts under GitHub domains (`github.io`, `ghcr.io`, signed
+  `.../cli/cli/'/../../../other/private` was judged as `cli/cli`), an inner `https:` no longer cuts the
+  outer URL (`.../cli/cli/https:/../../../other/private`), a link nested in a proxy or redirect URL is
+  judged as its own URL, and a URL parser's habit of dropping TAB/CR/LF is accounted for: the link is
+  judged alone and joined with the following text, and a bare `owner/repo` link that ends a line and
+  is followed directly by a word, digit or `-` is refused (it can read as `cli/cli-private-zz`;
+  end the link with a space or `/`, or leave a blank line). A new test checks the gate against node's
+  WHATWG parser on a generated corpus. Other hosts under GitHub domains (`github.io`, `ghcr.io`, signed
   `*.githubusercontent.com` downloads, assets) are refused; `api.github.com/repos/...` and
   `codeload.github.com/...` map to their repo and are visibility- and existence-checked; `/pull/N.diff`
   and `.patch` are PR N. Links to other sites remain the operator's free-text boundary.

@@ -61,7 +61,7 @@ so what you write into `--task` is on you. A prompt that merely says "Source: lo
 no exemption: `--workspace` counts only when the user registered it (`CGC_WORKSPACES`) and the app
 (`CGC_APPS`), and you never register either. Write every GitHub link plainly (`https://github.com/owner/repo/...`;
 no `..`, `%`-escapes, ports or `user@`): the gate refuses a link a browser would resolve differently from how
-it reads. Link a commit SHA, not a branch, so the ref check is exact. The gate checks GitHub links only; text and links to other sites are your responsibility.
+it reads. Put a space or a blank line after a bare `https://github.com/owner/repo` link that ends a line (the next line could be read as part of it). Link a commit SHA, not a branch, so the ref check is exact. The gate checks GitHub links only; text and links to other sites are your responsibility.
 
 ## The whole path — two commands
 
