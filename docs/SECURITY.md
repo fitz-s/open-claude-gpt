@@ -39,14 +39,98 @@ processes, do not run this tool on that machine.
 
 ## What the egress gate does and does not guarantee
 
-The daemon re-validates every prompt before sending, fail-closed: every cited
-repo must be gh-confirmed public (or user-allowlisted), cited PRs/refs must
-exist, and known secret shapes are refused. What it **cannot** do is vet
-arbitrary free-text prose: a `--task`, `--context-file`, or `--no-code` consult
-can carry any sentence the caller wrote, and no pattern scan proves a sentence
-is not sensitive. The guarantee is exactly "no recognized secret, no private
-repo link, no dead ref" — not "arbitrary-content safe". The skill contract
+The daemon re-validates every prompt before sending, fail-closed, over the exact bytes that leave
+(the click-owning process runs the same gate again, so a direct send cannot skip it). It checks:
+
+- **The URL law.** One judge, applied identically to every reading of a link, with no reading-specific
+  relaxations. A reading is a string a URL parser could be handed: the link as written, the link
+  joined with the text after it at each line break and at the end of its chain, and the readings in
+  which a final period belongs to the name (below). The prompt is cut into whitespace-delimited runs;
+  every `http(s):` inside a run starts a token that runs to the end of the run (an inner scheme never
+  truncates the outer URL: `.../ok/ok/https:/../../../other/private` is judged whole, and a link nested
+  in a proxy or redirect URL is judged as its own URL). Quotes, brackets and parentheses stay inside
+  the token; only trailing sentence punctuation is dropped. The judge refuses, for any
+  `github.com`, `raw.githubusercontent.com`, `gist.github.com`, `api.github.com` or
+  `codeload.github.com` URL: a scheme other than `https://`; a host not written exactly (userinfo,
+  port, escape, trailing dot, non-ASCII look-alike); a backslash; a `.` or `..` path segment, or a
+  `%2e` spelling of one; an escaped `/` or `\`; and an owner or repo (and the API's `/repos/OWNER/REPO`)
+  that is not plain. **Any `%` in an owner or repo refuses**, and so does a reading whose owner/repo
+  cannot be parsed at all, because GitHub decodes `cl%69` to `cli` (checked live) and a name the gate
+  cannot read is a name it cannot verify. A percent-escape in the segments after owner/repo and the
+  page kind (`Caf%C3%A9.md`) is data, decoded once before the existence probe. Any other host under
+  `github.com`, `githubusercontent.com`, `github.io`, `githubassets.com` or `ghcr.io` (Pages, signed
+  downloads, packages, assets) is refused outright, because the gate has no check for it. Links to
+  other sites are outside the gate.
+- **Line breaks.** A URL parser drops EVERY TAB, CR and LF from the string it is handed, a blank line
+  included, so where a line ends does not fix what a link says: `new URL("https://github.com/cli/cli\n\n-private-zz/x")`
+  is `cli/cli-private-zz`, and a host or even the `https:` can be spelled across breaks. Runs of text
+  separated only by TAB/CR/LF form a chain (a space ends one, because a parser keeps it). In each chain
+  the gate judges every reading a parser could be handed: the link alone, the link joined at **each**
+  break, and the **maximal** join to the end of the chain, exactly as a parser that strips every
+  TAB/CR/LF sees it, all by the one judge. Every reading must also name the same repo as the link
+  alone. A chain with more than 64 breaks after a link is **refused**, never judged on a prefix, and a
+  scheme split by a break is refused. The consequence you will notice: **a bare `owner/repo` link that
+  ends a line and is followed, across line breaks, by a line starting with a word, digit, `-` or `%`
+  is refused**, wrapped in brackets, quotes or backticks or not, because a reading the gate cannot name
+  is a reading it cannot verify (`widgets)Focus` is not a repo GitHub routes, but `cli-%70rivate` is) and
+  the one rule is applied to every reading. The refusal says how to fix it: put a space or a trailing
+  `/` right after the link. Links that end in a path (`/pull/12`), links ending in `/`, links followed
+  by a space, a next line starting with `#`, and the links in the `prep` refs list are unaffected. A TAB
+  or bare CR next to a link is refused always. A final period is judged both ways: `widgets.` is a
+  legal repo name, so `see https://github.com/acme/widgets.` can name `widgets` plus a full stop, or
+  the repo `widgets.`. The gate verifies `acme/widgets` as usual and probes `acme/widgets.` once: a 404
+  means the period was punctuation, a public `widgets.` passes, one that exists and is not public is
+  refused (unless the operator allowlisted it), and a gh outage on it holds the round for a retry. A
+  period after a path (`/pull/12.`) cannot change the repo and is not probed. The refusal's fix is to
+  put the link in `<angle brackets>` or end the sentence before it. `tests/test_gate_differential.py`
+  checks all of this against node's WHATWG URL parser on a generated corpus, with an oracle that
+  percent-decodes segments the way GitHub routes them, follows unbounded joins, and shares no code or
+  cap with the gate.
+  **Links to other sites are outside the gate**: they are part of the operator's free-text boundary
+  below, like any other sentence in a `--task`.
+- **Repos.** Every repo a link reaches must be gh-confirmed public. Gist links are refused.
+- **References.** Every PR link and every tree / blob / commit / compare / raw link on an admitted
+  repo is checked to exist, in prompt order, each gh path asked once. A ref containing `/` (the
+  branch `feat/x`) is one ref: the shortest leading prefix that resolves and under which the rest of
+  the link exists as a path is taken, so `/blob/main/missing.py` does not verify as `main`. A commit
+  link is exactly one ref. PR numbers are canonicalized (`0012`, `12.diff` and `12.patch` are PR 12).
+  More than 48 distinct gh
+  probes is refused as `partial verification`, so the gate never says "refs exist" about a link it
+  did not check. Issue and `/pulls` links and the sub-pages of a PR are not existence-checked.
+- **Secret shapes.** A fixed list of patterns: private-key blocks, AWS access key ids and secret-key
+  assignments, `sk-` keys, GitHub tokens (`ghp_`, `github_pat_`), Slack tokens, Google API keys, JWTs.
+
+**What the secret scan is.** A detector for those specified patterns, and nothing more. It does not
+prove that free text contains no secret. A `--task`, `--context-file` or `--no-code` consult can carry
+any sentence the caller wrote: a password in prose, a customer name, an internal hostname, a token
+in a format the list does not know. No pattern scan can prove a sentence is not sensitive. The
+guarantee is exactly "no recognized secret shape, no non-public repo link, no dead PR or ref, and no
+more references than the gate verified". It is not "arbitrary-content safe". The skill contract
 forbids putting secrets in those fields; the scan is a backstop, not a reader.
+
+### Operator opt-ins widen the boundary, on purpose
+
+- `CGC_GATE_PRIVATE_REPOS` names repos the gate may send although they are not public (`*` means any
+  repo your `gh` can resolve). `CGC_GATE_ALLOW_GIST=1` (also `true`, `yes`, `on`) accepts gist links.
+  Both are your policy, honoured only when set: unset, empty or any other value leaves them off.
+  Setting either replaces the "public repos only" guarantee with your own declaration, and the gate
+  cannot judge what is inside a private repo or a gist. The secret scan and the reference checks still
+  run. An allowlist entry that `gh` cannot reach at all (timeout, outage) is refused as `unverified`;
+  one that `gh` answers 404 for is admitted, because your ChatGPT connector may read it under another
+  account.
+- **A registered WebCodex workspace is a channel you opened.** `fire --workspace NAME --mention APP`
+  lets a round carry no public code link, because the remote model reads local files through the
+  app. The gate does not look inside the workspace, and the prompt is still only scanned for secret
+  shapes. The exemption from the public-source rule is granted by the round's recorded spec, checked
+  against `CGC_WORKSPACES` and `CGC_APPS` when the round is enqueued and again when it is sent. At that
+  moment the config file, when there is one, is the registry: a key missing from it means nothing is
+  registered, whatever the long-running daemon remembers from its start. A file that cannot be read
+  holds the round for a retry (it is never granted from the daemon's memory), and a workspace the
+  file does not list is held the same way instead of being rejected for good. A
+  sentence in the prompt (`Source: local workspace ...`) exempts nothing, and a workspace you did not
+  register is refused. `CGC_WORKSPACES`, `CGC_APPS` and the store are files your user can write, so a
+  hostile process running as you can register a workspace: that is the same-user boundary above, not
+  something the gate can add.
 
 ## Local data retention
 
@@ -107,7 +191,9 @@ The skill is built to **not** exfiltrate private content, but you own the inputs
 
 - **No code source → no send.** `prep`/`submit` refuse a non-followup consult
   with no real code link (`CGC_ERROR no_code_source`). Prose about code is not a
-  substitute for the code.
+  substitute for the code. The two declared exceptions are a `--no-code` question and
+  a registered `--workspace` round (see above); the workspace one is read from the
+  stored round, never from the prompt text.
 - **Wrong model → no send.** `submit`/`followup` refuse to send if the target
   model tier can't be selected, rather than silently degrading (override only
   with an explicit `--allow-model-mismatch`).

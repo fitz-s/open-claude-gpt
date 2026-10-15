@@ -83,6 +83,61 @@ releases until it stabilizes.
   three concurrent writers crash. Only a missing file is an empty config: an unreadable or non-UTF-8 file
   aborts the write and is left as it was (it used to be replaced by one line). `cgc doctor --deep` opens
   its CDP websocket on a socket of its own, so `HTTP_PROXY` can no longer tunnel the loopback connection.
+### Fixed — a sentence in a prompt no longer waives the public-source rule
+
+- `fire --workspace NAME` now records the workspace in the round (`consult_meta.workspace`). The
+  gate exempts a link-less prompt only for a stored round that records one, found by the rid on the
+  prompt's first line and the sha256 of the exact bytes, and only when `CGC_WORKSPACES` lists the
+  workspace and `CGC_APPS` lists a mention. Before, the line `Source: local workspace ...` anywhere
+  in the text was enough. A prompt that only contains it, a bare `enqueue`, or a workspace you did not
+  register is refused; **set `CGC_WORKSPACES` before using `--workspace`**. The enqueue pre-check and
+  the daemon's gate use one predicate, and the gate opens the store read-only.
+- **The gate now judges the URL a browser will request.** One parse of every GitHub link feeds the
+  visibility, existence and gist checks. Refused (not normalized and accepted): a `.`/`..` segment
+  (`github.com/ok/ok/tree/main/../../../../other/private` reached a repo the gate never vetted),
+  percent-escapes (`%66itz-s/...` skipped every existence probe), userinfo, ports, `http://`, a
+  trailing-dot / non-ASCII / escaped host, backslashes, empty segments, and a segment ending in `.`
+  (`main..` was silently checked as `main`).
+- Reference checks cover every PR and tree / blob / commit / compare / raw link, in prompt order (they
+  stopped after eight, in set order). A ref with `/` is one ref (`feat/x` was cut to `feat`) and the
+  rest of the link must exist under it (`/blob/main/missing.py` verified as `main`); `/commit/` is
+  exactly one ref; PR numbers are canonical. Over 48 distinct probes is refused as `partial
+  verification`, and the success message counts what it verified. A commit the API answers with 422 is
+  a dead link, not a gh outage that retried forever.
+- The gate's token now contains every character a URL can hold (a `'` in a path used to end it, so
+  `.../cli/cli/'/../../../other/private` was judged as `cli/cli`), an inner `https:` no longer cuts the
+  outer URL (`.../cli/cli/https:/../../../other/private`), a link nested in a proxy or redirect URL is
+  judged as its own URL, and a URL parser's habit of dropping TAB/CR/LF is accounted for: the link is
+  judged alone and joined with the following text, and a bare `owner/repo` link that ends a line and
+  is followed, across any run of line breaks (a blank line joins too), by a word, digit or `-` is
+  refused (it can read as `cli/cli-private-zz`; end the link with a space or `/`). The rule is exact
+  rather than a list of cases: every chain of text joined only by TAB/CR/LF is judged at each break and
+  at its maximal join, a chain with more than 64 breaks is refused instead of judged on a prefix (a host
+  spelled one character per line used to pass after 16), a scheme split by a break is refused, and
+  `%2e` spellings of `.`/`..` and escaped separators count as dot segments. The gate now has one judge
+  for every reading (as written, each join, the maximal join, both period readings) with no per-reading
+  relaxation: a joined reading used to skip the percent-escape rule and let an unparseable owner/repo
+  through, so `https://github.com/cli/cli` + LF + `-%70rivate` (GitHub routes it to `cli/cli-private`)
+  passed with only `cli/cli` verified. Any `%` in an owner or repo (and the API's `/repos/O/R`) now
+  refuses; a reading whose owner/repo cannot be parsed refuses; escapes after owner/repo/kind are data.
+  The cost: a bare `owner/repo` link directly followed by another line is refused even when wrapped in
+  `<>`, backticks or parentheses. A final period after a
+  link is judged both ways (`widgets.` is a legal repo name): `owner/widgets.` is probed once, a 404
+  means the period was punctuation, a non-public one is refused. A new test checks the gate against
+  node's WHATWG parser on a generated corpus. The repo-root examples in
+  `references/injection-and-prompting.md` now end in `/`. Other hosts under GitHub domains (`github.io`, `ghcr.io`, signed
+  `*.githubusercontent.com` downloads, assets) are refused; `api.github.com/repos/...` and
+  `codeload.github.com/...` map to their repo and are visibility- and existence-checked; `/pull/N.diff`
+  and `.patch` are PR N. Links to other sites remain the operator's free-text boundary.
+- The workspace registry is the config file when there is one: a key removed from it revokes the
+  workspace even if the long-running daemon still remembers it, an unreadable file holds the round for a
+  retry (`unverified:`) instead of granting from the daemon's memory, and a store or registry that
+  cannot confirm a recorded workspace holds the round where it used to reject it for good.
+- `CGC_GATE_ALLOW_GIST` opens only on `1`, `true`, `yes` or `on` (it opened on any junk value). The
+  raw-gist host counts as a gist. A GitHub site page (`/topics`, `/orgs/...`) no longer counts as "a
+  code link" for the source rule.
+- `docs/SECURITY.md` says what the secret scan is: a detector for specified patterns, not proof
+  that free text is clean.
 
 ### Added — one UI contract, and a repair bundle when ChatGPT's page changes
 

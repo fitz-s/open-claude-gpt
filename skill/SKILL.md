@@ -55,7 +55,13 @@ send to ChatGPT outright). Private code and local data reach the model only thro
 workspace the user registered (`--workspace` + `--mention`), never pasted into the prompt. NEVER secrets, `.env`, tokens, private-repo content, customer data, or
 unreviewed logs. A private repo is sendable ONLY if the user named it in
 `CGC_GATE_PRIVATE_REPOS` — you never decide that or add to it. The user's daemon independently
-re-validates every prompt (public repos, existing refs, no secret shapes) and refuses fail-closed.
+re-validates every prompt (public repos, every PR/ref link exists, no recognized secret shape) and
+refuses fail-closed. The secret scan matches known patterns only; it does not prove prose is clean,
+so what you write into `--task` is on you. A prompt that merely says "Source: local workspace" gets
+no exemption: `--workspace` counts only when the user registered it (`CGC_WORKSPACES`) and the app
+(`CGC_APPS`), and you never register either. Write every GitHub link plainly (`https://github.com/owner/repo/...`;
+no `..`, `%`-escapes, ports or `user@`): the gate refuses a link a browser would resolve differently from how
+it reads. End a bare `https://github.com/owner/repo` link with `/` or a space before the line break, even inside `<>`, backticks or parentheses (the next line, a blank line included, could be read as part of the repo name; the gate refuses it). Link a commit SHA, not a branch, so the ref check is exact. The gate checks GitHub links only; text and links to other sites are your responsibility.
 
 ## The whole path — two commands
 
@@ -75,7 +81,8 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid>
 - No code subject at all (a proof, research, writing) → add `--no-code`.
 - **WebCodex route.** The deciding evidence is local (private or unpushed code, a DB, logs, data,
   a check to run) and lives in a workspace the user registered with WebCodex → add
-  `--workspace <name> --mention "WebCodex Demo"` (no `@`). The remote model then reads files, lists
+  `--workspace <name> --mention "WebCodex Demo"` (no `@`; both must be in `consult.py apps`, else the
+  round is refused). The remote model then reads files, lists
   directories, runs processes, and observes jobs inside that workspace. In `--task`, name the
   revision or data window and the read/run scope; checks that write go to a temp dir or an isolated
   worktree, never the active one. The daemon picks the app from the composer's @ popup before

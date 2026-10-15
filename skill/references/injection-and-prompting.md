@@ -53,7 +53,7 @@ https://github.com/<owner>/<repo>
 
 Example placeholder:
 
-https://github.com/OWNER/REPO
+https://github.com/OWNER/REPO/
 Right choice when
 
 Use this as supporting context when the task involves broad repository orientation, project layout, README-level architecture, language/framework identification, or locating likely subsystems.
@@ -63,7 +63,7 @@ Repository root alone is rarely sufficient for code review. Pair it with PR, tre
 Prompt phrasing
 Markdown
 Start by opening the repository root to orient yourself to project structure and documentation:
-https://github.com/OWNER/REPO
+https://github.com/OWNER/REPO/
 
 Then use the more specific URLs below for the actual code review. Do not rely only on README-level information if code URLs are also provided.
 Failure modes
@@ -914,7 +914,7 @@ Required:
   https://gist.github.com/<user>/<gist-id>
 
 Also include if available:
-- Repository root: https://github.com/<owner>/<repo>
+- Repository root: https://github.com/<owner>/<repo>/
 - Base tree: https://github.com/<owner>/<repo>/tree/<BASE_SHA>
 - Base blob URLs for unchanged surrounding files
 - Inline summary of changed files
@@ -1233,7 +1233,7 @@ Perform a deep design and implementation review of the `{SUBSYSTEM_NAME}` subsys
 
 ## Source to review — open these with your browser tool before answering
 Repository root for orientation:
-https://github.com/OWNER/REPO
+https://github.com/OWNER/REPO/
 
 Stable repository snapshot:
 https://github.com/OWNER/REPO/tree/HEAD_SHA
@@ -1348,7 +1348,7 @@ Advise on a planned large refactor of `{AREA}` before Claude Code starts editing
 
 ## Source to review — open these with your browser tool before answering
 Repository root:
-https://github.com/OWNER/REPO
+https://github.com/OWNER/REPO/
 
 Stable source snapshot:
 https://github.com/OWNER/REPO/tree/HEAD_SHA
@@ -1472,7 +1472,7 @@ Investigate `{QUESTION_OR_PROBLEM}` and return a research-backed plan for Claude
 
 ## Source to review — open these with your browser tool before answering
 Repository root:
-https://github.com/OWNER/REPO
+https://github.com/OWNER/REPO/
 
 Stable source snapshot:
 https://github.com/OWNER/REPO/tree/HEAD_SHA

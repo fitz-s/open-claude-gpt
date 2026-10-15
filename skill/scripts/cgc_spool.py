@@ -42,10 +42,14 @@ import argparse
 import json
 import os
 import re
+from bisect import bisect_right
 import secrets
+import sqlite3
 import subprocess
 import sys
 import time
+from typing import NamedTuple
+from urllib.parse import quote, unquote, urlsplit
 
 try:
     import fcntl  # advisory locking (POSIX) — degrade to best-effort if absent
@@ -60,6 +64,7 @@ try:
 except Exception:
     pass
 
+import cgc_config as _cfg  # noqa: E402 — config_path/_parse: the gate re-reads the registry file
 import cgc_store as _store  # noqa: E402 — the durable data dir that anchors the lock namespace
 
 CGC_STATE_DIR = os.environ.get("CGC_STATE_DIR", "/tmp/cgc")
@@ -100,9 +105,12 @@ POLL_S = 20
 
 # The three phrases that declare a LEGITIMATE reason a prompt carries no code LINK (compared against
 # the lowercased prompt): a follow-up, a self-contained no-code question, or a question whose evidence
-# lives in a local WebCodex workspace (`fire --workspace`, which requires a --mention). Honoured by
-# validate_prompt and cmd_enqueue here and by cdp_consult._has_sendable_source; tests/test_parity.py
-# pins all three together. None of them exempts any other rule.
+# lives in a local WebCodex workspace (`fire --workspace`, which requires a --mention). The first two
+# are prose declarations, and rule 1 is a quality guard, not a security boundary. The third is NOT
+# honoured on its text: a sentence anyone can type must not decide which prompts need a public source,
+# so validate_prompt exempts a prompt only when the round's recorded spec registers the workspace
+# (workspace_refusal). The phrase stays here to recognize a prompt that CLAIMS a workspace, for
+# enqueue's pre-check and for refusal wording. None of them exempts any other rule.
 _WORKSPACE_SENTINEL = "source: local workspace `"
 
 # rid shape must match cdp_consult.py exactly.
@@ -120,55 +128,373 @@ def default_out(rid: str) -> str:
     """Where a round's answer file goes when nobody chose one."""
     return os.path.join(CGC_STATE_DIR, f"answer_{rid}.txt")
 
-# The SAME public-code-URL rule cdp_consult.cmd_submit uses (github / gist / raw), so the gate
-# and the submit backstop agree on what counts as a real, public code link.
-_CODE_URL_RE = re.compile(
-    r"https://(?:www\.)?(?:github\.com|gist\.github\.com|raw\.githubusercontent\.com)/\S+",
-    re.IGNORECASE)
+# ---- the URL law ------------------------------------------------------------
+#
+# ONE judge, applied identically to EVERY reading of a link. A reading is a string a URL parser could be
+# handed: the link as written, the link joined with the text after it at each line break and at the end
+# of its chain (a parser drops every TAB/CR/LF), and the readings in which a final period is part of the
+# name. There are no reading-specific relaxations: a joined reading that the judge would refuse if it
+# were written is refused, and the cost (a few false refusals, each with a fix hint) is accepted.
+#
+# Tokens. A prompt is cut into whitespace-delimited runs; every `http(s):` in a run starts a token that
+# runs to the END of the run (an inner scheme never cuts the outer URL, and is judged as one more URL).
+# Delimiters (`'`, `"`, `<`, `(`) stay inside the token; only trailing sentence punctuation is dropped.
+# Runs separated only by TAB/CR/LF form a chain (a space ends one: a parser keeps it); a scheme or host
+# may be split across its breaks; more than _MAX_BREAKS after a link is refused, never judged on a prefix.
+#
+# The judge (_judge) takes a string and returns one of:
+#   OTHER   not a GitHub-family URL (the gate has no opinion)
+#   ROOT    a GitHub URL that names no repo (the site root, a reserved page)
+#   REFUSE  with the reason
+#   OK      a GitHub URL, parsed once into kind, owner/repo and what follows, which feeds the
+#           visibility check, the existence check and the gist rule
+# and REFUSES: any other host under a GitHub domain (_GH_DOMAINS: Pages, signed downloads, packages,
+# assets); a scheme other than `https://`; a host not written exactly (userinfo, port, escape, trailing
+# dot, non-ASCII); a backslash; a `.` or `..` path segment, or a `%2e` spelling of one, ANYWHERE; an
+# escaped separator (`%2f`, `%5c`) anywhere in the path; and an owner or repo (and the API's
+# /repos/OWNER/REPO) that is not plain: any `%` there refuses, and so does a GitHub-host reading whose
+# owner/repo cannot be parsed at all, because GitHub decodes `cl%69` to `cli` and a name it cannot read
+# is a name it cannot verify. After owner/repo and the page kind (`pull`, `tree`...) a segment is data: a
+# percent-escape (`Caf%C3%A9.md`, decoded once before the existence probe) or an empty segment cannot
+# change which repo a link reaches. What the gate can VERIFY is a separate question, asked only of the link as
+# written (_parse_code_urls): an empty segment, a trailing `.`, a malformed PR number or compare range
+# is refused there, because the gate cannot check what it cannot read.
+#
+# The readings. All of them are judged by that one function and must agree:
+#   * a joined reading must name the SAME repo as the link alone (`https://github.com/cli/cli` + LF +
+#     `-private-zz/x` reaches cli/cli-private-zz; so does a blank line between), and a join that makes a
+#     GitHub link out of a non-GitHub one is the same thing; `https://git` + breaks + `hub.com/...`
+#     reaches github.com. So a bare `owner/repo` link that ends a line and is followed, across line
+#     breaks, by a line starting with a word, a digit, a `-` or a `%` is refused with the fix (end the
+#     link with a space or a trailing slash). A link that ends in a path (`/pull/12`), ends in `/`, is
+#     wrapped in brackets or quotes, or is followed by a space before the break, cannot change its repo;
+#   * a TAB or bare CR right beside a GitHub link is refused outright (neither a line end nor indentation);
+#   * a final period is judged both ways: `widgets.` is a legal repo name, so `see .../acme/widgets.` can
+#     mean the repo `widgets` plus a full stop, or the repo `widgets.`. The undotted repo is verified as
+#     usual and `owner/widgets.` is probed once: a 404 means the period was punctuation, a public one
+#     passes, one that exists and is not public is refused (unless the operator allowlisted it). Together
+#     the readings must satisfy: every one that exists is public, and at least one is. A period after a
+#     path segment cannot change the repo, an owner cannot contain a period, and two final periods
+#     (`main..`) are not a sentence end and are refused by the dot rules.
+# Not the gate's business, and the operator's free-text boundary (docs/SECURITY.md): links to other
+# sites, and GitHub hosts written without a scheme.
+_GH_HOSTS = {"github.com": "repo", "www.github.com": "repo", "raw.githubusercontent.com": "raw",
+             "gist.github.com": "gist", "gist.githubusercontent.com": "gist",
+             "api.github.com": "api", "codeload.github.com": "codeload"}
+_GH_DOMAINS = ("github.com", "githubusercontent.com", "github.io", "githubassets.com", "ghcr.io")
+_SCHEME_RE = re.compile(r"https?:", re.IGNORECASE)
+_RUN_RE = re.compile(r"\S+")
+_BREAK_GAP_RE = re.compile(r"[\t\r\n]+")
+_PR_RE = re.compile(r"([0-9]+)(?:\.(?:diff|patch))?")
+_TRAIL = ",;:!?)]}'\"*>|`"     # sentence punctuation and closing wrappers; an OPENING one stays and is refused
+_MAX_BREAKS = 64      # breaks after a link within one chain; more is refused, never judged on a prefix
+_MAX_SCHEMES = 64     # `http(s):` occurrences in one chain; more is refused, not sampled
+_OWNER_RE = re.compile(r"[A-Za-z0-9-]+")        # a GitHub account name: no `%`, no period, no underscore
+_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")      # a repo name, plain: no `%`, nothing else
+# github.com/<one of these>/... is a page of the site, never a repo (GitHub reserves the names).
+_NON_REPO_OWNERS = ("orgs", "sponsors", "settings", "features", "about", "topics", "trending", "marketplace")
+_REF_SEGMENTS = 8     # a ref may itself contain '/': at most this many leading segments form it
+# github.com/<owner>/<repo>/<one of these>/<ref>[/<path>]: the ref is a prefix of the rest of the path.
+_REF_PATH_KINDS = ("tree", "blob", "blame", "raw", "commits", "find", "edit")
 
-# Extract an owner/repo slug from a github.com (or raw.githubusercontent.com) URL so the gate can
-# re-check that repo's visibility. gist URLs carry no owner/repo slug (a gist is its own object);
-# they are handled separately (a gist is public-by-URL only if the user made it public — the gate
-# cannot cheaply verify a secret gist, so it refuses gist links unless CGC_GATE_ALLOW_GIST=1).
-_SLUG_RE = re.compile(
-    r"https://(?:www\.)?(?:github\.com|raw\.githubusercontent\.com)/"
-    r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", re.IGNORECASE)
-_GIST_RE = re.compile(r"https://gist\.github\.com/\S+", re.IGNORECASE)
-_CLEAN_SEG_RE = re.compile(r"[A-Za-z0-9_.-]+")
+
+class Link(NamedTuple):
+    host: str       # "repo" | "raw" | "gist" | "api" | "codeload"
+    slug: str       # "owner/repo"; "" for a gist
+    target: tuple   # () | ("pull", "12") | ("commit", "<ref>") | ("tree"|"blob"|..., ("seg", ...))
+    alts: tuple = ()    # other repos a final period could make this link name ("owner/repo.")
 
 
-def _classify_code_urls(text: str):
-    """Turn every RECOGNIZED code URL into an owner/repo slug to verify, FAILING CLOSED on any URL
-    that cannot be classified. The bug this closes (diff-review S0): the broad _CODE_URL_RE accepts a
-    github URL, but the narrow slug extraction skipped percent-encoded owners (e.g.
-    github.com/%66itz-s/private = github.com/fitz-s/private), so NO visibility check ran and the
-    prompt was approved after verifying zero repos. Here the invariant is 1:1 — a recognized code URL
-    that does not resolve to a clean owner/repo (unclassifiable, double-encoded, or non-repo path) is
-    a hard refusal, never silently dropped from verification. Returns (slugs, refuse_reason)."""
-    from urllib.parse import urlsplit, unquote
-    slugs = set()
-    for url in _CODE_URL_RE.findall(text):
-        u = url.rstrip('.,);]}"\'>')
-        parts = urlsplit(u)
-        host = parts.netloc.lower()
-        if host.startswith("www."):
-            host = host[4:]
-        if host == "gist.github.com":
-            continue  # gists carry no owner/repo slug; rule 3 handles them separately
-        segs = [s for s in unquote(parts.path).split("/") if s]
-        owner = segs[0] if len(segs) >= 1 else None
-        repo = segs[1] if len(segs) >= 2 else None
-        # owner/repo must be CLEAN slug chars — a residual '%' means double-encoding, anything else
-        # non-slug means this is not a repo path we can verify. Either way: refuse.
-        if (not owner or not repo
-                or not _CLEAN_SEG_RE.fullmatch(owner) or not _CLEAN_SEG_RE.fullmatch(repo)):
-            if owner and owner.lower() in ("orgs", "sponsors", "settings", "features", "about",
-                                           "topics", "trending", "marketplace"):
-                continue  # a non-repo github path (not a code source) — not a slug to verify
-            return None, (f"refused: code URL {u!r} does not resolve to a verifiable owner/repo "
-                          "(unclassifiable or ambiguously encoded) — failing closed.")
-        slugs.add(f"{owner}/{repo}")
-    return slugs, None
+class _LawRefusal(Exception):
+    """A prompt-wide refusal raised while tokenizing."""
+
+
+def _trim(tok: str) -> str:
+    """Drop what ends a sentence or wraps a link rather than belonging to it: trailing _TRAIL
+    characters and ONE `.`. Nothing else is removed or rewritten; a segment that still ends in `.`
+    (`main..`, `repo..`) is refused by the parser, because git forbids a ref ending in `.` and a link
+    must be checked as written."""
+    dot = False
+    while tok:
+        if tok[-1] in _TRAIL:
+            tok = tok[:-1]
+        elif tok[-1] == "." and not dot:
+            tok, dot = tok[:-1], True
+        else:
+            break
+    return tok
+
+
+def _keep_dot(tok: str) -> str:
+    """`tok` with trailing wrapper/punctuation characters stripped but its dots kept: the reading in
+    which a final period belongs to the name (see the period paragraph above)."""
+    while tok and tok[-1] in _TRAIL:
+        tok = tok[:-1]
+    return tok
+
+
+def _dot_alt(raw: str, slug: str) -> str:
+    """The repo a link names when its single final period is PART of the name, if that differs from
+    `slug` (the repo it names with the period dropped); else ""."""
+    dotted = _keep_dot(raw)
+    if not dotted.endswith("."):
+        return ""
+    st, pl = _judge(dotted)
+    return pl[1] if st == OK and pl[1] and pl[1].lower() != slug.lower() else ""
+
+
+def _gh_host(authority: str) -> str:
+    """The host a browser would connect to for this URL authority, or "" when it cannot be one."""
+    hostport = authority.rpartition("@")[2]
+    if hostport.startswith("["):
+        return ""
+    try:
+        return unquote(hostport.partition(":")[0]).encode("idna").decode("ascii").rstrip(".").lower()
+    except UnicodeError:
+        return ""
+
+
+def _is_gh(host: str) -> bool:
+    return host in _GH_HOSTS or any(host == d or host.endswith("." + d) for d in _GH_DOMAINS)
+
+
+def _split(tok: str):
+    """(scheme, SplitResult) of a token read the way a browser reads it (a backslash is a slash), or
+    None when it does not parse."""
+    scheme, _, rest = tok.partition(":")
+    try:
+        return scheme, urlsplit("https://" + rest.replace("\\", "/").lstrip("/"))
+    except ValueError:
+        return None
+
+
+_DOT_SEGMENTS = {".", "%2e", "..", ".%2e", "%2e.", "%2e%2e"}      # what a URL parser collapses
+_SEP_ESCAPE_RE = re.compile(r"%(?:2f|5c)", re.IGNORECASE)             # an escaped `/` or `\\`
+
+
+
+
+def _chains(text: str):
+    """Maximal groups of whitespace-delimited runs joined by gaps made only of TAB/CR/LF: (start, end)
+    spans, in order. A gap holding a space (or any other whitespace) ends a chain."""
+    chain = []
+    for m in _RUN_RE.finditer(text):
+        if chain and _BREAK_GAP_RE.fullmatch(text, chain[-1][1], m.start()):
+            chain.append((m.start(), m.end()))
+        else:
+            if chain:
+                yield chain
+            chain = [(m.start(), m.end())]
+    if chain:
+        yield chain
+
+
+def _url_tokens(text: str):
+    """(first, rest, glued, spans) for every `http(s):` in `text`, scheme split by a break included.
+
+    Within a chain (see _chains) with all breaks removed, `first` runs from the scheme to the end of
+    the piece it completes in, and `rest` is the same text extended to the end of each later piece:
+    every reading a parser that strips TAB/CR/LF could be handed, the maximal join last. `spans` says
+    the scheme itself straddles a break (so `first` is already a joined reading). `glued` says some gap
+    after the scheme held a TAB or bare CR before its first LF (not a line end, not indentation)."""
+    for chain in _chains(text):
+        pieces = [text[a:b] for a, b in chain]
+        joined = "".join(pieces)
+        found = list(_SCHEME_RE.finditer(joined))
+        if not found:
+            continue
+        if len(found) > _MAX_SCHEMES:
+            raise _LawRefusal(f"refused: {len(found)} `http(s):` links in one unbroken run of text "
+                              f"({pieces[0][:60]!r}...); put whitespace between links")
+        ends, pos = [], 0
+        for piece in pieces:
+            pos += len(piece)
+            ends.append(pos)
+        glue = []       # glue[i]: the gap after piece i is not a plain line end
+        for i in range(len(chain) - 1):
+            head, lf, _ = text[chain[i][1]:chain[i + 1][0]].partition("\n")
+            head = head[:-1] if lf and head.endswith("\r") else head
+            glue.append(not lf or "\t" in head or "\r" in head)
+        for m in found:
+            p0 = bisect_right(ends, m.start())          # the piece the scheme starts in
+            i0 = bisect_right(ends, m.end() - 1)        # the piece that completes it
+            if len(ends) - 1 - p0 > _MAX_BREAKS:
+                raise _LawRefusal(
+                    f"refused: more than {_MAX_BREAKS} line breaks follow the link starting "
+                    f"{joined[m.start():m.start() + 60]!r}, with no space between the pieces, so what a "
+                    "browser would read as that link cannot be judged; put a space after the link")
+            reads = [joined[m.start():ends[k]] for k in range(i0, len(ends))]
+            yield reads[0], reads[1:], any(glue[p0:]), i0 > p0
+
+
+OTHER, ROOT, REFUSE, OK = "other", "root", "refuse", "ok"
+
+
+def _judge(tok: str) -> tuple:
+    """THE judge of one reading (see the URL law above). Returns (state, payload):
+      (OTHER, None)   not a GitHub-family URL
+      (ROOT, None)    a GitHub URL that names no repo
+      (REFUSE, msg)   the refusal
+      (OK, (kind, slug, rest_segs, host))   `slug` is "" for a gist, else "owner/repo".
+    No argument changes what it enforces."""
+    got = _split(tok)
+    if got is None:
+        return OTHER, None
+    scheme, u = got
+    host = _gh_host(u.netloc)
+    if not _is_gh(host):
+        return OTHER, None
+    kind = _GH_HOSTS.get(host)
+    if kind is None:
+        return REFUSE, (f"refused: {host} is a GitHub-hosted domain the gate has no check for (Pages, "
+                        f"signed downloads, packages, assets) in {tok[:120]!r} — drop it, or link the "
+                        "repository on github.com instead")
+
+    def no(why):
+        return REFUSE, (f"refused: {why} in GitHub link {tok[:120]!r} — write it as https://{host}/... "
+                        "(and put whitespace between links)")
+
+    if scheme.lower() != "https":
+        return no("a non-https scheme")
+    if not re.match(r"https://[^/]", tok, re.IGNORECASE):
+        return no("a malformed scheme separator")
+    if "\\" in tok:
+        return no("a backslash")
+    if u.netloc.lower() != host:
+        return no("userinfo, a port, an escape, a trailing dot or a non-ASCII character in the host")
+    segs = u.path.split("/")[1:]
+    if segs and segs[-1] == "":
+        segs.pop()
+    if not segs:
+        return ROOT, None
+    if any(seg.lower() in _DOT_SEGMENTS for seg in segs):
+        return no("a `.` or `..` path segment")
+    if _SEP_ESCAPE_RE.search(u.path):
+        return no("an escaped `/` or `\\` in the path")
+    if kind == "gist":
+        return OK, ("gist", "", [], host)
+    if kind == "api":
+        if segs[0] != "repos" or len(segs) < 3:
+            return no("an api.github.com path that is not /repos/OWNER/REPO/...")
+        owner, repo, rest = segs[1], segs[2], segs[3:]
+    else:
+        owner, repo, rest = segs[0], (segs[1] if len(segs) > 1 else ""), segs[2:]
+    if kind == "repo" and owner.lower() in _NON_REPO_OWNERS:
+        return ROOT, None       # reserved names no account can hold: a site page, whatever follows
+    if not (_OWNER_RE.fullmatch(owner) and repo and _NAME_RE.fullmatch(repo)):
+        return no("an owner/repo that is not plain (a `%` escape, or something GitHub cannot name)")
+    return OK, (kind, f"{owner}/{repo}", rest, host)
+
+
+def _check_joins(first: str, state: str, payload, reads: list, glued: bool, spans: bool, alts: set):
+    """The refusal for the joined readings of a link, or None. Every reading goes through _judge; a
+    reading must come out as the same repo as the link alone (or as nothing the gate looks at)."""
+    seen, readings = set(), []
+    for r in ([first] if spans else []) + reads:
+        if r not in seen:
+            seen.add(r)
+            tok = _trim(r)
+            readings.append((tok, r, *_judge(tok)))
+    if state == OTHER and all(st == OTHER for _, _, st, _ in readings):
+        return None     # nothing GitHub-shaped on either side of any join
+    if glued:
+        return (f"refused: a TAB or bare CR inside or beside a GitHub link ({(first + ''.join(reads[-1:]))[:100]!r}); "
+                "a browser drops it and joins the pieces. Put the link on one line")
+    for tok, r, st, pl in readings:
+        if st == OTHER:
+            continue
+        if spans:
+            return (f"refused: a line break splits the scheme of a link that a browser reads as {tok[:100]!r}. "
+                    "Put the link on one line")
+        if st == REFUSE:
+            return (f"refused: a line break lets a browser join the link {first[:100]!r} with the text after it "
+                    f"into {tok[:120]!r}, which the gate refuses ({pl.split(' in GitHub link')[0].replace('refused: ', '')}). "
+                    "Put a space or a trailing `/` right after the link, before the line break, or put it on one line")
+        if st == OK and not (state == OK and payload[0] == pl[0] and payload[1].lower() == pl[1].lower()):
+            return (f"refused: a line break lets a browser join the link {first[:100]!r} with the text after "
+                    f"it into {tok[:120]!r}, which is a different repo ({pl[1] or 'a gist'}). Put a space or a "
+                    "trailing `/` right after the link, before the line break")
+        if st == OK:
+            alt = _dot_alt(r, pl[1])
+            if alt:
+                alts.add(alt)
+    return None
+
+
+def _parse_code_urls(text: str) -> tuple:
+    """Every GitHub link in `text` as a Link, in prompt order, or (None, refusal) on the first one that
+    breaks the URL law. Returns (links | None, refusal | None)."""
+    links = []
+    try:
+        tokens = list(_url_tokens(text))
+    except _LawRefusal as e:
+        return None, str(e)
+    for first, reads, glued, spans in tokens:
+        tok = _trim(first)
+        if spans:
+            state, payload = OTHER, None        # no plain reading: the scheme is split by a break
+        else:
+            state, payload = _judge(tok)
+            if state == REFUSE:
+                return None, payload
+        alts = set()
+        if state == OK and not spans:
+            alt = _dot_alt(first, payload[1])
+            if alt:
+                alts.add(alt)
+        if reads or spans:
+            why = _check_joins(first, state, payload, reads, glued, spans, alts)
+            if why:
+                return None, why
+        if state != OK:
+            continue
+        kind, slug, rest_segs, host = payload
+
+        def no(why, tok=tok, host=host):
+            return None, (f"refused: {why} in GitHub link {tok[:120]!r} — write it as "
+                          f"https://{host}/...")
+
+        if kind == "gist":
+            links.append(Link("gist", "", ()))
+            continue
+        # What follows is checked of the link AS WRITTEN, because it decides what the gate can VERIFY (the
+        # judge already decided what the link can REACH): no empty segment, no escape in the page kind
+        # (`%70ull`), segments after it decoded once as GitHub does, no control character, and no segment
+        # ending in `.` (git forbids a ref that does; the repo itself is judged both ways, see _dot_alt).
+        if "" in rest_segs:
+            return no("an empty path segment")
+        if rest_segs and "%" in rest_segs[0]:
+            return no("a percent-escape in the page kind (write `pull`, `tree`, `blob`...)")
+        rest_segs = rest_segs[:1] + [unquote(x) for x in rest_segs[1:]]
+        if any(c < " " or c == "\x7f" for x in rest_segs for c in x):
+            return no("a control character in the path")
+        if (rest_segs[-1] if rest_segs else slug.split("/", 1)[1]).endswith("."):
+            return no("a path segment ending in `.`")
+        target = ()
+        if kind == "raw" and rest_segs:
+            target = ("raw", tuple(rest_segs))
+        elif kind == "repo" and rest_segs:
+            what = rest_segs[0]
+            if what == "pull" and len(rest_segs) > 1:
+                pr = _PR_RE.fullmatch(rest_segs[1])
+                if not pr:
+                    return no("a malformed pull-request number")
+                target = ("pull", str(int(pr.group(1))))          # 012, 12, 12.diff, 12.patch: PR 12
+            elif what == "commit":
+                if len(rest_segs) != 2:
+                    return no("a commit link that is not exactly one SHA or ref")
+                target = ("commit", re.sub(r"\.(?:patch|diff)$", "", rest_segs[1]))
+            elif what in _REF_PATH_KINDS and len(rest_segs) > 1:
+                target = (what, tuple(rest_segs[1:]))
+            elif what == "compare" and len(rest_segs) > 1:
+                spec = re.sub(r"\.(?:patch|diff)$", "", "/".join(rest_segs[1:]))
+                a_, dots, b_ = spec.partition("...")
+                if not a_ or not dots or not b_ or "..." in b_:
+                    return no("a compare link that is not A...B (three dots)")
+                target = ("compare", spec)
+        links.append(Link(kind, slug, target, tuple(sorted(alts))))
+    return links, None
+
 
 # Obvious-secret patterns — the gate refuses to send a prompt matching any of these, fail-closed.
 # Not exhaustive (nothing is); it catches the high-signal shapes so an injected --task/--context
@@ -495,6 +821,7 @@ def acquire_conversation_lease(conversation):
 # attempt at 20s cost a real consult its whole 25-minute budget, so: a wider window, and one retry.
 _GH_TIMEOUT_S = 25
 _GH_ATTEMPTS = 2
+_INVISIBLE = "visibility=invisible"   # _repo_is_public's detail for a 404: an answer (no such repo, to this token)
 
 
 def _private_allowlist() -> set:
@@ -509,6 +836,11 @@ def _private_allowlist() -> set:
     behaviour for anyone who wants it, deliberately and in one obvious place."""
     raw = os.environ.get("CGC_GATE_PRIVATE_REPOS", "").strip()
     return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+
+def _gist_opt_in() -> bool:
+    """The operator's explicit `CGC_GATE_ALLOW_GIST=1` (also true/yes/on). Anything else is off."""
+    return os.environ.get("CGC_GATE_ALLOW_GIST", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _repo_is_public(slug: str) -> tuple:
@@ -537,7 +869,7 @@ def _repo_is_public(slug: str) -> tuple:
             err = (r.stderr or "").strip()
             # 404 IS an answer: this token cannot see the repo, so it is private or absent. Terminal.
             if "404" in err or "Not Found" in err:
-                return False, "visibility=invisible to your gh token (404 — private or nonexistent)"
+                return False, _INVISIBLE + " to your gh token (404 — private or nonexistent)"
             last = f"unverified: gh api repos/{slug} failed: {err[:120]}"
             continue
         vis = (r.stdout or "").strip()
@@ -550,12 +882,7 @@ def _repo_is_public(slug: str) -> tuple:
 # when ChatGPT hits a 404 — or worse, answers around it. The daemon already runs gh here, so the
 # gate is the right (and only) place to verify the references actually exist: seconds of feedback
 # instead of a wasted round.
-_PR_URL_RE = re.compile(
-    r"https://(?:www\.)?github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)", re.IGNORECASE)
-_REF_URL_RE = re.compile(
-    r"https://(?:www\.)?github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(?:tree|blob|commit)/([A-Za-z0-9_./-]+)",
-    re.IGNORECASE)
-_EXISTENCE_CAP = 8  # dedup usually leaves 1-3; the cap bounds gh cost on a pathological prompt
+_EXISTENCE_CAP = 48   # distinct gh probes per prompt; more is a refusal ('partial verification'), never a pass
 
 
 def _gh_exists(path: str) -> tuple:
@@ -579,53 +906,219 @@ def _gh_exists(path: str) -> tuple:
         err = (r.stderr or "").strip()
         if "404" in err or "Not Found" in err:
             return False, "404"
+        if "blob is too large" in err:
+            return True, "exists"   # the contents API refuses blobs over 1 MB, which proves the path is there
+        if "No commit found for SHA" in err:
+            # The commits API answers an unresolvable ref with 422, not 404. That is gh ANSWERING
+            # "no such ref", so it must not read as an outage: unverified: requeues the round with
+            # backoff, and a dead ref never reaches the refusal that names it.
+            return False, "422"
         last = f"unverified: gh api {path} failed: {err[:120]}"
     return None, last
 
 
-def _verify_refs_exist(text: str, verified_slugs: set) -> str | None:
-    """Refuse dead references (nonexistent PR numbers / tree-blob-commit refs) on repos the gate
-    already vetted. Returns a refusal reason, or None when everything checked out. Fail-closed on a
-    gh outage the same way the visibility check is: `unverified:` → the caller requeues."""
-    checks = []
-    for slug, pr in set(_PR_URL_RE.findall(text)):
-        checks.append((f"repos/{slug}/pulls/{pr}", f"PR github.com/{slug}/pull/{pr}", slug))
-    for slug, ref in set(_REF_URL_RE.findall(text)):
-        ref = ref.split("/")[0]  # tree/<ref>/sub/path — only the ref segment names a commit
-        checks.append((f"repos/{slug}/commits/{ref}", f"ref {ref} of github.com/{slug}", slug))
-    admitted = {s.lower() for s in (verified_slugs or set())}
-    seen = set()
-    for path, label, slug in checks:
-        if path in seen:
-            continue
-        seen.add(path)
-        if len(seen) > _EXISTENCE_CAP:
-            break  # bounded cost; the leading references are the load-bearing ones
-        if admitted and slug.lower() not in admitted:
-            continue  # only check repos the visibility pass actually admitted
-        ok, detail = _gh_exists(path)
-        if ok is False:
-            return (f"refused: {label} does not exist (404 — a dead link). ChatGPT would browse to "
-                    "nothing or answer around it. Fix the reference and re-fire.")
+class _Stop(Exception):
+    """A verdict that ends the existence pass: the refusal / unverified text for validate_prompt."""
+
+
+def _verify_refs_exist(links) -> tuple:
+    """Check every PR / tree / blob / commit target of `links` (the one parse validate_prompt made).
+    Returns (verdict | None, n): n distinct targets verified to exist. NOT checked: issue, gist and
+    /pulls links, and the sub-pages of a PR.
+
+    Every target is checked, each gh path asked once, in prompt order. A tree/blob ref is a leading
+    path prefix: the shortest one gh resolves AND under which the rest of the link exists as a path is
+    taken (a SHA or `main` costs two probes, and a PR-pinned link's commit is shared), longer prefixes
+    only when that fails, so branch `feat/x` is one ref and is never cut at its first segment, and
+    `/blob/main/missing.py` does not verify as `main`. A `commit` link is exactly one ref. More than
+    _EXISTENCE_CAP distinct probes is an explicit `refused: partial verification`, never a pass that
+    checked only some. A gh outage is `unverified:` (the caller requeues), as for visibility."""
+    asked, seen, n = {}, set(), 0
+
+    def ask(path, label):
+        if path not in asked:
+            if len(asked) >= _EXISTENCE_CAP:
+                raise _Stop(f"refused: partial verification — this prompt needs more than {_EXISTENCE_CAP} "
+                            "distinct GitHub probes to check its PR / ref links and the gate will not vouch "
+                            "for the rest. Nothing was sent. Link fewer (one tree at a commit SHA covers a "
+                            "repo) and re-fire.")
+            asked[path] = _gh_exists(path)
+        ok, detail = asked[path]
         if ok is None:
-            return (f"unverified: could not check that {label} exists ({detail.split(':', 1)[1].strip()}). "
-                    "Nothing is known about it and nothing was sent. Re-enqueue to retry.")
+            raise _Stop(f"unverified: could not check that {label} exists "
+                        f"({detail.split(':', 1)[1].strip()}). Nothing is known about it and nothing was "
+                        "sent. Re-enqueue to retry.")
+        return ok
+
+    def dead(label):
+        return _Stop(f"refused: {label} does not exist (a dead link). ChatGPT would browse to nothing or "
+                     "answer around it. Fix the reference (a commit SHA is the safest) and re-fire.")
+
+    try:
+        for link in links:
+            if not link.target:
+                continue
+            kind, arg = link.target
+            if (link.slug.lower(), kind, arg) in seen:
+                continue
+            seen.add((link.slug.lower(), kind, arg))
+            base, where = f"repos/{link.slug}", f"github.com/{link.slug}"
+            if kind == "pull":
+                label = f"PR {where}/pull/{arg}"
+                if not ask(f"{base}/pulls/{arg}", label):
+                    raise dead(label)
+            elif kind == "commit":
+                label = f"commit {arg} of {where}"
+                if not ask(f"{base}/commits/{quote(arg, safe='')}", label):
+                    raise dead(label)
+            elif kind == "compare":
+                label = f"compare {arg} of {where}"
+                if not ask(f"{base}/compare/{quote(arg, safe='')}", label):
+                    raise dead(label)
+            else:
+                label = f"{kind} {'/'.join(arg)} of {where}"
+                for k in range(1, min(len(arg), _REF_SEGMENTS) + 1):
+                    ref, path = "/".join(arg[:k]), "/".join(arg[k:])
+                    if ask(f"{base}/commits/{quote(ref, safe='')}", label) and (
+                            not path or ask(f"{base}/contents/{quote(path, safe='/')}"
+                                            f"?ref={quote(ref, safe='')}", label)):
+                        break
+                else:
+                    raise dead(label)
+            n += 1
+    except _Stop as stop:
+        return str(stop), n
+    return None, n
+
+
+# ---- workspace authority ----------------------------------------------------
+#
+# Rule 1 lets a `fire --workspace` round carry no code link, because its evidence is in a local
+# WebCodex workspace the remote model reaches through an app. That exemption is authority, so it is
+# granted by the round's structured spec and never by a sentence in the prompt: `fire` records the
+# workspace in the round (spec.consult_meta.workspace) beside its mentions, and the gate honours it
+# only when the workspace is in CGC_WORKSPACES and a mention is in CGC_APPS. The gate sees a bare
+# prompt (the daemon and the driver's send-time backstop both call validate_prompt(prompt)), so it
+# finds the round by the rid on the prompt's first line AND the sha256 of these exact bytes: a
+# prompt that merely quotes the sentinel, or another round's rid, matches no row and gets nothing.
+_HEAD_RID_RE = re.compile(r"CGC_RID:(REQ-\d{8}-\d{6}-[0-9a-f]{6})\n")
+
+
+class _RegistryUnreadable(Exception):
+    """The config file is there but could not be read just now: a transient fact, never a verdict."""
+
+
+def _registry(key: str, default: str) -> str:
+    """The value of `key` the gate acts on. When the config file exists and is readable it IS the
+    registry: a key absent from it reads as `default` (nothing registered; for CGC_APPS, the documented
+    default), whatever this process's environment remembers. The environment is consulted only when
+    there is no config file at all. A daemon loaded the file once, at import, and `load_config` fills
+    only what the environment lacks, so an environment copy goes stale the moment the user edits the
+    file; letting it outvote the file would keep a revoked workspace authorized. A file that cannot be
+    read raises _RegistryUnreadable: the question is open, not answered no."""
+    try:
+        with open(_cfg.config_path(), encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return os.environ.get(key, default)
+    except (OSError, ValueError) as e:     # unreadable, a directory, not UTF-8
+        raise _RegistryUnreadable(f"{type(e).__name__}: {e}") from e
+    for k, v in _cfg._parse(text):
+        if k == key:
+            return v
+    return default
+
+
+def workspace_refusal(workspace, mentions) -> str | None:
+    """None when (workspace, mentions) is a registered evidence channel, else why it is not. One
+    predicate for enqueue's pre-check and the gate, so the two cannot disagree on what registered
+    means (see _registry for where the lists come from). Raises _RegistryUnreadable."""
+    import consult   # the single definition of how CGC_WORKSPACES / CGC_APPS are parsed
+    if not workspace:
+        return "no --workspace is recorded for this round (only `consult.py fire` records one)"
+    known_ws = consult.known_workspaces(_registry("CGC_WORKSPACES", ""))
+    if workspace.lower() not in {w.lower() for w in known_ws}:
+        return f"workspace {workspace!r} is not in CGC_WORKSPACES"
+    apps = {x.lower() for x in consult.known_apps(_registry("CGC_APPS", consult.DEFAULT_APPS))}
+    if not any(str(m).lower() in apps for m in mentions or ()):
+        return "none of this round's --mention apps is in CGC_APPS"
     return None
+
+
+def _workspace_fix(bad: str) -> str:
+    return (f"the 'Source: local workspace' line is only text, and {bad}. A workspace source comes from "
+            "`consult.py fire --workspace NAME --mention APP` with NAME in CGC_WORKSPACES and APP in "
+            "CGC_APPS (register one with `cgc_config.py set CGC_WORKSPACES \"NAME\"`)")
+
+
+class _StoreUnreadable(Exception):
+    """The store exists but could not be read just now: a transient fact, never a verdict."""
+
+
+def _round_workspace(text: str) -> tuple:
+    """(workspace, mentions) of the stored round this exact prompt belongs to; (None, []) when there is
+    no such round (no head rid, no store file, no row for that rid AND those bytes, a spec with no
+    workspace). Raises _StoreUnreadable when the store is there but cannot be read now. A read-only
+    connection: the gate must never create, migrate or write the store."""
+    m = _HEAD_RID_RE.match(text)
+    path = _store.db_path()
+    if not m or path == ":memory:" or not os.path.exists(path):
+        return None, []
+    try:
+        db = sqlite3.connect("file:" + quote(os.path.abspath(path)) + "?mode=ro", uri=True, timeout=5)
+        try:
+            row = db.execute("SELECT spec_json FROM rounds WHERE rid=? AND prompt_sha256=?",
+                             (m.group(1), _store.sha256(text))).fetchone()
+        finally:
+            db.close()
+    except (sqlite3.Error, OSError) as e:
+        raise _StoreUnreadable(f"{type(e).__name__}: {e}") from e
+    try:
+        spec = json.loads(row[0]) if row and row[0] else {}
+    except ValueError:
+        return None, []
+    return (spec.get("consult_meta") or {}).get("workspace"), spec.get("mentions") or []
+
+
+def _workspace_verdict(text: str) -> str | None:
+    """None when this link-less prompt belongs to a stored round whose recorded workspace is
+    registered; else the gate's reason. TERMINAL (`refused:`) when no stored round records a workspace
+    for these bytes: the sentence in the text is all there is. TRANSIENT (`unverified:`, which the
+    caller requeues with backoff) when the round DOES record one but the registry or the store cannot
+    confirm it right now: that is a fact about the registry, fixable without re-firing."""
+    try:
+        workspace, mentions = _round_workspace(text)
+    except _StoreUnreadable as e:
+        return (f"unverified: the store could not be read to confirm this round's workspace ({e}). "
+                "Nothing was sent. Re-enqueue to retry.")
+    try:
+        bad = workspace_refusal(workspace, mentions)
+    except _RegistryUnreadable as e:
+        return (f"unverified: the config file that registers workspaces could not be read ({e}). "
+                "Nothing was sent. Re-enqueue to retry.")
+    if bad is None:
+        return None
+    if workspace:
+        return (f"unverified: this round records workspace {workspace!r}, but {bad}. Nothing was sent; "
+                "the round retries, so register it (`cgc_config.py set CGC_WORKSPACES \"NAME\"`) or cancel it.")
+    return ("refused: no public code link (github/gist/raw URL) in the prompt — " + _workspace_fix(bad))
 
 
 def validate_prompt(prompt_text: str) -> tuple:
     """The egress gate. Returns (ok: bool, reason: str). ok means: it is safe to send this prompt to
     the external ChatGPT session. Rules, all fail-closed:
       1. Must contain at least one real public-code link (github/gist/raw), UNLESS it is a follow-up
-         (the thread already holds the code) or a declared no-code consult — `prep --no-code`, for a
-         maths/research/writing question, renders "references no code" — or a `fire --workspace`
-         question, whose evidence is in a local WebCodex workspace, renders "Source: local
-         workspace `NAME`". Rules 2-4 still apply to all of them. Note what this rule is and isn't: it stops a *code* consult from going out as blind
-         prose, which is a quality guard; the security guarantees are rules 2-4 (nothing private,
-         nothing secret), and they are untouched by the exemption.
-      2. Every github/raw repo slug in the prompt must be a gh-confirmed PUBLIC repo. Any private /
+         (the thread already holds the code), a declared no-code consult (`prep --no-code` renders
+         "references no code"), or a `fire --workspace` round whose evidence is in a registered local
+         WebCodex workspace. The first two are declared in the prompt text. The third is NOT: the
+         "Source: local workspace" line alone exempts nothing; the stored round must register the
+         workspace and a mention (see workspace_refusal). This rule is a quality guard against blind
+         prose about code; the security guarantees are rules 2-4, untouched by any exemption.
+      2. Every github/raw repo a link reaches must be a gh-confirmed PUBLIC repo. Any private /
          unknown / unverifiable repo -> refuse. This is the independent re-check that makes the
-         daemon a real gate rather than a blind relay of whatever the agent enqueued.
+         daemon a real gate rather than a blind relay of whatever the agent enqueued. The link is
+         judged as a browser would request it (see "the URL law"): userinfo, a port, an escape, a
+         `.`/`..` segment, a non-https scheme are refused, never normalized and accepted.
       3. gist links are refused unless CGC_GATE_ALLOW_GIST=1 (the gate cannot cheaply prove a gist
          is public, and a secret gist is world-readable-by-URL exfiltration).
       4. No obvious secret (see _SECRET_RES) may appear anywhere in the prompt.
@@ -640,23 +1133,40 @@ def validate_prompt(prompt_text: str) -> tuple:
         if rx.search(text):
             return False, f"refused: prompt contains what looks like a {label} — will not send it to an external service"
 
-    links = _CODE_URL_RE.findall(text)
-    if (not links and not is_followup and "references no code" not in low
-            and _WORKSPACE_SENTINEL not in low):
-        return False, "refused: no public code link (github/gist/raw URL) in the prompt — nothing safe to send"
-
-    # 3. gists
-    if _GIST_RE.search(text) and os.environ.get("CGC_GATE_ALLOW_GIST", "0").strip().lower() in ("0", "false", "no", "off", ""):
-        return False, "refused: prompt contains a gist link and CGC_GATE_ALLOW_GIST is off — the gate cannot verify a gist is public"
-
-    # 2. every recognized code URL must classify to a repo slug (fail closed on any that doesn't),
-    #    and every slug must be gh-confirmed public.
-    slugs, refuse = _classify_code_urls(text)
+    # The URL law: one parse of every GitHub link, refusing any that is not written plainly.
+    links, refuse = _parse_code_urls(text)
     if refuse:
         return False, refuse
+
+    if not links and not is_followup and "references no code" not in low:
+        if _WORKSPACE_SENTINEL not in low:
+            return False, "refused: no public code link (github/gist/raw URL) in the prompt — nothing safe to send"
+        verdict = _workspace_verdict(text)
+        if verdict:
+            return False, verdict
+
+    # 3. gists. The opt-in is honoured only when it is affirmatively set: any other value (a typo,
+    #    "disabled", "none") leaves it off, because a switch that opens on junk is not an opt-in.
+    if any(link.host == "gist" for link in links) and not _gist_opt_in():
+        return False, "refused: prompt contains a gist link and CGC_GATE_ALLOW_GIST is not set to 1 — the gate cannot verify a gist is public"
+
+    # 2. every repo the links reach must be gh-confirmed public (or named by the operator).
+    slugs = {link.slug for link in links if link.slug}
     allowed = _private_allowlist()
+    probed = {}
+
+    def vis(slug):      # one gh question per repo, whichever rule asks it
+        if slug not in probed:
+            probed[slug] = _repo_is_public(slug)
+        return probed[slug]
+    alts_of = {}
+    for link in links:
+        if link.slug and link.alts:
+            alts_of.setdefault(link.slug, set()).update(link.alts)
     for slug in sorted(slugs):
-        ok, detail = _repo_is_public(slug)
+        ok, detail = vis(slug)
+        if not ok and detail.startswith(_INVISIBLE) and any(vis(a)[0] for a in alts_of.get(slug, ())):
+            continue    # `widgets` does not exist but `widgets.` is public: the link names the dotted repo
         if not ok and ("*" in allowed or slug.lower() in allowed):
             # Declared sendable by the user. Still fail closed on a repo gh could not resolve AT
             # ALL — an allowlist entry says "this repo of mine may go", not "skip the check".
@@ -672,13 +1182,31 @@ def validate_prompt(prompt_text: str) -> tuple:
                                f"Re-enqueue to retry.")
             return False, f"refused: repo {slug} is not confirmed PUBLIC ({detail}) — will not send its link to an external service"
 
+    # 2b. a final period that may be part of a repo name: `owner/name.` is probed once. A 404 (no such
+    #     repo, to this token) means the period was punctuation; public passes; anything else that
+    #     exists must be named by the operator, like any other non-public repo.
+    for alt in sorted({a for link in links for a in link.alts}):
+        ok, detail = vis(alt)
+        if ok or detail.startswith(_INVISIBLE):
+            continue
+        if detail.startswith("unverified:"):
+            return False, (f"unverified: a link ends in a period that may be part of the repo name {alt}, "
+                           f"and gh could not say whether that repo exists ({detail.split(':', 1)[1].strip()}). "
+                           "Nothing was sent. Re-enqueue to retry.")
+        if "*" in allowed or alt.lower() in allowed:
+            continue
+        return False, (f"refused: a link ends in a period that may be part of the repo name {alt}, which "
+                       f"exists and is not confirmed PUBLIC ({detail}). Put the link in <angle brackets> or "
+                       "end the sentence before it")
+
     # 5. dead references: a typo'd PR number or nonexistent ref would otherwise fail 25 minutes
     #    later at ChatGPT (or be silently answered around). The gate has gh anyway — check now.
-    dead = _verify_refs_exist(text, slugs)
+    dead, n_refs = _verify_refs_exist(links)
     if dead:
         return False, dead
 
-    return True, f"ok: {len(slugs)} public repo(s), refs exist, no secrets detected"
+    return True, (f"ok: {len(slugs)} public repo(s), {n_refs} PR/ref link(s) verified to exist, "
+                  "no recognized secret shape (free text is not vouched for)")
 
 
 # ---- CLI: enqueue -----------------------------------------------------------
@@ -758,12 +1286,26 @@ def cmd_enqueue(a) -> int:
                              "as its source, but the round has no --mention to reach it. Use "
                              "`consult.py fire --workspace NAME --mention APP`.\n")
             return 2
-        if (not _CODE_URL_RE.search(prompt) and not is_followup and "references no code" not in low
-                and _WORKSPACE_SENTINEL not in low):
-            sys.stderr.write("CGC_ERROR no_code_source: prompt has no public code link — deliver "
-                             "a link first, render a no-code question with `prep --no-code`, or name "
-                             "a local workspace with `fire --workspace NAME --mention APP`.\n")
+        links, refuse = _parse_code_urls(prompt)
+        if refuse:
+            sys.stderr.write(f"CGC_ERROR gate_refused: {refuse}. NOT enqueuing.\n")
             return 2
+        if (not links and not is_followup and "references no code" not in low):
+            if _WORKSPACE_SENTINEL not in low:
+                sys.stderr.write("CGC_ERROR no_code_source: prompt has no public code link — deliver "
+                                 "a link first, render a no-code question with `prep --no-code`, or name "
+                                 "a local workspace with `fire --workspace NAME --mention APP`.\n")
+                return 2
+            # The same authority test the daemon's gate applies, from the same inputs: the workspace
+            # `fire` recorded for this round, not the sentence in the text.
+            try:
+                bad = workspace_refusal((getattr(a, "consult_meta", None) or {}).get("workspace"),
+                                        getattr(a, "mentions", None))
+            except _RegistryUnreadable as e:
+                bad = f"the config file that registers workspaces could not be read ({e})"
+            if bad:
+                sys.stderr.write(f"CGC_ERROR no_code_source: {_workspace_fix(bad)}. Nothing was queued.\n")
+                return 2
     return cgc_backend.enqueue_round(a, prompt, os.path.abspath(out))
 
 

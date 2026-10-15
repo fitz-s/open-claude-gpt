@@ -143,12 +143,13 @@ Role: {role}
 
 
 # `fire --workspace NAME` declares that this question's evidence lives in a local WebCodex workspace,
-# reached through the --mention'd app. This is the sentence prep renders for it, and its opening is
-# the phrase every source gate keys on (compared lowercased) to accept a prompt that names a
-# workspace in place of a code link: cgc_spool.validate_prompt + cmd_enqueue, and
-# cdp_consult._has_sendable_source. It carries no URL, so every secret-shape and URL-provenance rule
-# still runs over the prompt unchanged. No "@" in the text: a literal @ pasted into the composer
-# could open the mention popup mid-paste; the app is attached by the driver, not by this prose.
+# reached through the --mention'd app. This is the sentence prep renders for it, so the model knows
+# where to look. It is a label, not authority: the public-source exemption is granted by the round's
+# recorded spec (consult_meta.workspace, set in cmd_fire) against CGC_WORKSPACES / CGC_APPS, and
+# cgc_spool.validate_prompt / cmd_enqueue use the phrase only to recognize a prompt that CLAIMS a
+# workspace. It carries no URL, so every secret-shape and URL-provenance rule still runs over the
+# prompt unchanged. No "@" in the text: a literal @ pasted into the composer could open the mention
+# popup mid-paste; the app is attached by the driver, not by this prose.
 WORKSPACE_SENTINEL = "Source: local workspace `"
 
 FOLLOWUP_TEMPLATE = RID_MARKER + """# {title}
@@ -834,6 +835,11 @@ def cmd_fire(a: argparse.Namespace) -> int:
     meta["policy_rev"] = policy_rev()
 
     workspace = getattr(a, "workspace", None)
+    if workspace:
+        # The round's structured source declaration. The gate exempts a link-less prompt from the
+        # public-source rule on THIS (checked against CGC_WORKSPACES / CGC_APPS), never on the
+        # "Source: local workspace" sentence prep renders for the model's benefit.
+        meta["workspace"] = workspace
     if workspace and not getattr(a, "mention", None):
         sys.stderr.write(
             "CGC_ERROR workspace_needs_mention: --workspace names where the evidence lives, but the "
@@ -925,10 +931,11 @@ _MARKER_NAME_WHY = ("an app name may not contain 'CGC_RID': the label is pasted 
                     "would put a foreign rid marker first, so the turn would read as another request")
 
 
-def known_apps() -> list:
+def known_apps(raw: str | None = None) -> list:
     """The ChatGPT apps this user has told us about (CGC_APPS, comma-separated) — the list an agent
-    reads with `consult.py apps` instead of reasoning about what exists."""
-    raw = os.environ.get("CGC_APPS", DEFAULT_APPS)
+    reads with `consult.py apps` instead of reasoning about what exists. `raw` is a caller-supplied
+    value (the gate passes the config file's current one) in place of this process's environment."""
+    raw = os.environ.get("CGC_APPS", DEFAULT_APPS) if raw is None else raw
     return [x for x in (" ".join(p.split()).lstrip("@").strip() for p in raw.split(",")) if x and not _MARKER_NAME_RE.search(x)]
 
 
@@ -947,11 +954,11 @@ def _mention_name(v: str) -> str:
     return exact[0] if exact else (pref[0] if len(pref) == 1 else v)
 
 
-def known_workspaces() -> list:
+def known_workspaces(raw: str | None = None) -> list:
     """The local WebCodex workspaces the user registered (CGC_WORKSPACES, comma-separated, default
     none) — read like CGC_APPS. An agent cannot see that registry, so this list is how it knows
     when the --workspace route applies."""
-    raw = os.environ.get("CGC_WORKSPACES", "")
+    raw = os.environ.get("CGC_WORKSPACES", "") if raw is None else raw
     return [x for x in (" ".join(p.split()) for p in raw.split(",")) if x]
 
 
@@ -1083,7 +1090,9 @@ def main() -> int:
                     help="the evidence for this question lives in a local WebCodex workspace of this "
                          "name (see `consult.py apps`), reached through --mention. It stands in for the "
                          "code link the source rule demands, so the round no longer has to claim "
-                         "--no-code; REQUIRES at least one --mention. Every secret and URL gate still runs.")
+                         "--no-code; REQUIRES at least one --mention, and both must be registered by "
+                         "the user (CGC_WORKSPACES, CGC_APPS) or the round is refused. Every secret "
+                         "and URL gate still runs.")
     pf.add_argument("--origin", choices=("agent", "user"),
                     help="who decided to fire this: the agent on its own initiative, or the user asked")
     pf.add_argument("--trigger", choices=("premise-conflict", "workspace-evidence", "design-fork",

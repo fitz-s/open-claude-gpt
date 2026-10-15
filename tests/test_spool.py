@@ -41,9 +41,11 @@ def _rid(suffix="000001"):
     return f"REQ-20260707-120000-{suffix}"
 
 
-def _sendable(rid, body="please review https://github.com/acme/widgets"):
+def _sendable(rid, body="please review https://github.com/acme/widgets/"):
     """What `prep` renders for a round: the head marker first, the body, the sentinel pair last. enqueue
-    refuses a prompt whose turn would not parse as its own rid, so a fixture needs the real shape."""
+    refuses a prompt whose turn would not parse as its own rid, so a fixture needs the real shape. The
+    link ends in `/`: deliver never emits a bare repo link, and one that ends a line would be refused
+    (a parser joins the next line onto it)."""
     return f"CGC_RID:{rid}\n{body}\nBEGIN_RESPONSE:{rid}\n<full answer>\nEND_RESPONSE:{rid}\n"
 
 
@@ -522,7 +524,8 @@ def test_enqueue_reads_the_rid_from_the_prompt_when_none_is_passed(spool, tmp_pa
     import argparse
     rid = _rid("bb0001")
     pf = tmp_path / "p.md"
-    pf.write_text(f"review https://github.com/acme/widgets\n\nBEGIN_RESPONSE:{rid}\n...\nEND_RESPONSE:{rid}\n")
+    # the link ends in "/": a bare repo link directly before a line would read as part of the repo name
+    pf.write_text(f"review https://github.com/acme/widgets/\n\nBEGIN_RESPONSE:{rid}\n...\nEND_RESPONSE:{rid}\n")
     a = _enqueue_args(rid, str(pf))
     a.rid = None
     assert spool.cmd_enqueue(a) == 0
@@ -653,3 +656,1005 @@ def test_cmd_reconcile_unknown_rid_exits_nonzero_not_a_traceback(spool, capsys):
         _rid("rc9999"), not_sent=True, evidence="checked, nothing there"))
     assert code == 2
     assert "CGC_ERROR" in capsys.readouterr().err
+
+
+# ---- reference checks: every ref, slash refs whole, partial verification is a refusal -----------
+#
+# The gate used to stop after eight probes (in hash order, so WHICH eight varied by run) and cut
+# every tree/blob ref at its first '/', so branch `feat/x` was checked as `feat`. A dead link past the
+# eighth, or behind a slash, went out as "refs exist".
+
+def _probe_log(spool, monkeypatch, dead=(), known_refs=None, paths=None):
+    """Stub _gh_exists with a recording fake. `dead` are path suffixes that 404. `known_refs`, when
+    given, are the only commit refs that exist; `paths`, when given, are the only file paths that exist
+    under any ref (default: every path exists), so a mis-split ref or a missing file resolves to nothing."""
+    asked = []
+
+    def fake(path):
+        asked.append(path)
+        if any(path.endswith(d) for d in dead):
+            return False, "404"
+        if known_refs is not None and "/commits/" in path:
+            ref = path.split("/commits/", 1)[1].replace("%2F", "/")
+            return (True, "exists") if ref in known_refs else (False, "422")
+        if paths is not None and "/contents/" in path:
+            sub = path.split("/contents/", 1)[1].split("?", 1)[0]
+            return (True, "exists") if sub in paths else (False, "404")
+        return True, "exists"
+    monkeypatch.setattr(spool, "_gh_exists", fake)
+    return asked
+
+
+def test_every_ref_is_checked_not_just_the_first_eight(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch, dead=("/pulls/12",))
+    links = " ".join(f"https://github.com/acme/widgets/pull/{i}" for i in range(1, 13))
+    ok, why = spool.validate_prompt("review " + links)
+    assert not ok and "pull/12" in why and "does not exist" in why
+    assert sorted(int(p.rsplit("/", 1)[1]) for p in asked) == list(range(1, 13)), \
+        "all twelve PRs were probed, none skipped"
+
+
+def test_a_dead_ref_is_found_wherever_it_sits(spool, monkeypatch):
+    for dead in range(1, 11):    # whichever position holds the dead one
+        _probe_log(spool, monkeypatch, dead=(f"/pulls/{dead}",))
+        links = " ".join(f"https://github.com/acme/widgets/pull/{i}" for i in range(1, 11))
+        ok, why = spool.validate_prompt("review " + links)
+        assert not ok and f"pull/{dead} " in why + " ", (dead, why)
+
+
+def test_a_slash_branch_resolves_as_one_ref(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch, known_refs={"feat/x"}, paths={"src/app.py"})
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/tree/feat/x/src/app.py")
+    assert ok, why
+    assert "repos/acme/widgets/commits/feat%2Fx" in asked, "feat/x was asked for as ONE encoded ref"
+    assert "repos/acme/widgets/contents/src/app.py?ref=feat%2Fx" in asked
+
+
+def test_a_dead_slash_branch_is_refused_not_skipped(spool, monkeypatch):
+    _probe_log(spool, monkeypatch, known_refs=set())
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/tree/feat/gone")
+    assert not ok and "does not exist" in why
+
+
+def test_a_commit_sha_tree_link_is_one_commit_probe_plus_its_path(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/tree/0123abc456/src/a/b")
+    assert ok, why
+    assert asked == ["repos/acme/widgets/commits/0123abc456",
+                     "repos/acme/widgets/contents/src/a/b?ref=0123abc456"], asked
+
+
+def test_a_missing_path_under_a_real_ref_is_a_dead_link(spool, monkeypatch):
+    """`/blob/main/nonexistent.py` must not verify as plain `main`."""
+    _probe_log(spool, monkeypatch, known_refs={"main"}, paths={"src/app.py"})
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/blob/main/src/app.py")
+    assert ok, why
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/blob/main/nonexistent.py")
+    assert not ok and "does not exist" in why
+
+
+def test_commit_main_nonexistent_is_not_the_commit_main(spool, monkeypatch):
+    """/commit/<x> is exactly one ref: the extra segment is refused, not silently dropped."""
+    asked = _probe_log(spool, monkeypatch, known_refs={"main"})
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/commit/main/nonexistent")
+    assert not ok and "commit link" in why and asked == []
+
+
+def test_a_percent_escape_in_a_path_is_refused_not_decoded(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch, known_refs={"feat/x"})
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/tree/feat%2Fx")
+    assert not ok and "escaped `/`" in why and asked == [], "write feat/x plainly, or use a SHA"
+
+
+def test_dotdot_in_a_ref_never_reaches_the_api_path(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    spool.validate_prompt("review https://github.com/acme/widgets/tree/a/../../../../user")
+    assert not any(".." in p for p in asked), asked
+
+
+def test_more_refs_than_the_cap_is_an_explicit_partial_verification_refusal(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    n = spool._EXISTENCE_CAP + 1
+    links = " ".join(f"https://github.com/acme/widgets/pull/{i}" for i in range(1, n + 1))
+    ok, why = spool.validate_prompt("review " + links)
+    assert not ok and why.startswith("refused:") and "partial verification" in why
+    assert "ok:" not in why and len(asked) == spool._EXISTENCE_CAP, \
+        "never a success message that claims refs exist when some were not checked"
+
+
+def test_exactly_the_cap_is_verified_in_full(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    links = " ".join(f"https://github.com/acme/widgets/pull/{i}" for i in range(1, spool._EXISTENCE_CAP + 1))
+    ok, why = spool.validate_prompt("review " + links)
+    assert ok, why
+    assert len(asked) == spool._EXISTENCE_CAP and f"{spool._EXISTENCE_CAP} PR/ref link(s) verified" in why
+
+
+def test_the_success_message_counts_what_it_verified_and_disclaims_free_text(spool, monkeypatch):
+    _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets/pull/1 and "
+                                    "https://github.com/acme/widgets/tree/abc1234")
+    assert ok and "2 PR/ref link(s) verified" in why and "free text is not vouched for" in why
+    ok, why = spool.validate_prompt("review https://github.com/acme/widgets")
+    assert ok and "0 PR/ref link(s) verified" in why, "a bare repo link claims no ref check"
+
+
+_REAL_GH_EXISTS = _load()._gh_exists
+
+
+def test_an_unresolvable_ref_is_a_dead_link_not_a_gh_outage(spool, monkeypatch):
+    """The commits API answers a ref it cannot resolve with 422 'No commit found', not 404. That is
+    gh answering, so it must read as a dead link — an `unverified:` requeue would retry it forever."""
+    class _R:
+        returncode = 1
+        stdout = ""
+        stderr = "gh: No commit found for SHA: deadbeef00 (HTTP 422)"
+    monkeypatch.setattr(spool, "_gh_exists", _REAL_GH_EXISTS)
+    calls = []
+    monkeypatch.setattr(spool.subprocess, "run", lambda *a, **k: calls.append(1) or _R())
+    assert spool._gh_exists("repos/acme/widgets/commits/deadbeef00") == (False, "422")
+    assert len(calls) == 1, "an answer is not retried"
+
+
+# ---- opt-ins are honoured only when affirmatively set -------------------------------------------
+
+@pytest.mark.parametrize("val", ["", "0", "off", "no", "false", "disabled", "none", "maybe", " "])
+def test_gist_stays_refused_unless_the_opt_in_is_affirmative(spool, monkeypatch, val):
+    monkeypatch.setenv("CGC_GATE_ALLOW_GIST", val)
+    ok, why = spool.validate_prompt("see https://gist.github.com/someuser/abc123")
+    assert not ok and "gist" in why
+
+
+@pytest.mark.parametrize("val", ["1", "true", "YES", " on "])
+def test_gist_opt_in_values_that_mean_yes(spool, monkeypatch, val):
+    monkeypatch.setenv("CGC_GATE_ALLOW_GIST", val)
+    assert spool.validate_prompt("see https://gist.github.com/someuser/abc123")[0]
+
+
+def test_the_raw_gist_host_is_a_gist(spool, monkeypatch):
+    monkeypatch.delenv("CGC_GATE_ALLOW_GIST", raising=False)
+    ok, why = spool.validate_prompt("see https://github.com/acme/widgets and "
+                                    "https://gist.githubusercontent.com/u/abc/raw/f.py")
+    assert not ok and "gist" in why
+
+
+def test_a_plaintext_github_link_is_refused_not_silently_skipped(spool):
+    ok, why = spool.validate_prompt("see https://github.com/acme/widgets and http://github.com/acme/private")
+    assert not ok and "http://" in why
+
+
+@pytest.mark.parametrize("val", ["", " ", " , ", ",,"])
+def test_an_empty_private_allowlist_allows_nothing(spool, monkeypatch, val):
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", val)
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (False, "visibility=private"))
+    ok, why = spool.validate_prompt(_PRIV)
+    assert not ok and "not confirmed PUBLIC" in why
+
+
+def test_an_allowlisted_repo_still_gets_its_refs_checked(spool, monkeypatch):
+    """Allowlisting admits a private repo; it does not make a dead ref on it acceptable."""
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", "acme/secret-thing")
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (False, "visibility=private"))
+    _probe_log(spool, monkeypatch, known_refs=set())
+    ok, why = spool.validate_prompt("review https://github.com/acme/secret-thing/tree/main")
+    assert not ok and "does not exist" in why
+
+
+# ---- the URL law: the gate judges the URL a browser will request ---------------------------------
+#
+# Reviewer repros against live main. Each used to return `ok` while the link reached a repo (or a PR,
+# or a ref) the gate never looked at. Every one is refused, and refused BEFORE any gh call, so none
+# can leak a probe about a repo the visibility pass did not admit.
+
+_OWN = "https://github.com/acme/widgets"
+
+_LAW_REFUSED = [
+    ("traversal", f"review {_OWN}/tree/main/../../../../private-owner/private-repo", "`.` or `..`"),
+    ("dot segment", f"review {_OWN}/tree/main/./src", "`.` or `..`"),
+    ("encoded owner PR", "review https://github.com/%66itz-s/widgets/pull/999999999", "not plain"),
+    ("encoded repo", f"review https://github.com/acme/wid%67ets/pull/1", "not plain"),
+    ("encoded dots", f"review {_OWN}/tree/main%2E%2E", "ending in `.`"),
+    ("encoded page kind", f"review {_OWN}/%70ull/1", "page kind"),
+    ("userinfo", "references no code\nhttps://x@github.com/acme/private", "userinfo"),
+    ("userinfo http", "references no code\nhttp://x@github.com/acme/private", "non-https"),
+    ("explicit https port", "references no code\nhttps://github.com:443/acme/private", "userinfo, a port"),
+    ("explicit http port", "references no code\nhttp://github.com:80/acme/private", "non-https"),
+    ("http", "references no code\nhttp://github.com/acme/private", "non-https"),
+    ("trailing-dot host", "references no code\nhttps://github.com./acme/private", "trailing dot"),
+    ("fullwidth host", "references no code\nhttps://ｇithub.com/acme/private", "non-ASCII"),
+    ("ideographic-dot host", "references no code\nhttps://github。com/acme/private", "non-ASCII"),
+    ("percent host", "references no code\nhttps://%67ithub.com/acme/private", "an escape"),
+    ("backslash", "references no code\nhttps://github.com\\acme/private", "backslash"),
+    ("one slash", "references no code\nhttps:/github.com/acme/private", "malformed scheme"),
+    ("no slashes", "references no code\nhttps:github.com/acme/private", "malformed scheme"),
+    ("three slashes", "references no code\nhttps:///github.com/acme/private", "malformed scheme"),
+    ("empty segment", f"review {_OWN}//tree/main", "empty path segment"),
+    ("main..", f"review {_OWN}/tree/main..", "ending in `.`"),
+    ("commit main..", f"review {_OWN}/commit/main..", "ending in `.`"),
+    ("commit with a path", f"review {_OWN}/commit/main/nonexistent", "commit link"),
+    ("gist userinfo", "references no code\nhttps://x@gist.github.com/u/abc", "userinfo"),
+    ("bad owner char", "references no code\nhttps://github.com/ac_me/widgets", "owner/repo"),
+    ("owner only", "references no code\nhttps://github.com/acme", "owner/repo"),
+    ("unverifiable raw", "references no code\nhttps://raw.githubusercontent.com/onlyowner", "owner/repo"),
+    ("compare, two dots", f"review {_OWN}/compare/a..b", "three dots"),
+]
+
+
+@pytest.mark.parametrize("name,prompt,why_has", _LAW_REFUSED, ids=[c[0] for c in _LAW_REFUSED])
+def test_the_url_law_refuses_and_probes_nothing(spool, monkeypatch, name, prompt, why_has):
+    probes = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (probes.append(("vis", s)) or (True, "stub")))
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (probes.append(("ex", p)) or (True, "exists")))
+    ok, why = spool.validate_prompt(prompt)
+    assert not ok and why.startswith("refused:") and why_has in why, why
+    assert probes == [], "refused at the parse, before any gh call"
+
+
+def test_the_traversal_repro_never_reaches_a_repo_the_gate_did_not_vet(spool, monkeypatch):
+    """The exact live-main repro: public acme/widgets verified, a browser lands on private-owner/*."""
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (s == "acme/widgets", "stub")))
+    ok, why = spool.validate_prompt(f"review {_OWN}/tree/main/../../../../private-owner/private-repo")
+    assert not ok and seen == []
+
+
+def test_non_github_links_are_not_the_gates_business(spool, monkeypatch):
+    probes = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (probes.append(s) or (True, "stub")))
+    ok, why = spool.validate_prompt(
+        "references no code\nsee https://arxiv.org/abs/2401.00001 and http://example.com/x?u=https://evil/"
+        " and https://github.com.evil.example/acme/private and https://notgithub.com/a/b")
+    assert ok and probes == []
+
+
+@pytest.mark.parametrize("prompt", [
+    f"review ({_OWN}/pull/12).", f"review {_OWN}/pull/12, then {_OWN}/pull/13.", f"<{_OWN}/pull/12>",
+    f'"{_OWN}/pull/12"', f"[x]({_OWN}/pull/12)", f"see {_OWN}.", f"see {_OWN}/", f"see {_OWN}/tree/main/",
+    f"see {_OWN}?tab=readme", f"see {_OWN}/pull/12#issuecomment-1", f"see {_OWN}/tree/main?plain=1",
+    "see https://github.com/acme/widgets/pull/12/files", "see https://www.github.com/acme/widgets",
+    "see https://GitHub.COM/acme/widgets", f"see {_OWN} and https://github.com/topics and https://github.com/orgs",
+])
+def test_ordinary_ways_of_writing_a_link_still_pass(spool, monkeypatch, prompt):
+    _probe_log(spool, monkeypatch, known_refs={"main"})
+    ok, why = spool.validate_prompt(prompt)
+    assert ok, (prompt, why)
+
+
+def test_markdown_and_prose_wrapping_does_not_hide_a_bad_link(spool):
+    ok, why = spool.validate_prompt("see ([the diff](https://x@github.com/acme/private)).")
+    assert not ok and "userinfo" in why
+
+
+def test_a_pr_number_is_canonical_so_padding_cannot_multiply_probes(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(
+        "review " + " ".join(f"{_OWN}/pull/{'0' * k}12" for k in range(0, 40)))
+    assert ok and asked == ["repos/acme/widgets/pulls/12"], (why, asked)
+
+
+def test_more_distinct_prs_than_the_cap_is_a_partial_verification_refusal(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    n = spool._EXISTENCE_CAP + 1
+    ok, why = spool.validate_prompt("review " + " ".join(f"{_OWN}/pull/{i}" for i in range(1, n + 1)))
+    assert not ok and "partial verification" in why and len(asked) == spool._EXISTENCE_CAP
+
+
+def test_thirty_three_encoded_prs_are_refused_by_the_parse_not_skipped(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    prompt = "review " + " ".join(f"https://github.com/%61cme/widgets/pull/{i}" for i in range(1, 34))
+    ok, why = spool.validate_prompt(prompt)
+    assert not ok and "not plain" in why and asked == []
+
+
+def test_a_compare_link_is_checked_as_one_range(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(f"review {_OWN}/compare/abc1234...def5678")
+    assert ok and asked == ["repos/acme/widgets/compare/abc1234...def5678"], (why, asked)
+    _probe_log(spool, monkeypatch, dead=("/compare/abc1234...def5678",))
+    ok, why = spool.validate_prompt(f"review {_OWN}/compare/abc1234...def5678")
+    assert not ok and "does not exist" in why
+
+
+def test_a_raw_link_has_its_ref_and_path_checked(spool, monkeypatch):
+    _probe_log(spool, monkeypatch, known_refs={"main"}, paths={"src/app.py"})
+    assert spool.validate_prompt("review https://raw.githubusercontent.com/acme/widgets/main/src/app.py")[0]
+    ok, why = spool.validate_prompt("review https://raw.githubusercontent.com/acme/widgets/main/gone.py")
+    assert not ok and "does not exist" in why
+
+
+def test_visibility_and_existence_judge_the_same_spelling_of_the_repo(spool, monkeypatch):
+    """One parse feeds both: the slug the visibility check saw is the slug every probe path carries."""
+    vis, asked = [], _probe_log(spool, monkeypatch, known_refs={"main"})
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (vis.append(s) or (True, "stub")))
+    ok, why = spool.validate_prompt(
+        "review https://GitHub.com/Acme/Widgets/pull/3 and https://www.github.com/acme/widgets/tree/main")
+    assert ok, why
+    assert {v.lower() for v in vis} == {"acme/widgets"}
+    assert all(p.lower().startswith("repos/acme/widgets/") for p in asked), asked
+
+
+def test_a_github_site_page_is_not_a_code_source(spool):
+    """github.com/topics, /orgs, /marketplace... used to count as "a code link" for rule 1 while verifying
+    zero repos, so a prompt could pass on one. They are pages of the site, not code: no link."""
+    ok, why = spool.validate_prompt("review https://github.com/topics and https://github.com/orgs/acme/people")
+    assert not ok and "no public code link" in why
+
+
+def test_a_ref_is_never_truncated_at_a_plus_or_other_url_character(spool, monkeypatch):
+    """`tree/main+dead` used to be cut at `+` and verified as `main`."""
+    asked = _probe_log(spool, monkeypatch, known_refs={"main"})
+    ok, why = spool.validate_prompt(f"review {_OWN}/tree/main+dead")
+    assert not ok and "does not exist" in why
+    assert "repos/acme/widgets/commits/main%2Bdead" in asked
+
+
+def test_a_blob_the_contents_api_calls_too_large_still_proves_the_path_exists(spool, monkeypatch):
+    class _R:
+        returncode = 1
+        stdout = ""
+        stderr = "gh: This API returns blobs up to 1 MB in size. The requested blob is too large to fetch via the API (HTTP 403)"
+    monkeypatch.setattr(spool, "_gh_exists", _REAL_GH_EXISTS)
+    monkeypatch.setattr(spool.subprocess, "run", lambda *a, **k: _R())
+    assert spool._gh_exists("repos/acme/widgets/contents/big.bin?ref=main") == (True, "exists")
+
+
+# ---- E1: the gate's token contains every URL a parser would read ---------------------------------
+#
+# The tokenizer used to stop at `'`, so `https://github.com/cli/cli/'/../../../private-owner/repo`
+# was judged as `https://github.com/cli/cli/`, while a browser requests /private-owner/repo. It also
+# ignored that a browser drops TAB, CR and LF from inside a URL.
+
+_E1_REFUSED = [
+    ("quote in path", f"<{_OWN}/'/../../../private-owner/private-repo>", "`.` or `..`"),
+    ("double quote in path", f'{_OWN}/"/../../../private-owner/private-repo', "`.` or `..`"),
+    ("paren in path", f"{_OWN}/(/../../../private-owner/private-repo", "`.` or `..`"),
+    ("star in path", f"{_OWN}/*/../../../private-owner/private-repo", "`.` or `..`"),
+    ("bang in path", f"{_OWN}/!/../../../private-owner/private-repo", "`.` or `..`"),
+    ("tab then dots", f"{_OWN}/tree/main/\t../../../private-owner/private-repo", "TAB or bare CR"),
+    ("tab inside the host", "https://git\thub.com/private-owner/private-repo", "TAB or bare CR"),
+    ("tab before the path", "https://github.com\t/private-owner/private-repo", "TAB or bare CR"),
+    ("bare CR then dots", f"{_OWN}/tree/main/\r../../../private-owner/private-repo", "TAB or bare CR"),
+    ("quote then tab", f"{_OWN}/'\t/../../private-owner/private-repo", "TAB or bare CR"),
+    ("LF then dots", f"{_OWN}/tree/main/\n../../../private-owner/private-repo", "line break"),
+    ("CRLF then dots", f"{_OWN}/tree/main/\r\n../../../private-owner/private-repo", "line break"),
+    ("two LFs then dots", f"{_OWN}/tree/main/\n\n../../../private-owner/private-repo", "line break"),
+    ("LF then escape", f"{_OWN}/tree/main/\n%2e%2e/%2e%2e/private-owner/private-repo", "line break"),
+    ("LF then backslash", f"{_OWN}/tree/main/\n..\\..\\private-owner/private-repo", "line break"),
+    ("chained gaps", f"{_OWN}/tree/main/\n.\n./../private-owner/private-repo", "line break"),
+]
+
+
+@pytest.mark.parametrize("name,link,why_has", _E1_REFUSED, ids=[c[0] for c in _E1_REFUSED])
+def test_e1_a_link_a_parser_would_read_differently_is_refused_before_any_probe(spool, monkeypatch, name, link, why_has):
+    probes = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (probes.append(("vis", s)) or (True, "stub")))
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (probes.append(("ex", p)) or (True, "exists")))
+    ok, why = spool.validate_prompt("review " + link)
+    assert not ok and why.startswith("refused:") and why_has in why, why
+    assert probes == [], "the whole URL was judged, so nothing was probed on a half-read link"
+
+
+@pytest.mark.parametrize("name,prompt", [
+    ("pr link, line, word", f"see {_OWN}/pull/1\nthen explain"),
+    ("repo link, space, line, word", f"see {_OWN} \nthen explain"),
+    ("repo link, slash, line, word", f"see {_OWN}/\nthen explain"),
+    ("repo link, slash, blank line, word", f"see {_OWN}/\n\nthen explain"),
+    ("repo link, space, blank line, word", f"see {_OWN} \n\nthen explain"),
+    ("pr link, blank line, word", f"see {_OWN}/pull/1\n\nthen explain"),
+    ("two urls, two lines", f"{_OWN}/pull/1\n{_OWN}/pull/2"),
+    ("crlf then word", f"see {_OWN}/pull/1\r\nnext"),
+    ("lf, header", f"see {_OWN}/pull/1\n\n# Header"),
+    ("lf, bullet", f"see {_OWN}/pull/1\n- b"),
+    ("lf, indented", f"see {_OWN}/pull/1\n   more"),
+    ("lf, tab-indented", f"see {_OWN}/pull/1\n\tmore"),
+    ("space, tab", f"see {_OWN}/pull/1 \tmore"),
+    ("tab-indented bullets", f"\t- {_OWN}/pull/1\n\t- {_OWN}/pull/2"),
+    ("wrapped in quotes", f"'{_OWN}/pull/1' and \"{_OWN}/pull/2\" and `{_OWN}/pull/3`"),
+    ("wrapped in markdown", f"**{_OWN}/pull/1** and [x]({_OWN}/pull/2) and <{_OWN}/pull/3>"),
+    ("blob name with parens", f"{_OWN}/blob/abc1234/src/a(1).py"),
+])
+def test_e1_ordinary_line_ends_and_wrappers_still_pass(spool, monkeypatch, name, prompt):
+    _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(prompt)
+    assert ok, (name, why)
+
+
+def test_e1_a_link_nested_in_a_proxy_or_redirect_is_judged_too(spool, monkeypatch):
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (s == "acme/widgets", "stub")))
+    for prompt in ("references no code\nhttps://r.jina.ai/https://github.com/priv/repo",
+                   "references no code\nhttps://www.google.com/url?q=https://github.com/priv/repo",
+                   "references no code\nhttps://web.archive.org/web/2020/https://github.com/priv/repo"):
+        seen.clear()
+        ok, why = spool.validate_prompt(prompt)
+        assert not ok and "priv/repo" in why and seen == ["priv/repo"], (prompt, why)
+
+
+# ---- E2: every GitHub-family host is checked or refused ------------------------------------------
+
+def test_e2_api_and_codeload_map_to_their_repo_and_are_visibility_checked(spool, monkeypatch):
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public",
+                        lambda s: (seen.append(s) or (s == "acme/widgets", "visibility=private")))
+    for url in ("https://api.github.com/repos/private-owner/private-repo/contents/x",
+                "https://codeload.github.com/private-owner/private-repo/zip/main",
+                "https://codeload.github.com/private-owner/private-repo/tar.gz/refs/heads/main"):
+        seen.clear()
+        ok, why = spool.validate_prompt(f"review {_OWN} and {url}")
+        assert not ok and "private-owner/private-repo" in why and "not confirmed PUBLIC" in why, (url, why)
+        assert "private-owner/private-repo" in seen
+
+
+def test_e2_a_public_repo_through_api_or_codeload_passes(spool, monkeypatch):
+    _probe_log(spool, monkeypatch)
+    assert spool.validate_prompt("review https://api.github.com/repos/acme/widgets/pulls/3")[0]
+    assert spool.validate_prompt("review https://codeload.github.com/acme/widgets/zip/main")[0]
+
+
+@pytest.mark.parametrize("url", [
+    "https://objects.githubusercontent.com/github-production-repository-file-5c1aeb/1/2?X-Amz-Signature=x",
+    "https://acme.github.io/site/", "https://ghcr.io/private-owner/img:latest",
+    "https://github.githubassets.com/x.js", "https://user-images.githubusercontent.com/1/x.png",
+    "https://avatars.githubusercontent.com/u/1", "https://pkg.github.com/x",
+    "https://GITHUB.IO./x", "https://Objects.GitHubUserContent.com./x",
+])
+def test_e2_every_other_github_family_host_is_refused_outright(spool, monkeypatch, url):
+    probes = _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(f"review {_OWN} and {url}")
+    assert not ok and why.startswith("refused:") and "GitHub-hosted domain" in why, why
+    assert probes == []
+
+
+def test_e2_an_api_path_that_is_not_a_repo_is_refused(spool):
+    ok, why = spool.validate_prompt("review https://api.github.com/user/repos")
+    assert not ok and "/repos/OWNER/REPO" in why
+
+
+def test_e2_lookalikes_and_other_sites_are_outside_the_gates_scope(spool, monkeypatch):
+    probes = _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(
+        f"review {_OWN} and https://github.com.evil.example/x and https://notgithub.com/a/b "
+        "and https://arxiv.org/abs/1")
+    assert ok and probes == [], "bare repo link, no refs; the other hosts were never the gate's business"
+
+
+# ---- E4: PR export forms -------------------------------------------------------------------------
+
+@pytest.mark.parametrize("form", ["{n}.diff", "{n}.patch", "{n}"])
+def test_e4_pr_export_forms_are_existence_checked_as_the_pr(spool, monkeypatch, form):
+    asked = _probe_log(spool, monkeypatch, dead=("/pulls/999999999",))
+    ok, why = spool.validate_prompt(f"review {_OWN}/pull/{form.format(n=999999999)}")
+    assert not ok and "does not exist" in why and "pull/999999999" in why
+    assert asked == ["repos/acme/widgets/pulls/999999999"]
+
+
+def test_e4_diff_patch_and_plain_are_one_probe(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(f"review {_OWN}/pull/12 {_OWN}/pull/12.diff {_OWN}/pull/012.patch")
+    assert ok and asked == ["repos/acme/widgets/pulls/12"], (why, asked)
+
+
+def test_e4_a_malformed_pr_suffix_is_refused(spool):
+    ok, why = spool.validate_prompt(f"review {_OWN}/pull/12.zip")
+    assert not ok and "pull-request number" in why
+
+
+# ---- both readings of a link followed by a line break --------------------------------------------
+#
+# A URL parser drops TAB, CR and LF from the string it is handed, so a bare owner/repo link that ends a
+# line can be JOINED with the next line into another repo: `.../cli/cli` + LF + `-private-zz/x` reads as
+# cli/cli-private-zz. Both readings are judged; the joined one must name the same repo or none.
+
+_JOIN_REFUSED = [
+    ("repo extension (-private-zz)", "review https://github.com/acme/widgets\n-private-zz/blob/main/x", "different repo"),
+    ("repo extension, plain word", "review https://github.com/acme/widgets\nserver is internal", "different repo"),
+    ("repo extension, CRLF", "review https://github.com/acme/widgets\r\nserver", "different repo"),
+    ("repo extension after a period", "review https://github.com/acme/widgets.\nserver", "different repo"),
+    ("repo extension, tab indent", "review https://github.com/acme/widgets\n\tserver", "different repo"),
+    # node: new URL("https://github.com/cli/cli\n\n-private-zz/blob/main/x").pathname == "/cli/cli-private-zz/blob/main/x"
+    ("blank line, -private-zz", "review https://github.com/acme/widgets\n\n-private-zz/blob/main/x", "different repo"),
+    ("blank line, plain word", "review https://github.com/acme/widgets\n\nFocus on the retry loop.", "different repo"),
+    ("four blank lines", "review https://github.com/acme/widgets\n\n\n\n-private-zz", "different repo"),
+    ("CRLF blank line", "review https://github.com/acme/widgets\r\n\r\n-private-zz", "different repo"),
+    ("blank lines then an owner extension", "review https://github.com/fitz-\n\nprivate/repo", "owner/repo"),
+    ("blank line, raw host", "review https://raw.githubusercontent.com/acme/widgets\n\nserver/main/x", "different repo"),
+    ("blank line, api host", "review https://api.github.com/repos/acme/widgets\n\nserver", "different repo"),
+    ("blank line, then dot segments", "review https://github.com/acme/widgets/pull/12\n\n/../../../priv/repo", "`.` or `..`"),
+    ("repo extension, digits", "review https://github.com/acme/widgets\n2", "different repo"),
+    ("owner extension (fitz- + private/repo)", "review https://github.com/fitz-\nprivate/repo", "owner/repo"),
+    ("host split", "review https://git\nhub.com/priv/repo", "different repo"),
+    ("scheme split", "review https:\n//github.com/priv/repo", "different repo"),
+    ("slash then repo", "review https://github.com/\npriv/repo", "different repo"),
+    ("root then repo", "review https://github.com\n/priv/repo", "different repo"),
+    ("raw host extension", "review https://raw.githubusercontent.com/acme/widgets\nserver/main/x", "different repo"),
+    ("api host extension", "review https://api.github.com/repos/acme/widgets\nserver", "different repo"),
+    # node: new URL(".../acme/widgets/pull/12\n/../../../priv/repo").pathname == "/acme/priv/repo"
+    ("path then dot segments", f"review {_OWN}/pull/12\n/../../../priv/repo", "`.` or `..`"),
+    # node: new URL(".../acme/widgets\n/../../priv/repo").pathname == "/priv/repo"
+    ("a bare link whose join leaves the owner", f"review {_OWN}\n/../../priv/repo", "`.` or `..`"),
+]
+
+
+@pytest.mark.parametrize("name,prompt,why_has", _JOIN_REFUSED, ids=[c[0] for c in _JOIN_REFUSED])
+def test_join_a_link_that_a_line_break_would_extend_into_another_repo_is_refused(spool, monkeypatch, name, prompt, why_has):
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (True, "stub")))
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (True, "exists"))
+    ok, why = spool.validate_prompt(prompt)
+    assert not ok and why.startswith("refused:") and why_has in why, why
+    assert seen == [], "refused at the parse, before any gh call"
+
+
+@pytest.mark.parametrize("name,prompt", [
+    ("path link, line, sentence", f"Review {_OWN}/pull/12\nFocus on the retry loop."),
+    ("tree link, line, sentence", f"Review {_OWN}/tree/abc1234\nFocus on the retry loop."),
+    ("trailing slash, line, sentence", f"Review {_OWN}/\nFocus on the retry loop."),
+    ("repo, SPACE, line, sentence", f"Review {_OWN} \nFocus on the retry loop."),
+    ("repo with slash, blank line, sentence", f"Review {_OWN}/\n\nFocus on the retry loop."),
+    ("repo, space, blank line, sentence", f"Review {_OWN} \n\nFocus on the retry loop."),
+    ("pr link, blank line, sentence", f"Review {_OWN}/pull/12\n\nFocus on the retry loop."),
+    ("repo, blank line, header", f"Review {_OWN}\n\n# Notes"),
+    ("repo, blank line, indented", f"Review {_OWN}\n\n  Focus on the retry loop."),
+    ("repo, indented sentence", f"Review {_OWN}\n  Focus on the retry loop."),
+    ("repo, markdown header", f"Review {_OWN}\n# Notes"),
+    ("wrapped repo with a slash inside", f"Review ({_OWN}/)\nFocus on the retry loop."),
+    ("wrapped PR link", f"Review ({_OWN}/pull/12)\nFocus on the retry loop."),
+    ("repo, then a link line that has a path", f"Review {_OWN}/\nhttps://github.com/acme/widgets/pull/2"),
+    ("deliver-style list", f"- {_OWN}/pull/12  — PR\n- {_OWN}/pull/12/files  — diff\n"),
+])
+def test_join_ordinary_prose_next_to_a_link_still_passes(spool, monkeypatch, name, prompt):
+    _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(prompt)
+    assert ok, (name, why)
+
+
+@pytest.mark.parametrize("name,prompt", [
+    ("repo in parens", f"Review ({_OWN})\nFocus on the retry loop."),
+    ("repo in a markdown link", f"Review [x]({_OWN})\nFocus on the retry loop."),
+    ("repo in angle brackets", f"Review <{_OWN}>\nFocus on the retry loop."),
+    ("repo in backticks", f"Review `{_OWN}`\nFocus on the retry loop."),
+    ("repo in quotes, blank line", f"Review \"{_OWN}\"\n\nFocus on the retry loop."),
+    ("repo in backticks, blank line", f"Review `{_OWN}`\n\nFocus on the retry loop."),
+    ("repo in angle brackets, blank line", f"Review <{_OWN}>\n\nFocus on the retry loop."),
+    ("two bare repo links, one per line", f"{_OWN}\nhttps://github.com/acme/gadgets"),
+    ("repo, then its own link line", f"Review {_OWN}\nhttps://github.com/acme/widgets/pull/2"),
+    ("repo, then a sentinel line", f"review {_OWN}\nBEGIN_RESPONSE:REQ-20260101-000000-aaaaaa\n..."),
+])
+def test_join_a_bare_repo_link_followed_by_a_line_is_refused_even_when_wrapped(spool, monkeypatch, name, prompt):
+    """THE COST of judging every reading with one rule. `widgets)Focus` is not a repo name GitHub routes,
+    but a reading that cannot be named is a reading that cannot be verified, and the one place a rule
+    like 'unparseable means ignore' went wrong was `cli-%70rivate`. So a bare owner/repo link directly
+    followed by another line is refused, wrapped or not; the refusal says how to fix it."""
+    _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(prompt)
+    assert not ok and why.startswith("refused:") and "trailing `/`" in why, (name, why)
+
+
+def test_join_the_refusal_names_the_fix(spool):
+    ok, why = spool.validate_prompt(f"Review {_OWN}\nFocus on the retry loop.")
+    assert not ok and "trailing `/` right after the link" in why
+
+
+def test_join_what_makes_a_bare_link_safe_before_a_line_break(spool, monkeypatch):
+    """A trailing slash, a space, a path, or a wrapper that carries its own slash cannot change the repo."""
+    _probe_log(spool, monkeypatch)
+    for text in (f"see {_OWN}/\nFocus on this", f"see {_OWN} \nFocus on this", f"see ({_OWN}/)\nFocus on this",
+                 f"see {_OWN}/pull/1\nFocus on this", f"see {_OWN}\n# Notes"):
+        assert spool.validate_prompt(text)[0], text
+
+
+# ---- an inner scheme never truncates the outer URL ------------------------------------------------
+
+@pytest.mark.parametrize("name,link", [
+    ("inner https:/", f"{_OWN}/https:/../../../private-owner/private-repo"),
+    ("inner http:/", f"{_OWN}/http:/../../../private-owner/private-repo"),
+    ("inner https://", f"{_OWN}/https://../../../private-owner/private-repo"),
+    ("inner scheme after a path", f"{_OWN}/tree/main/https:/../../../../private-owner/private-repo"),
+])
+def test_inner_scheme_the_outer_url_is_judged_whole(spool, monkeypatch, name, link):
+    probes = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (probes.append(s) or (True, "stub")))
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (probes.append(p) or (True, "exists")))
+    ok, why = spool.validate_prompt("review " + link)
+    assert not ok and why.startswith("refused:") and ("`.` or `..`" in why or "empty path segment" in why), why
+    assert probes == []
+
+
+def test_inner_scheme_without_a_traversal_is_an_ordinary_link(spool, monkeypatch):
+    """A `..` in the QUERY is data: node new URL(".../pull/1?u=https:/../../../x").pathname is still
+    /acme/widgets/pull/1, so there is no second reading to refuse."""
+    _probe_log(spool, monkeypatch)
+    assert spool.validate_prompt(f"review {_OWN}/pull/1?u=https:/../../../private-owner/private-repo")[0]
+    assert spool.validate_prompt(f"review {_OWN}/blob/main/docs/http:notes.md")[0]
+    assert spool.validate_prompt(f"review {_OWN}?next=https://example.com/x")[0]
+
+
+def test_inner_scheme_a_nested_github_link_is_judged_as_its_own_url(spool, monkeypatch):
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (s == "acme/widgets", "stub")))
+    ok, why = spool.validate_prompt("references no code\nhttps://r.jina.ai/https://github.com/priv/repo")
+    assert not ok and seen == ["priv/repo"] and "priv/repo" in why
+
+
+def test_inner_scheme_many_in_one_run_is_refused_not_sampled(spool):
+    ok, why = spool.validate_prompt("review https://x.example/" + "https:" * 100 + "/a")
+    assert not ok and "unbroken run" in why
+
+
+# ---- chains: every reading, the maximal join included, never a prefix ------------------------------
+#
+# The gate followed at most 16 joins and then stopped and yielded, so a host spelled one character per
+# line (`https://git` + 18 lines + `hub.com/private/repo`) was judged on its first sixteen pieces. The
+# rule is now exact: a chain of runs joined only by TAB/CR/LF is judged at every break and at its end,
+# and a chain with more breaks than the cap is refused outright.
+
+def _spelled_across_breaks(prefix, rest, sep="\n"):
+    return prefix + sep.join([""] + list(rest))
+
+
+@pytest.mark.parametrize("sep", ["\n", "\r\n", "\n\n"])
+def test_chain_the_lead_repro_host_spelled_across_twenty_breaks_is_refused(spool, monkeypatch, sep):
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (True, "stub")))
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (True, "exists"))
+    raw = _spelled_across_breaks("https://git", "hub.com/private/repo", sep)
+    ok, why = spool.validate_prompt("review https://github.com/cli/cli/ \n\n<" + raw + "> ")
+    assert not ok and why.startswith("refused:"), why
+    assert "private/repo" not in seen, "refused before any probe of the joined repo"
+
+
+def test_chain_a_host_spelled_across_more_breaks_than_the_cap_is_refused_not_judged_on_a_prefix(spool, monkeypatch):
+    n = spool._MAX_BREAKS + 20
+    raw = _spelled_across_breaks("https://git", "hub.com/" + "a" * n)
+    ok, why = spool.validate_prompt("review " + raw)
+    assert not ok and why.startswith("refused:") and str(spool._MAX_BREAKS) in why and "space" in why
+
+
+def test_chain_a_repo_name_extended_beyond_the_cap_is_refused(spool, monkeypatch):
+    _probe_log(spool, monkeypatch)
+    raw = _spelled_across_breaks(_OWN, "x" * (spool._MAX_BREAKS + 5))
+    ok, why = spool.validate_prompt("review " + raw)
+    assert not ok and why.startswith("refused:")
+
+
+def test_chain_just_under_the_cap_is_judged_on_every_reading(spool, monkeypatch):
+    _probe_log(spool, monkeypatch)
+    raw = _spelled_across_breaks(_OWN, "x" * (spool._MAX_BREAKS - 2))
+    ok, why = spool.validate_prompt("review " + raw)
+    assert not ok and "different repo" in why, why
+
+
+@pytest.mark.parametrize("name,prompt", [
+    ("scheme split once", "review ht\ntps://github.com/priv/repo"),
+    ("scheme split mid-word", "review xht\ntps://github.com/priv/repo"),
+    ("scheme split by a blank line", "review ht\n\ntps://github.com/priv/repo"),
+    ("scheme split across many", "review " + _spelled_across_breaks("h", "ttps://github.com/priv/repo")),
+])
+def test_chain_a_scheme_split_by_a_break_is_refused(spool, monkeypatch, name, prompt):
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (True, "stub")))
+    ok, why = spool.validate_prompt(prompt)
+    assert not ok and why.startswith("refused:") and seen == [], why
+
+
+def test_chain_a_join_through_a_scheme_run_is_judged(spool, monkeypatch):
+    """The next line starts with its own scheme, but a parser joins it all the same."""
+    _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(f"review {_OWN}/\nhttps:\n/../../priv/repo")
+    assert not ok and why.startswith("refused:")
+
+
+def test_chain_a_space_ends_a_chain(spool, monkeypatch):
+    """A space is not dropped by a URL parser, so text after `link space newline` is not joined."""
+    _probe_log(spool, monkeypatch)
+    assert spool.validate_prompt(f"review {_OWN} \n-private-zz/x")[0]
+    assert spool.validate_prompt(f"review {_OWN}/pull/1 \n\n\n-private-zz/x")[0]
+
+
+def test_chain_a_long_list_of_links_one_per_line_is_not_a_chain_problem(spool, monkeypatch):
+    asked = _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt("\n".join(f"{_OWN}/pull/{i}" for i in range(1, 31)))
+    assert ok, why
+
+
+@pytest.mark.parametrize("later,ok_expected", [
+    ("https://en.wikipedia.org/wiki/Caf%C3%A9", True),            # an escape that is data
+    ("https://x.example/%2e%2e/%2e%2e/priv/repo", False),         # %2e aliases collapse as dot segments
+    ("https://x.example/a%2Fb", False),                           # an escaped separator
+    ("https://x.example/a%5Cb", False),
+])
+def test_chain_escapes_in_a_later_link_matter_only_when_they_can_move_the_path(spool, monkeypatch, later, ok_expected):
+    _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(f"{_OWN}/pull/1\n{later}")
+    assert ok == ok_expected, why
+
+
+def test_chain_percent_2e_dot_aliases_are_dot_segments_in_a_written_link(spool):
+    for seg in ("%2e%2e", ".%2e", "%2E.", "%2E%2e"):
+        ok, why = spool.validate_prompt(f"review {_OWN}/{seg}/{seg}/priv/repo")
+        assert not ok and why.startswith("refused:"), (seg, why)
+
+
+def test_chain_one_final_period_is_a_sentence_end_by_documented_assumption(spool, monkeypatch):
+    """`widgets.` is a legal repo name; the gate reads one trailing period as the end of a sentence
+    (docs/SECURITY.md), and two are refused by the dot rules."""
+    _probe_log(spool, monkeypatch)
+    assert spool.validate_prompt(f"see {_OWN}.")[0]
+    ok, why = spool.validate_prompt(f"see {_OWN}/tree/main..")
+    assert not ok and "ending in `.`" in why
+
+
+def test_chain_a_split_scheme_gets_its_own_clear_refusal(spool, monkeypatch):
+    """Not just 'a different repo': the scheme itself straddles a break, which is never ordinary text,
+    so even a split link that names no repo (a GitHub page) is refused, and says why."""
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (True, "stub")))
+    for prompt in ("review ht\ntps://github.com/priv/repo", "review ht\n\ntps://github.com/orgs/acme"):
+        ok, why = spool.validate_prompt(prompt)
+        assert not ok and "splits the scheme" in why, why
+    assert seen == []
+
+
+# ---- a final period that may be part of the repo name: both readings, one probe --------------------
+#
+# `widgets.` is a legal repo name (GitHub accepts a trailing dot), so `see .../acme/widgets.` can mean the
+# repo `widgets` plus a full stop, or the repo `widgets.`. The link is verified as `widgets` as usual and
+# `acme/widgets.` is probed once. gh is mocked everywhere in these tests.
+
+def _dot_gate(spool, monkeypatch, dotted):
+    """acme/widgets is public; `acme/widgets.` answers as `dotted` says."""
+    asked = []
+    answers = {
+        "404": (False, spool._INVISIBLE + " to your gh token (404 — private or nonexistent)"),
+        "public": (True, "visibility=public"),
+        "private": (False, "visibility=private"),
+        "outage": (False, "unverified: gh timed out after 25s"),
+    }
+
+    def vis(slug):
+        asked.append(slug)
+        return answers[dotted] if slug.endswith(".") else (True, "visibility=public")
+    monkeypatch.setattr(spool, "_repo_is_public", vis)
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (True, "exists"))
+    return asked
+
+
+def test_dot_a_sentence_period_whose_dotted_repo_does_not_exist_passes(spool, monkeypatch):
+    asked = _dot_gate(spool, monkeypatch, "404")
+    ok, why = spool.validate_prompt(f"see {_OWN}.")
+    assert ok, why
+    assert asked == ["acme/widgets", "acme/widgets."], "both readings were looked at, the dotted one once"
+
+
+def test_dot_a_dotted_repo_that_exists_and_is_public_passes(spool, monkeypatch):
+    _dot_gate(spool, monkeypatch, "public")
+    assert spool.validate_prompt(f"see {_OWN}.")[0]
+
+
+def test_dot_a_dotted_repo_that_exists_and_is_not_public_is_refused(spool, monkeypatch):
+    _dot_gate(spool, monkeypatch, "private")
+    ok, why = spool.validate_prompt(f"see {_OWN}.")
+    assert not ok and why.startswith("refused:") and "acme/widgets." in why and "not confirmed PUBLIC" in why
+    assert "angle brackets" in why, "the refusal names the fix"
+
+
+def test_dot_a_gh_outage_on_the_dotted_reading_is_unverified_and_retryable(spool, monkeypatch):
+    _dot_gate(spool, monkeypatch, "outage")
+    ok, why = spool.validate_prompt(f"see {_OWN}.")
+    assert not ok and why.startswith("unverified:") and "acme/widgets." in why
+
+
+def test_dot_the_operator_allowlist_admits_a_private_dotted_repo(spool, monkeypatch):
+    _dot_gate(spool, monkeypatch, "private")
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", "acme/widgets.")
+    assert spool.validate_prompt(f"see {_OWN}.")[0]
+    monkeypatch.setenv("CGC_GATE_PRIVATE_REPOS", "acme/widgets")      # the undotted one does not admit it
+    assert not spool.validate_prompt(f"see {_OWN}.")[0]
+
+
+@pytest.mark.parametrize("name,text", [
+    ("no period", f"see {_OWN}"),
+    ("period after a path", f"see {_OWN}/pull/12."),
+    ("period after a tree link", f"see {_OWN}/tree/abc1234."),
+    ("wrapped, period outside", f"see <{_OWN}>."),
+    ("paren, period outside", f"(see {_OWN})."),
+])
+def test_dot_no_second_reading_means_no_extra_probe(spool, monkeypatch, name, text):
+    asked = _dot_gate(spool, monkeypatch, "private")
+    _probe_log(spool, monkeypatch)      # existence stub only
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (asked.append(s) or (not s.endswith("."), "visibility=private")))
+    ok, why = spool.validate_prompt(text)
+    assert ok, (name, why)
+    assert not any(a.endswith(".") for a in asked), asked
+
+
+@pytest.mark.parametrize("name,text", [
+    ("brackets, period inside", f"see <{_OWN}.>"),
+    ("period at the end of the line before text", f"see {_OWN}. "),
+    ("period then a sentence on the same line", f"see {_OWN}. Then explain."),
+])
+def test_dot_a_period_that_ends_the_token_gets_the_second_reading(spool, monkeypatch, name, text):
+    asked = _dot_gate(spool, monkeypatch, "private")
+    ok, why = spool.validate_prompt(text)
+    assert not ok and "acme/widgets." in why, (name, why)
+
+
+def test_dot_the_second_reading_also_comes_from_a_joined_link(spool, monkeypatch):
+    """A link that ends a line with its sentence period, joined with the following text, is the same
+    link: the dotted reading is probed through the join too."""
+    asked = _dot_gate(spool, monkeypatch, "private")
+    ok, why = spool.validate_prompt(f"see {_OWN}/\n\nThen explain.")
+    assert ok, why      # a trailing slash: no period, no second reading
+    asked.clear()
+    ok, why = spool.validate_prompt(f"see {_OWN}.\n\nThen explain.")
+    assert not ok, "a bare link + period + line break is refused by the join rule before any probe"
+
+
+def test_dot_two_final_periods_are_never_a_sentence_end(spool, monkeypatch):
+    asked = _dot_gate(spool, monkeypatch, "404")
+    ok, why = spool.validate_prompt(f"see {_OWN}..")
+    assert not ok and "ending in `.`" in why and asked == []
+
+
+def test_dot_an_owner_cannot_hold_a_period_so_no_second_reading_exists(spool, monkeypatch):
+    asked = _dot_gate(spool, monkeypatch, "404")
+    for text in ("see https://github.com/acme.", "see https://github.com/acme./widgets",
+                 "see https://github.com/acme./widgets."):
+        ok, why = spool.validate_prompt(text)
+        assert not ok and why.startswith("refused:") and "owner/repo" in why, (text, why)
+    assert asked == [], "refused at the parse, before any gh call"
+
+
+def test_dot_a_dotted_repo_inside_a_longer_link_is_just_a_repo(spool, monkeypatch):
+    """`.../acme/widgets./pull/3` names the repo `widgets.` as written: verified directly, no second reading."""
+    asked = _dot_gate(spool, monkeypatch, "private")
+    ok, why = spool.validate_prompt("see https://github.com/acme/widgets./pull/3")
+    assert not ok and "acme/widgets." in why and "not confirmed PUBLIC" in why
+    assert asked == ["acme/widgets."]
+
+
+@pytest.mark.parametrize("text", [f"see {_OWN}\n.", f"see {_OWN}\n.\n", f"see {_OWN}\n\n."])
+def test_dot_a_period_that_arrives_only_after_a_line_break_gets_the_second_reading_too(spool, monkeypatch, text):
+    """A parser joins `widgets` + LF + `.` into the repo `widgets.`: the dotted reading comes from the
+    JOIN, not from the link as written, and is probed all the same."""
+    asked = _dot_gate(spool, monkeypatch, "private")
+    ok, why = spool.validate_prompt(text)
+    assert not ok and "acme/widgets." in why and "not confirmed PUBLIC" in why, why
+    assert "acme/widgets." in asked
+
+
+# ---- the readings of a trailing period must satisfy: all that exist are public, and one is -------------
+
+def _readings_gate(spool, monkeypatch, plain, dotted):
+    """`acme/widgets` answers as `plain`, `acme/widgets.` as `dotted` (each: 404 / public / private)."""
+    answers = {"404": (False, spool._INVISIBLE + " to your gh token (404 — private or nonexistent)"),
+               "public": (True, "visibility=public"), "private": (False, "visibility=private")}
+    asked = []
+
+    def vis(slug):
+        asked.append(slug)
+        return answers[dotted if slug.endswith(".") else plain]
+    monkeypatch.setattr(spool, "_repo_is_public", vis)
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (True, "exists"))
+    return asked
+
+
+@pytest.mark.parametrize("plain,dotted,passes", [
+    ("public", "public", True),
+    ("public", "404", True),
+    ("404", "public", True),      # the dotted repo is the real one: `widgets` does not exist
+    ("public", "private", False),
+    ("404", "private", False),
+    ("404", "404", False),        # neither reading is a public repo
+    ("private", "public", False),
+    ("private", "404", False),
+])
+def test_dot_the_two_readings_together(spool, monkeypatch, plain, dotted, passes):
+    asked = _readings_gate(spool, monkeypatch, plain, dotted)
+    ok, why = spool.validate_prompt(f"see {_OWN}.")
+    assert ok == passes, (plain, dotted, why)
+    assert len(asked) == len(set(asked)), f"one gh question per repo: {asked}"
+
+
+def test_dot_a_link_to_a_dotted_public_repo_without_a_sentence_still_works(spool, monkeypatch):
+    """`https://github.com/acme/widgets./` or followed by a path: the dotted repo is named as written."""
+    _readings_gate(spool, monkeypatch, "404", "public")
+    assert spool.validate_prompt("see https://github.com/acme/widgets./pull/3")[0]
+
+
+def test_dot_the_undotted_link_alone_is_unchanged_when_that_repo_does_not_exist(spool, monkeypatch):
+    _readings_gate(spool, monkeypatch, "404", "public")
+    ok, why = spool.validate_prompt(f"see {_OWN}")
+    assert not ok and "not confirmed PUBLIC" in why
+
+
+# ---- ONE judge: the same rules for a link as written and for every reading a join makes -------------
+#
+# The lead's repro: `<https://github.com/cli/cli` + LF + `-%70rivate>`. A parser reads /cli/cli-%70rivate
+# and GitHub decodes the segment to cli-private (live, read-only: github.com/cli/cl%69 answers 200).
+# The old judge skipped the escape rule for a joined reading and let an unparseable owner/repo through.
+
+def test_judge_has_no_mode(spool):
+    import inspect
+    assert list(inspect.signature(spool._judge).parameters) == ["tok"], "one judge, no flag that relaxes it"
+    assert not hasattr(spool, "_read") and not hasattr(spool, "_unsafe")
+
+
+@pytest.mark.parametrize("name,prompt", [
+    ("lead: %70rivate", f"review <{_OWN}\n-%70rivate> "),
+    ("%2d", f"review {_OWN}\n%2dprivate"),
+    ("%2e", f"review {_OWN}\n%2eprivate"),
+    ("%2D upper", f"review {_OWN}\n%2Dprivate"),
+    ("escape on its own line", f"review {_OWN}\n%70\nrivate"),
+    ("blank line before the escape", f"review {_OWN}\n\n-%70rivate"),
+    ("encoded owner joined", "review https://github.com/%61cme\n/widgets"),
+    ("api: escape in repo, joined", "review https://api.github.com/repos/acme/wid\n%67ets"),
+    ("api: encoded owner, written", "review https://api.github.com/repos/%61cme/widgets"),
+    ("api: encoded repo, written", "review https://api.github.com/repos/acme/wid%67ets/pulls/1"),
+    ("written escape in repo", "review https://github.com/acme/wid%67ets"),
+    ("written escape in owner", "review https://github.com/%61cme/widgets"),
+    ("double-encoded", "review https://github.com/acme/wid%2567ets"),
+    ("encoded page kind", f"review {_OWN}/%70ull/1"),
+    ("escape then a join", f"review {_OWN}/tree/main/%2e%2e\n/%2e%2e/priv"),
+])
+def test_judge_an_escaped_owner_or_repo_is_refused_in_every_reading(spool, monkeypatch, name, prompt):
+    seen = []
+    monkeypatch.setattr(spool, "_repo_is_public", lambda s: (seen.append(s) or (True, "stub")))
+    monkeypatch.setattr(spool, "_gh_exists", lambda p: (True, "exists"))
+    ok, why = spool.validate_prompt(prompt)
+    assert not ok and why.startswith("refused:"), (name, why)
+    assert seen == [], "refused before any probe"
+
+
+@pytest.mark.parametrize("name,prompt,probed", [
+    ("escape in a file path", f"review {_OWN}/blob/main/docs/Caf%C3%A9.md", "docs/Caf\u00e9.md"),
+    ("escaped space in a path", f"review {_OWN}/blob/main/my%20file.md", "my file.md"),
+])
+def test_judge_an_escape_after_owner_repo_and_kind_is_data_decoded_once(spool, monkeypatch, name, prompt, probed):
+    asked = _probe_log(spool, monkeypatch, known_refs={"main"})
+    ok, why = spool.validate_prompt(prompt)
+    assert ok, (name, why)
+    assert any(probed in __import__("urllib.parse").parse.unquote(a) for a in asked), asked
+
+
+def test_judge_an_encoded_pr_number_is_the_pr_it_decodes_to(spool, monkeypatch):
+    """`pull/%39%39` is PR 99 to GitHub; the gate probes PR 99, the thing the link reaches."""
+    asked = _probe_log(spool, monkeypatch)
+    ok, why = spool.validate_prompt(f"review {_OWN}/pull/%39%39")
+    assert ok and asked == ["repos/acme/widgets/pulls/99"], (why, asked)
+    ok, why = spool.validate_prompt(f"review {_OWN}/pull/%2539")      # decodes once to `%39`: not a number
+    assert not ok and "pull-request number" in why
+
+
+def test_judge_a_control_character_in_a_decoded_path_is_refused(spool, monkeypatch):
+    _probe_log(spool, monkeypatch)
+    for esc in ("%00", "%0a", "%0d", "%09", "%7f"):
+        ok, why = spool.validate_prompt(f"review {_OWN}/blob/main/a{esc}b")
+        assert not ok and "control character" in why, (esc, why)
+
+
+@pytest.mark.parametrize("reading", [
+    f"{_OWN}", f"{_OWN}/", f"{_OWN}/pull/12", f"{_OWN}/tree/main/docs/Caf%C3%A9.md",
+    "https://github.com/acme/widgets-private-zz/blob/main/x", "https://github.com/acme/wid%67ets",
+    "https://github.com/%61cme/widgets", "https://api.github.com/repos/acme/wid%67ets",
+    f"{_OWN}/tree/main/../x", f"{_OWN}//x", "https://github.com/acme/widgetsBEGIN_RESPONSE:REQ-1",
+])
+def test_judge_gives_a_reading_the_same_verdict_written_or_joined(spool, reading):
+    """The judge is a pure function of the string: what it says about a reading is what the gate acts
+    on whether the reading was written or made by a join. (The gate only adds the question 'is it the
+    same repo as the link alone'.)"""
+    assert spool._judge(reading) == spool._judge(reading)
+    a = spool._judge(reading)
+    split = reading.index("//") + 2 + len("github.com")
+    b = spool._judge(reading[:split] + reading[split:])
+    assert a == b
+
+
+def test_judge_an_escape_in_a_path_after_a_join_is_allowed_but_not_probed(spool, monkeypatch):
+    """The link as written is `.../blob/main/`; the next line only exists in the joined reading, where the
+    escape is data after owner/repo/kind. It passes the judge (that is the point of one rule: `Caf%C3%A9`
+    is data wherever it appears) and the gate verifies what the link SAYS, not what a join could add."""
+    asked = _probe_log(spool, monkeypatch, known_refs={"main"})
+    ok, why = spool.validate_prompt(f"review {_OWN}/blob/main/\ndocs/Caf%C3%A9.md")
+    assert ok, why
+    assert asked == ["repos/acme/widgets/commits/main"]

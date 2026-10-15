@@ -39,12 +39,13 @@ def test_egress_gate_allows_a_followup_with_no_new_link():
 # --- URL classification fail-open (diff-review S0): a recognized code URL that does not classify to
 # a verifiable owner/repo must FAIL CLOSED, never be silently skipped from visibility verification. ---
 
-def test_classify_decodes_single_percent_encoding_to_a_clean_slug():
-    """github.com/%66itz-s/repo is URI-equivalent to github.com/fitz-s/repo, so it must decode to the
-    slug 'fitz-s/repo' and be VERIFIED (the old code saw the raw %66 and skipped verification)."""
+def test_a_percent_encoded_owner_is_refused_not_normalized():
+    """github.com/%66itz-s/repo is URI-equivalent to github.com/fitz-s/repo. The gate does not decode it
+    and accept it (the old code did, and then checked refs on a different spelling than it checked
+    visibility): a link must be written plainly or it is refused."""
     spool = _load("cgc_spool.py")
-    slugs, refuse = spool._classify_code_urls("see https://github.com/%66itz-s/repo for the code")
-    assert refuse is None and "fitz-s/repo" in slugs
+    links, refuse = spool._parse_code_urls("see https://github.com/%66itz-s/repo for the code")
+    assert links is None and refuse.startswith("refused:") and "not plain" in refuse
 
 
 def test_validate_refuses_double_encoded_owner_without_network():

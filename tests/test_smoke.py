@@ -258,6 +258,8 @@ def test_code_url_re_requires_real_url():
     assert m._CODE_URL_RE.search("raw: https://raw.githubusercontent.com/acme/widgets/main/x.py")
     assert not m._CODE_URL_RE.search("this mentions github but has no link")
     assert not m._CODE_URL_RE.search("github.com/acme/widgets")  # no scheme
+    # the raw-gist host is a gist: the driver's source check must not refuse a link the gist opt-in allows
+    assert m._CODE_URL_RE.search("see https://gist.githubusercontent.com/user/deadbeef/raw/f.py")
 
 
 if __name__ == "__main__":

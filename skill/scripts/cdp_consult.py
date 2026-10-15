@@ -2614,7 +2614,7 @@ def _select_model(c, target, family=None):
 # Deliberately does NOT match the bare word "github" — that substring alone used to fail-open
 # the no_code_source gate (spoofable by prose that merely mentions "GitHub").
 _CODE_URL_RE = re.compile(
-    r"https://(?:www\.)?(?:github\.com|gist\.github\.com|raw\.githubusercontent\.com)/\S+",
+    r"https://(?:www\.)?(?:github\.com|gist\.github\.com|gist\.githubusercontent\.com|raw\.githubusercontent\.com)/\S+",
     re.IGNORECASE)
 
 # Two sentence-sentinels prep stamps into the rendered prompt to declare a LEGITIMATE reason it
