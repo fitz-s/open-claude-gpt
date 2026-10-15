@@ -35,11 +35,29 @@ process will not go away, `install.sh` changes nothing and names its pid. A daem
 yourself (`cgc watch`, `cgc up`) is not under launchd; `install.sh` refuses to continue while one runs.
 
 The swap is a transaction. If anything fails after the old tree was moved aside (the copy, a rename, the
-new daemon not coming up, Ctrl-C), the old tree is put back and the old daemon restarted. An existing
-`.bak` is a previous install, possibly the only intact one: it is parked, and deleted only after the new
-daemon has been verified. `--force` keeps a new install whose daemon did not come up, and then keeps
-that older backup too, at `chatgpt-consult.bak.prev.<pid>`. `install.sh` never touches the consult
-store (`control.db`).
+new daemon not coming up, Ctrl-C, SIGTERM, a closed terminal), the old tree is put back and the old
+daemon restarted. Two rules make that hold when the failure lands in the middle of the swap:
+
+- **A signal never cuts between a rename and the bookkeeping for it.** The three renames (park an older
+  `.bak`, move the current install to `.bak`, move the staged tree into place) run with signals deferred;
+  one that arrives meanwhile is acted on right after, so it always finds a state it can undo.
+- **The rollback reads the disk, not its own variables.** It identifies the trees by file identity
+  (device and inode, which a rename keeps): the old tree is wherever the old identity is, and it is moved
+  back to `chatgpt-consult` only after whatever sits there (the new tree, or the `--link` symlink, removed
+  as a link and never descended into) has been removed. Nothing is ever renamed onto an existing path, so
+  a rollback cannot nest one tree inside another or write into your clone of the repo.
+
+An existing `.bak` is a previous install, possibly the only intact one: it is parked, and deleted only
+after the new daemon has been verified. `--force` keeps a new install whose daemon did not come up, and
+then keeps that older backup too, at `chatgpt-consult.bak.prev.<pid>`. `install.sh` never touches the
+consult store (`control.db`).
+
+**Known limit: SIGKILL.** A `kill -9` (or a power loss) cannot be trapped. If it lands after the old tree
+was moved to `.bak` and before the new one is in place, nothing is left at `chatgpt-consult`, the service
+is unloaded and the old tree is only at `chatgpt-consult.bak`. Re-running `install.sh` detects exactly that
+(a `.bak` and nothing at the install path), says so, moves the old tree back first, and then upgrades
+normally, starting the daemon again if a service is installed. Stale `.chatgpt-consult.new.<pid>` stage
+directories of dead runs are cleaned at the same time.
 
 If the daemon does not come up on the new code the upgrade fails and rolls back (`--force` keeps the new
 install anyway); run `cgc daemon-start` to retry. The daemon verbs are `cgc daemon-stop`,
@@ -180,8 +198,12 @@ and deleting it forgets that, so a resend of an uncertain round can no longer be
 store, or your config file, lies inside the code tree about to be deleted, the uninstall refuses up
 front instead of taking it along.
 
-With `--purge` it prints exactly which paths it is about to delete, then deletes **only files the tool
-wrote, one by one**: the database and its `-wal`/`-shm`/`.v<n>.bak` (each a regular file, the database
+With `--purge` it prints exactly which paths it is about to delete, then deletes **only those paths, as
+printed, one by one**: the delete step is handed the printed plan (with each file's identity) and
+re-checks only the listed paths (still a regular file, still the same file, still named the way the tool
+names it). It never scans again, so a file that appeared after the plan was shown, for example a
+`chrome.log` written by something you restarted meanwhile, is not touched. What the plan contains
+is only files the tool wrote: the database and its `-wal`/`-shm`/`.v<n>.bak` (each a regular file, the database
 and backups with a valid SQLite header), lock files the daemon creates, drift bundles
 (`incidents/I-*/diagnosis.json`, `fixture.html`) and scratch files (`answer_*`, `prompt_*`, `refs_*`,
 `daemon.log`, `chrome.log`, `active.json`, spool logs). It never runs `rm -rf` on a directory because
@@ -189,7 +211,11 @@ of its name, and it leaves a directory alone unless it is a default location (`~
 `/tmp/cgc`) or strictly inside `$HOME`. A foreign file in any of these directories survives, and so
 does the directory. A directory is removed only if it is one of the tool's own (`locks`, `incidents`,
 `spool`) or a default location, and only when it ends up empty; a custom `CGC_DATA_DIR`/`CGC_STATE_DIR`
-you chose stays in place. Your config file is never removed, in any mode. The Chrome profile is offered
+you chose stays in place. Your config file is never removed, in any mode, and it is recognised by file
+identity (device and inode), not by how its path is spelled: on a case-insensitive filesystem (the macOS
+default) `CGC_CONFIG=.../ACTIVE.JSON` is the very file the scan lists as `active.json`, and a hard link
+or a symlink to a scratch file is the same file again. The same identity test decides every "is this
+inside the tree being deleted" check. The Chrome profile is offered
 for deletion only if it is `~/.cgc-chrome` (or a directory with a Chrome `Local State`) strictly inside
 `$HOME` and contains none of your config, store, scratch or settings; you must answer `y`.
 

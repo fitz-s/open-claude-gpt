@@ -20,6 +20,19 @@ releases until it stabilizes.
   Older code is refused over a newer store before anything is stopped. New verbs: `cgc daemon-stop`,
   `daemon-start [--any]`, `daemon-pid`; `cgc uninstall-daemon` and `install-daemon` now wait for the
   process to exit (`uninstall-daemon` keeps the plist if it will not).
+- **A signal can no longer strand an upgrade half way.** The renames of the swap run with signals
+  deferred and a signal that arrives meanwhile is acted on right after them. The rollback reads the disk
+  by file identity (device and inode) instead of trusting its progress variables, removes whatever occupies
+  the install path (the new tree, or the `--link` symlink, as a link) before moving the old tree back, and
+  never renames onto an existing path, so it cannot nest a tree inside another or write into the repo a
+  `--link` install points at. Re-running `install.sh` after a SIGKILL that left the old tree only at
+  `.bak` now restores it first instead of reporting success over an empty install path.
+- **`uninstall.sh --purge` protects the config by identity and deletes the plan it showed.** Paths are
+  compared by device and inode, not by spelling: a case alias (`ACTIVE.JSON` for `active.json` on APFS), a
+  hard link or a symlink to the config file is the config file, and so is every "inside the tree being
+  deleted" test. The delete step is handed the printed plan and re-checks only those paths (regular file,
+  same inode, tool-shaped name); it never scans again, so a file created or swapped after the plan was
+  shown is left alone.
 - **`uninstall.sh` removes things in a safe order, keeps the journal, and deletes only what the tool
   wrote.** Every path is resolved and checked before anything changes. The service is stopped (process and
   lock, not heartbeat) and removed first, then our `SessionStart` entry leaves `settings.json` (JSON-aware;
