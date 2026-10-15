@@ -232,7 +232,11 @@ if mode == "delete":
             if os.path.lexists(p):
                 print("failed\t" + p + "\tno longer a regular file; left alone")
             continue                       # already gone (e.g. it lay inside the code tree removed a step ago)
-        if f"{st.st_dev}:{st.st_ino}" != ident:
+        if same(p, config):
+            # at plan time `p` was not the config file; it is now (a link or alias made since). The
+            # config is never deleted, so the plan is not honoured for this path.
+            print("failed\t" + p + "\tis your config file; left alone")
+        elif f"{st.st_dev}:{st.st_ino}" != ident:
             print("failed\t" + p + "\tis not the file that was planned (replaced since); left alone")
         elif not name_ok(kind, p) or not allowed(os.path.dirname(p)) or not header_ok(kind, p):
             print("failed\t" + p + "\tno longer matches what the tool writes; left alone")

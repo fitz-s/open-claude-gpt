@@ -57,14 +57,15 @@ def _install_from(sb, repo, *args, **env):
 def _mv_shim(sb, window):
     """A `mv` that does the move and then sends SIGTERM to its parent (the install script), but only for the
     rename named by `window`. Windows: 1 = old tree moved aside, 2 = new tree moved into place,
-    3 = an older .bak parked at .bak.prev.<pid>."""
+    3 = an older .bak parked at .bak.prev.<pid>, 4 = the SIGKILL-recovery rename .bak -> DEST."""
     marks = {1: ("*/chatgpt-consult", "*/chatgpt-consult.bak"),
              2: ("*/.chatgpt-consult.new.*", "*/chatgpt-consult"),
-             3: ("*/chatgpt-consult.bak", "*/chatgpt-consult.bak.prev.*")}[window]
+             3: ("*/chatgpt-consult.bak", "*/chatgpt-consult.bak.prev.*"),
+             4: ("*/chatgpt-consult.bak", "*/chatgpt-consult")}[window]
     shim = sb.stubs / "mv"
     shim.write_text(
         "#!/bin/bash\n"
-        'args=(); for a in "$@"; do [ "$a" = "--" ] || args+=("$a"); done\n'
+        'args=(); for a in "$@"; do case "$a" in -*) ;; *) args+=("$a");; esac; done\n'
         'src="${args[0]}"; dst="${args[1]}"\n'
         '/bin/mv "$@"; rc=$?\n'
         f'case "$src" in {marks[0]}) case "$dst" in {marks[1]}) [ "$rc" = 0 ] && kill -TERM $PPID;; esac;; esac\n'
@@ -343,3 +344,121 @@ def test_link_install_in_the_clone_leaves_the_worktree_untouched(sb, clone):
     assert r.returncode == 0, r.stdout + r.stderr
     assert sb.dest.is_symlink() and os.path.realpath(sb.dest) == os.path.realpath(clone / "skill")
     assert _snapshot(ROOT) == before
+
+
+# ---- the recovery rename and the record that the daemon is owed a start are one deferred step -----
+
+def test_recovery_signal_after_bak_to_dest_still_restarts_the_daemon(sb, clone):
+    """After a SIGKILL the retry first moves .bak back to DEST. A TERM right after that rename used to land
+    before 'this run owes the daemon a start' was recorded: the old tree was back and the daemon stayed
+    unloaded. Run in a scratch clone with the reviewer's shim (TERM after .bak -> DEST)."""
+    sb.old_install()
+    sb.cgc("install-daemon")                                              # the plist, and a loaded service...
+    sb.run(["launchctl", "bootout", "gui/501/com.open-claude-gpt.daemon"])    # ...that the killed run had stopped
+    (sb.sd / "log").unlink()
+    os.rename(sb.dest, str(sb.dest) + ".bak")                             # the state a SIGKILL left behind
+    _mv_shim(sb, 4)
+    before = _snapshot(clone)
+    r = _install_from(sb, clone)
+    assert r.returncode == 143, (r.returncode, r.stdout, r.stderr)
+    assert (sb.dest / "OLD_MARKER").exists() and not (sb.dest.parent / "chatgpt-consult.bak").exists()
+    assert (sb.sd / "loaded").exists(), "the daemon was left unloaded after the signal: " + r.stderr
+    assert sb.calls() == ["bootstrap"], sb.log()
+    assert _snapshot(clone) == before
+
+
+# ---- place verifies its result: something planted at the target is detected, never trusted ----------
+
+def _plant_shim(sb, plans):
+    """A `mv` that plants a symlink at the target, to a foreign directory, JUST BEFORE it runs the real move,
+    for each (src_glob, dst_glob, foreign_dir) in `plans` (each plan fires once). This is the window between
+    place's pre-check and its rename."""
+    lines = ["#!/bin/bash",
+             'args=(); for a in "$@"; do case "$a" in -*) ;; *) args+=("$a");; esac; done',
+             'src="${args[0]}"; dst="${args[1]}"']
+    for i, (sg, dg, foreign) in enumerate(plans):
+        lines.append(f'if [ ! -e "$STUB_DIR/planted.{i}" ]; then case "$src" in {sg}) case "$dst" in {dg}) '
+                     f'touch "$STUB_DIR/planted.{i}"; ln -s "{foreign}" "$dst";; esac;; esac; fi')
+    lines.append('exec /bin/mv "$@"')
+    shim = sb.stubs / "mv"
+    shim.write_text("\n".join(lines) + "\n")
+    shim.chmod(0o755)
+
+
+def test_place_detects_a_symlink_planted_at_the_target_and_the_rollback_recovers_the_tree(sb):
+    """Repro (reviewer): a symlink to $HOME/foreign is planted at .bak after the pre-check. mv then moves the
+    old tree INTO foreign/. The install must fail loudly, report both paths, and bring the tree back."""
+    sb.old_install()
+    foreign = sb.home / "foreign"
+    foreign.mkdir()
+    sb.daemon_up()
+    _plant_shim(sb, [("*/chatgpt-consult", "*/chatgpt-consult.bak", foreign)])
+    r = sb.install()
+    assert r.returncode != 0, "an install whose rename landed in the wrong place reported success"
+    assert "running doctor" not in r.stdout, "the install went on to report success after a misplaced rename"
+    assert "did not put it there" in r.stderr
+    assert str(sb.dest) in r.stderr and f"{sb.dest}.bak" in r.stderr and f"{sb.dest}.bak/chatgpt-consult" in r.stderr
+    assert (sb.dest / "OLD_MARKER").exists(), "the tree that went into the foreign directory was not recovered"
+    assert not (foreign / "chatgpt-consult").exists(), "our tree was left inside a directory that is not ours"
+    assert (sb.sd / "loaded").exists(), "the old daemon was not restarted"
+
+
+def test_place_failure_that_cannot_be_rolled_back_reports_where_the_old_tree_is(sb):
+    """The reviewer's second shim as well: the rename back is hijacked too. Nothing may continue or claim
+    success, and the old tree must be reported where it ended up."""
+    sb.old_install()
+    foreign, foreign2 = sb.home / "foreign", sb.home / "foreign2"
+    foreign.mkdir()
+    foreign2.mkdir()
+    sb.daemon_up()
+    _plant_shim(sb, [("*/chatgpt-consult", "*/chatgpt-consult.bak", foreign),
+                     ("*/chatgpt-consult.bak/chatgpt-consult", "*/chatgpt-consult", foreign2)])
+    r = sb.install()
+    assert r.returncode != 0
+    assert "could not restore the previous install" in r.stderr
+    # the report names the path the tree is reachable at; DEST is now a symlink to foreign2, so that path
+    # is DEST/chatgpt-consult and it resolves to foreign2/chatgpt-consult
+    reported = r.stderr.split("The old tree is at: ")[1].split(". The older backup")[0]
+    assert reported == f"{sb.dest}/chatgpt-consult", reported
+    assert os.path.realpath(reported) == os.path.realpath(foreign2 / "chatgpt-consult")
+    assert (foreign2 / "chatgpt-consult" / "OLD_MARKER").exists(), "the report points at a place the tree is not"
+    assert "running doctor" not in r.stdout, "the install went on to report success"
+
+
+def test_place_planted_symlink_at_dest_in_link_mode_never_writes_into_the_repo(sb, clone):
+    """--link: the staged tree is a symlink INTO the repo. A symlink planted at DEST makes the final rename
+    move that symlink into the foreign directory instead. The install fails, and nothing was written into
+    the repo; the old tree is reported."""
+    sb.old_install()
+    foreign = sb.home / "foreign"
+    foreign.mkdir()
+    sb.daemon_up()
+    before = _snapshot(clone)
+    _plant_shim(sb, [("*/.chatgpt-consult.new.*", "*/chatgpt-consult", foreign)])
+    r = _install_from(sb, clone, "--link")
+    assert r.returncode != 0
+    assert "did not put it there" in r.stderr
+    assert _snapshot(clone) == before, "the install wrote into the repo"
+    assert not (clone / "skill" / "chatgpt-consult").exists() and not (clone / "skill" / "chatgpt-consult.bak").exists()
+    assert (sb.dest.parent / "chatgpt-consult.bak" / "OLD_MARKER").exists() or (sb.dest / "OLD_MARKER").exists()
+
+
+# ---- uninstall: the delete step re-checks the config at delete time, not only at plan time ------------
+
+def test_uninstall_delete_skips_a_path_that_became_the_config_after_the_plan(sb):
+    """The plan was printed when the config file was elsewhere. By the time the delete runs, the config path
+    is a hard link to a planned scratch file. The delete re-checks identity and leaves it."""
+    sb.old_install()
+    sb.state.mkdir()
+    victim = sb.state / "daemon.log"
+    victim.write_text("CGC_MODEL=Pro\n")
+    cfg = sb.home / "later-config"
+    stub = sb.stubs / "launchctl"
+    sb.cgc("install-daemon")
+    stub.write_text(stub.read_text().replace(
+        'case "$1" in\n  bootout|unload)',
+        f'case "$1" in\n  bootout|unload)\n    ln "{victim}" "{cfg}"', 1))
+    r = sb.uninstall("--purge", CGC_CONFIG=str(cfg))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert victim.exists() and cfg.read_text() == "CGC_MODEL=Pro\n"
+    assert "is your config file; left alone" in r.stderr

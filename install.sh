@@ -118,25 +118,53 @@ except OSError:
 print("%d:%d" % (s.st_dev, s.st_ino))' "$1" 2>/dev/null || true
 }
 
-# holder ID PATH...: the first PATH whose own identity is ID (prints nothing if none).
-holder() {
+# Trees that a rename did not leave where it was aimed (see place), found by identity.
+STRAYS=()
+
+# where_is ID: the first of the places the swap uses (and any stray) whose own identity is ID.
+where_is() {
   local id="$1" p
-  shift
   [ -n "$id" ] || return 0
-  for p in "$@"; do
+  for p in "$DEST" "$DEST.bak" "$ASIDE" "$STAGE" ${STRAYS[@]+"${STRAYS[@]}"}; do
     if [ "$(ident "$p")" = "$id" ]; then printf '%s' "$p"; return 0; fi
   done
   return 0
 }
+show_where() { local w; w="$(where_is "$1")"; printf '%s' "${w:-(not found)}"; }
 
-# Rename SRC to DST only if DST is free. A bare mv would move SRC INTO an existing directory, or
-# through a symlink to one, into whatever that points at (the repo, for a --link install).
+# Rename SRC to DST, and PROVE it landed there. A bare mv moves SRC INTO an existing directory, or through
+# a symlink to one, into whatever that points at (the repo, for a --link install); so DST must be free
+# when we start, `mv -n` never overwrites, and since neither stops a directory or symlink that appears at
+# DST between the check and the rename, the result is checked by file identity: the path DST itself (not
+# what a symlink there points at) must now be the tree that was SRC. If not, say where it is and fail;
+# the caller aborts the swap. Only a concurrent writer to the skills directory can get here, and that is
+# detected, not defended against further.
 place() {
-  if [ -e "$2" ] || [ -L "$2" ]; then
-    echo "ERROR: refusing to move $1 onto $2: it already exists." >&2
+  local src="$1" dst="$2" id inside
+  id="$(ident "$src")"
+  if [ -z "$id" ]; then
+    echo "ERROR: cannot move $src to $dst: $src does not exist." >&2
     return 1
   fi
-  mv -- "$1" "$2"
+  if [ -e "$dst" ] || [ -L "$dst" ]; then
+    echo "ERROR: refusing to move $src onto $dst: it already exists." >&2
+    return 1
+  fi
+  if ! mv -n -- "$src" "$dst" 2>/dev/null; then
+    # a mv without -n, or a real failure: retry once plainly if nothing moved and DST is still free
+    if [ "$(ident "$src")" = "$id" ] && [ ! -e "$dst" ] && [ ! -L "$dst" ]; then mv -- "$src" "$dst" || true; fi
+  fi
+  if [ "$(ident "$dst")" = "$id" ]; then return 0; fi
+  inside="$dst/$(basename -- "$src")"
+  if [ "$(ident "$inside")" = "$id" ]; then
+    STRAYS+=("$inside")
+    echo "ERROR: moving $src to $dst did not put it there: something appeared at $dst meanwhile and the tree went INTO it, to $inside." >&2
+  elif [ "$(ident "$src")" = "$id" ]; then
+    echo "ERROR: moving $src to $dst failed; the tree is still at $src." >&2
+  else
+    echo "ERROR: moving $src to $dst left nothing at $dst and nothing at $src; look for the tree by name." >&2
+  fi
+  return 1
 }
 
 # Signals are exit requests everywhere except where they must not cut in. While deferred, one is only
@@ -163,9 +191,9 @@ rollback() {
     fi
     STARTED=0
   fi
-  old="$(holder "$OLD_ID" "$DEST" "$DEST.bak" "$ASIDE" "$STAGE")"
-  new="$(holder "$NEW_ID" "$DEST" "$DEST.bak" "$ASIDE" "$STAGE")"
-  prev="$(holder "$PREV_ID" "$DEST" "$DEST.bak" "$ASIDE" "$STAGE")"
+  old="$(where_is "$OLD_ID")"
+  new="$(where_is "$NEW_ID")"
+  prev="$(where_is "$PREV_ID")"
   if [ -n "$new" ] && [ "$new" = "$DEST" ]; then rm -rf -- "$DEST" || return 1; fi
   if [ -n "$old" ] && [ "$old" != "$DEST" ]; then place "$old" "$DEST" || return 1; fi
   if [ -n "$prev" ] && [ "$prev" != "$DEST.bak" ]; then place "$prev" "$DEST.bak" || return 1; fi
@@ -182,7 +210,7 @@ on_exit() {
     ok=1
     if [ "$SWAPPING" = 1 ] || [ "$STARTED" = 1 ]; then
       echo "• install did not finish — restoring the previous install" >&2
-      rollback || { ok=0; echo "ERROR: could not restore the previous install (see above); the old tree is at $DEST.bak, an older backup at $ASIDE." >&2; }
+      rollback || { ok=0; echo "ERROR: could not restore the previous install (see above). The old tree is at: $(show_where "$OLD_ID"). The older backup is at: $(show_where "$PREV_ID")." >&2; }
     fi
     if [ "$STOPPED" = 1 ] && [ "$ok" = 1 ]; then
       echo "• restarting the egress daemon on the previous install" >&2
@@ -226,9 +254,13 @@ done
 # of it restores a working install. That run also stopped the daemon: this one starts it again.
 if [ ! -e "$DEST" ] && [ ! -L "$DEST" ] && { [ -e "$DEST.bak" ] || [ -L "$DEST.bak" ]; }; then
   echo "• an earlier install was interrupted (the old tree is at $DEST.bak, nothing at $DEST) — restoring it first"
+  # The rename and the note "this run owes the daemon a start" are one step to a signal: between them a TERM
+  # would leave the old tree back in place and the daemon unloaded with nobody to start it.
+  defer_signals
   place "$DEST.bak" "$DEST"
   # that run had stopped the daemon before it died; this one starts it again if there is a service to start
   if [ -e "$HOME/Library/LaunchAgents/com.open-claude-gpt.daemon.plist" ]; then STOPPED=1; fi
+  allow_signals
 fi
 OLD_ID="$(ident "$DEST")"
 PREV_ID="$(ident "$DEST.bak")"
