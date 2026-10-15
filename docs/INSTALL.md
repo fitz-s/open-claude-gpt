@@ -19,9 +19,28 @@ cd open-claude-gpt
 `install.sh`:
 
 1. checks `python3` + auto-installs `websocket-client` if missing,
-2. copies `skill/` into `~/.claude/skills/chatgpt-consult` (backing up any prior install to `.bak`),
-3. makes the scripts executable,
-4. runs `cgc doctor`.
+2. refuses (before changing anything) if the consult store was written by a newer schema than this
+   checkout understands,
+3. **stops the launchd egress daemon and waits until its process has exited**,
+4. copies `skill/` to a staging directory and swaps it into `~/.claude/skills/chatgpt-consult`
+   (the prior install is kept as `.bak`; a failed copy leaves it untouched),
+5. **starts the daemon again and checks its heartbeat** names this install's store and schema,
+6. runs `cgc doctor`.
+
+Nothing is replaced under a running daemon, so no process ever executes a half-old, half-new tree. If
+the daemon will not stop, `install.sh` changes nothing and says so. A daemon you started yourself
+(`cgc watch`, `cgc up`) is not under launchd; `install.sh` refuses to continue while one is running
+and names its pid. If the install fails after the daemon was stopped, the previous tree is put back
+and the daemon is restarted. `install.sh` never touches the consult store (`control.db`).
+
+If the daemon does not come up on the new code the upgrade fails (`--force` continues anyway); run
+`cgc daemon-start` to retry. The daemon verbs are `cgc daemon-stop`, `cgc daemon-start`,
+`cgc daemon-pid`, and (first install) `cgc install-daemon`.
+
+Every path is rooted at `$HOME` (skills dir, `~/Library/LaunchAgents`, `~/.claude/settings.json`,
+`~/.config/cgc`, `~/.local/state/cgc`) and `launchctl` is looked up on `PATH`, so
+`HOME=/tmp/h PATH=/tmp/stubs:$PATH ./install.sh` runs the whole thing in a sandbox. The lifecycle tests
+do exactly that.
 
 Options:
 
@@ -29,6 +48,7 @@ Options:
 | --- | --- |
 | `--link` | Symlink instead of copy — edits in the clone go live. Good for development. |
 | `--dir DIR` | Install into a different skills root (default `~/.claude/skills`, or `$CLAUDE_SKILLS_DIR`). |
+| `--force` | Continue past a dependency range miss, an unreadable store, a daemon that did not come up, or a not-ready doctor. |
 | `--activation-hook` | Also install the optional proactive `SessionStart` hook (see below). Off by default. |
 
 ## First-run setup: log into ChatGPT once
@@ -49,12 +69,24 @@ default profile (anti-cookie-theft). The dedicated profile lives at
 ## Verify
 
 ```bash
-bin/cgc doctor          # deps, browser, port, scratch, skill files, config
+bin/cgc doctor          # deps, browser, port, daemon, store, scratch, skill files, config
 bin/cgc doctor --deep   # + ChatGPT login state (needs Chrome up)
 bin/cgc doctor --json   # machine-readable, for CI
 ```
 
-A green run means the skill is ready; in Claude Code it activates automatically.
+The doctor ends in three separate verdicts, because "the files are there" and "a consult can be sent"
+are different claims:
+
+| Verdict | True when |
+| --- | --- |
+| `installed` | every file the code loads is present and non-empty (including `chatgpt_contract.json`, `fixture_dom.js`, `cgc_drift.py`), `SKILL.md` exists, Python and `websocket-client` are usable |
+| `can_send` | `installed`, **and** the egress daemon's heartbeat is live and names this install's store and schema, **and** the debug Chrome port answers (with `--deep`, ChatGPT is also logged in), and the scratch dir is writable |
+| `can_read` | the store opens read-only at a schema this code understands (the doctor never creates or migrates it) |
+
+Overall **ready is `can_send`**: with no daemon there is no way to send, so it is not ready. Exit
+status: `0` ready, `3` installed but cannot send yet (start the daemon / Chrome / log in), `1` the
+install is incomplete (or a `--secure` advisory failed). A fresh `install.sh` therefore ends "installed,
+cannot send yet" until you run `cgc install-daemon` once.
 
 ## Activation: on-demand vs. proactive
 
@@ -108,11 +140,32 @@ description). There is no proactive path for subagents.
 cd open-claude-gpt && git pull && ./install.sh
 ```
 
-The prior install is moved to `~/.claude/skills/chatgpt-consult.bak` first.
+The daemon is stopped, the files are replaced, the daemon is started on the new code (see above). The
+prior install is kept as `~/.claude/skills/chatgpt-consult.bak`.
 
 ## Uninstall
 
 ```bash
-./uninstall.sh          # remove the installed skill
-./uninstall.sh --purge  # also remove scratch dir + (prompted) the Chrome profile
+./uninstall.sh          # remove the service, the hook entry and the code; KEEP the consult store
+./uninstall.sh --purge  # also delete the consult store (listed first), scratch, and (prompted) the Chrome profile
 ```
+
+In this order:
+
+1. the launchd service is stopped (waiting for the process to exit) and its plist removed,
+2. our `SessionStart` entry is removed from `settings.json` (every other hook and setting is left
+   as it was; `settings.json.bak` keeps the previous file; an unparseable `settings.json` is not
+   touched),
+3. only then is the code deleted.
+
+The **send journal is kept** unless you pass `--purge`: `control.db` records which prompts were sent,
+and deleting it forgets that, so a resend of an uncertain round can no longer be recognised. Without
+`--purge` the uninstall prints the paths it kept (`control.db`, `-wal`, `-shm`, the
+`control.db.v<n>.bak` pre-migration backups under `~/.local/state/cgc` or `$CGC_DATA_DIR`). With
+`--purge` it prints exactly which paths it is about to delete (those files, the `locks/` and
+`incidents/` directories of the tool's own data dir, and the scratch dir `$CGC_STATE_DIR`), then
+deletes them; a data dir that holds anything else is left in place. Your config file
+(`~/.config/cgc/config`) is never removed. The Chrome profile is deleted only if you answer `y`.
+
+To stop only the daemon: `cgc uninstall-daemon` (also waits for the process to exit and keeps the
+plist if it will not).

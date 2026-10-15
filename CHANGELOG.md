@@ -6,6 +6,37 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — install, uninstall, doctor and config lifecycle (v0.6 review)
+
+- **Upgrade stops the daemon before replacing files.** `install.sh` used to copy the new tree over a
+  running daemon and restart it afterwards, so the daemon imported modules lazily from a half-replaced
+  tree. It now stops the launchd job, waits until the daemon process has exited, swaps in a staged
+  copy, starts the daemon and checks its heartbeat names this install's store schema. A daemon that will
+  not stop, or one running outside launchd (`cgc watch`), stops the install before anything changes. A
+  failure after the stop puts the previous tree back and restarts the daemon. Older code is refused
+  over a newer store before anything is stopped. New verbs: `cgc daemon-stop`, `daemon-start`,
+  `daemon-pid`; `cgc uninstall-daemon` and `install-daemon` now wait for the process to exit
+  (`uninstall-daemon` keeps the plist if it will not).
+- **`uninstall.sh` removes things in a safe order and keeps the journal.** The service is stopped and
+  removed first, then our `SessionStart` entry leaves `settings.json` (JSON-aware; other hooks
+  untouched; `.bak` kept), then the code goes. The consult store (`control.db`, `-wal`, `-shm`,
+  `control.db.v<n>.bak`) is kept unless `--purge`, which lists every path it deletes. Its old purge
+  message pointed at `/tmp/cgc`, where the store has not lived since it moved to `~/.local/state/cgc`.
+- **`cgc doctor` reports three verdicts and is ready only when it can send.** `installed`, `can_send`
+  (daemon heartbeat live and serving this install's store and schema, debug Chrome port answering) and
+  `can_read` (store readable at a known schema). No daemon is not ready (exit 3); it used to be a
+  warning, so a machine that could not send printed "all checks passed". The required-file list now
+  matches what the code loads (`chatgpt_contract.json`, `fixture_dom.js`, `cgc_drift.py` and every
+  other module; `retrieval_window.js` is gone), and a test pins the list to `skill/scripts`.
+  `--json` gains `ready` and `verdicts`. The debug-port probe no longer goes through `http_proxy`.
+- **`cgc_config` validates and writes safely.** A key must be `CGC_` plus capitals, digits or `_`; a
+  key no script reads is stored with a warning (a typo); a value with a newline, CR or NUL is refused
+  (it would write a second line); `CGC_PORT`, `CGC_WEEKLY_BUDGET` and the on/off flags must parse, and a
+  hand-edited bad value is skipped at load with a message instead of crashing every command. Writes
+  take an exclusive lock, re-read the file under it and replace it through a unique temp file, so
+  concurrent `set`s all land. The old fixed `<config>.tmp` lost updates and made two of three
+  concurrent writers crash.
+
 ### Added — one UI contract, and a repair bundle when ChatGPT's page changes
 
 - Every ChatGPT DOM fact the driver reads (turn schemas, answer body, composer, mention popup and
