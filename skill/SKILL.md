@@ -138,6 +138,11 @@ re-send) · `source_unresolved` · `remote_failed` · `observation_deadline` · 
   with `turn_failed` — re-fire with a NEW `--request-key` only if you still need the answer. If the
   continue could not be confirmed it ends `possibly_accepted` like any unconfirmed send: follow
   `next_command` (retrieve), never re-fire.
+- ChatGPT's safety filter blocking the round ends it at once as `remote_failed` with `remote_refused`
+  in `detail`: rephrase the framing and re-fire with a NEW `--request-key`.
+- A round that shows no sign of generation for 15 minutes (`CGC_NO_GENERATION_S`), usually a
+  pending app-authorization prompt, ends as `send_uncertain` with `no_generation`: relay
+  `human_action`, retrieve, never re-send.
 - "Still running" is not an outcome: await keeps waiting through the round's 90-minute deadline.
 
 **A stopped/killed `await` is a NON-EVENT.** The round lives in the store and the daemon finishes
