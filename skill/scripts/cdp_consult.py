@@ -136,7 +136,9 @@ CONTRACT_PATH = os.environ.get("CGC_CONTRACT") or os.path.join(
 #             role_from: value|last_colon_segment, send_rank: int}, send_ranks distinct
 _CONTRACT_SCHEMA = {
     "turn_schemas": "schemas", "assistant_body": "body", "turn_container": "sel",
-    "conversation_root": "sel", "failure_markers": "words", "model_slug_attr": "attr",
+    "conversation_root": "sel", "failure_markers": "words", "refusal_headings": "words",
+    "prose_container": "sel", "refusal_reasons": "words", "refusal_link_hosts": "words",
+    "attachment_card": "sel", "model_slug_attr": "attr",
     "composer": "sel", "composer_exclude_ancestor": "sel",
     "trailing_break_class": "class", "mention_chip_attr": "attr", "mention_chip_label_attr": "attr",
     "mention_popup_attr": "attr", "mention_option_attr": "attr", "mention_row_content_attr": "attr",
@@ -374,6 +376,23 @@ STALE_RELOAD_SETTLE_S = 8
 # resets the streak before it can reach 3 — so 15 idle minutes sits far outside a live round while
 # costing ~1/6 of the 5400s actually lost.
 STALE_STUB_CYCLES = 3
+
+# A sent round whose page shows no generation (no stop button) and no assistant node in the round's own
+# interval is not slow, it is dead: a live Pro round keeps the stop button up or an assistant node on the
+# page through every thinking phase (the stub nodes of the thinking summary count as nodes). Seen live
+# 2026-10-18, REQ-20261018-101759-06b1be: the tab read gen=True for two seconds, then gen=False node=none
+# ac=0 for the 5400s budget, because the conversation sat parked on a pending tool-approval card
+# (the server transcript ends in a confirm_action elicitation with status "pending"). After this many
+# CONTINUOUS seconds the waiter spends the wait's one reload, then ends `no_generation` once the state
+# survives it for NO_GEN_RECHECK_S more. 0 disables. The end is post-send: possibly_accepted, retrieve,
+# never a resend.
+try:
+    NO_GENERATION_S = max(0, int(os.environ.get("CGC_NO_GENERATION_S", "900")))
+except ValueError:
+    NO_GENERATION_S = 900
+# A reload re-renders the thread asynchronously; the dead state must hold this long after it before the
+# verdict, so a page still hydrating is never read as an empty one.
+NO_GEN_RECHECK_S = 120
 
 
 @contextlib.contextmanager
@@ -832,6 +851,14 @@ _RID_FN = ("function __cgcRid(t){t=t||'';"
            "for(var i=0;i<ls.length;i++){var m=ls[i].replace(tr,'').match(re);if(!m)continue;"
            "if(m[1]==='BEGIN')ob[m[2]]=1;else if(ob[m[2]])rid=m[2];}return rid;}")
 
+# THE interval-end rule, page side: given `lo` (the source turn's index in `nx`), sets `hi` to the first
+# user turn that ends rid's interval. The answer read (__cgcNode) and the refusal read (_detect_js) both
+# splice this one string, so they can never disagree about which messages are rid's own.
+_INTERVAL_END_JS = (
+    "var rep=false;for(var j=lo+1;j<nx.length;j++){var rj=__cgcRole(nx[j]);"
+    "if(rj==='assistant'){rep=rep||/\\S/.test(nx[j].textContent||'');continue;}"
+    "if(rj==='user'&&(rep||__cgcRid(__cgcText(nx[j])))){hi=j;break;}}")
+
 _NODE_FN = (
     _ROLE_FN + _TEXT_FN + _RID_FN +
     # __cgcSrc(nx, RID): index in nx of the source turn — the LAST user node whose OWN canonical rid
@@ -866,9 +893,7 @@ _NODE_FN = (
     # exchange, even when the model reuses this rid's wrapper in answering it. Where the DOM cannot
     # tell the two apart, the rule errs toward ending the interval: a missed answer is retrieved, a
     # wrong one is not caught. A resend under this rid is lo itself (__cgcSrc takes the last).
-    "var rep=false;for(var j=lo+1;j<nx.length;j++){var rj=__cgcRole(nx[j]);"
-    "if(rj==='assistant'){rep=rep||/\\S/.test(nx[j].textContent||'');continue;}"
-    "if(rj==='user'&&(rep||__cgcRid(__cgcText(nx[j])))){hi=j;break;}}}"
+    + _INTERVAL_END_JS + "}"
     # 1) exact: any assistant node containing our (unique) BEGIN sentinel, newest-first. Scoped ->
     #    within [lo,hi) only. Unscoped -> the whole document (lo=-1,hi=nx.length), matching the
     #    original global search.
@@ -1049,7 +1074,7 @@ def _blocker(c):
 
 
 def _detect_js(rid: str, *, scoped=False) -> str:
-    """Returns JSON {generating,done,blocker,failed,node,len,begin,end,ac} for the answer node.
+    """Returns JSON {generating,done,blocker,failed,refused,refused_note,node,len,begin,end,ac} for the answer node.
     done comes from the canonical bare-line _sentinel_js parser (SHARED CONTRACT #1) — a line
     merely CONTAINING BEGIN/END_RESPONSE:<rid> (quoted in prose or a code block) never counts,
     only a bare standalone sentinel line does. This is NOT stop-button driven: the model writes
@@ -1099,13 +1124,42 @@ def _detect_js(rid: str, *, scoped=False) -> str:
         "if(v.length>80||!/^(" + _js_alt(UI["failure_markers"]) + ")\\b/.test(v))continue;"
         "if(p.closest(" + _js_str(_IN_MESSAGE_SEL) + "))continue;"
         "failed=v;}})();"
+        # ChatGPT's safety filter replaced the reply. It renders a NOTICE, not an answer (live DOM, 2026-10-20), and
+        # the match is POSITIVE, every part of it from that capture:
+        #   - a leaf <p> whose whole trimmed text equals a contract heading (refusal_headings);
+        #   - its NEXT element sibling is a <p> whose text starts with a contract reason (refusal_reasons);
+        #   - the two share a parent that holds an <a> whose href is https://<host>/... (refusal_link_hosts);
+        #   - none of it is in the answer's prose (prose_container) or an attachment card (attachment_card): an
+        #     attached file named like the heading is a card, not the notice.
+        # And it sits inside rid's OWN interval (the same end rule __cgcNode uses, _INTERVAL_END_JS), read per
+        # assistant message so a thinking stub beside it does not hide it. A page that is generating never reads as
+        # refused. The reason text rides along as `refused_note`: it is part of the evidence the waiter compares.
+        "var refused=null,refusedNote=null;(function(){if(document.querySelector(" + _js_str(_STOP_BUTTON_SEL) + "))return;"
+        "var lo=src,hi=nx.length;"
+        "if(!RID){lo=-1;for(var q=nx.length-1;q>=0;q--){"
+        "if(__cgcRole(nx[q])==='user'&&__cgcRid(__cgcText(nx[q]))===" + json.dumps(rid) + "){lo=q;break;}}}"
+        "if(lo<0)return;" + _INTERVAL_END_JS +
+        "var HEAD=/^(" + _js_alt(UI["refusal_headings"]) + ")$/,REAS=/^(" + _js_alt(UI["refusal_reasons"]) + ")/,"
+        "HOST=/^https:\\/\\/(" + _js_alt(UI["refusal_link_hosts"]) + ")(\\/|$)/;"
+        "function clean(t){return (t||'').replace(/\\s+/g,' ').trim();}"
+        "for(var j2=lo+1;j2<hi;j2++){if(__cgcRole(nx[j2])!=='assistant')continue;"
+        "var ls=nx[j2].querySelectorAll('p');for(var k2=0;k2<ls.length;k2++){var e2=ls[k2];"
+        "if(e2.children&&e2.children.length)continue;if(!HEAD.test(clean(e2.textContent)))continue;"
+        "if(e2.closest(" + _js_str(UI["prose_container"]) + ")||e2.closest(" + _js_str(UI["attachment_card"]) + "))continue;"
+        "var par=e2.parentElement;if(!par||par.querySelector(" + _js_str(UI["attachment_card"]) + "))continue;"
+        "var sb=par.children,at=Array.prototype.indexOf.call(sb,e2),rs=sb[at+1];"
+        "if(!rs||rs.tagName!=='P'||!REAS.test(clean(rs.textContent)))continue;"
+        "var as=par.querySelectorAll('a'),ok=false;for(var m2=0;m2<as.length;m2++){"
+        "if(HOST.test(as[m2].getAttribute('href')||'')){ok=true;break;}}"
+        "if(!ok)continue;"
+        "refused=clean(e2.textContent);refusedNote=clean(rs.textContent).slice(0,200);}}})();"
         "var rawT=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
         "var res=" + sentinel + ";"
         "var hasB=rawT.indexOf(BG)>=0,hasE=rawT.indexOf(EN)>=0;"
         "var stop=!!document.querySelector(" + _js_str(_STOP_BUTTON_SEL) + ");"
         + _BLOCKER_FN + "var blocker=__cgcBlocker();"
         "var done=(res.done&&a.length>0);"
-        "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,node:where,superseded:sup,"
+        "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,refused:refused,refused_note:refusedNote,node:where,superseded:sup,"
         "len:rawT.length,begin:hasB,end:hasE,ac:a.length});})()"
     )
 
@@ -4190,6 +4244,8 @@ def cmd_wait(a) -> int:
         approvals = 0
         idle_since, idle_len = time.time(), None
         sup_since = None
+        nogen_since = None   # when the page last STARTED showing no generation and no reply (NO_GENERATION_S)
+        refused_seen = None  # the refusal text the PREVIOUS poll read; it must repeat before anything ends
         idle_exit = getattr(a, "idle_exit", 0) or 0   # followup --watch reuses this waiter
         # A valid wrapper in ONE snapshot is not finality: a stream can pause right after END and then
         # continue below it. So done must be read twice, on consecutive polls, at the same length
@@ -4210,6 +4266,7 @@ def cmd_wait(a) -> int:
                 sys.stderr.write(f"CGC_WAIT eval-retry: {e}\n")
                 sup_since = None
                 done_body = None
+                nogen_since = refused_seen = None   # a failed read proves nothing about the page
                 time.sleep(a.poll)
                 continue
             ticks += 1
@@ -4222,6 +4279,7 @@ def cmd_wait(a) -> int:
                                  f"t+{int(time.time()-(deadline-a.timeout))}s\n")
             card = _answer_approval(c, click=not getattr(a, "no_approve", False))
             if card:
+                nogen_since = refused_seen = None   # a card on the page is a live prompt, not a dead round
                 app, text = card
                 approvals += 1
                 if not app or approvals > 5 or getattr(a, "no_approve", False):
@@ -4238,7 +4296,32 @@ def cmd_wait(a) -> int:
             if st.get("blocker"):
                 sys.stderr.write(f"CGC_BLOCKER {st['blocker']}\n")
                 return 3
-            if st.get("failed") and not st.get("generating") and not st.get("done"):
+            # ChatGPT's safety filter replaced the reply with a refusal notice (contract refusal_headings, read
+            # structurally by _detect_js as a positive match: heading <p>, its reason <p>, a chatgpt.com link,
+            # none of it in the answer's prose or an attachment card, inside this round's interval). It is
+            # terminal and says nothing about the transport, so it ends the wait instead of the budget (the
+            # 2026-10-14 refusal was waited out for 90 minutes) -- and it outranks a failed-turn marker: the
+            # failure path auto-continues into the thread, a second paid message the filter will refuse again.
+            # Order: a completed wrapped answer first (`done`), then a refusal, then a continuable failure.
+            # The one check kept on top of the structure: the same evidence (heading AND the reason beside it,
+            # compared in FULL, never a prefix) on two consecutive polls. The structural read already rules out an
+            # answer's words; the second look buys a notice caught mid-render, or the stop button gone for a beat
+            # between generation phases while the page is still changing. It costs one poll.
+            refused_now = ((st["refused"], st["refused_note"])
+                           if st.get("refused") and st.get("refused_note")
+                           and not st.get("done") and not st.get("generating") else None)
+            if refused_now and refused_now == refused_seen:
+                sys.stderr.write(
+                    f"CGC_ERROR remote_refused: ChatGPT's safety filter replaced {rid}'s reply with "
+                    f"{refused_now[0]!r} ({refused_now[1][:160]})"
+                    " -- it will never produce an answer. Nothing to retrieve; "
+                    "rephrase the security framing (e.g. describe it as code review) and re-fire with a "
+                    "NEW --request-key.\n")
+                if not a.keep_tab:
+                    c.close_tab()
+                return 4
+            refused_seen = refused_now
+            if st.get("failed") and not st.get("generating") and not st.get("done") and not refused_now:
                 sys.stderr.write(
                     f"CGC_ERROR turn_failed: ChatGPT marked {rid}'s turn '{st['failed']}' — it will "
                     "never produce an answer. Nothing to retrieve; re-send it as a new round.\n")
@@ -4271,6 +4354,33 @@ def cmd_wait(a) -> int:
                     return 5
             else:
                 sup_since = None
+            # A sent round that shows no generation (no stop button) and no assistant message in its own
+            # interval is dead, not slow: a live Pro round keeps one of the two up through every thinking
+            # phase. The clock is CONTINUOUS (any generation, any message, a card, a blocker or a
+            # superseding turn resets it), and the wait's one reload is spent before the verdict so a stale
+            # tab is never what ends it. The end is post-send, like every timeout: retrieve, never resend.
+            if (NO_GENERATION_S and not st.get("generating") and st.get("node") == "none"
+                    and not st.get("done") and not st.get("superseded")):
+                nogen_since = nogen_since or time.time()
+                if time.time() - nogen_since >= NO_GENERATION_S:
+                    if not reloaded:
+                        reloaded = True
+                        _reload_stale_tab(
+                            c, f"{rid}'s page has shown no generation and no reply for "
+                               f"{int(time.time() - nogen_since)}s")
+                        nogen_since = time.time() - NO_GENERATION_S + NO_GEN_RECHECK_S
+                        continue
+                    sys.stderr.write(
+                        f"CGC_ERROR no_generation: {rid}'s page has shown no generation and no reply for "
+                        f"{int(time.time() - nogen_since)}s after the send, past the one reload — a live round "
+                        "keeps its stop button or a reply up, so nothing is coming. The send landed: it may be "
+                        "parked on an app-approval prompt in the thread (look at the ChatGPT window). "
+                        "Retrieve, never re-send.\n")
+                    if not a.keep_tab:
+                        c.close_tab()
+                    return 4
+            else:
+                nogen_since = None
             # Idleness must be CONTINUOUS: any generation or byte movement restarts the clock, so the
             # gap between a thinking phase and the written answer can never end a live round.
             if st.get("generating") or st.get("len", 0) != idle_len:

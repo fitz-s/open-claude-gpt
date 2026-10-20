@@ -227,7 +227,11 @@ def test_law4_an_invalid_contract_blocks_the_round_as_proven_not_sent(tmp_path, 
 
 
 # Updated 2026-10-14: approval labels moved to code; LAW 7 click guard; implicit-submit and aria-haspopup="false" refused.
-_GOLDEN_JS = "aab68ec505dbdcd50b4fa40b8627e91886c410552564398f29bbdf805559848e"
+# Updated 2026-10-20: _detect_js reads ChatGPT's safety-filter refusal as a POSITIVE structural match (heading
+# <p> from refusal_headings, its next-sibling reason <p>, a chatgpt.com link under their parent; none of it in
+# prose_container or an attachment_card), in the same interval __cgcNode reads (one _INTERVAL_END_JS), and
+# never while the page is generating.
+_GOLDEN_JS = "8393cbb3a7f4acebd13f66438b66690e9828449fd8cf3f07c6f643ee1d35d802"
 
 
 def _generated_js(cdp):
@@ -285,6 +289,12 @@ _MAIN_DELTAS = {"_contract_js": [('button[aria-label*="Stop"]\')', 'button[aria-
                                  ("return vis(b)&&/^(allow once|\\u5141", "return vis(b)&&!(b.closest&&b.closest('form'))&&/^(allow once|\\u5141")]}
 
 
+# The one reviewed non-guard addition to the reader since main: _detect_js also reports `refused`, ChatGPT's
+# safety-filter replacement of the reply (contract refusal_headings). Taken out the way the guard is, so
+# what remains is main's detect JS byte for byte.
+_REFUSAL_READ = __import__("re").compile(r"var refused=null,refusedNote=null;\(function\(\)\{.*?refusedNote=clean\(rs\.textContent\)\.slice\(0,200\);\}\}\}\)\(\);")
+
+
 def test_law7_the_generated_js_is_mains_except_the_guard(mods):
     """Every generated JS string equals main's once the click-authority guard is taken out: the
     _AUTHORITY_FN prelude and its call sites. Nothing else about the page JS changed."""
@@ -310,6 +320,7 @@ def test_law7_the_generated_js_is_mains_except_the_guard(mods):
         for a, b in subs:
             got = got.replace(a, b)
         got = mention.sub("", got)
+        got = _REFUSAL_READ.sub("", got).replace("refused:refused,refused_note:refusedNote,", "")
         for a, b in _MAIN_DELTAS.get(k, []):
             want = want.replace(a, b, 1)
         assert got == want, k

@@ -1042,12 +1042,12 @@ _ERRORS = {
     "send_uncertain": (
         "unknown_send wait_produced_no submit_did_not followup_send_failed daemon_died "
         "worker_exited daemon_startup periodic_sweep refire_refused "
-        "chatgpt_failed_the accepted_but_no"),
+        "chatgpt_failed_the accepted_but_no no_generation"),
     "source_unresolved": (
         "rid_absent rid_superseded rid_ambiguous ambiguous_rid ambiguous_target rid_mismatch "
         "rid_echo_mismatch rid_unresolved rid_not_on_any_open_tab conversation_mismatch "
         "conversation_not_found no_conversation_id retrieve_could_not retrieve_parent_unresolved"),
-    "remote_failed": "turn_failed",
+    "remote_failed": "turn_failed remote_refused",
     "observation_deadline": "timeout_no_answer observation_deadline_passed expired",
     "not_found": "no_such_round",
 }
@@ -1291,7 +1291,14 @@ def _answer_file(r: dict, out: str | None = None) -> str | None:
 
 
 _DONE_STATES = (store_mod.COMPLETED_VERIFIED, store_mod.COMPLETED_UNVERIFIED)
-_PROVIDER_FINAL = re.compile(r"^(?:CGC_ERROR )?turn_failed(?![A-Za-z0-9_])")
+_PROVIDER_FINAL = re.compile(r"^(?:CGC_ERROR )?(?:turn_failed|remote_refused)(?![A-Za-z0-9_])")
+_REFUSED = re.compile(r"^(?:CGC_ERROR )?remote_refused(?![A-Za-z0-9_])")
+_REFUSED_ACTION = ("ChatGPT's safety filter blocked this round: rephrase the security framing "
+                   "(e.g. describe it as code review) and re-fire with a new --request-key")
+_NO_GENERATION = re.compile(r"^(?:CGC_ERROR )?no_generation(?![A-Za-z0-9_])")
+_NO_GENERATION_ACTION = ("the thread shows no generation and no reply, so nothing is coming; the send "
+                         "may have landed. Look at the ChatGPT window for a pending app-approval "
+                         "prompt, answer it there, then retrieve (never re-send)")
 # auto_continue_state values after which a failed turn is final: never claimed, or an outcome known.
 _CONTINUE_FINAL = (None, "landed", "not_sent")
 
@@ -1378,12 +1385,13 @@ def decide(s, r: dict, *, daemon_up: bool = True, out: str | None = None) -> dic
     if (state == store_mod.FAILED and _PROVIDER_FINAL.match(str(err or ""))
             and s.auto_continue_state(rid) in _CONTINUE_FINAL):
         d.update(code="remote_failed",
-                 human_action="ChatGPT failed the turn: re-fire with a NEW --request-key if still "
-                              "needed")
+                 human_action=_REFUSED_ACTION if _REFUSED.match(str(err or "")) else
+                 "ChatGPT failed the turn: re-fire with a NEW --request-key if still needed")
         return d
     d.update(next_command=_retrieve_cmd(rid, s.conversation_of(rid)),
-             human_action="the send may have landed: check the ChatGPT window; retrieve, never "
-                          "re-send")
+             human_action=(_NO_GENERATION_ACTION if _NO_GENERATION.match(str(err or "")) else
+                           "the send may have landed: check the ChatGPT window; retrieve, never "
+                           "re-send"))
     if state == store_mod.FAILED and d["code"] == "remote_failed":
         d["code"] = "send_uncertain"
     return d
@@ -2312,6 +2320,32 @@ def _send_continue(store, rid, conv, spec, run_cdp, prompt, deadline) -> str:
     return "landed"
 
 
+def _typed_end(store, rid, res, is_retrieve):
+    """The state of a wait that ended on one of the waiter's typed terminal verdicts that is not a failed
+    TURN, else None. Read from its last CGC_ERROR line, exit 4 only:
+      remote_refused  ChatGPT's safety filter replaced the reply. Nothing is coming, ever, and a continue
+                      would be a second paid message into a thread the filter just refused, so: FAILED with
+                      the typed line (decide() turns it into the rephrase-and-re-fire instruction).
+      no_generation   the page showed no generation and no reply for CGC_NO_GENERATION_S after the send.
+                      Nothing is coming, but the send landed and the thread may be parked on a prompt only
+                      a human can answer: possibly_accepted, retrieve, never resend.
+    A retrieve (recovery) keeps its own classification below: its FAILED row carries the same typed line."""
+    if is_retrieve or res.get("code") != 4:
+        return None
+    line = _stderr_error_line(res.get("stderr") or "")
+    if line and _REFUSED.match(line):
+        store.finish(rid, store_mod.FAILED, error_code=line + "; " + _REFUSED_ACTION + ".")
+        return store_mod.FAILED
+    if line and _NO_GENERATION.match(line):
+        prior_row = store.get_round(rid)
+        prior = prior_row["error_code"] if prior_row else None
+        store.set_state(rid, store_mod.POSSIBLY_ACCEPTED,
+                        error_code=line + " — retrieve, don't resend"
+                                   + (f"; original disposition: {prior}" if prior else ""))
+        return store_mod.POSSIBLY_ACCEPTED
+    return None
+
+
 def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=False,
                 may_continue=False, final_look=False) -> str:
     """Wait for the round's answer and commit what the waiter saw.
@@ -2358,6 +2392,9 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
                   approve=may_continue)
     code = res.get("code")
     turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
+    ended = _typed_end(store, rid, res, is_retrieve)
+    if ended:
+        return ended
     if turn_failed and not is_retrieve:
         prior = store.auto_continue_state(rid)
         if prior is None and not may_continue:
@@ -2400,6 +2437,9 @@ def _wait_phase(store, rid, conv, spec, run_cdp, wait_rid=None, *, is_retrieve=F
                           poll=spec.get("poll"), timeout=left, approve=may_continue)
             code = res.get("code")
             turn_failed = code == 4 and "turn_failed" in (res.get("stderr") or "")
+            ended = _typed_end(store, rid, res, is_retrieve)
+            if ended:
+                return ended
     answer_path = res.get("out") or out_tmp
     answer = _read_answer(answer_path)
     if code == 0 and answer.strip():

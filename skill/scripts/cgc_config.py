@@ -71,7 +71,7 @@ KNOWN = {
     "CGC_APPS": None, "CGC_AUTO_APPROVE": None, "CGC_AUTO_MODEL": _flag, "CGC_CHROME": None,
     "CGC_CONTRACT": None, "CGC_DATA_DIR": None, "CGC_GATE_ALLOW_GIST": _flag,
     "CGC_GATE_PRIVATE_REPOS": None, "CGC_MODEL": None, "CGC_MODEL_FAMILY": None,
-    "CGC_MODEL_SLUG": None, "CGC_PORT": _port, "CGC_PROFILE": None, "CGC_PROJECT_URL": None,
+    "CGC_MODEL_SLUG": None, "CGC_NO_GENERATION_S": _count, "CGC_PORT": _port, "CGC_PROFILE": None, "CGC_PROJECT_URL": None,
     "CGC_SPOOL_DIR": None, "CGC_STATE_DIR": None, "CGC_STORE_DB": None, "CGC_WEEKLY_BUDGET": _count,
     "CGC_WORKSPACES": None,
 }

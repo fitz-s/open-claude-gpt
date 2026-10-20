@@ -6,6 +6,37 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — two waits that burned the whole 90-minute budget on a round that could never answer
+
+- **A safety-filter block is a terminal answer, not a slow one.** ChatGPT can replace a reply with
+  "This content can't be shown / was flagged for possible …" (258 chars, no wrapper). The waiter read
+  that as a short unwrapped stub and waited out the budget (2026-10-14), and the follow-up sent into the
+  same thread then got no reply at all. The refusal is a NOTICE, not an answer, and is matched
+  POSITIVELY from the live DOM (captured 2026-10-20): a leaf `<p>` whose whole trimmed text equals a
+  contract heading (`refusal_headings`: "This content can't be shown", either apostrophe); its NEXT
+  element sibling is a `<p>` starting with a contract reason (`refusal_reasons`: "This content was
+  flagged for possible"); their shared parent holds an `<a>` whose href is `https://chatgpt.com/...`
+  (`refusal_link_hosts`; the captured link is /cyber, any path accepted); and none of it sits in the
+  answer's prose (`prose_container`) or an attachment card (`attachment_card`, `[data-file-reference]`:
+  a file named like the heading is a card, not the notice). It must be inside the round's own interval
+  (one `_INTERVAL_END_JS`, shared with the answer read) and is never read while the stop button is up.
+  The reason text is part of the evidence (`refused_note`): the wait ends when the same heading AND
+  reason are read on two consecutive polls, compared in full, with `CGC_ERROR remote_refused`. The round
+  is `failed` with code `remote_failed` and the human_action "ChatGPT's safety filter blocked this
+  round: rephrase the security framing (e.g. describe it as code review) and re-fire with a new
+  --request-key". No automatic continue is sent into a refused thread; a wrapped answer outranks a
+  refusal, and a refusal outranks a continuable `turn_failed`.
+  The link is part of the match on purpose: it is on the captured page, and a UI that drops it fails
+  closed (the wait falls back to its own budget) rather than guessing. A real answer that merely opens
+  with the phrase, or is still streaming it, renders inside the markdown container and is never a refusal.
+- **A sent round with no generation and no reply is dead, not slow.** 2026-10-18: the tab read
+  `gen=False node=none ac=0` for 5400 s because the thread was parked on a pending tool-approval prompt
+  (the server transcript holds one user message and ends on an unanswered `confirm_action`). After
+  `CGC_NO_GENERATION_S` (default 900) of continuous deadness the wait spends its one stale-tab reload,
+  rechecks for 120 s, then ends `no_generation`: `possibly_accepted`, retrieve, never re-send, with the
+  likely cause named. A thinking round keeps the stop button or a reply node up and is never cut; any
+  sign of life restarts the clock -- an approval card seen or answered, and a failed read, included.
+
 ### Fixed — install, uninstall, doctor and config lifecycle (v0.6 review)
 
 - **Upgrade stops the daemon before replacing files.** `install.sh` used to copy the new tree over a
