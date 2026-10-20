@@ -621,3 +621,57 @@ def test_an_app_whose_name_merely_contains_the_allowlisted_one_is_another_app(tm
 def test_only_the_known_prompt_templates_with_an_exactly_equal_operand_bind(tmp_path, card):
     _driver(tmp_path, {})
     assert _clicks(_in_form(_live_card(**card)), ["WebCodex Demo"])["log"] == []
+
+
+# The live file-materialization card (2026-10-20), line for line. It names its app only in the operand
+# line; the title "Allow file materialization?" names none. No "Always allow" on this card.
+def _mat_card(app="WebCodex Demo", header=None, title="Allow file materialization?", operand=None):
+    lines = [header or app]
+    if title:
+        lines.append(title)
+    lines.append(operand if operand is not None else
+                 "ChatGPT needs your approval to materialize 1 file attachments returned by %s. See details" % app)
+    return ["div", {"id": "card"}, [["div", {}, [l]] for l in lines] + [
+        _btn("details", "See details"), _btn("deny", "DenyEsc"), _btn("allow", "Allow once⏎"),
+        _btn("more", "")]]
+
+
+def test_the_live_materialization_card_is_clicked_in_the_form_and_out_of_it(tmp_path):
+    _driver(tmp_path, {})
+    assert _clicks(_in_form(_mat_card()), ["WebCodex Demo"])["log"] == [["click", "allow"]]
+    assert _clicks(_page(["form", {}, [EDITOR, SEND]], _mat_card()), ["WebCodex Demo"])["log"] == [["click", "allow"]]
+    plain = _mat_card(operand="ChatGPT needs your approval to materialize 12 file attachments returned by "
+                              "WebCodex Demo.")
+    assert _clicks(_in_form(plain), ["WebCodex Demo"])["log"] == [["click", "allow"]]
+
+
+@pytest.mark.parametrize("card", [
+    dict(app="Fake WebCodex Demo"),
+    dict(app="Canva"),
+    dict(header="Canva", operand="ChatGPT needs your approval to materialize 1 file attachments returned by "
+                                 "WebCodex Demo. See details"),
+    dict(title=None, operand="Allow file materialization?"),                          # title alone, no operand line
+    dict(operand="ChatGPT needs your approval to materialize 1 file attachments returned by WebCodex Demo. "
+                 "See details and also allow Canva"),                                  # trailing extra text
+    dict(operand="ChatGPT needs your approval to materialize 1 file attachments returned by WebCodex Demo. "
+                 "See details Allow ChatGPT to use Canva?"),
+])
+def test_the_materialization_card_binds_only_by_an_exactly_equal_operand(tmp_path, card):
+    _driver(tmp_path, {})
+    assert _clicks(_in_form(_mat_card(**card)), ["WebCodex Demo"])["log"] == []
+    assert _clicks(_page(["form", {}, [EDITOR, SEND]], _mat_card(**card)), ["WebCodex Demo"])["log"] == []
+
+
+def test_the_materialization_title_alone_binds_nothing(tmp_path):
+    _driver(tmp_path, {})
+    card = ["div", {}, [["div", {}, ["WebCodex Demo"]], ["div", {}, ["Allow file materialization?"]],
+                        _btn("deny", "Deny"), _btn("allow", "Allow once")]]
+    assert _clicks(_in_form(card), ["WebCodex Demo"])["log"] == []
+
+
+def test_the_live_use_card_still_clicks_beside_the_materialization_template(tmp_path):
+    _driver(tmp_path, {})
+    card = ["div", {"id": "card"}, [["div", {}, ["WebCodex Demo"]],
+                                    ["div", {}, ["Allow ChatGPT to use WebCodex Demo?"]],
+                                    _btn("deny", "DenyEsc"), _btn("allow", "Allow once⏎")]]
+    assert _clicks(_in_form(card), ["WebCodex Demo"])["log"] == [["click", "allow"]]

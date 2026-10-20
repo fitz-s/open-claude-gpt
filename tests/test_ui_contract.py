@@ -233,7 +233,7 @@ def test_law4_an_invalid_contract_blocks_the_round_as_proven_not_sent(tmp_path, 
 # never while the page is generating.
 # Updated 2026-10-20 (approval card in the composer form): _approval_js binds a card by its own prompt operand, and
 # __cgcMayClick judges a button by its form owner and, for approve, by its card widget.
-_GOLDEN_JS = "fa20d020b22f9f25a28b54a8d68e84979617535a700e8c6c679707ab2f3d892e"
+_GOLDEN_JS = "ace430e7dbdfdf3deed01d8a963ad4113ba0c67abaa9d85cc342123f09054133"
 
 
 def _generated_js(cdp):
