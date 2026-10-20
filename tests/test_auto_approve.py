@@ -1,4 +1,4 @@
-# App approval cards ("WebCodex Demo — Allow file materialization? [Deny] [Allow once]") stall a round
+# App approval cards ("Allow ChatGPT to use WebCodex Demo? [Deny] [Allow once]") stall a round
 # until answered. The waiter answers them in the consult's own tab for allowlisted apps only. These run
 # the real card-finder JS in node against a mock DOM (no browser, no network).
 import importlib.util
@@ -39,7 +39,7 @@ def _run(setup, allow):
 
 
 CARD = ("var deny=btn('Deny Esc'),once=btn('Allow once ↩'),menu=btn('');"
-        "var card=node('div','',[node('div','WebCodex Demo'),node('div','Allow file materialization?')].concat("
+        "var card=node('div','',[node('div','WebCodex Demo'),node('div','Allow ChatGPT to use WebCodex Demo?')].concat("
         "[node('div','',[deny,once,menu])]));"
         "var ROOT=node('body','',[node('div','',[btn('Send')]),card]);")
 
@@ -72,7 +72,7 @@ def test_off_disables(monkeypatch):
 
 def test_foreign_card_cannot_borrow_the_app_name_from_the_conversation():
     setup = ("var deny=btn('Deny'),once=btn('Allow once');"
-             "var card=node('div','',[node('div','Canva'),node('div','Allow file materialization?'),node('div','',[deny,once])]);"
+             "var card=node('div','',[node('div','Canva'),node('div','Allow ChatGPT to use Canva?'),node('div','',[deny,once])]);"
              "var ROOT=node('main','" + "@WebCodex Demo please review this. " * 20 + "',[card]);")
     out = _run(setup, ["WebCodex Demo"])
     assert out["r"]["app"] is None and "Canva" in out["r"]["text"]
@@ -81,7 +81,7 @@ def test_foreign_card_cannot_borrow_the_app_name_from_the_conversation():
 
 def test_a_lookalike_app_name_is_not_approved():
     setup = ("var deny=btn('Deny'),once=btn('Allow once');"
-             "var card=node('div','',[node('div','WebCodex Demo Clone'),node('div','Allow file materialization?'),"
+             "var card=node('div','',[node('div','WebCodex Demo Clone'),node('div','Allow ChatGPT to use WebCodex Demo Clone?'),"
              "node('div','',[deny,once])]);var ROOT=node('body','',[card]);")
     out = _run(setup, ["WebCodex Demo"])
     assert out["r"]["app"] is None and sum(out["clicks"]) == 0
@@ -93,8 +93,8 @@ def test_two_stacked_cards_never_lend_one_card_the_other_apps_name():
     """Review S4: a Canva card above a WebCodex Demo card under one small parent. Canva's own button
     must not be clicked just because the shared parent mentions WebCodex Demo."""
     setup = ("var d1=btn('Deny'),o1=btn('Allow once'),d2=btn('Deny'),o2=btn('Allow once');"
-             "var c1=node('div','',[node('div','Canva'),node('div','Allow file materialization?'),node('div','',[d1,o1])]);"
-             "var c2=node('div','',[node('div','WebCodex Demo'),node('div','Allow file materialization?'),node('div','',[d2,o2])]);"
+             "var c1=node('div','',[node('div','Canva'),node('div','Allow ChatGPT to use Canva?'),node('div','',[d1,o1])]);"
+             "var c2=node('div','',[node('div','WebCodex Demo'),node('div','Allow ChatGPT to use WebCodex Demo?'),node('div','',[d2,o2])]);"
              "var ROOT=node('body','',[node('div','',[c1,c2])]);")
     out = _run(setup, ["WebCodex Demo"])
     assert out["clicks"][1] == 0, "Canva's Allow once must never be clicked"
@@ -103,10 +103,10 @@ def test_two_stacked_cards_never_lend_one_card_the_other_apps_name():
 def test_no_contract_edit_can_make_an_approval_click_hit_send(tmp_path):
     """Review 2026-10-14: allow labels in the editable contract set to ['send'] made the approval
     click hit the composer's send button. The labels are code now, and the approval search skips
-    anything inside a form (the composer)."""
+    anything that is not a card WIDGET (no form, editor, send or stop) — see test_click_authority."""
     assert not any(k.startswith("approval_") for k in CDP.UI)
     js = CDP._approval_js(["WebCodex Demo"])
-    assert "'send'" not in js.lower() and "closest('form')" in js
+    assert "'send'" not in js.lower() and "__cgcMayClick(ok[i],'approve',card)" in js
 
 
 def test_a_read_only_approval_check_never_clicks(monkeypatch):

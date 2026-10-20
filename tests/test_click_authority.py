@@ -83,6 +83,7 @@ SEND = ["button", {"id": "send", "data-testid": "send-button", "aria-label": "Se
 STOP = ["button", {"id": "stop", "data-testid": "stop-button", "aria-label": "Stop"}, ["Stop"]]
 COMPOSER = ["form", {"id": "composer-form"}, [EDITOR, SEND, STOP]]
 APPROVAL = ["div", {"id": "card"}, [["div", {}, ["Other App"]],
+                                    ["div", {}, ["Allow ChatGPT to use Other App?"]],
                                     ["button", {"id": "allow"}, ["Allow once"]],
                                     ["button", {"id": "deny"}, ["Deny"]]]]
 EDIT_FORM = ["article", {"data-message-author-role": "user"}, [
@@ -330,14 +331,87 @@ def test_law7_the_shipped_contract_still_drives_the_model_picker(tmp_path):
     assert _run(flat, d._click_item_js("Pro"))["log"][0] == ["pointerdown", "pro"]
 
 
-def test_law7_approval_clicks_only_a_card_outside_every_form(tmp_path):
+def test_law7_approval_clicks_only_a_card_widget(tmp_path):
     d = _driver(tmp_path, {})
     out = _run(TRAP, d._approval_js(["Other App"]))
     assert out["result"]["app"] == "Other App" and out["log"] == [["click", "allow"]]
-    in_form = _page(["form", {}, [EDITOR, ["div", {}, [["div", {}, ["Other App"]],
+    no_type = _page(["form", {}, [EDITOR, ["div", {}, [["div", {}, ["Other App"]],
                                                        ["button", {"id": "allow"}, ["Allow once"]],
                                                        ["button", {"id": "deny"}, ["Deny"]]]]]])
-    assert _run(in_form, d._approval_js(["Other App"]))["log"] == []
+    assert _run(no_type, d._approval_js(["Other App"]))["log"] == []
+
+
+# ChatGPT renders the app approval card INSIDE the composer form (live DOM 2026-10-20): the card is a
+# WIDGET (not a form, no editor, no send/stop) whose buttons are explicit type=button.
+def _btn(i, label, **a):
+    return ["button", dict({"id": i, "type": "button"}, **a), [label]]
+
+
+def _card(app="Other App", deny=True, allow_label="Allow once", extra=()):
+    row = [_btn("always", "Always allow"), _btn("allow", allow_label)] + list(extra)
+    return ["div", {"id": "card"}, [["div", {}, [app]], ["div", {}, ["Allow ChatGPT to use %s?" % app]]]
+            + ([_btn("deny", "Deny")] if deny else []) + row]
+
+
+def _in_form(card, *rest):
+    return _page(["form", {"id": "composer-form"}, [["div", {}, [card]], EDITOR, SEND] + list(rest)])
+
+
+def test_approval_card_inside_the_composer_form_is_answered(tmp_path):
+    d = _driver(tmp_path, {})
+    live = _card(extra=[_btn("more", "", **{"aria-haspopup": "menu"}),
+                        _btn("details", "See details", **{"aria-haspopup": "dialog"})])
+    out = _run(_in_form(live), d._approval_js(["Other App"]))
+    assert out["result"]["app"] == "Other App" and out["log"] == [["click", "allow"]], out
+    out = _run(_in_form(_card()), d._approval_js(["Other App"], click=False))
+    assert out["result"] is not None and out["log"] == []   # read-only: the card is seen, never clicked
+
+
+def test_approval_never_clicks_when_the_card_container_holds_the_editor_or_send(tmp_path):
+    d = _driver(tmp_path, {})
+    for held in (EDITOR, SEND, STOP):
+        crowded = _page(["form", {"id": "composer-form"}, [["div", {}, [
+            ["div", {}, ["Other App"]], _btn("deny", "Deny"), _btn("allow", "Allow once"), held]]]])
+        out = _run(crowded, d._approval_js(["Other App"]))
+        assert out["log"] == [] and (out["result"] or {}).get("app") is None, (held[1], out)
+    # the card is the form itself
+    bare = _page(["form", {"id": "composer-form"}, [["div", {}, ["Other App"]], _btn("deny", "Deny"),
+                                                     _btn("allow", "Allow once"), EDITOR, SEND]])
+    assert _run(bare, d._approval_js(["Other App"]))["log"] == []
+
+
+def test_approval_never_clicks_always_allow(tmp_path):
+    d = _driver(tmp_path, {})
+    only_always = _in_form(["div", {}, [["div", {}, ["Other App"]], _btn("deny", "Deny"),
+                                        _btn("always", "Always allow")]])
+    out = _run(only_always, d._approval_js(["Other App"]))
+    assert out["result"] is None and out["log"] == []
+    assert _run(_in_form(_card()), d._approval_js(["Other App"]))["log"] == [["click", "allow"]]
+
+
+def test_approval_card_without_deny_is_not_clicked(tmp_path):
+    d = _driver(tmp_path, {})
+    out = _run(_in_form(_card(deny=False)), d._approval_js(["Other App"]))
+    assert out["log"] == [] and out["result"] is None
+
+
+def test_approval_for_an_unlisted_app_is_reported_not_clicked(tmp_path):
+    d = _driver(tmp_path, {})
+    out = _run(_in_form(_card("Canva")), d._approval_js(["Other App"]))
+    assert out["log"] == [] and out["result"]["app"] is None and "Canva" in out["result"]["text"]
+
+
+def test_approval_button_without_a_type_in_the_composer_form_is_not_clicked(tmp_path):
+    d = _driver(tmp_path, {})
+    card = _card()
+    [b for b in card[2] if b[1].get("id") == "allow"][0][1].pop("type")   # no type: it would submit
+    assert _run(_in_form(card), d._approval_js(["Other App"]))["log"] == []
+
+
+def test_approval_card_outside_every_form_is_still_answered(tmp_path):
+    d = _driver(tmp_path, {})
+    out = _run(_page(["form", {}, [EDITOR, SEND]], _card()), d._approval_js(["Other App"]))
+    assert out["log"] == [["click", "allow"]]
 
 
 def test_a_selector_list_where_a_scope_is_joined_is_refused_at_load(tmp_path):
@@ -394,3 +468,156 @@ def test_a_form_button_without_a_type_is_a_submit_and_never_clicked():
     assert may({"type": "button", "aria-haspopup": "menu"}) is True
     assert may({"aria-haspopup": "menu"}) is False
     assert may({"type": "button", "aria-haspopup": "false"}) is False
+
+
+# ---- Sol review of 780cc64: native form activation, card identity, message scope ------------------
+def _clicks(tree, apps=("Other App",)):
+    d = _driver(None, {}) if False else _DRIVERS[next(iter(_DRIVERS))]
+    return _run(tree, d._approval_js(list(apps)))
+
+
+def _prompt(app):
+    return ["div", {}, ["Allow ChatGPT to use %s?" % app]]
+
+
+@pytest.mark.parametrize("bad", ["invalid", "submit", "submit ", " button", "button ", "", "reset", "menu"])
+def test_approval_button_in_a_form_needs_type_button_exactly(tmp_path, bad):
+    """An invalid or padded type is a submit button to the HTML parser; only 'button' may be clicked."""
+    _driver(tmp_path, {})
+    card = _card()
+    [b for b in card[2] if b[1].get("id") == "allow"][0][1]["type"] = bad
+    assert _clicks(_in_form(card))["log"] == []
+    for ok in ("button", "BUTTON"):
+        card = _card()
+        [b for b in card[2] if b[1].get("id") == "allow"][0][1]["type"] = ok
+        assert _clicks(_in_form(card))["log"] == [["click", "allow"]]
+
+
+def test_approval_click_is_wrapped_so_the_forms_own_submit_is_cancelled(tmp_path):
+    d = _driver(tmp_path, {})
+    js = d._approval_js(["Other App"])
+    assert "addEventListener('submit',h,true)" in js and "stopImmediatePropagation" in js
+    assert "removeEventListener('submit',h,true)" in js and js.count(".click()") == 1
+    assert "function press(b){var f=b.form," in js, "the blocker sits on the button's form OWNER, not its ancestor"
+
+
+def test_a_card_without_its_own_deny_never_borrows_a_neighbours_name(tmp_path):
+    """Staged render: Canva's card has no Deny yet, so its first Deny-holding ancestor is the shared
+    parent, which names WebCodex Demo. Canva's Allow once must not be clicked."""
+    _driver(tmp_path, {})
+    canva = ["div", {}, [["div", {}, ["Canva"]], _prompt("Canva"), _btn("allow-canva", "Allow once")]]
+    web = ["div", {}, [["div", {}, ["WebCodex Demo"]], _prompt("WebCodex Demo"), _btn("deny", "Deny"),
+                       _btn("allow-web", "Allow once")]]
+    out = _clicks(_page(["form", {}, [["div", {}, [canva, web]], EDITOR, SEND]]), ["WebCodex Demo"])
+    assert out["log"] == [["click", "allow-web"]], out
+
+
+def test_a_short_line_outside_the_card_cannot_lend_it_a_name(tmp_path):
+    _driver(tmp_path, {})
+    foreign = ["div", {}, [["div", {}, ["Canva"]], _prompt("Canva"), _btn("deny", "Deny"), _btn("allow", "Allow once")]]
+    out = _clicks(_page(["form", {}, [["div", {}, [["div", {}, ["WebCodex Demo"]], foreign]], EDITOR, SEND]]),
+                  ["WebCodex Demo"])
+    assert out["log"] == [] and (out["result"] or {}).get("app") is None, out
+
+
+def test_the_cards_own_prompt_must_name_the_app_as_a_whole_phrase(tmp_path):
+    _driver(tmp_path, {})
+
+    def card(*lines):
+        return ["div", {}, [["div", {}, [l]] for l in lines] + [_btn("deny", "Deny"), _btn("allow", "Allow once")]]
+    ok = _clicks(_in_form(card("WebCodex Demo", "Allow ChatGPT to use WebCodex Demo?",
+                               "ChatGPT will call WebCodex Demo's Run Process tool.")), ["WebCodex Demo"])
+    assert ok["log"] == [["click", "allow"]]
+    for lines in (("WebCodex Demo", "Allow ChatGPT to use WebCodex Demo Clone?"),     # longer name
+                  ("WebCodex Demo", "Allow ChatGPT to use Canva?"),                    # header lies
+                  ("WebCodex Demo",),                                                  # no prompt at all
+                  ("WebCodex Demo", "Allow ChatGPT to use WebCodex Demo?", "ChatGPT will call Canva's tool."),
+                  ("Allow ChatGPT to use XWebCodex Demo?",)):
+        out = _clicks(_in_form(card(*lines)), ["WebCodex Demo"])
+        assert out["log"] == [], lines
+    # no header fallback: a prompt that names no app (the legacy card) is left for a human
+    assert _clicks(_in_form(card("WebCodex Demo", "Allow file materialization?")), ["WebCodex Demo"])["log"] == []
+
+
+def test_a_name_on_a_neighbouring_line_never_binds_a_foreign_card(tmp_path):
+    _driver(tmp_path, {})
+    foreign = ["div", {}, [["div", {}, ["Allow file materialization?"]], _btn("deny", "Deny"), _btn("allow", "Allow once")]]
+    tree = _page(["form", {}, [["div", {}, [["div", {}, ["Canva"]], ["div", {}, ["WebCodex Demo"]], foreign]], EDITOR, SEND]])
+    assert _clicks(tree, ["WebCodex Demo"])["log"] == []
+
+
+def test_a_card_prompt_naming_an_unknown_app_is_not_clicked(tmp_path):
+    _driver(tmp_path, {})
+    card = ["div", {}, [["div", {}, ["WebCodex Demo"]], ["div", {}, ["Allow Canva access?"]],
+                        _btn("deny", "Deny"), _btn("allow", "Allow once")]]
+    assert _clicks(_in_form(card), ["WebCodex Demo"])["log"] == []
+
+
+def test_an_approval_button_outside_the_form_but_owned_by_it_is_not_clicked(tmp_path):
+    """<button form=composer-form> outside the form has no form ancestor but submits the composer."""
+    _driver(tmp_path, {})
+    card = _card()
+    allow = [b for b in card[2] if b[1].get("id") == "allow"][0]
+    allow[1]["form"] = "composer-form"
+    for typ in ("button", "invalid"):
+        allow[1]["type"] = typ
+        tree = _page(["form", {"id": "composer-form"}, [EDITOR, SEND]], card)
+        assert _clicks(tree)["log"] == [], typ
+
+
+def test_an_approval_button_whose_form_attribute_redirects_the_owner_is_not_clicked(tmp_path):
+    _driver(tmp_path, {})
+    card = _card()
+    [b for b in card[2] if b[1].get("id") == "allow"][0][1]["form"] = "other"
+    tree = _page(["form", {"id": "other"}, []], ["form", {"id": "composer-form"}, [["div", {}, [card]], EDITOR, SEND]])
+    assert _clicks(tree)["log"] == []
+
+
+
+def test_a_fake_card_inside_a_message_is_never_clicked(tmp_path):
+    _driver(tmp_path, {})
+    msg = ["article", {"data-message-author-role": "assistant"}, [["form", {}, [_card()]]]]
+    out = _clicks(_page(msg, ["form", {}, [EDITOR, SEND]]))
+    assert out["log"] == []
+    assert _clicks(_page(["article", {"data-message-author-role": "assistant"}, [_card()]]))["log"] == []
+
+
+# The live card (2026-10-20), line for line: header, prompt, tool line, button labels.
+def _live_card(app="WebCodex Demo", header=None, prompt=None, call=None):
+    return ["div", {"id": "card"}, [
+        ["div", {}, [header or app]],
+        ["div", {}, [prompt or "Allow ChatGPT to use %s?" % app]],
+        ["div", {}, [call or "ChatGPT will call %s's Run Process tool. See details" % app]],
+        _btn("details", "See details", **{"aria-haspopup": "dialog"}),
+        _btn("always", "Always allow"), _btn("deny", "DenyEsc"), _btn("allow", "Allow once\u23ce"),
+        _btn("more", "", **{"aria-haspopup": "menu"})]]
+
+
+def test_the_live_card_lines_are_clicked_in_the_form_and_out_of_it(tmp_path):
+    _driver(tmp_path, {})
+    assert _clicks(_in_form(_live_card()), ["WebCodex Demo"])["log"] == [["click", "allow"]]
+    assert _clicks(_page(["form", {}, [EDITOR, SEND]], _live_card()), ["WebCodex Demo"])["log"] == [["click", "allow"]]
+    curly = _live_card(call="ChatGPT will call WebCodex Demo\u2019s Run Process tool.")
+    assert _clicks(_in_form(curly), ["webcodex demo"])["log"] == [["click", "allow"]]
+
+
+@pytest.mark.parametrize("app", ["Fake WebCodex Demo", "Not WebCodex Demo", "Canva (WebCodex Demo)",
+                                 "WebCodex Demo Clone", "WebCodex Demo 2", "XWebCodex Demo"])
+def test_an_app_whose_name_merely_contains_the_allowlisted_one_is_another_app(tmp_path, app):
+    _driver(tmp_path, {})
+    assert _clicks(_in_form(_live_card(app)), ["WebCodex Demo"])["log"] == []
+
+
+@pytest.mark.parametrize("card", [
+    dict(prompt="Allow Canva to use WebCodex Demo?", call="ChatGPT will call WebCodex Demo's Run Process tool."),
+    dict(prompt="Allow ChatGPT to access WebCodex Demo?"),                          # unknown template
+    dict(prompt="Please allow WebCodex Demo to run"),                                # unknown template
+    dict(call="ChatGPT will call Canva's Run Process tool."),                        # the lines disagree
+    dict(header="Canva"),                                                            # header is another app
+    dict(prompt="Allow ChatGPT to use WebCodex Demo? Allow ChatGPT to use Canva?"),
+    dict(call="ChatGPT will call WebCodex Demo's Run Process tool. See details Allow ChatGPT to use Canva?"),
+    dict(call="ChatGPT will call WebCodex Demo's Run Process tool. Also allow Canva."),   # unanchored tail
+])
+def test_only_the_known_prompt_templates_with_an_exactly_equal_operand_bind(tmp_path, card):
+    _driver(tmp_path, {})
+    assert _clicks(_in_form(_live_card(**card)), ["WebCodex Demo"])["log"] == []

@@ -251,6 +251,12 @@ _MENTION_APP_ICON = "rounded-2xs"
 # never the editable contract (a contract that named "Send" as an allow label would have clicked send).
 _APPROVAL_ALLOW = ["allow once", "允许一次"]
 _APPROVAL_DENY = ["deny", "拒绝"]
+# The two prompt lines of ChatGPT's app approval card, as regexes (case-insensitive, whitespace
+# collapsed). Group 1 is the app OPERAND, compared for exact equality with the allowlist: never a phrase
+# searched for in a line, so "Fake WebCodex Demo" or "Canva (WebCodex Demo)" are other apps. Same reasoning
+# as the allow labels: they decide what grants access, so code, never the contract.
+_APPROVAL_PROMPTS = [r"^allow chatgpt to use (.+)\?$",
+                     r"^chatgpt will call (.+)['\u2019]s [^.?!]+ tool\.(?: see details)?$"]
 
 # The page-side authority functions. Code, never data: nothing here reads the contract.
 #   __cgcMayType(d)      `d` may be typed into: a visible editor inside the ONE visible form on the
@@ -258,15 +264,24 @@ _APPROVAL_DENY = ["deny", "拒绝"]
 #                        ambiguous, so nothing is typed or sent), in no conversation
 #                        message (an edit-message box fails), and not itself a button or a menu.
 #   __cgcMayClick(el,p,w) may `el` be clicked, focused or keyed for purpose `p`? Never a send or stop
-#                        button or anything inside one, a submit control, an editor, or an element
+#                        button or anything inside one, a submit control, an editor, a form button whose type is not "button", or an element
 #                        whose name starts with send|stop|deny (or allow, except for 'approve').
 #                        Then per purpose:
 #     'switcher'  a <button>, not the attach button, in no message; inside a form only as a menu
 #                 trigger (aria-haspopup) — the composer's own model switcher;
 #     'picker'    inside an open menu ([role=menu]/[role=listbox]) that is a valid WIDGET;
 #     'mention'   inside `w`, the popup root the caller located, itself a valid WIDGET;
-#     'approve'   outside every form;
+#     'approve'   in no message, inside `w`, the approval card the caller located, itself a valid WIDGET —
+#                 so a card rendered inside the composer's form is answerable, the composer never is;
+#                 the target is the <button> itself;
 #     anything else, 'send' included: never (the send click has its own scope, _send_click_js).
+#   Any button with a form owner (button.form) or form ancestor must have them agree and be type=button.
+#   GUARANTEED: no click lands on a send/stop/submit control, an editor, or a form-owned button that is
+#   not type=button; and _approval_js cancels, on the button's owner form, a submit event dispatched
+#   synchronously during the click, and stops later listeners on that form from seeing it.
+#   NOT covered: an asynchronous requestSubmit (a microtask), a native form.submit(), capture listeners
+#   registered earlier on the form or document, a handler that clicks another send control. The threat
+#   model is ChatGPT's own card, not a hostile page.
 #   A WIDGET is not a form and holds no editor and no send or stop button — so no selector, however
 #   wide, can make the composer's form or the page the widget being driven.
 # A refusal clicks nothing: the helper reports not-done, and its caller fails pre-click.
@@ -292,13 +307,19 @@ _AUTHORITY_FN = (
     ".replace(/\\s+/g,' ').trim().toLowerCase();}"
     "function __cgcMayClick(el,p,w){if(!el||!el.closest||!el.getAttribute)return false;"
     "if(el.closest(" + _js_str(_SEND_BUTTON_SEL + "," + _STOP_BUTTON_SEL) + "))return false;"
-    # A form button with no type attribute submits the form; only an explicit non-submit one may be clicked.
-    "var sb=el.closest('button');if(sb&&sb.closest('form')&&(sb.getAttribute('type')||'submit').toLowerCase()==='submit')return false;"
+    # A button submits its form OWNER (button.form: the ancestor form, or the one its form= attribute
+    # names) unless its type is "button" in some ASCII case; a missing, invalid or padded type submits
+    # too, since HTML does not trim an enumerated attribute. So a button with an owner or inside a form
+    # is clickable only when both agree (no form= redirect, no button outside a form owned by one) and
+    # its type is that one spelling, never "everything but submit".
+    "var sb=el.closest('button');if(sb){var ow=sb.form||null,an=sb.closest('form');"
+    "if((ow||an)&&(ow!==an||(sb.getAttribute('type')||'').toLowerCase()!=='button'))return false;}"
     "if(el.closest('[type=\"submit\"]')||el.closest(" + _js_str(_EDITOR_SHAPE_SEL) + "))return false;"
     "var n=__cgcName(el);"
     "if(/^(send|stop|deny|\\u53d1\\u9001|\\u505c\\u6b62|\\u62d2\\u7edd)/.test(n))return false;"
-    "if(p==='approve')return !el.closest('form');"
-    "if(/^(allow|\\u5141\\u8bb8)/.test(n)||el.closest(" + _js_str(_MESSAGE_SCOPE_SEL) + "))return false;"
+    "if(el.closest(" + _js_str(_MESSAGE_SCOPE_SEL) + "))return false;"
+    "if(p==='approve')return el.tagName==='BUTTON'&&__cgcWidget(w)&&w.contains(el);"
+    "if(/^(allow|\\u5141\\u8bb8)/.test(n))return false;"
     "if(p==='switcher')return el.tagName==='BUTTON'&&el.id!==" + _js_str(_PLUS_BUTTON_ID)
     + "&&(!el.closest('form')||/^(true|menu|listbox|dialog|tree|grid)$/i.test(el.getAttribute('aria-haspopup')||''));"
     "if(p==='picker')w=el.closest(" + _js_str(_MENU_WIDGET_SEL) + ");"
@@ -4075,32 +4096,61 @@ def cmd_followup(a) -> int:
 # Found by what a person sees, not by an unprobed container class: a visible "Allow once" button whose
 # nearest ancestor (<= 6 up) also holds a visible "Deny" button is one card. The click is a page-level
 # element.click() over CDP — no mouse, no focus, no window activation — in this consult's own tab only.
+# A card binds to app A only through its own prompt lines (_APPROVAL_PROMPTS): each yields an app OPERAND,
+# the operand must EQUAL A, every prompt line of the card must agree, and A must also be a line of the
+# card on its own (its header). A line that talks of allowing or using something in no known template
+# ("Allow file materialization?", "Allow Canva to use X?") binds the card to nothing: left for a human.
+# A button label ("Allow once", "Always allow") is not a prompt. Equality, not containment: a longer
+# name, a prefixed or parenthesized one, is another app.
+_APPROVAL_BIND_JS = (
+    r"function lines(e){return (e.innerText||'').split('\n').map(function(l){return l.replace(/\s+/g,' ').trim();});}"
+    "var PROMPTS=" + json.dumps(_APPROVAL_PROMPTS) + ".map(function(s){return new RegExp(s,'i');});"
+    r"function operand(l){for(var i=0;i<PROMPTS.length;i++){var m=PROMPTS[i].exec(l);"
+    r"if(m)return m[1].trim().toLowerCase();}return null;}"
+    r"function bound(e,a){var ls=lines(e),al=a.toLowerCase(),hit=false;"
+    r"if(ls.map(function(l){return l.toLowerCase();}).indexOf(al)<0)return false;"
+    r"for(var i=0;i<ls.length;i++){var l=ls[i];"
+    r"if(/^(always allow|\u59cb\u7ec8\u5141\u8bb8|" + _js_alt(_APPROVAL_ALLOW) + ")/i.test(l))continue;"
+    r"var o=operand(l);if(o===null){if(/\ballow\b|\bto use\b|\bwill call\b|\u5141\u8bb8|\u4f7f\u7528/i.test(l))return false;continue;}"
+    r"if(o!==al)return false;hit=true;}return hit;}")
+# The click is wrapped so that a submit dispatched on the button's owner form during it is cancelled.
+_APPROVAL_PRESS_JS = (
+    "function press(b){var f=b.form,h=function(e){e.preventDefault();e.stopImmediatePropagation();};"
+    "if(f)f.addEventListener('submit',h,true);try{b.click();}finally{if(f)f.removeEventListener('submit',h,true);}}")
+
+
 def _approval_js(allow, click=True):
     # From each visible "Allow once": climb to the first ancestor that also holds a visible "Deny" (the
-    # card's button row), then keep climbing while the text stays card-sized (<= 400 chars) until it
-    # names an allowlisted app. "Names" is an exact, case-insensitive match against one LINE of the
-    # card's text (its header line is the app's label), never a substring — this click grants access,
-    # so "WebCodex Demo Clone" must not ride on "WebCodex Demo". The size cap stops a foreign card from
-    # climbing into the conversation and matching a line of the prompt.
+    # card's button row), then keep climbing while the text stays card-sized (<= 400 chars) until its
+    # own prompt names an allowlisted app (_APPROVAL_BIND_JS: a whole phrase in an "Allow ..." line,
+    # never a substring — this click grants access, so "WebCodex Demo Clone" must not ride on "WebCodex
+    # Demo"). The size cap stops a foreign card from climbing into the conversation and matching a
+    # line of the prompt. The card may sit inside the
+    # composer's form (ChatGPT renders it there): the climb then stops at the first node that is not a
+    # WIDGET (the form, or anything holding the editor or send/stop), and the click is authorized only
+    # within that card, never for a card that is not one.
     return ("(function(){" + _AUTHORITY_FN + "var allow=" + json.dumps(allow) + ";"
             "function vis(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0;}"
             "function t(e){return (e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim();}"
             "function hasDeny(n){return Array.prototype.slice.call(n.querySelectorAll('button')).some("
             "function(b){return vis(b)&&/^(" + _js_alt(_APPROVAL_DENY) + ")/i.test(t(b));});}"
-            "function named(e){var ls=(e.innerText||'').split('\\n').map(function(l){"
-            "return l.replace(/\\s+/g,' ').trim().toLowerCase();});return allow.filter(function(a){"
-            "return ls.indexOf(a.toLowerCase())>=0;})[0]||null;}"
+            + _APPROVAL_BIND_JS + _APPROVAL_PRESS_JS +
+            "function named(e){return allow.filter(function(a){return bound(e,a);})[0]||null;}"
             "var ok=Array.prototype.slice.call(document.querySelectorAll('button')).filter(function(b){"
-            "return vis(b)&&!(b.closest&&b.closest('form'))&&/^(" + _js_alt(_APPROVAL_ALLOW) + ")/i.test(t(b));});"
+            "return vis(b)&&/^(" + _js_alt(_APPROVAL_ALLOW) + ")/i.test(t(b));});"
             "for(var i=0;i<ok.length;i++){var n=ok[i].parentElement,d=0;"
             "while(n&&d<6&&!hasDeny(n)){n=n.parentElement;d++;}if(!n||d>=6)continue;"
-            "var txt=t(n),app=named(n);"
+            "var txt=t(n),app=null,card=n;"
             # Climb only while the ancestor still holds exactly ONE visible "Allow once": a parent of
             # two stacked cards would otherwise lend the second card's app name to the first's button.
             "function ones(e){return [].slice.call(e.querySelectorAll('button')).filter(function(b){"
             "return vis(b)&&/^(" + _js_alt(_APPROVAL_ALLOW) + ")/i.test(t(b));}).length;}"
-            "for(var m=n.parentElement;!app&&m&&t(m).length<=400&&ones(m)===1;m=m.parentElement){txt=t(m);app=named(m);}"
-            "if(app&&" + ("" if click else "false&&") + "__cgcMayClick(ok[i],'approve'))ok[i].click();else if(app)app=null;"
+            # The starting node is itself ONE card: exactly one Allow once (the candidate) beside its Deny.
+            # Otherwise it is the shared parent of two cards and lends one's name to the other's button.
+            "if(ones(n)!==1)continue;app=__cgcWidget(n)?named(n):null;"
+            "for(var m=n.parentElement;!app&&m&&__cgcWidget(m)&&t(m).length<=400&&ones(m)===1;m=m.parentElement){"
+            "txt=t(m);app=named(m);card=m;}"
+            "if(app&&" + ("" if click else "false&&") + "__cgcMayClick(ok[i],'approve',card))press(ok[i]);else if(app)app=null;"
             "return {app:app,text:txt.slice(0,300)};}return null;})()")
 
 
