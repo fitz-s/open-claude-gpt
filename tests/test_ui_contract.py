@@ -227,11 +227,13 @@ def test_law4_an_invalid_contract_blocks_the_round_as_proven_not_sent(tmp_path, 
 
 
 # Updated 2026-10-14: approval labels moved to code; LAW 7 click guard; implicit-submit and aria-haspopup="false" refused.
-# Updated 2026-10-20: _detect_js reads ChatGPT's safety-filter refusal as a POSITIVE structural match (heading
+# Updated 2026-10-20 (channel reliability): _detect_js reads ChatGPT's safety-filter refusal as a POSITIVE structural match (heading
 # <p> from refusal_headings, its next-sibling reason <p>, a chatgpt.com link under their parent; none of it in
 # prose_container or an attachment_card), in the same interval __cgcNode reads (one _INTERVAL_END_JS), and
 # never while the page is generating.
-_GOLDEN_JS = "8393cbb3a7f4acebd13f66438b66690e9828449fd8cf3f07c6f643ee1d35d802"
+# Updated 2026-10-20 (approval card in the composer form): _approval_js binds a card by its own prompt operand, and
+# __cgcMayClick judges a button by its form owner and, for approve, by its card widget.
+_GOLDEN_JS = "fa20d020b22f9f25a28b54a8d68e84979617535a700e8c6c679707ab2f3d892e"
 
 
 def _generated_js(cdp):
@@ -279,14 +281,11 @@ def test_law1_the_shipped_contract_generates_exactly_the_reviewed_js(mods):
 # main (fdfaa5d)'s generated JS, dumped with _generated_js's sample arguments.
 _MAIN_JS = os.path.join(ROOT, "tests", "fixtures", "main_generated_js.json")
 # The deliberate non-guard changes since main, each reviewed: the send contract's stop selector
-# gained the waiter's Chinese label; the approval regexes write their CJK as \u escapes, and the
-# approval search skips any Allow once inside a form (46ed0bc).
+# gained the waiter's Chinese label; the approval regexes write their CJK as \u escapes.
 _MAIN_DELTAS = {"_contract_js": [('button[aria-label*="Stop"]\')', 'button[aria-label*="Stop"],'
                                   'button[aria-label*="\\u505c\\u6b62"]\')')],
                 "_approval_js": [("/^(deny|拒绝)/", "/^(deny|\\u62d2\\u7edd)/"),
-                                 ("/^(allow once|允许一次)/", "/^(allow once|\\u5141\\u8bb8\\u4e00\\u6b21)/"),
-                                 # 46ed0bc: the approval search skips any Allow once inside a form
-                                 ("return vis(b)&&/^(allow once|\\u5141", "return vis(b)&&!(b.closest&&b.closest('form'))&&/^(allow once|\\u5141")]}
+                                 ("/^(allow once|允许一次)/", "/^(allow once|\\u5141\\u8bb8\\u4e00\\u6b21)/")]}
 
 
 # The one reviewed non-guard addition to the reader since main: _detect_js also reports `refused`, ChatGPT's
@@ -311,7 +310,18 @@ def test_law7_the_generated_js_is_mains_except_the_guard(mods):
             ("if(!__cgcMayType(d))return -1;", "if(!d)return -1;"),
             ("if(!__cgcMayType(d))return null;", "if(!d)return null;"),
             ("if(!__cgcMayType(d))return 'no-composer';", "if(!d)return 'no-composer';"),
-            ("if(app&&__cgcMayClick(ok[i],'approve'))ok[i].click();else if(app)app=null;", "if(app)ok[i].click();"),
+            ("if(app&&__cgcMayClick(ok[i],'approve',card))press(ok[i]);else if(app)app=null;", "if(app)ok[i].click();"),
+            # the approval card is a WIDGET (no form, editor, send or stop) at every step of its climb
+            ("var txt=t(n),app=null,card=n;", "var txt=t(n),app=named(n);"),
+            ("if(ones(n)!==1)continue;app=__cgcWidget(n)?named(n):null;", ""),
+            (cdp._APPROVAL_BIND_JS + cdp._APPROVAL_PRESS_JS, ""),
+            ("function named(e){return allow.filter(function(a){return bound(e,a);})[0]||null;}",
+             "function named(e){var ls=(e.innerText||'').split('\\n').map(function(l){"
+             "return l.replace(/\\s+/g,' ').trim().toLowerCase();});return allow.filter(function(a){"
+             "return ls.indexOf(a.toLowerCase())>=0;})[0]||null;}"),
+            ("press(ok[i])", "ok[i].click()"),
+            ("m&&__cgcWidget(m)&&t(m)", "m&&t(m)"),
+            ("app=named(m);card=m;}", "app=named(m);}"),
             (cdp._SEND_MARK, "")]
     mention = _re.compile(r"var root=document\.querySelector\([^;]*\);if\(!__cgcMayClick\(hit,'mention',root\)\)"
                           r"return \{[^}]*\};")

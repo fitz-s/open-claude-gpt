@@ -63,6 +63,11 @@ class El {
         return { width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
     return { width: 1, height: 1, top: 0, left: 0, right: 1, bottom: 1 };
   }
+  get form() {   // a button's form owner: the form= attribute's target, else the ancestor form
+    if (this.tagName !== 'BUTTON') return null;
+    if ('form' in this._a) { const f = document.getElementById(this._a.form); return f && f.tagName === 'FORM' ? f : null; }
+    return this.closest('form');
+  }
   contains(n) { for (; n; n = n.parentElement) if (n === this) return true; return false; }
   closest(sel) { const L = parse(sel); for (let n = this; n && n.nodeType === 1; n = n.parentElement) if (matchList(n, L)) return n; return null; }
   matches(sel) { return matchList(this, parse(sel)); }
@@ -75,6 +80,8 @@ class El {
   focus() { document.activeElement = this; }
   click() {}
   dispatchEvent() { return true; }
+  addEventListener() {}
+  removeEventListener() {}
   scrollIntoView() {}
 }
 

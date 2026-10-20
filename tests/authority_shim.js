@@ -33,6 +33,10 @@ function AUTH(n) {
   if (!n.getAttribute) n.getAttribute = function (k) { return k in this._a ? this._a[k] : null; };
   if (!n.parentElement && n.parent) n.parentElement = n.parent;
   var up = function (x) { return x.parentElement || x.parent || null; };
+  if (!n.contains) n.contains = function (x) { for (; x; x = up(x)) if (x === this) return true; return false; };
+  if (n.form === undefined) Object.defineProperty(n, 'form', { get: function () {
+    if (this.tagName !== 'BUTTON') return null;
+    return this.closest('form'); } });
   n.matches = function (sel) { return __M.matches(this, sel); };
   n.closest = function (sel) { for (var x = this; x && x.nodeType !== 3; x = up(x)) { AUTH(x); if (__M.matches(x, sel)) return x; } return null; };
   // The guard's own queries (comma lists a mock's narrow matcher refuses) fall back to the real
