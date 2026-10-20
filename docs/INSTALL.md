@@ -158,7 +158,10 @@ bin/cgc activation-hook --status     # report configured / broken / absent / unr
 touches nothing) and copies your existing `settings.json` to `settings.json.bak`
 before writing, atomically, the first time it actually changes something. It edits
 only its own `SessionStart` entry — every other hook and setting in the file is
-left untouched. `--install` also works as `install.sh --activation-hook`, run once
+left untouched. It also installs the `chatgpt-pro` subagent (which the note tells Claude
+to dispatch) at `~/.claude/agents/chatgpt-pro.md` — a link to the skill's copy, or a marked
+copy with the real path when the skill is installed outside `~/.claude/skills` (`--dir`);
+an existing file there is left alone and reported, and `--remove` deletes only our own. `--install` also works as `install.sh --activation-hook`, run once
 at install time instead of as a separate step.
 
 If you'd rather edit `settings.json` by hand, merge the printed `SessionStart`

@@ -23,6 +23,11 @@ nothing else should duplicate the snippet text.
     --settings PATH     default: ${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json
     --activation PATH   default: ACTIVATION.md next to this script's skill root
 
+install/remove/status also manage the `chatgpt-pro` subagent that ACTIVATION.md dispatches: a symlink
+<dir of settings.json>/agents/chatgpt-pro.md -> <skill root>/agents/chatgpt-pro.md; if the skill is not
+at ~/.claude/skills/chatgpt-consult (install.sh --dir), a marked copy with the real path substituted.
+A file or foreign symlink already at that path is reported and never overwritten or removed.
+
 Installing is opt-in only — nothing calls `install` unless the user asks for it
 (`bin/cgc activation-hook --install`, or `install.sh --activation-hook`). Printing the snippet
 (the default of `cgc activation-hook`) never touches settings.json.
@@ -32,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import stat
 import sys
@@ -62,6 +68,10 @@ MARKER_SNAPSHOT = "cgc_activation.py' snapshot"
 HERE = os.path.dirname(os.path.abspath(__file__))
 SELF = os.path.join(HERE, "cgc_activation.py")
 DEFAULT_ACTIVATION = os.path.join(os.path.dirname(HERE), "ACTIVATION.md")
+AGENT_FILE = os.path.join("agents", "chatgpt-pro.md")
+AGENT_TEXT_ROOT = "~/.claude/skills/chatgpt-consult"   # the skill path chatgpt-pro.md hard-codes
+RENDER_MARK = "<!-- cgc-rendered-agent: from"
+DEFAULT_AGENT_SRC = os.path.join(os.path.dirname(HERE), AGENT_FILE)
 
 
 def default_settings_path() -> str:
@@ -297,6 +307,124 @@ def status(settings_path: str, activation_path: str) -> dict:
     return result
 
 
+# ---- the chatgpt-pro subagent -------------------------------------------------
+# Claude Code loads user subagents from <config dir>/agents/*.md. Rooted at the settings.json's own
+# directory, so `--settings` (tests, alternate config dirs) can never reach the real ~/.claude.
+
+def agent_path(settings_path: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(settings_path)), AGENT_FILE)
+
+
+def _ours_link(path: str) -> bool:
+    """A symlink into a chatgpt-consult skill tree's agents/chatgpt-pro.md — judged by the link text,
+    so it still counts after the tree it points into is gone."""
+    if not os.path.islink(path):
+        return False
+    t = os.readlink(path)
+    if not t.endswith(os.sep + AGENT_FILE):
+        return False
+    root = t[:-len(AGENT_FILE) - 1]
+    return os.path.basename(root) == "chatgpt-consult" or os.path.isfile(os.path.join(root, "scripts", "cgc_activation.py"))
+
+
+def default_skill_root() -> str:
+    return os.path.expanduser(AGENT_TEXT_ROOT)
+
+
+def _ours_rendered(path: str) -> bool:
+    if os.path.islink(path) or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            return RENDER_MARK in f.read()
+    except (OSError, ValueError):
+        return False
+
+
+def _ours(path: str) -> bool:
+    return _ours_link(path) or _ours_rendered(path)
+
+
+def render_agent(src: str) -> str:
+    """The agent text with the skill path it hard-codes pointed at the real skill root, plus a marker
+    line (right after the frontmatter) that lets install/remove recognise the copy as ours."""
+    root = os.path.dirname(os.path.dirname(src))
+    with open(src, encoding="utf-8") as f:
+        text = f.read().replace(AGENT_TEXT_ROOT, shlex.quote(root))
+    head, sep, body = text.partition("\n---\n")
+    if not sep:
+        raise ValueError(f"{src}: no frontmatter")
+    return f"{head}\n---\n{RENDER_MARK} {src}; edits are overwritten by `cgc activation-hook --install` -->\n{body}"
+
+
+def _replace_with(dst: str, make) -> None:
+    """Swap whatever is at dst (a file or a symlink, never followed) for make(tmp_path)'s result."""
+    tmp = f"{dst}.cgc-{os.getpid()}"
+    try:
+        make(tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def install_agent(settings_path: str, src: str = DEFAULT_AGENT_SRC) -> str:
+    """'added' / 'unchanged' / 'upgraded' (our link or copy replaced) / 'foreign' (left alone) /
+    'missing-source'. The agent text names the skill as ~/.claude/skills/chatgpt-consult; when the skill
+    really lives there, link to it, otherwise (install.sh --dir, CLAUDE_SKILLS_DIR) write a copy with
+    the real path substituted — a link would send the courier to a path that does not exist."""
+    dst = agent_path(settings_path)
+    if not os.path.isfile(src):
+        return "missing-source"
+    root = os.path.dirname(os.path.dirname(os.path.abspath(src)))
+    link = root == default_skill_root()
+    existed = os.path.lexists(dst)
+    if existed and not _ours(dst):
+        return "foreign"
+    if link:
+        if os.path.islink(dst) and os.readlink(dst) == src:
+            return "unchanged"
+        make = lambda tmp: os.symlink(src, tmp)  # noqa: E731
+    else:
+        text = render_agent(src)
+        try:
+            with open(dst, encoding="utf-8") as f:
+                if not os.path.islink(dst) and f.read() == text:
+                    return "unchanged"
+        except (OSError, ValueError):
+            pass
+
+        def make(tmp):
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    _replace_with(dst, make)
+    return "upgraded" if existed else "added"
+
+
+def remove_agent(settings_path: str) -> str:
+    """'removed' / 'absent' / 'foreign' (left alone)."""
+    dst = agent_path(settings_path)
+    if not os.path.lexists(dst):
+        return "absent"
+    if not _ours(dst):
+        return "foreign"
+    os.remove(dst)
+    return "removed"
+
+
+def agent_status(settings_path: str) -> dict:
+    """state: installed / broken (our link, target gone) / foreign / absent; kind: link / copy."""
+    dst = agent_path(settings_path)
+    if not os.path.lexists(dst):
+        return {"path": dst, "state": "absent"}
+    if not _ours(dst):
+        return {"path": dst, "state": "foreign"}
+    return {"path": dst, "state": "installed" if os.path.isfile(dst) else "broken",
+            "kind": "link" if os.path.islink(dst) else "copy"}
+
+
 # ---- the SessionStart snapshot ------------------------------------------------
 
 SNAPSHOT_BUDGET_S = 0.8   # wall-clock cap on the whole line; the hook must never slow a session start
@@ -434,6 +562,7 @@ See docs/INSTALL.md → "Activation: on-demand vs. proactive".""")
 def cmd_status(a) -> int:
     settings, activation = _paths(a)
     r = status(settings, activation)
+    r["agent"] = agent_status(settings)
     if a.json:
         print(json.dumps(r, indent=2))
         return 0
@@ -446,6 +575,7 @@ def cmd_status(a) -> int:
         print(f"unreadable — {r['detail']}")
     else:
         print("absent — no proactive hook installed (on-demand activation still works)")
+    print(f"chatgpt-pro agent: {r['agent']['state']} ({r['agent']['path']})")
     return 0
 
 
@@ -456,8 +586,10 @@ def cmd_install(a) -> int:
     except (SettingsError, QuoteError) as e:
         sys.stderr.write(f"cgc_activation: refusing — {e}\n")
         return 1
+    agent = install_agent(settings)
     if a.json:
-        print(json.dumps({"outcome": outcome, "count": count, "settings_path": settings}, indent=2))
+        print(json.dumps({"outcome": outcome, "count": count, "settings_path": settings,
+                          "agent": {"outcome": agent, "path": agent_path(settings)}}, indent=2))
         return 0
     if outcome == "added":
         print(f"added — SessionStart hook installed in {settings}")
@@ -465,23 +597,29 @@ def cmd_install(a) -> int:
         print(f"upgraded — {count} entry(ies) updated to the current hook form in {settings}")
     else:
         print(f"unchanged — hook already up to date in {settings}")
+    print(f"chatgpt-pro agent: {agent} ({agent_path(settings)})")
+    if agent == "foreign":
+        print("  ! another file is already there; left as is (the hook's `chatgpt-pro` dispatch will use it)")
     return 0
 
 
 def cmd_remove(a) -> int:
     settings, _activation = _paths(a)
+    agent = remove_agent(settings)   # independent of settings.json: unreadable settings must not strand the link
     try:
         outcome, count = remove(settings)
     except SettingsError as e:
         sys.stderr.write(f"cgc_activation: refusing — {e}\n")
         return 1
     if a.json:
-        print(json.dumps({"outcome": outcome, "count": count, "settings_path": settings}, indent=2))
+        print(json.dumps({"outcome": outcome, "count": count, "settings_path": settings,
+                          "agent": {"outcome": agent, "path": agent_path(settings)}}, indent=2))
         return 0
     if outcome == "removed":
         print(f"removed — {count} entry(ies) dropped from {settings}")
     else:
         print(f"absent — nothing to remove in {settings}")
+    print(f"chatgpt-pro agent: {agent} ({agent_path(settings)})")
     return 0
 
 

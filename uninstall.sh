@@ -533,6 +533,7 @@ fi
 if [ "${SETTINGS_NOTE%%:*}" = "parse" ]; then
   echo "  ! --force: $SETTINGS_PATH is not valid JSON, so it was not edited. If it holds our hook entry" >&2
   echo "    (a command mentioning ACTIVATION.md / cgc_activation.py), delete that entry by hand." >&2
+  python3 "$SCRIPTS/cgc_activation.py" remove >/dev/null 2>&1 || true   # still drops our chatgpt-pro agent link
 else
   echo "• removing our SessionStart hook entry"
   if ! python3 "$SCRIPTS/cgc_activation.py" remove; then

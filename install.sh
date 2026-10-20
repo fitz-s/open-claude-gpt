@@ -346,8 +346,9 @@ Next steps
      description and invokes it when a task fits. Nothing else is required.
   4. (optional) PROACTIVE background offloading — if you want Claude to reach for a
      consult on its own every session, add a SessionStart hook that injects this
-     skill's activation note. This edits YOUR OWN Claude settings, so the installer
-     does NOT do it for you by default — two ways to opt in:
+     skill's activation note and installs the chatgpt-pro subagent into ~/.claude/agents/.
+     This edits YOUR OWN Claude settings, so the installer does NOT do it for you by
+     default — two ways to opt in:
        bin/cgc activation-hook              # print the snippet (changes nothing)
        bin/cgc activation-hook --install    # add it for you (backs up settings.json first)
      (See docs/INSTALL.md → "Activation: on-demand vs. proactive". The note lives at
