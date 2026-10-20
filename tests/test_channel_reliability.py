@@ -225,8 +225,9 @@ def wait(tmp_path, monkeypatch):
 
 # ---- B: end to end -----------------------------------------------------------------------------------
 
-def test_a_refused_round_ends_remote_refused_on_the_first_poll(wait, capsys):
-    """The 2026-10-14 round waited 5400 s for a reply the filter had already replaced."""
+def test_a_refused_round_ends_remote_refused_on_the_second_poll(wait, capsys):
+    """The 2026-10-14 round waited 5400 s for a reply the filter had already replaced. The text must repeat
+    on two consecutive polls (see the flicker test), so it ends one poll after the first read."""
     code, tab, spent, _ = wait(lambda c: FakeTab(c, lambda t: _dead(refused=REFUSAL[:160], node="found",
                                                                     len=258, ac=1)))
     err = capsys.readouterr().err
@@ -419,3 +420,151 @@ def test_one_click_is_one_send_eval_and_no_enter(monkeypatch, tmp_path, capfd):
         assert tab.send_evals == 1 and tab.keys == [], (cmd, tab.send_evals, tab.keys)
     rc, tab = safety._drive(monkeypatch, tmp_path, "submit", "no-send")
     assert tab.send_evals == 1 and tab.keys == [("Enter", "Enter", 13)]
+
+
+# ===== review round 1 (Sol): precedence, evidence, interval, dead clock =====================================
+
+class ScriptedTab(FakeTab):
+    """FakeTab plus: an approval card on screen during `card(t)` and a failed detect read during `gap(t)`."""
+
+    def __init__(self, clock, state, card=lambda t: False, gap=lambda t: False, **kw):
+        super().__init__(clock, state, **kw)
+        self.card, self.gap, self.cards_answered = card, gap, 0
+
+    def eval(self, expr, timeout=None):
+        if "var allow=" in expr and self.card(self.now()):
+            self.cards_answered += 1
+            return {"app": "WebCodex Demo", "text": "WebCodex Demo\nAllow file materialization?"}
+        if "generating:stop,done:done" in expr and self.gap(self.now()):
+            raise RuntimeError("CDP Runtime.evaluate timeout")
+        return super().eval(expr, timeout)
+
+
+def _refused_state(**over):
+    return lambda t: _dead(refused=REFUSAL[:160], node="found", len=258, ac=1, **over)
+
+
+# ---- 1: a refusal outranks a continuable failure; a finished answer outranks both ----------------------
+
+def test_a_refusal_beside_a_failed_marker_is_remote_refused_and_nothing_is_continued(wait, env, capsys):
+    """Both markers on the page: the old order exited turn_failed and the backend then sent a continue into
+    the refused thread (wait, followup, wait). The waiter now reports the refusal, and fed through the
+    backend that is FAILED with no followup issued."""
+    code, tab, spent, _ = wait(lambda c: FakeTab(c, _refused_state(failed="Thinking failed")))
+    err = capsys.readouterr().err
+    assert code == 4 and "CGC_ERROR remote_refused" in err and "turn_failed" not in err, err
+    store_mod, backend, s = env
+    cdp = _script({"code": code, "stderr": err})
+    assert backend._wait_phase(s, RID, CONV, {"model": "Pro"}, cdp, may_continue=True) == store_mod.FAILED
+    assert cdp.calls == ["wait"], "no continue goes into a refused thread"
+    assert s.get_round(RID)["error_code"].startswith("CGC_ERROR remote_refused")
+
+
+def test_a_failed_marker_alone_is_still_a_continuable_turn_failure(wait, capsys):
+    code, tab, spent, _ = wait(lambda c: FakeTab(c, lambda t: _dead(failed="Thinking failed", node="found",
+                                                                   len=40, ac=1)))
+    err = capsys.readouterr().err
+    assert code == 4 and "CGC_ERROR turn_failed" in err and "remote_refused" not in err
+
+
+def test_a_finished_wrapped_answer_outranks_both_markers(wait, capsys):
+    both = lambda t: _dead(done=True, failed="Thinking failed", refused=REFUSAL[:160], node="found", len=500, ac=2)
+
+    def mk(c):
+        tab = FakeTab(c, both)
+        orig = tab.eval
+        tab.eval = lambda expr, timeout=None: ("the verified answer" if "res.done?res.body" in expr
+                                               else orig(expr, timeout))
+        return tab
+    code, tab, _, ns = wait(mk)
+    assert code == 0 and open(ns.out).read() == "the verified answer"
+    assert "remote_refused" not in capsys.readouterr().err
+
+
+# ---- 2: a prefix is not evidence ---------------------------------------------------------------------
+
+def test_a_streaming_prefix_with_the_stop_button_up_is_not_a_refusal():
+    """The first characters of any reply can be the marker while the answer is still streaming."""
+    stop = "E('DIV',{}," + "[" + STOP_BUTTON + "])"
+    st = _detect(_page(_turn(1, RID, "This content can’t be shown"), stop))
+    assert st["generating"] is True and st["refused"] is None, st
+    # the same text with the stop button gone is the refusal
+    assert _detect(_page(_turn(1, RID, "This content can’t be shown")))["refused"]
+
+
+def test_a_short_legitimate_answer_that_opens_with_the_phrase_is_not_a_refusal():
+    """A real answer carries the wrapper the prompt demands. 111 chars of it, finished or still streaming
+    (BEGIN seen, no END yet, stop button momentarily absent), is never read as the filter's replacement."""
+    body = "This content was flagged for possible risk is just the UI string; the verdict follows below."
+    finished = _detect(_page(_turn(1, RID, _wrapped(RID, body))))
+    assert finished["done"] is True and finished["refused"] is None
+    partial = _detect(_page(_turn(1, RID, "BEGIN_RESPONSE:%s\n%s" % (RID, body))))
+    assert partial["done"] is False and partial["refused"] is None, partial
+
+
+def test_a_refusal_must_repeat_on_two_polls_before_it_ends_anything(wait, capsys):
+    """A one-poll read (a message caught mid-render) ends nothing: the refusal flickers every other poll
+    and the wait runs to its own timeout."""
+    flicker = lambda t: _dead(refused=REFUSAL[:160] if int(t / 20) % 2 else None, node="found", len=258, ac=1)
+    code, tab, spent, _ = wait(lambda c: FakeTab(c, flicker))
+    err = capsys.readouterr().err
+    assert code == 4 and spent >= 5400 and "remote_refused" not in err
+
+
+def test_a_refusal_read_while_generating_ends_nothing(wait, capsys):
+    """Defence in depth: even a reader that reports `refused` while the stop button is up cannot end the wait."""
+    code, tab, spent, _ = wait(lambda c: FakeTab(c, _refused_state(generating=True)))
+    assert code == 4 and spent >= 5400 and "remote_refused" not in capsys.readouterr().err
+
+
+# ---- 3: the refusal is read in the same interval as the answer ---------------------------------------
+
+def test_a_refusal_after_a_later_riless_exchange_is_not_the_answered_rounds():
+    """RID answered, then the human types a rid-less note and the filter refuses THAT reply: the interval
+    ended at the note (a reply already existed), so the earlier round is not refused."""
+    answered = _turn(1, RID, _wrapped(RID, "the verdict"))
+    note = ("E('DIV',{'data-turn-key':'h'},[unit('h:0:user',[P('and what about speed?')]),"
+            "unit('h:2:assistant',[md([%s])])])" % json.dumps(REFUSAL))
+    st = _detect(_page(answered, note))
+    assert st["done"] is True and st["refused"] is None, st
+
+
+def test_a_steer_before_any_reply_does_not_end_the_refusal_interval():
+    """The exception __cgcNode keeps: a rid-less steer typed while the round was still thinking folds into
+    it, and the one reply after it (here a refusal) is this round's."""
+    steer = "E('DIV',{'data-turn-key':'h'},[unit('h:0:user',[P('additional focus on speed')])])"
+    reply = "E('DIV',{'data-turn-key':'r'},[unit('r:2:assistant',[md([%s])])])" % json.dumps(REFUSAL)
+    st = _detect(_page(_turn(1, RID), steer, reply))
+    assert st["refused"], st
+
+
+def test_the_refusal_and_the_answer_share_one_interval_rule():
+    assert CDP._INTERVAL_END_JS in CDP._NODE_FN and CDP._INTERVAL_END_JS in CDP._detect_js(RID, scoped=True)
+
+
+# ---- 4: the dead-round clock ------------------------------------------------------------------------
+
+def test_an_approval_card_seen_mid_wait_restarts_the_dead_clock(wait, capsys):
+    """A card answered at t=800 is a live prompt: the clock restarts there, so the verdict is NO_GENERATION_S
+    after it, not at 900 s of cumulative deadness (which reloaded at 902 and exited at 1022)."""
+    code, tab, spent, _ = wait(lambda c: ScriptedTab(c, lambda t: _dead(), card=lambda t: 800 <= t < 805))
+    assert tab.cards_answered >= 1
+    assert code == 4 and "CGC_ERROR no_generation" in capsys.readouterr().err
+    assert spent >= 800 + CDP.NO_GENERATION_S, spent
+
+
+def test_a_failed_read_restarts_the_dead_clock(wait, capsys):
+    """A CDP read gap is not evidence of inactivity: the clock restarts at the first good read after it."""
+    code, tab, spent, _ = wait(lambda c: ScriptedTab(c, lambda t: _dead(), gap=lambda t: 800 <= t < 860))
+    err = capsys.readouterr().err
+    assert code == 4 and "CGC_WAIT eval-retry" in err and "CGC_ERROR no_generation" in err
+    assert spent >= 860 + CDP.NO_GENERATION_S, spent
+
+
+def test_a_marker_led_message_carrying_a_cgc_sentinel_is_not_a_refusal():
+    """The wrapper is the proof an answer is the model's own words. A short message that opens with the marker
+    but carries BEGIN_RESPONSE (a model quoting the UI string inside its wrapper, mid-stream, with the stop
+    button momentarily absent) is never the filter's replacement."""
+    text = "This content was flagged for possible risk. BEGIN_RESPONSE:%s the UI shows this string" % RID
+    assert len(text) < CDP._REFUSAL_MAX_CHARS
+    assert _detect(_page(_turn(1, RID, text)))["refused"] is None

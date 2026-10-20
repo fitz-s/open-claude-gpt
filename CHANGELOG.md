@@ -17,13 +17,20 @@ releases until it stabilizes.
   outranks it). The round is `failed` with code `remote_failed` and the human_action "ChatGPT's safety
   filter blocked this round: rephrase the security framing (e.g. describe it as code review) and re-fire
   with a new --request-key". No automatic continue is sent into a refused thread.
+- **A refusal is judged on evidence, in a fixed order.** A completed wrapped answer wins; then a
+  refusal; only then a continuable `turn_failed` (so a "Thinking failed" leaf beside a refusal no longer
+  triggers a continue into the refused thread). Text is the only evidence the contract has, so the
+  reader withholds `refused` while the stop button is up, requires the message to carry no
+  `BEGIN_RESPONSE`/`END_RESPONSE`, and reads the same interval as the answer (one `_INTERVAL_END_JS`:
+  a later rid-less exchange is not the answered round's); the waiter ends only when the same text is
+  read on two consecutive polls.
 - **A sent round with no generation and no reply is dead, not slow.** 2026-10-18: the tab read
   `gen=False node=none ac=0` for 5400 s because the thread was parked on a pending tool-approval prompt
   (the server transcript holds one user message and ends on an unanswered `confirm_action`). After
   `CGC_NO_GENERATION_S` (default 900) of continuous deadness the wait spends its one stale-tab reload,
   rechecks for 120 s, then ends `no_generation`: `possibly_accepted`, retrieve, never re-send, with the
   likely cause named. A thinking round keeps the stop button or a reply node up and is never cut; any
-  sign of life restarts the clock.
+  sign of life restarts the clock -- an approval card seen or answered, and a failed read, included.
 
 ### Fixed — install, uninstall, doctor and config lifecycle (v0.6 review)
 

@@ -227,8 +227,9 @@ def test_law4_an_invalid_contract_blocks_the_round_as_proven_not_sent(tmp_path, 
 
 
 # Updated 2026-10-14: approval labels moved to code; LAW 7 click guard; implicit-submit and aria-haspopup="false" refused.
-# Updated 2026-10-20: _detect_js reads ChatGPT's safety-filter refusal (contract refusal_markers).
-_GOLDEN_JS = "758f2b7f8fa3baba2c156d8399e98ae08d436c3d992193f25b4f61e88905d366"
+# Updated 2026-10-20: _detect_js reads ChatGPT's safety-filter refusal (contract refusal_markers), in the
+# same interval __cgcNode reads (one _INTERVAL_END_JS), and never while the page is generating.
+_GOLDEN_JS = "7a0d95adcfe4aa469ea47351ad94d11d7796932d0858f6f89321b38717712ed5"
 
 
 def _generated_js(cdp):

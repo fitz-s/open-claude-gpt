@@ -850,6 +850,14 @@ _RID_FN = ("function __cgcRid(t){t=t||'';"
            "for(var i=0;i<ls.length;i++){var m=ls[i].replace(tr,'').match(re);if(!m)continue;"
            "if(m[1]==='BEGIN')ob[m[2]]=1;else if(ob[m[2]])rid=m[2];}return rid;}")
 
+# THE interval-end rule, page side: given `lo` (the source turn's index in `nx`), sets `hi` to the first
+# user turn that ends rid's interval. The answer read (__cgcNode) and the refusal read (_detect_js) both
+# splice this one string, so they can never disagree about which messages are rid's own.
+_INTERVAL_END_JS = (
+    "var rep=false;for(var j=lo+1;j<nx.length;j++){var rj=__cgcRole(nx[j]);"
+    "if(rj==='assistant'){rep=rep||/\\S/.test(nx[j].textContent||'');continue;}"
+    "if(rj==='user'&&(rep||__cgcRid(__cgcText(nx[j])))){hi=j;break;}}")
+
 _NODE_FN = (
     _ROLE_FN + _TEXT_FN + _RID_FN +
     # __cgcSrc(nx, RID): index in nx of the source turn — the LAST user node whose OWN canonical rid
@@ -884,9 +892,7 @@ _NODE_FN = (
     # exchange, even when the model reuses this rid's wrapper in answering it. Where the DOM cannot
     # tell the two apart, the rule errs toward ending the interval: a missed answer is retrieved, a
     # wrong one is not caught. A resend under this rid is lo itself (__cgcSrc takes the last).
-    "var rep=false;for(var j=lo+1;j<nx.length;j++){var rj=__cgcRole(nx[j]);"
-    "if(rj==='assistant'){rep=rep||/\\S/.test(nx[j].textContent||'');continue;}"
-    "if(rj==='user'&&(rep||__cgcRid(__cgcText(nx[j])))){hi=j;break;}}}"
+    + _INTERVAL_END_JS + "}"
     # 1) exact: any assistant node containing our (unique) BEGIN sentinel, newest-first. Scoped ->
     #    within [lo,hi) only. Unscoped -> the whole document (lo=-1,hi=nx.length), matching the
     #    original global search.
@@ -1123,18 +1129,23 @@ def _detect_js(rid: str, *, scoped=False) -> str:
         "if(v.length>80||!/^(" + _js_alt(UI["failure_markers"]) + ")\\b/.test(v))continue;"
         "if(p.closest(" + _js_str(_IN_MESSAGE_SEL) + "))continue;"
         "failed=v;}})();"
-        # ChatGPT's safety filter replaced the reply: an assistant message in rid's own interval (up to
-        # the next round's turn) whose WHOLE text is a short refusal. Every message is read, not the
-        # largest: a thinking stub can be larger than the 258-char refusal beside it.
-        "var refused=null;(function(){var lo=src;"
+        # ChatGPT's safety filter replaced the reply. Text is the only evidence the contract has (no live DOM
+        # sample of a refusal), so the read is strict about everything around the text: the page is NOT
+        # generating (a streaming answer shows its first characters before anything else), the message is in
+        # rid's OWN interval (the same end rule __cgcNode uses, _INTERVAL_END_JS), it opens with a contract
+        # marker, is short, and carries no CGC sentinel. Every message is read, not the largest: a thinking
+        # stub can be larger than the 258-char refusal beside it. cmd_wait still requires the same text on
+        # two consecutive polls before it ends anything.
+        "var refused=null;(function(){if(document.querySelector(" + _js_str(_STOP_BUTTON_SEL) + "))return;"
+        "var lo=src,hi=nx.length;"
         "if(!RID){lo=-1;for(var q=nx.length-1;q>=0;q--){"
         "if(__cgcRole(nx[q])==='user'&&__cgcRid(__cgcText(nx[q]))===" + json.dumps(rid) + "){lo=q;break;}}}"
-        "if(lo<0)return;"
-        "for(var j2=lo+1;j2<nx.length;j2++){var r2=__cgcRole(nx[j2]);"
-        "if(r2==='user'){if(__cgcRid(__cgcText(nx[j2])))break;continue;}"
-        "if(r2!=='assistant')continue;var t2=(nx[j2].textContent||'').replace(/\\s+/g,' ').trim();"
+        "if(lo<0)return;" + _INTERVAL_END_JS +
+        "for(var j2=lo+1;j2<hi;j2++){if(__cgcRole(nx[j2])!=='assistant')continue;"
+        "var t2=(nx[j2].textContent||'').replace(/\\s+/g,' ').trim();"
         "if(t2.length>0&&t2.length<=" + str(_REFUSAL_MAX_CHARS) + "&&/^(" + _js_alt(UI["refusal_markers"])
-        + ")/.test(t2))refused=t2.slice(0,160);}})();"
+        + ")/.test(t2)&&t2.indexOf('BEGIN_RESPONSE:')<0&&t2.indexOf('END_RESPONSE:')<0)"
+        "refused=t2.slice(0,160);}})();"
         "var rawT=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
         "var res=" + sentinel + ";"
         "var hasB=rawT.indexOf(BG)>=0,hasE=rawT.indexOf(EN)>=0;"
@@ -4227,6 +4238,7 @@ def cmd_wait(a) -> int:
         idle_since, idle_len = time.time(), None
         sup_since = None
         nogen_since = None   # when the page last STARTED showing no generation and no reply (NO_GENERATION_S)
+        refused_seen = None  # the refusal text the PREVIOUS poll read; it must repeat before anything ends
         idle_exit = getattr(a, "idle_exit", 0) or 0   # followup --watch reuses this waiter
         # A valid wrapper in ONE snapshot is not finality: a stream can pause right after END and then
         # continue below it. So done must be read twice, on consecutive polls, at the same length
@@ -4247,6 +4259,7 @@ def cmd_wait(a) -> int:
                 sys.stderr.write(f"CGC_WAIT eval-retry: {e}\n")
                 sup_since = None
                 done_body = None
+                nogen_since = refused_seen = None   # a failed read proves nothing about the page
                 time.sleep(a.poll)
                 continue
             ticks += 1
@@ -4259,6 +4272,7 @@ def cmd_wait(a) -> int:
                                  f"t+{int(time.time()-(deadline-a.timeout))}s\n")
             card = _answer_approval(c, click=not getattr(a, "no_approve", False))
             if card:
+                nogen_since = refused_seen = None   # a card on the page is a live prompt, not a dead round
                 app, text = card
                 approvals += 1
                 if not app or approvals > 5 or getattr(a, "no_approve", False):
@@ -4275,23 +4289,29 @@ def cmd_wait(a) -> int:
             if st.get("blocker"):
                 sys.stderr.write(f"CGC_BLOCKER {st['blocker']}\n")
                 return 3
-            if st.get("failed") and not st.get("generating") and not st.get("done"):
+            # ChatGPT's safety filter replaced the reply with a refusal (contract refusal_markers). It is
+            # terminal and says nothing about the transport, so it ends the wait instead of the budget (the
+            # 2026-10-14 refusal was waited out for 90 minutes) -- and it outranks a failed-turn marker: the
+            # failure path auto-continues into the thread, a second paid message the filter will refuse again.
+            # Order: a completed wrapped answer first (`done`), then a refusal, then a continuable failure.
+            # The text is the only evidence there is, so it must be the SAME on two consecutive polls with no
+            # stop button (the reader already withholds `refused` while generating): a streaming answer's
+            # first characters, or a long answer that merely opens with the phrase, never end a wait.
+            refused_now = st.get("refused") if not st.get("done") and not st.get("generating") else None
+            if refused_now and refused_now == refused_seen:
                 sys.stderr.write(
-                    f"CGC_ERROR turn_failed: ChatGPT marked {rid}'s turn '{st['failed']}' — it will "
-                    "never produce an answer. Nothing to retrieve; re-send it as a new round.\n")
+                    f"CGC_ERROR remote_refused: ChatGPT's safety filter replaced {rid}'s reply with "
+                    f"{refused_now[:120]!r} -- it will never produce an answer. Nothing to retrieve; "
+                    "rephrase the security framing (e.g. describe it as code review) and re-fire with a "
+                    "NEW --request-key.\n")
                 if not a.keep_tab:
                     c.close_tab()
                 return 4
-            # ChatGPT's safety filter replaced the reply with a refusal (contract refusal_markers). It is
-            # terminal and says nothing about the transport, so it ends the wait on this poll instead of
-            # at the budget: the 2026-10-14 refusal was waited out for the full 90 minutes. A real wrapped
-            # answer (done) always outranks it.
-            if st.get("refused") and not st.get("done"):
+            refused_seen = refused_now
+            if st.get("failed") and not st.get("generating") and not st.get("done") and not refused_now:
                 sys.stderr.write(
-                    f"CGC_ERROR remote_refused: ChatGPT's safety filter replaced {rid}'s reply with "
-                    f"{st['refused'][:120]!r} — it will never produce an answer. Nothing to retrieve; "
-                    "rephrase the security framing (e.g. describe it as code review) and re-fire with a "
-                    "NEW --request-key.\n")
+                    f"CGC_ERROR turn_failed: ChatGPT marked {rid}'s turn '{st['failed']}' — it will "
+                    "never produce an answer. Nothing to retrieve; re-send it as a new round.\n")
                 if not a.keep_tab:
                     c.close_tab()
                 return 4
