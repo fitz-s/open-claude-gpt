@@ -6,6 +6,25 @@ releases until it stabilizes.
 
 ## [Unreleased]
 
+### Fixed — two waits that burned the whole 90-minute budget on a round that could never answer
+
+- **A safety-filter block is a terminal answer, not a slow one.** ChatGPT can replace a reply with
+  "This content can't be shown / was flagged for possible …" (258 chars, no wrapper). The waiter read
+  that as a short unwrapped stub and waited out the budget (2026-10-14), and the follow-up sent into the
+  same thread then got no reply at all. The phrases are contract data (`refusal_markers`); the reader
+  reports `refused` for any assistant message in the round's own interval that opens with one and stays
+  under 600 chars, and the wait ends on that poll with `CGC_ERROR remote_refused` (a wrapped answer still
+  outranks it). The round is `failed` with code `remote_failed` and the human_action "ChatGPT's safety
+  filter blocked this round: rephrase the security framing (e.g. describe it as code review) and re-fire
+  with a new --request-key". No automatic continue is sent into a refused thread.
+- **A sent round with no generation and no reply is dead, not slow.** 2026-10-18: the tab read
+  `gen=False node=none ac=0` for 5400 s because the thread was parked on a pending tool-approval prompt
+  (the server transcript holds one user message and ends on an unanswered `confirm_action`). After
+  `CGC_NO_GENERATION_S` (default 900) of continuous deadness the wait spends its one stale-tab reload,
+  rechecks for 120 s, then ends `no_generation`: `possibly_accepted`, retrieve, never re-send, with the
+  likely cause named. A thinking round keeps the stop button or a reply node up and is never cut; any
+  sign of life restarts the clock.
+
 ### Fixed — install, uninstall, doctor and config lifecycle (v0.6 review)
 
 - **Upgrade stops the daemon before replacing files.** `install.sh` used to copy the new tree over a

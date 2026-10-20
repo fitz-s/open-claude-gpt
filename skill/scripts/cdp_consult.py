@@ -136,7 +136,8 @@ CONTRACT_PATH = os.environ.get("CGC_CONTRACT") or os.path.join(
 #             role_from: value|last_colon_segment, send_rank: int}, send_ranks distinct
 _CONTRACT_SCHEMA = {
     "turn_schemas": "schemas", "assistant_body": "body", "turn_container": "sel",
-    "conversation_root": "sel", "failure_markers": "words", "model_slug_attr": "attr",
+    "conversation_root": "sel", "failure_markers": "words", "refusal_markers": "words",
+    "model_slug_attr": "attr",
     "composer": "sel", "composer_exclude_ancestor": "sel",
     "trailing_break_class": "class", "mention_chip_attr": "attr", "mention_chip_label_attr": "attr",
     "mention_popup_attr": "attr", "mention_option_attr": "attr", "mention_row_content_attr": "attr",
@@ -374,6 +375,23 @@ STALE_RELOAD_SETTLE_S = 8
 # resets the streak before it can reach 3 — so 15 idle minutes sits far outside a live round while
 # costing ~1/6 of the 5400s actually lost.
 STALE_STUB_CYCLES = 3
+
+# A sent round whose page shows no generation (no stop button) and no assistant node in the round's own
+# interval is not slow, it is dead: a live Pro round keeps the stop button up or an assistant node on the
+# page through every thinking phase (the stub nodes of the thinking summary count as nodes). Seen live
+# 2026-10-18, REQ-20261018-101759-06b1be: the tab read gen=True for two seconds, then gen=False node=none
+# ac=0 for the 5400s budget, because the conversation sat parked on a pending tool-approval card
+# (the server transcript ends in a confirm_action elicitation with status "pending"). After this many
+# CONTINUOUS seconds the waiter spends the wait's one reload, then ends `no_generation` once the state
+# survives it for NO_GEN_RECHECK_S more. 0 disables. The end is post-send: possibly_accepted, retrieve,
+# never a resend.
+try:
+    NO_GENERATION_S = max(0, int(os.environ.get("CGC_NO_GENERATION_S", "900")))
+except ValueError:
+    NO_GENERATION_S = 900
+# A reload re-renders the thread asynchronously; the dead state must hold this long after it before the
+# verdict, so a page still hydrating is never read as an empty one.
+NO_GEN_RECHECK_S = 120
 
 
 @contextlib.contextmanager
@@ -1048,8 +1066,14 @@ def _blocker(c):
         return "unreadable"
 
 
+# A safety-filter refusal replaces the reply with ~260 chars ("This content can't be shown This content
+# was flagged for possible ..."); nothing follows it. The ceiling keeps a real answer that merely opens
+# with the phrase from ever reading as one.
+_REFUSAL_MAX_CHARS = 600
+
+
 def _detect_js(rid: str, *, scoped=False) -> str:
-    """Returns JSON {generating,done,blocker,failed,node,len,begin,end,ac} for the answer node.
+    """Returns JSON {generating,done,blocker,failed,refused,node,len,begin,end,ac} for the answer node.
     done comes from the canonical bare-line _sentinel_js parser (SHARED CONTRACT #1) — a line
     merely CONTAINING BEGIN/END_RESPONSE:<rid> (quoted in prose or a code block) never counts,
     only a bare standalone sentinel line does. This is NOT stop-button driven: the model writes
@@ -1099,13 +1123,25 @@ def _detect_js(rid: str, *, scoped=False) -> str:
         "if(v.length>80||!/^(" + _js_alt(UI["failure_markers"]) + ")\\b/.test(v))continue;"
         "if(p.closest(" + _js_str(_IN_MESSAGE_SEL) + "))continue;"
         "failed=v;}})();"
+        # ChatGPT's safety filter replaced the reply: an assistant message in rid's own interval (up to
+        # the next round's turn) whose WHOLE text is a short refusal. Every message is read, not the
+        # largest: a thinking stub can be larger than the 258-char refusal beside it.
+        "var refused=null;(function(){var lo=src;"
+        "if(!RID){lo=-1;for(var q=nx.length-1;q>=0;q--){"
+        "if(__cgcRole(nx[q])==='user'&&__cgcRid(__cgcText(nx[q]))===" + json.dumps(rid) + "){lo=q;break;}}}"
+        "if(lo<0)return;"
+        "for(var j2=lo+1;j2<nx.length;j2++){var r2=__cgcRole(nx[j2]);"
+        "if(r2==='user'){if(__cgcRid(__cgcText(nx[j2])))break;continue;}"
+        "if(r2!=='assistant')continue;var t2=(nx[j2].textContent||'').replace(/\\s+/g,' ').trim();"
+        "if(t2.length>0&&t2.length<=" + str(_REFUSAL_MAX_CHARS) + "&&/^(" + _js_alt(UI["refusal_markers"])
+        + ")/.test(t2))refused=t2.slice(0,160);}})();"
         "var rawT=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
         "var res=" + sentinel + ";"
         "var hasB=rawT.indexOf(BG)>=0,hasE=rawT.indexOf(EN)>=0;"
         "var stop=!!document.querySelector(" + _js_str(_STOP_BUTTON_SEL) + ");"
         + _BLOCKER_FN + "var blocker=__cgcBlocker();"
         "var done=(res.done&&a.length>0);"
-        "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,node:where,superseded:sup,"
+        "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,refused:refused,node:where,superseded:sup,"
         "len:rawT.length,begin:hasB,end:hasE,ac:a.length});})()"
     )
 
@@ -4190,6 +4226,7 @@ def cmd_wait(a) -> int:
         approvals = 0
         idle_since, idle_len = time.time(), None
         sup_since = None
+        nogen_since = None   # when the page last STARTED showing no generation and no reply (NO_GENERATION_S)
         idle_exit = getattr(a, "idle_exit", 0) or 0   # followup --watch reuses this waiter
         # A valid wrapper in ONE snapshot is not finality: a stream can pause right after END and then
         # continue below it. So done must be read twice, on consecutive polls, at the same length
@@ -4245,6 +4282,19 @@ def cmd_wait(a) -> int:
                 if not a.keep_tab:
                     c.close_tab()
                 return 4
+            # ChatGPT's safety filter replaced the reply with a refusal (contract refusal_markers). It is
+            # terminal and says nothing about the transport, so it ends the wait on this poll instead of
+            # at the budget: the 2026-10-14 refusal was waited out for the full 90 minutes. A real wrapped
+            # answer (done) always outranks it.
+            if st.get("refused") and not st.get("done"):
+                sys.stderr.write(
+                    f"CGC_ERROR remote_refused: ChatGPT's safety filter replaced {rid}'s reply with "
+                    f"{st['refused'][:120]!r} — it will never produce an answer. Nothing to retrieve; "
+                    "rephrase the security framing (e.g. describe it as code review) and re-fire with a "
+                    "NEW --request-key.\n")
+                if not a.keep_tab:
+                    c.close_tab()
+                return 4
             # Another round's turn followed this one before any reply (a correction sent under a new rid
             # mid-reasoning): the reply after it is that round's. Once the page has stopped generating
             # for a settle window, none is coming for this rid — say so now instead of at the timeout.
@@ -4271,6 +4321,33 @@ def cmd_wait(a) -> int:
                     return 5
             else:
                 sup_since = None
+            # A sent round that shows no generation (no stop button) and no assistant message in its own
+            # interval is dead, not slow: a live Pro round keeps one of the two up through every thinking
+            # phase. The clock is CONTINUOUS (any generation, any message, a card, a blocker or a
+            # superseding turn resets it), and the wait's one reload is spent before the verdict so a stale
+            # tab is never what ends it. The end is post-send, like every timeout: retrieve, never resend.
+            if (NO_GENERATION_S and not st.get("generating") and st.get("node") == "none"
+                    and not st.get("done") and not st.get("superseded")):
+                nogen_since = nogen_since or time.time()
+                if time.time() - nogen_since >= NO_GENERATION_S:
+                    if not reloaded:
+                        reloaded = True
+                        _reload_stale_tab(
+                            c, f"{rid}'s page has shown no generation and no reply for "
+                               f"{int(time.time() - nogen_since)}s")
+                        nogen_since = time.time() - NO_GENERATION_S + NO_GEN_RECHECK_S
+                        continue
+                    sys.stderr.write(
+                        f"CGC_ERROR no_generation: {rid}'s page has shown no generation and no reply for "
+                        f"{int(time.time() - nogen_since)}s after the send, past the one reload — a live round "
+                        "keeps its stop button or a reply up, so nothing is coming. The send landed: it may be "
+                        "parked on an app-approval prompt in the thread (look at the ChatGPT window). "
+                        "Retrieve, never re-send.\n")
+                    if not a.keep_tab:
+                        c.close_tab()
+                    return 4
+            else:
+                nogen_since = None
             # Idleness must be CONTINUOUS: any generation or byte movement restarts the clock, so the
             # gap between a thinking phase and the written answer can never end a live round.
             if st.get("generating") or st.get("len", 0) != idle_len:

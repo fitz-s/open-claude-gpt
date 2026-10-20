@@ -52,6 +52,13 @@
       ],
       "why": "Whole text of a leaf status element in the turn, outside any message body, when a turn will never answer (2026-09-25)."
     },
+    "refusal_markers": {
+      "value": [
+        "This content can\u2019t be shown",
+        "This content was flagged for possible"
+      ],
+      "why": "Leading text of an assistant message ChatGPT's safety filter replaced the reply with (258 chars, no wrapper, nothing follows): a terminal refusal, never a slow answer (2026-10-15)."
+    },
     "model_slug_attr": {
       "value": "data-message-model-slug",
       "why": "The producing model's slug on the answer's message node (2026-09-06)."
