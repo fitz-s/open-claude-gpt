@@ -136,8 +136,8 @@ CONTRACT_PATH = os.environ.get("CGC_CONTRACT") or os.path.join(
 #             role_from: value|last_colon_segment, send_rank: int}, send_ranks distinct
 _CONTRACT_SCHEMA = {
     "turn_schemas": "schemas", "assistant_body": "body", "turn_container": "sel",
-    "conversation_root": "sel", "failure_markers": "words", "refusal_markers": "words",
-    "model_slug_attr": "attr",
+    "conversation_root": "sel", "failure_markers": "words", "refusal_headings": "words",
+    "prose_container": "sel", "model_slug_attr": "attr",
     "composer": "sel", "composer_exclude_ancestor": "sel",
     "trailing_break_class": "class", "mention_chip_attr": "attr", "mention_chip_label_attr": "attr",
     "mention_popup_attr": "attr", "mention_option_attr": "attr", "mention_row_content_attr": "attr",
@@ -1072,14 +1072,8 @@ def _blocker(c):
         return "unreadable"
 
 
-# A safety-filter refusal replaces the reply with ~260 chars ("This content can't be shown This content
-# was flagged for possible ..."); nothing follows it. The ceiling keeps a real answer that merely opens
-# with the phrase from ever reading as one.
-_REFUSAL_MAX_CHARS = 600
-
-
 def _detect_js(rid: str, *, scoped=False) -> str:
-    """Returns JSON {generating,done,blocker,failed,refused,node,len,begin,end,ac} for the answer node.
+    """Returns JSON {generating,done,blocker,failed,refused,refused_note,node,len,begin,end,ac} for the answer node.
     done comes from the canonical bare-line _sentinel_js parser (SHARED CONTRACT #1) — a line
     merely CONTAINING BEGIN/END_RESPONSE:<rid> (quoted in prose or a code block) never counts,
     only a bare standalone sentinel line does. This is NOT stop-button driven: the model writes
@@ -1129,30 +1123,34 @@ def _detect_js(rid: str, *, scoped=False) -> str:
         "if(v.length>80||!/^(" + _js_alt(UI["failure_markers"]) + ")\\b/.test(v))continue;"
         "if(p.closest(" + _js_str(_IN_MESSAGE_SEL) + "))continue;"
         "failed=v;}})();"
-        # ChatGPT's safety filter replaced the reply. Text is the only evidence the contract has (no live DOM
-        # sample of a refusal), so the read is strict about everything around the text: the page is NOT
-        # generating (a streaming answer shows its first characters before anything else), the message is in
-        # rid's OWN interval (the same end rule __cgcNode uses, _INTERVAL_END_JS), it opens with a contract
-        # marker, is short, and carries no CGC sentinel. Every message is read, not the largest: a thinking
-        # stub can be larger than the 258-char refusal beside it. cmd_wait still requires the same text on
-        # two consecutive polls before it ends anything.
-        "var refused=null;(function(){if(document.querySelector(" + _js_str(_STOP_BUTTON_SEL) + "))return;"
+        # ChatGPT's safety filter replaced the reply. It renders a NOTICE, not an answer (live DOM, 2026-10-20):
+        # a leaf <p> whose whole text is a contract refusal heading, inside the assistant unit and OUTSIDE any
+        # prose container (an answer's words always render inside one). So the evidence is structure, never a
+        # prefix of the message text: the leaf's WHOLE trimmed text must equal a heading, it must not sit in the
+        # prose container, and it must sit inside rid's OWN interval (the same end rule __cgcNode uses,
+        # _INTERVAL_END_JS), read per assistant message so a thinking stub beside it does not hide it. A page that
+        # is generating never reads as refused. The notice's next sibling (the filter's stated reason) rides along
+        # as `refused_note`, for the human only; no decision reads it.
+        "var refused=null,refusedNote=null;(function(){if(document.querySelector(" + _js_str(_STOP_BUTTON_SEL) + "))return;"
         "var lo=src,hi=nx.length;"
         "if(!RID){lo=-1;for(var q=nx.length-1;q>=0;q--){"
         "if(__cgcRole(nx[q])==='user'&&__cgcRid(__cgcText(nx[q]))===" + json.dumps(rid) + "){lo=q;break;}}}"
         "if(lo<0)return;" + _INTERVAL_END_JS +
         "for(var j2=lo+1;j2<hi;j2++){if(__cgcRole(nx[j2])!=='assistant')continue;"
-        "var t2=(nx[j2].textContent||'').replace(/\\s+/g,' ').trim();"
-        "if(t2.length>0&&t2.length<=" + str(_REFUSAL_MAX_CHARS) + "&&/^(" + _js_alt(UI["refusal_markers"])
-        + ")/.test(t2)&&t2.indexOf('BEGIN_RESPONSE:')<0&&t2.indexOf('END_RESPONSE:')<0)"
-        "refused=t2.slice(0,160);}})();"
+        "var ls=nx[j2].querySelectorAll('*');for(var k2=0;k2<ls.length;k2++){var e2=ls[k2];"
+        "if(e2.children&&e2.children.length)continue;var v2=(e2.textContent||'').replace(/\\s+/g,' ').trim();"
+        "if(!/^(" + _js_alt(UI["refusal_headings"]) + ")$/.test(v2))continue;"
+        "if(e2.closest(" + _js_str(UI["prose_container"]) + "))continue;"
+        "refused=v2;var sb=e2.parentElement?e2.parentElement.children:[];"
+        "var nt=sb[Array.prototype.indexOf.call(sb,e2)+1];"
+        "refusedNote=nt?(nt.textContent||'').replace(/\\s+/g,' ').trim().slice(0,200):null;}}})();"
         "var rawT=((node?node.textContent:'')||'').replace(/\\r\\n/g,'\\n');"
         "var res=" + sentinel + ";"
         "var hasB=rawT.indexOf(BG)>=0,hasE=rawT.indexOf(EN)>=0;"
         "var stop=!!document.querySelector(" + _js_str(_STOP_BUTTON_SEL) + ");"
         + _BLOCKER_FN + "var blocker=__cgcBlocker();"
         "var done=(res.done&&a.length>0);"
-        "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,refused:refused,node:where,superseded:sup,"
+        "return JSON.stringify({generating:stop,done:done,blocker:blocker,failed:failed,refused:refused,refused_note:refusedNote,node:where,superseded:sup,"
         "len:rawT.length,begin:hasB,end:hasE,ac:a.length});})()"
     )
 
@@ -4289,19 +4287,22 @@ def cmd_wait(a) -> int:
             if st.get("blocker"):
                 sys.stderr.write(f"CGC_BLOCKER {st['blocker']}\n")
                 return 3
-            # ChatGPT's safety filter replaced the reply with a refusal (contract refusal_markers). It is
-            # terminal and says nothing about the transport, so it ends the wait instead of the budget (the
+            # ChatGPT's safety filter replaced the reply with a refusal notice (contract refusal_headings, read
+            # structurally by _detect_js: a leaf heading outside the answer's prose, in this round's interval).
+            # It is terminal and says nothing about the transport, so it ends the wait instead of the budget (the
             # 2026-10-14 refusal was waited out for 90 minutes) -- and it outranks a failed-turn marker: the
             # failure path auto-continues into the thread, a second paid message the filter will refuse again.
             # Order: a completed wrapped answer first (`done`), then a refusal, then a continuable failure.
-            # The text is the only evidence there is, so it must be the SAME on two consecutive polls with no
-            # stop button (the reader already withholds `refused` while generating): a streaming answer's
-            # first characters, or a long answer that merely opens with the phrase, never end a wait.
+            # The one text-level check kept: the same heading on two consecutive polls, compared in FULL. The
+            # structural read already rules out an answer's words; what the second look buys is a notice caught
+            # mid-render, or the stop button gone for a beat between generation phases while the page is still
+            # mid-change. It costs one poll, and ends nothing a lone read would not.
             refused_now = st.get("refused") if not st.get("done") and not st.get("generating") else None
             if refused_now and refused_now == refused_seen:
                 sys.stderr.write(
                     f"CGC_ERROR remote_refused: ChatGPT's safety filter replaced {rid}'s reply with "
-                    f"{refused_now[:120]!r} -- it will never produce an answer. Nothing to retrieve; "
+                    f"{refused_now!r}" + (f" ({st['refused_note'][:160]})" if st.get("refused_note") else "")
+                    + " -- it will never produce an answer. Nothing to retrieve; "
                     "rephrase the security framing (e.g. describe it as code review) and re-fire with a "
                     "NEW --request-key.\n")
                 if not a.keep_tab:

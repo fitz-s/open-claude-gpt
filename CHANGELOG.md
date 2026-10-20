@@ -11,19 +11,20 @@ releases until it stabilizes.
 - **A safety-filter block is a terminal answer, not a slow one.** ChatGPT can replace a reply with
   "This content can't be shown / was flagged for possible …" (258 chars, no wrapper). The waiter read
   that as a short unwrapped stub and waited out the budget (2026-10-14), and the follow-up sent into the
-  same thread then got no reply at all. The phrases are contract data (`refusal_markers`); the reader
-  reports `refused` for any assistant message in the round's own interval that opens with one and stays
-  under 600 chars, and the wait ends on that poll with `CGC_ERROR remote_refused` (a wrapped answer still
-  outranks it). The round is `failed` with code `remote_failed` and the human_action "ChatGPT's safety
-  filter blocked this round: rephrase the security framing (e.g. describe it as code review) and re-fire
-  with a new --request-key". No automatic continue is sent into a refused thread.
-- **A refusal is judged on evidence, in a fixed order.** A completed wrapped answer wins; then a
-  refusal; only then a continuable `turn_failed` (so a "Thinking failed" leaf beside a refusal no longer
-  triggers a continue into the refused thread). Text is the only evidence the contract has, so the
-  reader withholds `refused` while the stop button is up, requires the message to carry no
-  `BEGIN_RESPONSE`/`END_RESPONSE`, and reads the same interval as the answer (one `_INTERVAL_END_JS`:
-  a later rid-less exchange is not the answered round's); the waiter ends only when the same text is
-  read on two consecutive polls.
+  same thread then got no reply at all. The refusal is read STRUCTURALLY, from the live DOM (captured
+  2026-10-20): a notice, not an answer -- a leaf `<p>` whose whole trimmed text equals a contract heading
+  (`refusal_headings`: "This content can't be shown", either apostrophe), outside the answer's prose
+  (`prose_container`: `.markdown`, `[class*="markdown"]`, `[data-markdown-text-style]`), inside the
+  round's own interval (one `_INTERVAL_END_JS`, shared with the answer read, so a later rid-less
+  exchange is not the answered round's). The filter's stated reason rides along as `refused_note`, for
+  the human. Never read while the stop button is up; the wait ends when the same heading is read on two
+  consecutive polls (a full-text compare) with `CGC_ERROR remote_refused`. The round is `failed` with
+  code `remote_failed` and the human_action "ChatGPT's safety filter blocked this round: rephrase the
+  security framing (e.g. describe it as code review) and re-fire with a new --request-key". No
+  automatic continue is sent into a refused thread; a wrapped answer outranks a refusal, and a
+  refusal outranks a continuable `turn_failed`.
+  A real answer that merely opens with the phrase, or is still streaming it, renders inside the
+  markdown container and is never a refusal (an earlier text-prefix read was wrong on exactly that).
 - **A sent round with no generation and no reply is dead, not slow.** 2026-10-18: the tab read
   `gen=False node=none ac=0` for 5400 s because the thread was parked on a pending tool-approval prompt
   (the server transcript holds one user message and ends on an unanswered `confirm_action`). After

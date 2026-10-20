@@ -41,9 +41,13 @@ CDP = _load("cdp_consult_channel", os.path.join(SCRIPTS, "cdp_consult.py"))
 _SU = _load("test_search_unit_schema_channel", os.path.join(ROOT, "tests", "test_search_unit_schema.py"))
 _DOM = _SU._DOM
 
-# The refusal as the live page rendered it: one assistant message, 258 chars, no wrapper.
-REFUSAL = ("This content can’t be shown This content was flagged for possible biological risk. "
-           "If you think this is a mistake, please submit feedback. " + "x" * 100)[:258]
+# The refusal as the live page renders it (captured read-only from the debug Chrome, 2026-10-20, conversation
+# 6acf3714, REQ-20261014-192330-a959d4): NOT a markdown answer but a notice -- a leaf <p class="font-semibold">
+# heading, a <p> with the filter's stated reason, a Learn more link, all outside any .markdown container, inside
+# a fallback-turn assistant unit. The page had no [data-message-author-role] (historical render).
+HEADING = "This content can\u2019t be shown"
+REASON = ("This content was flagged for possible cybersecurity risk. You may be eligible for Daybreak Blue, "
+          "which reduces refusals for authorized defensive work on supported models. Other safeguards still apply.")
 STOP_BUTTON = "E('BUTTON',{'data-testid':'stop-button','aria-label':'Stop streaming'},[],'Stop')"
 
 
@@ -67,6 +71,24 @@ def _turn(i, rid, *assistant_texts, extra=""):
     return "E('DIV',{'data-turn-key':%s},[%s%s])" % (json.dumps("k%d" % i), ",".join(kids), extra)
 
 
+def _notice(i, extra_class="font-semibold"):
+    """The captured notice as an assistant unit: heading leaf + reason leaf + link, no markdown container."""
+    return ("unit(%s,[E('DIV',{},[E('DIV',{},[E('DIV',{'data-talvt-turn-state':'cancelled'},["
+            "E('DIV',{'class':'mt-3 flex flex-col gap-2'},[E('DIV',{'class':'flex min-w-0 grow items-start'},["
+            "E('DIV',{'class':'min-w-0 grow pt-[2px]'},[E('P',{'class':%s},[],%s),E('P',{},[],%s),"
+            "E('A',{'href':'https://chatgpt.com/cyber'},[],'Learn more')])])])])])])])"
+            % (json.dumps("t%d:2:assistant" % i), json.dumps(extra_class), json.dumps(HEADING), json.dumps(REASON)))
+
+
+def _refused_turn(i, rid):
+    return "E('DIV',{'data-turn-key':%s},[%s,%s])" % (json.dumps("k%d" % i), _user(i, rid), _notice(i))
+
+
+def _answer_turn(i, rid, text):
+    """A real answer: the words render inside the markdown container (assistant_body), unwrapped or wrapped."""
+    return _turn(i, rid, text)
+
+
 def _wrapped(rid, body):
     return "BEGIN_RESPONSE:%s\n%s\nEND_RESPONSE:%s" % (rid, body, rid)
 
@@ -82,37 +104,157 @@ def _detect(page, rid=RID):
 
 # ---- B: the safety block is read, in the reader JS ---------------------------------------------------
 
-def test_the_safety_block_is_read_as_a_refusal():
-    st = _detect(_page(_turn(1, RID, REFUSAL)))
-    assert st["refused"] and st["refused"].startswith("This content can’t be shown"), st
-    assert st["done"] is False and st["failed"] is None
+def test_the_captured_refusal_notice_is_read_as_a_refusal():
+    """The real DOM: heading leaf outside any markdown, in a fallback-turn assistant unit."""
+    st = _detect(_page(_refused_turn(3, RID)))
+    assert st["refused"] == HEADING, st
+    assert st["refused_note"].startswith("This content was flagged for possible cybersecurity risk"), st
+    assert st["done"] is False and st["failed"] is None and st["generating"] is False
 
 
-def test_the_flagged_phrase_alone_is_read_too():
-    st = _detect(_page(_turn(1, RID, "This content was flagged for possible cyber risk.")))
-    assert st["refused"], st
+def test_the_captured_page_has_no_author_role_attribute_and_the_reader_still_resolves_its_interval():
+    """The fallback render has zero [data-message-author-role]: the reader runs on the search-unit schema alone.
+    The source turn resolves, the assistant unit is `found`, and the interval ends at the next round."""
+    page = _page(_refused_turn(3, RID), _turn(4, OTHER, _wrapped(OTHER, "a later round's answer")))
+    assert "data-message-author-role" not in page
+    st = _detect(page)
+    assert st["node"] == "found" and st["ac"] == 2 and st["refused"] == HEADING, st
+    assert _detect(page, OTHER)["done"] is True and _detect(page, OTHER)["refused"] is None
 
 
-def test_an_answer_that_merely_quotes_the_phrase_is_not_a_refusal():
-    """A real, wrapped answer (and a long one that starts with the phrase) must never read as a block."""
-    body = "This content was flagged for possible risk, the filter said. " + "analysis " * 120
-    st = _detect(_page(_turn(1, RID, _wrapped(RID, body))))
-    assert st["refused"] is None and st["done"] is True
-    st = _detect(_page(_turn(1, RID, "The reply said: This content can’t be shown (quoted)")))
-    assert st["refused"] is None, "anchored at the start of the message, not a substring"
+def test_either_apostrophe_is_the_heading():
+    straight = _notice(3).replace(json.dumps(HEADING), json.dumps("This content can't be shown"))
+    page = _page("E('DIV',{'data-turn-key':'k3'},[%s,%s])" % (_user(3, RID), straight))
+    assert _detect(page)["refused"] == "This content can't be shown"
+
+
+def test_a_heading_inside_the_answers_markdown_is_the_models_words_not_a_refusal():
+    """The same words as a leaf INSIDE the answer's markdown container (assistant_body) are prose."""
+    nested = ("E('DIV',{'data-turn-key':'k1'},[%s,unit('t1:2:assistant',[E('DIV',"
+              "{'data-markdown-text-style':'assistant-message'},[E('P',{},[],%s)])])])"
+              % (_user(1, RID), json.dumps(HEADING)))
+    assert _detect(_page(nested))["refused"] is None, "the assistant_body attribute is enough"
+
+
+# ---- the captured DOM, on the replay engine that knows classes (skill/scripts/fixture_dom.js) -----------
+
+def _fx(tag, attrs, *kids):
+    return [tag, attrs, list(kids)]
+
+
+def _captured_page(rid=RID, *, heading_wrapper=None, stop=False, later=None):
+    """The live page, structure as captured: a fallback-turn user unit carrying the rid marker, then the
+    assistant unit holding the notice (ancestors as listed, classes as listed). No data-message-author-role
+    anywhere. `heading_wrapper` wraps the heading <p> in an element with that class (an answer's prose);
+    `later` appends a following turn."""
+    heading = _fx("p", {"class": "font-semibold"}, HEADING)
+    if heading_wrapper:
+        heading = _fx("div", {"class": heading_wrapper}, heading)
+    notice = _fx("div", {"data-chatgpt-selection-conversation-id": "c", "data-chatgpt-selection-message-id": "m"},
+                 _fx("div", {},
+                     _fx("div", {"data-chatgpt-search-unit-key": "fallback-turn-3:2:assistant",
+                                 "data-content-search-unit-key": "fallback-turn-3:2:assistant"},
+                         _fx("div", {}, _fx("div", {}, _fx("div", {"data-talvt-turn-state": "cancelled"},
+                             _fx("div", {}, _fx("div", {"data-content-search-turn-key": "fallback-turn-3"},
+                                 _fx("div", {"class": "mt-3 flex flex-col gap-2"},
+                                     _fx("div", {"class": "flex items-center gap-6 self-start"},
+                                         _fx("div", {"class": "flex min-w-0 grow items-start"},
+                                             _fx("div", {"class": "min-w-0 grow pt-[2px]"}, heading,
+                                                 _fx("p", {}, REASON),
+                                                 _fx("a", {"href": "https://chatgpt.com/cyber"}, "Learn more")
+                                                 ))))))))))))
+    user = _fx("div", {"data-chatgpt-search-unit-key": "fallback-turn-3:0:user"},
+               _fx("p", {}, "CGC_RID:" + rid), _fx("p", {}, "BEGIN_RESPONSE:" + rid),
+               _fx("p", {}, "<full answer>"), _fx("p", {}, "END_RESPONSE:" + rid))
+    turns = [_fx("div", {"data-turn-key": "88281a9c"}, user, notice)] + (later or [])
+    body = [_fx("main", {}, *turns)]
+    if stop:
+        body.append(_fx("button", {"data-testid": "stop-button", "aria-label": "Stop streaming"}, "Stop"))
+    return [_fx("html", {}, _fx("body", {}, *body))]
+
+
+def _fx_detect(tree, rid=RID):
+    if not shutil.which("node"):
+        pytest.skip("node not installed")
+    r = subprocess.run(["node", os.path.join(SCRIPTS, "fixture_dom.js")], capture_output=True, text=True,
+                       input=json.dumps({"tree": tree, "path": "/c/x", "js": CDP._detect_js(rid, scoped=True)}))
+    assert r.returncode == 0, r.stderr[-400:]
+    return json.loads(json.loads(r.stdout))
+
+
+def test_the_captured_live_refusal_dom_is_a_refusal():
+    st = _fx_detect(_captured_page())
+    assert st["refused"] == HEADING, st
+    assert st["refused_note"].startswith("This content was flagged for possible cybersecurity risk"), st
+    assert st["node"] == "found" and st["done"] is False and st["generating"] is False
+
+
+def test_the_captured_dom_has_no_author_role_and_the_reader_resolves_its_interval_anyway():
+    """Reported, not widened: on the fallback render (zero [data-message-author-role]) the source turn, the
+    assistant unit and the interval end all resolve through the search-unit schema alone."""
+    later = [_fx("div", {"data-turn-key": "next"},
+                 _fx("div", {"data-chatgpt-search-unit-key": "fallback-turn-4:0:user"},
+                     _fx("p", {}, "CGC_RID:" + OTHER), _fx("p", {}, "BEGIN_RESPONSE:" + OTHER),
+                     _fx("p", {}, "END_RESPONSE:" + OTHER)),
+                 _fx("div", {"data-chatgpt-search-unit-key": "fallback-turn-4:2:assistant"},
+                     _fx("div", {"data-markdown-text-style": "assistant-message"},
+                         _fx("p", {}, "BEGIN_RESPONSE:" + OTHER), _fx("p", {}, "later answer"),
+                         _fx("p", {}, "END_RESPONSE:" + OTHER))))]
+    page = _captured_page(later=later)
+    assert "data-message-author-role" not in json.dumps(page)
+    st = _fx_detect(page)
+    assert st["node"] == "found" and st["refused"] == HEADING and st["ac"] == 2, st
+    nxt = _fx_detect(page, OTHER)
+    assert nxt["done"] is True and nxt["refused"] is None, "the later round is its own interval"
+
+
+@pytest.mark.parametrize("wrapper", ["markdown prose dark:prose-invert", "x-markdown-y"])
+def test_the_same_heading_inside_a_markdown_container_is_prose_not_a_notice(wrapper):
+    """`.markdown` and `[class*=markdown]` both mark an answer's own words (contract prose_container)."""
+    assert _fx_detect(_captured_page(heading_wrapper=wrapper))["refused"] is None
+
+
+def test_the_captured_notice_is_not_read_while_the_stop_button_is_up():
+    st = _fx_detect(_captured_page(stop=True))
+    assert st["generating"] is True and st["refused"] is None
+
+
+# Sol's counterexamples, UNWRAPPED, inside a markdown answer: never a refusal.
+SHORT_ANSWER = ("This content was flagged for possible risk is just the UI string; the code does not verify a "
+                "moderation status.")
+
+
+def test_a_short_unwrapped_answer_that_opens_with_the_phrase_is_not_a_refusal():
+    assert len(SHORT_ANSWER) == 103 or 100 < len(SHORT_ANSWER) < 120
+    st = _detect(_page(_turn(1, RID, SHORT_ANSWER)))
+    assert st["refused"] is None, st
+    st = _detect(_page(_turn(1, RID, "This content can\u2019t be shown is the literal UI heading; the code does "
+                                    "not handle it.")))
+    assert st["refused"] is None, "a whole-message heading prefix is not a heading leaf"
+
+
+def test_the_heading_alone_as_an_answers_whole_message_inside_markdown_is_not_a_refusal():
+    st = _detect(_page(_turn(1, RID, HEADING)))
+    assert st["refused"] is None
+
+
+def test_the_notice_is_not_read_while_the_stop_button_is_up():
+    stop = "E('DIV',{}," + "[" + STOP_BUTTON + "])"
+    st = _detect(_page(_refused_turn(3, RID), stop))
+    assert st["generating"] is True and st["refused"] is None, st
 
 
 def test_a_refusal_on_a_later_round_is_not_this_rounds():
-    page = _page(_turn(1, RID, _wrapped(RID, "fine answer")), _turn(2, OTHER, REFUSAL))
+    page = _page(_turn(1, RID, _wrapped(RID, "fine answer")), _refused_turn(2, OTHER))
     assert _detect(page, RID)["refused"] is None
-    assert _detect(page, OTHER)["refused"]
+    assert _detect(page, OTHER)["refused"] == HEADING
 
 
-def test_the_refusal_phrases_live_in_the_contract():
+def test_the_refusal_headings_and_prose_container_live_in_the_contract():
     facts = json.load(open(os.path.join(SCRIPTS, "chatgpt_contract.json"), encoding="utf-8"))["facts"]
-    assert CDP._CONTRACT_SCHEMA["refusal_markers"] == "words"
-    assert any(w.startswith("This content can") for w in facts["refusal_markers"]["value"])
-    assert "refusal_markers" in CDP.UI
+    assert CDP._CONTRACT_SCHEMA["refusal_headings"] == "words" and CDP._CONTRACT_SCHEMA["prose_container"] == "sel"
+    assert HEADING in facts["refusal_headings"]["value"] and "refusal_markers" not in facts
+    assert "markdown" in facts["prose_container"]["value"] and "refusal_headings" in CDP.UI
 
 
 # ---- C: what the reader reports for a LIVE thinking round (the real detect JS, in node) -----------------
@@ -228,7 +370,7 @@ def wait(tmp_path, monkeypatch):
 def test_a_refused_round_ends_remote_refused_on_the_second_poll(wait, capsys):
     """The 2026-10-14 round waited 5400 s for a reply the filter had already replaced. The text must repeat
     on two consecutive polls (see the flicker test), so it ends one poll after the first read."""
-    code, tab, spent, _ = wait(lambda c: FakeTab(c, lambda t: _dead(refused=REFUSAL[:160], node="found",
+    code, tab, spent, _ = wait(lambda c: FakeTab(c, lambda t: _dead(refused=HEADING, node="found",
                                                                     len=258, ac=1)))
     err = capsys.readouterr().err
     assert code == 4 and spent < 60, (code, spent)
@@ -239,7 +381,7 @@ def test_a_refused_round_ends_remote_refused_on_the_second_poll(wait, capsys):
 
 def test_a_wrapped_answer_outranks_a_refusal_read(wait, capsys):
     """done beats refused: a finished, verified answer is never discarded for a phrase in its interval."""
-    both = lambda t: _dead(done=True, refused=REFUSAL[:160], node="found", len=500, ac=2)
+    both = lambda t: _dead(done=True, refused=HEADING, node="found", len=500, ac=2)
 
     def mk(c):
         tab = FakeTab(c, both)
@@ -441,7 +583,7 @@ class ScriptedTab(FakeTab):
 
 
 def _refused_state(**over):
-    return lambda t: _dead(refused=REFUSAL[:160], node="found", len=258, ac=1, **over)
+    return lambda t: _dead(refused=HEADING, node="found", len=258, ac=1, **over)
 
 
 # ---- 1: a refusal outranks a continuable failure; a finished answer outranks both ----------------------
@@ -468,7 +610,7 @@ def test_a_failed_marker_alone_is_still_a_continuable_turn_failure(wait, capsys)
 
 
 def test_a_finished_wrapped_answer_outranks_both_markers(wait, capsys):
-    both = lambda t: _dead(done=True, failed="Thinking failed", refused=REFUSAL[:160], node="found", len=500, ac=2)
+    both = lambda t: _dead(done=True, failed="Thinking failed", refused=HEADING, node="found", len=500, ac=2)
 
     def mk(c):
         tab = FakeTab(c, both)
@@ -483,29 +625,28 @@ def test_a_finished_wrapped_answer_outranks_both_markers(wait, capsys):
 
 # ---- 2: a prefix is not evidence ---------------------------------------------------------------------
 
-def test_a_streaming_prefix_with_the_stop_button_up_is_not_a_refusal():
-    """The first characters of any reply can be the marker while the answer is still streaming."""
+def test_a_streaming_37_char_prefix_with_the_stop_button_up_is_not_a_refusal():
+    """Sol's counterexample: the first characters of a long answer still streaming (stop button up) are the
+    marker. Unwrapped, inside the markdown container, and the page is generating: never a refusal."""
+    prefix = "This content was flagged for possible"
+    assert len(prefix) == 37
     stop = "E('DIV',{}," + "[" + STOP_BUTTON + "])"
-    st = _detect(_page(_turn(1, RID, "This content can’t be shown"), stop))
+    st = _detect(_page(_turn(1, RID, prefix), stop))
     assert st["generating"] is True and st["refused"] is None, st
-    # the same text with the stop button gone is the refusal
-    assert _detect(_page(_turn(1, RID, "This content can’t be shown")))["refused"]
 
 
-def test_a_short_legitimate_answer_that_opens_with_the_phrase_is_not_a_refusal():
-    """A real answer carries the wrapper the prompt demands. 111 chars of it, finished or still streaming
-    (BEGIN seen, no END yet, stop button momentarily absent), is never read as the filter's replacement."""
-    body = "This content was flagged for possible risk is just the UI string; the verdict follows below."
-    finished = _detect(_page(_turn(1, RID, _wrapped(RID, body))))
-    assert finished["done"] is True and finished["refused"] is None
-    partial = _detect(_page(_turn(1, RID, "BEGIN_RESPONSE:%s\n%s" % (RID, body))))
-    assert partial["done"] is False and partial["refused"] is None, partial
+def test_a_streaming_prefix_between_phases_with_the_stop_button_gone_is_still_not_a_refusal():
+    """Sol's counterexample: a pause between generation phases (the stop button gone for ~40 s) with the
+    answer's text unchanged. Structure, not stability, is the evidence: the words sit inside the markdown
+    container, so the read is None however many polls repeat it."""
+    for text in ("This content can\u2019t be shown", "This content was flagged for possible"):
+        assert _detect(_page(_turn(1, RID, text)))["refused"] is None, text
 
 
 def test_a_refusal_must_repeat_on_two_polls_before_it_ends_anything(wait, capsys):
     """A one-poll read (a message caught mid-render) ends nothing: the refusal flickers every other poll
     and the wait runs to its own timeout."""
-    flicker = lambda t: _dead(refused=REFUSAL[:160] if int(t / 20) % 2 else None, node="found", len=258, ac=1)
+    flicker = lambda t: _dead(refused=HEADING if int(t / 20) % 2 else None, node="found", len=258, ac=1)
     code, tab, spent, _ = wait(lambda c: FakeTab(c, flicker))
     err = capsys.readouterr().err
     assert code == 4 and spent >= 5400 and "remote_refused" not in err
@@ -523,8 +664,7 @@ def test_a_refusal_after_a_later_riless_exchange_is_not_the_answered_rounds():
     """RID answered, then the human types a rid-less note and the filter refuses THAT reply: the interval
     ended at the note (a reply already existed), so the earlier round is not refused."""
     answered = _turn(1, RID, _wrapped(RID, "the verdict"))
-    note = ("E('DIV',{'data-turn-key':'h'},[unit('h:0:user',[P('and what about speed?')]),"
-            "unit('h:2:assistant',[md([%s])])])" % json.dumps(REFUSAL))
+    note = ("E('DIV',{'data-turn-key':'h'},[unit('h:0:user',[P('and what about speed?')]),%s])" % _notice(9))
     st = _detect(_page(answered, note))
     assert st["done"] is True and st["refused"] is None, st
 
@@ -533,7 +673,7 @@ def test_a_steer_before_any_reply_does_not_end_the_refusal_interval():
     """The exception __cgcNode keeps: a rid-less steer typed while the round was still thinking folds into
     it, and the one reply after it (here a refusal) is this round's."""
     steer = "E('DIV',{'data-turn-key':'h'},[unit('h:0:user',[P('additional focus on speed')])])"
-    reply = "E('DIV',{'data-turn-key':'r'},[unit('r:2:assistant',[md([%s])])])" % json.dumps(REFUSAL)
+    reply = "E('DIV',{'data-turn-key':'r'},[%s])" % _notice(9)
     st = _detect(_page(_turn(1, RID), steer, reply))
     assert st["refused"], st
 
@@ -561,10 +701,84 @@ def test_a_failed_read_restarts_the_dead_clock(wait, capsys):
     assert spent >= 860 + CDP.NO_GENERATION_S, spent
 
 
-def test_a_marker_led_message_carrying_a_cgc_sentinel_is_not_a_refusal():
-    """The wrapper is the proof an answer is the model's own words. A short message that opens with the marker
-    but carries BEGIN_RESPONSE (a model quoting the UI string inside its wrapper, mid-stream, with the stop
-    button momentarily absent) is never the filter's replacement."""
-    text = "This content was flagged for possible risk. BEGIN_RESPONSE:%s the UI shows this string" % RID
-    assert len(text) < CDP._REFUSAL_MAX_CHARS
-    assert _detect(_page(_turn(1, RID, text)))["refused"] is None
+# ---- review round 2 (Sol): structure is the evidence, stability only a corroboration -------------------
+
+def test_sols_111_char_counterexample_is_exactly_111_chars_and_not_a_refusal():
+    assert len(SHORT_ANSWER) == 111
+    st = _detect(_page(_turn(1, RID, SHORT_ANSWER)))
+    assert st["refused"] is None and st["generating"] is False, st
+
+
+def test_a_growing_answer_that_opens_with_the_phrase_is_never_a_refusal_at_any_length(wait, capsys):
+    """Sol's 207 -> 226 char answer: still growing, unwrapped, in markdown. Structure never reads it, so no pair
+    of polls -- stable or not, compared in full or by a prefix -- can turn it into a refusal."""
+    for n in (207, 226):
+        text = (SHORT_ANSWER + " " + "x" * 300)[:n]
+        assert len(text) == n
+        assert _detect(_page(_turn(1, RID, text)))["refused"] is None, n
+    lens = iter(range(207, 100000, 19))
+    grow = lambda t: _dead(refused=None, node="found", len=next(lens), ac=1)
+    code, tab, spent, _ = wait(lambda c: FakeTab(c, grow))
+    assert code == 4 and spent >= 5400 and "remote_refused" not in capsys.readouterr().err
+
+
+def test_the_reader_reports_the_whole_heading_never_a_prefix_of_it():
+    """The two-poll comparison sees exactly what the reader returned: the full leaf text, uncut."""
+    long_heading = "This content can\u2019t be shown"
+    st = _fx_detect(_captured_page())
+    assert st["refused"] == long_heading and len(st["refused"]) == len(long_heading)
+
+
+def test_a_second_poll_must_match_the_heading_in_full(wait, capsys):
+    """The kept stability check compares the whole reported value: two reads that differ anywhere are two
+    different reads, not a stable one."""
+    seq = {"n": 0}
+
+    def state(t):
+        seq["n"] += 1
+        return _dead(refused=HEADING + ("A" if seq["n"] % 2 else "B"), node="found", len=258, ac=1)
+    code, tab, spent, _ = wait(lambda c: FakeTab(c, state))
+    assert code == 4 and spent >= 5400 and "remote_refused" not in capsys.readouterr().err
+
+
+# ---- the leaf must EQUAL a heading, and be a leaf (the two structural rules that need their own cases) -----
+
+def _notice_with(heading_text, *, wrap_in_div=False, extra_sibling=None):
+    """The captured notice with a different heading leaf, outside any markdown container."""
+    head = "E('P',{'class':'font-semibold'},[],%s)" % json.dumps(heading_text)
+    if wrap_in_div:                                   # the heading's text carried by a NON-leaf container
+        head = "E('DIV',{},[E('SPAN',{},[],%s)])" % json.dumps(heading_text)
+    kids = head + ("," + extra_sibling if extra_sibling else "")
+    return ("E('DIV',{'data-turn-key':'k3'},[%s,unit('t3:2:assistant',[E('DIV',{},[E('DIV',{},[%s])])])])"
+            % (_user(3, RID), kids))
+
+
+def test_a_leaf_that_only_starts_with_the_heading_is_not_a_refusal_even_outside_markdown():
+    """Whole-leaf equality, not a prefix: a notice-shaped element whose text merely BEGINS with the heading
+    (here the heading and its reason fused in one leaf, outside markdown) is not the heading."""
+    fused = HEADING + " This content was flagged for possible cybersecurity risk."
+    assert _detect(_page(_notice_with(fused)))["refused"] is None
+    assert _detect(_page(_notice_with(HEADING + ".")))["refused"] is None
+    assert _detect(_page(_notice_with(HEADING)))["refused"] == HEADING
+
+
+def test_the_heading_must_be_a_leaf_element_not_a_container_that_holds_it():
+    """A DIV whose only content is a SPAN holding the heading: the SPAN is the leaf and is read once; a block
+    that holds the heading AND other text (a container) is not a heading, however it starts."""
+    holds_more = "E('DIV',{},[E('SPAN',{},[],%s),E('SPAN',{},[],' and more text')])" % json.dumps(HEADING)
+    page = _page("E('DIV',{'data-turn-key':'k3'},[%s,unit('t3:2:assistant',[%s])])" % (_user(3, RID), holds_more))
+    assert _detect(page)["refused"] == HEADING, "the inner SPAN leaf IS the heading; the container is not"
+    both = ("E('DIV',{'data-turn-key':'k3'},[%s,unit('t3:2:assistant',[E('DIV',{},[E('SPAN',{},[],%s),"
+            "E('SPAN',{},[],' and more text')])])])" % (_user(3, RID), json.dumps("Intro: " + HEADING)))
+    assert _detect(_page(both))["refused"] is None
+
+
+def test_a_heading_split_across_several_leaves_is_not_a_heading_leaf():
+    """The leaf rule's only observable edge, kept on purpose (the contract's failure_markers use the same
+    whole-leaf semantics): a block whose text equals the heading only by joining SEVERAL leaves is not a leaf
+    heading. The captured notice is one <p>; a UI that splits it needs a contract/reader change, and until then
+    the wait falls back to its own budget rather than guess from joined fragments."""
+    a, b = HEADING[:12], HEADING[12:]
+    split = ("E('DIV',{'data-turn-key':'k3'},[%s,unit('t3:2:assistant',[E('DIV',{},[E('P',{},[E('SPAN',{},[],%s),"
+             "E('SPAN',{},[],%s)])])])])" % (_user(3, RID), json.dumps(a), json.dumps(b)))
+    assert _detect(_page(split))["refused"] is None

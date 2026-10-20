@@ -52,12 +52,16 @@
       ],
       "why": "Whole text of a leaf status element in the turn, outside any message body, when a turn will never answer (2026-09-25)."
     },
-    "refusal_markers": {
+    "refusal_headings": {
       "value": [
         "This content can\u2019t be shown",
-        "This content was flagged for possible"
+        "This content can't be shown"
       ],
-      "why": "Leading text of an assistant message ChatGPT's safety filter replaced the reply with (258 chars, no wrapper, nothing follows): a terminal refusal, never a slow answer (2026-10-15)."
+      "why": "Whole text of the leaf heading ChatGPT's safety filter renders in place of a reply: a <p> in the assistant unit, outside the answer's markdown, followed by a notice (\"This content was flagged for possible ...\") and a Learn more link; either apostrophe (2026-10-20)."
+    },
+    "prose_container": {
+      "value": ".markdown,[class*=\"markdown\"],[data-markdown-text-style]",
+      "why": "Where an answer's own words render: the markdown container, or the assistant_body attribute. A refusal notice is a UI element outside both (live DOM, 2026-10-20), so a paragraph inside one that reads like a heading is the model's text."
     },
     "model_slug_attr": {
       "value": "data-message-model-slug",
