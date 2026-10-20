@@ -256,7 +256,11 @@ _APPROVAL_DENY = ["deny", "拒绝"]
 # searched for in a line, so "Fake WebCodex Demo" or "Canva (WebCodex Demo)" are other apps. Same reasoning
 # as the allow labels: they decide what grants access, so code, never the contract.
 _APPROVAL_PROMPTS = [r"^allow chatgpt to use (.+)\?$",
-                     r"^chatgpt will call (.+)['\u2019]s [^.?!]+ tool\.(?: see details)?$"]
+                     r"^chatgpt will call (.+)['\u2019]s [^.?!]+ tool\.(?: see details)?$",
+                     r"^chatgpt needs your approval to materialize \d+ file attachments? returned by (.+)\.(?: see details)?$"]
+# Known titles that name no app: not a prompt (no operand), and not an unknown "allow" line either.
+# The file-materialization card is bound by its operand line above, never by this title.
+_APPROVAL_TITLES = [r"^allow file materialization\?$"]
 
 # The page-side authority functions. Code, never data: nothing here reads the contract.
 #   __cgcMayType(d)      `d` may be typed into: a visible editor inside the ONE visible form on the
@@ -4099,19 +4103,21 @@ def cmd_followup(a) -> int:
 # A card binds to app A only through its own prompt lines (_APPROVAL_PROMPTS): each yields an app OPERAND,
 # the operand must EQUAL A, every prompt line of the card must agree, and A must also be a line of the
 # card on its own (its header). A line that talks of allowing or using something in no known template
-# ("Allow file materialization?", "Allow Canva to use X?") binds the card to nothing: left for a human.
+# ("Allow Canva to use X?", a title with no operand line) binds the card to nothing: left for a human.
 # A button label ("Allow once", "Always allow") is not a prompt. Equality, not containment: a longer
 # name, a prefixed or parenthesized one, is another app.
 _APPROVAL_BIND_JS = (
     r"function lines(e){return (e.innerText||'').split('\n').map(function(l){return l.replace(/\s+/g,' ').trim();});}"
     "var PROMPTS=" + json.dumps(_APPROVAL_PROMPTS) + ".map(function(s){return new RegExp(s,'i');});"
+    "var TITLES=" + json.dumps(_APPROVAL_TITLES) + ".map(function(s){return new RegExp(s,'i');});"
     r"function operand(l){for(var i=0;i<PROMPTS.length;i++){var m=PROMPTS[i].exec(l);"
     r"if(m)return m[1].trim().toLowerCase();}return null;}"
     r"function bound(e,a){var ls=lines(e),al=a.toLowerCase(),hit=false;"
     r"if(ls.map(function(l){return l.toLowerCase();}).indexOf(al)<0)return false;"
     r"for(var i=0;i<ls.length;i++){var l=ls[i];"
     r"if(/^(always allow|\u59cb\u7ec8\u5141\u8bb8|" + _js_alt(_APPROVAL_ALLOW) + ")/i.test(l))continue;"
-    r"var o=operand(l);if(o===null){if(/\ballow\b|\bto use\b|\bwill call\b|\u5141\u8bb8|\u4f7f\u7528/i.test(l))return false;continue;}"
+    r"var o=operand(l);if(o===null){if(TITLES.some(function(t){return t.test(l);}))continue;"
+    r"if(/\ballow\b|\bto use\b|\bwill call\b|\u5141\u8bb8|\u4f7f\u7528/i.test(l))return false;continue;}"
     r"if(o!==al)return false;hit=true;}return hit;}")
 # The click is wrapped so that a submit dispatched on the button's owner form during it is cancelled.
 _APPROVAL_PRESS_JS = (
