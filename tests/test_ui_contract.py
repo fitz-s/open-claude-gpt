@@ -227,10 +227,11 @@ def test_law4_an_invalid_contract_blocks_the_round_as_proven_not_sent(tmp_path, 
 
 
 # Updated 2026-10-14: approval labels moved to code; LAW 7 click guard; implicit-submit and aria-haspopup="false" refused.
-# Updated 2026-10-20: _detect_js reads ChatGPT's safety-filter refusal STRUCTURALLY (a leaf heading from the
-# contract's refusal_headings, outside its prose_container), in the same interval __cgcNode reads (one
-# _INTERVAL_END_JS), and never while the page is generating.
-_GOLDEN_JS = "53f1249663ad74d0aa21e46f7a2d43e870d3c7611682a8e0bb921a4739e0cb94"
+# Updated 2026-10-20: _detect_js reads ChatGPT's safety-filter refusal as a POSITIVE structural match (heading
+# <p> from refusal_headings, its next-sibling reason <p>, a chatgpt.com link under their parent; none of it in
+# prose_container or an attachment_card), in the same interval __cgcNode reads (one _INTERVAL_END_JS), and
+# never while the page is generating.
+_GOLDEN_JS = "8393cbb3a7f4acebd13f66438b66690e9828449fd8cf3f07c6f643ee1d35d802"
 
 
 def _generated_js(cdp):
@@ -291,7 +292,7 @@ _MAIN_DELTAS = {"_contract_js": [('button[aria-label*="Stop"]\')', 'button[aria-
 # The one reviewed non-guard addition to the reader since main: _detect_js also reports `refused`, ChatGPT's
 # safety-filter replacement of the reply (contract refusal_headings). Taken out the way the guard is, so
 # what remains is main's detect JS byte for byte.
-_REFUSAL_READ = __import__("re").compile(r"var refused=null,refusedNote=null;\(function\(\)\{.*?\.slice\(0,200\):null;\}\}\}\)\(\);")
+_REFUSAL_READ = __import__("re").compile(r"var refused=null,refusedNote=null;\(function\(\)\{.*?refusedNote=clean\(rs\.textContent\)\.slice\(0,200\);\}\}\}\)\(\);")
 
 
 def test_law7_the_generated_js_is_mains_except_the_guard(mods):

@@ -51,10 +51,27 @@ REASON = ("This content was flagged for possible cybersecurity risk. You may be 
 STOP_BUTTON = "E('BUTTON',{'data-testid':'stop-button','aria-label':'Stop streaming'},[],'Stop')"
 
 
+# test_search_unit_schema's mock DOM matches attribute selectors only. The refusal read selects by tag
+# (`p`, `a`) and the contract's prose_container is a class/attribute list, so this file redeclares `match`
+# (a later function declaration wins) with tag, .class and [a], [a=v], [a*=v], [a^=v], [a$=v]: still the
+# same tiny engine, just enough selector for the contract. The replay engine (fixture_dom.js) is the
+# faithful one; the captured-DOM tests run on it.
+_MATCH = r"""
+function match(el,sel){return sel.split(',').some(function(s){s=s.trim();if(s==='*')return true;
+ var m=s.match(/^([a-zA-Z]*)(?:\.([\w-]+)|\[([\w-]+)(?:([$*^]?=)"?([^"\]]*)"?)?\])?$/);
+ if(!m||(!m[1]&&!m[2]&&!m[3]))return false;
+ if(m[1]&&el.tagName.toLowerCase()!==m[1].toLowerCase())return false;
+ if(m[2])return (el.getAttribute('class')||'').split(/\s+/).indexOf(m[2])>=0;
+ if(m[3]){var v=el.getAttribute(m[3]);if(v==null)return false;if(!m[4])return true;
+  return m[4]==='='?v===m[5]:m[4]==='$='?v.slice(-m[5].length)===m[5]:m[4]==='^='?v.indexOf(m[5])===0:v.indexOf(m[5])>=0;}
+ return true;});}
+"""
+
+
 def _node(js, setup):
     if not shutil.which("node"):
         pytest.skip("node not installed")
-    src = _DOM + setup + "\nconsole.log(JSON.stringify(" + js + "));"
+    src = _DOM + _MATCH + setup + "\nconsole.log(JSON.stringify(" + js + "));"
     return json.loads(subprocess.run(["node", "-e", src], capture_output=True, text=True,
                                      check=True).stdout)
 
@@ -71,17 +88,37 @@ def _turn(i, rid, *assistant_texts, extra=""):
     return "E('DIV',{'data-turn-key':%s},[%s%s])" % (json.dumps("k%d" % i), ",".join(kids), extra)
 
 
-def _notice(i, extra_class="font-semibold"):
-    """The captured notice as an assistant unit: heading leaf + reason leaf + link, no markdown container."""
-    return ("unit(%s,[E('DIV',{},[E('DIV',{},[E('DIV',{'data-talvt-turn-state':'cancelled'},["
-            "E('DIV',{'class':'mt-3 flex flex-col gap-2'},[E('DIV',{'class':'flex min-w-0 grow items-start'},["
-            "E('DIV',{'class':'min-w-0 grow pt-[2px]'},[E('P',{'class':%s},[],%s),E('P',{},[],%s),"
-            "E('A',{'href':'https://chatgpt.com/cyber'},[],'Learn more')])])])])])])])"
-            % (json.dumps("t%d:2:assistant" % i), json.dumps(extra_class), json.dumps(HEADING), json.dumps(REASON)))
+def _notice(i, extra_class="font-semibold", *, heading=HEADING, heading_tag="P", reason=REASON,
+            reason_tag="P", link="https://chatgpt.com/cyber", link_tag="A", link_outside=False,
+            outer_attrs=None, inner_file_ref=False):
+    """The captured notice as an assistant unit: heading leaf, reason leaf, Learn more link, no markdown
+    container. Every keyword bends exactly ONE structural fact, so a negative case differs from the
+    positive control in the one thing it is about."""
+    kids = ["E(%s,{'class':%s},[],%s)" % (json.dumps(heading_tag), json.dumps(extra_class), json.dumps(heading))]
+    if reason is not None:
+        kids.append("E(%s,{},[],%s)" % (json.dumps(reason_tag), json.dumps(reason)))
+    anchor = ("E(%s,{'href':%s},[],'Learn more')" % (json.dumps(link_tag), json.dumps(link))) if link else None
+    if anchor and not link_outside:
+        kids.append(anchor)
+    if inner_file_ref:
+        kids.append("E('SPAN',{'data-file-reference':'true'},[],'x.py')")
+    box = "E('DIV',{'class':'min-w-0 grow pt-[2px]'},[%s])" % ",".join(kids)
+    row = "E('DIV',{'class':'flex min-w-0 grow items-start'},[%s])" % ",".join(
+        [box] + ([anchor] if anchor and link_outside else []))
+    inner = "E('DIV',{'class':'mt-3 flex flex-col gap-2'},[%s])" % row
+    core = "E('DIV',{},[E('DIV',{},[E('DIV',{'data-talvt-turn-state':'cancelled'},[%s])])])" % inner
+    if outer_attrs:
+        core = "E('DIV',%s,[%s])" % (json.dumps(outer_attrs), core)
+    return "unit(%s,[%s])" % (json.dumps("t%d:2:assistant" % i), core)
 
 
-def _refused_turn(i, rid):
-    return "E('DIV',{'data-turn-key':%s},[%s,%s])" % (json.dumps("k%d" % i), _user(i, rid), _notice(i))
+def _refused_turn(i, rid, **kw):
+    return "E('DIV',{'data-turn-key':%s},[%s,%s])" % (json.dumps("k%d" % i), _user(i, rid), _notice(i, **kw))
+
+
+def _one(**kw):
+    """One round whose only reply is the (bent) notice."""
+    return _page(_refused_turn(3, RID, **kw))
 
 
 def _answer_turn(i, rid, text):
@@ -123,9 +160,7 @@ def test_the_captured_page_has_no_author_role_attribute_and_the_reader_still_res
 
 
 def test_either_apostrophe_is_the_heading():
-    straight = _notice(3).replace(json.dumps(HEADING), json.dumps("This content can't be shown"))
-    page = _page("E('DIV',{'data-turn-key':'k3'},[%s,%s])" % (_user(3, RID), straight))
-    assert _detect(page)["refused"] == "This content can't be shown"
+    assert _detect(_one(heading="This content can't be shown"))["refused"] == "This content can't be shown"
 
 
 def test_a_heading_inside_the_answers_markdown_is_the_models_words_not_a_refusal():
@@ -370,8 +405,7 @@ def wait(tmp_path, monkeypatch):
 def test_a_refused_round_ends_remote_refused_on_the_second_poll(wait, capsys):
     """The 2026-10-14 round waited 5400 s for a reply the filter had already replaced. The text must repeat
     on two consecutive polls (see the flicker test), so it ends one poll after the first read."""
-    code, tab, spent, _ = wait(lambda c: FakeTab(c, lambda t: _dead(refused=HEADING, node="found",
-                                                                    len=258, ac=1)))
+    code, tab, spent, _ = wait(lambda c: FakeTab(c, _refused_state()))
     err = capsys.readouterr().err
     assert code == 4 and spent < 60, (code, spent)
     assert "CGC_ERROR remote_refused" in err and "timeout_no_answer" not in err
@@ -381,7 +415,7 @@ def test_a_refused_round_ends_remote_refused_on_the_second_poll(wait, capsys):
 
 def test_a_wrapped_answer_outranks_a_refusal_read(wait, capsys):
     """done beats refused: a finished, verified answer is never discarded for a phrase in its interval."""
-    both = lambda t: _dead(done=True, refused=HEADING, node="found", len=500, ac=2)
+    both = lambda t: _dead(done=True, refused=HEADING, refused_note=REASON[:200], node="found", len=500, ac=2)
 
     def mk(c):
         tab = FakeTab(c, both)
@@ -583,7 +617,7 @@ class ScriptedTab(FakeTab):
 
 
 def _refused_state(**over):
-    return lambda t: _dead(refused=HEADING, node="found", len=258, ac=1, **over)
+    return lambda t: _dead(refused=HEADING, refused_note=REASON[:200], node="found", len=258, ac=1, **over)
 
 
 # ---- 1: a refusal outranks a continuable failure; a finished answer outranks both ----------------------
@@ -610,7 +644,8 @@ def test_a_failed_marker_alone_is_still_a_continuable_turn_failure(wait, capsys)
 
 
 def test_a_finished_wrapped_answer_outranks_both_markers(wait, capsys):
-    both = lambda t: _dead(done=True, failed="Thinking failed", refused=HEADING, node="found", len=500, ac=2)
+    both = lambda t: _dead(done=True, failed="Thinking failed", refused=HEADING, refused_note=REASON[:200],
+                           node="found", len=500, ac=2)
 
     def mk(c):
         tab = FakeTab(c, both)
@@ -646,7 +681,8 @@ def test_a_streaming_prefix_between_phases_with_the_stop_button_gone_is_still_no
 def test_a_refusal_must_repeat_on_two_polls_before_it_ends_anything(wait, capsys):
     """A one-poll read (a message caught mid-render) ends nothing: the refusal flickers every other poll
     and the wait runs to its own timeout."""
-    flicker = lambda t: _dead(refused=HEADING if int(t / 20) % 2 else None, node="found", len=258, ac=1)
+    flicker = lambda t: _dead(refused=HEADING if int(t / 20) % 2 else None, refused_note=REASON[:200],
+                              node="found", len=258, ac=1)
     code, tab, spent, _ = wait(lambda c: FakeTab(c, flicker))
     err = capsys.readouterr().err
     assert code == 4 and spent >= 5400 and "remote_refused" not in err
@@ -736,38 +772,31 @@ def test_a_second_poll_must_match_the_heading_in_full(wait, capsys):
 
     def state(t):
         seq["n"] += 1
-        return _dead(refused=HEADING + ("A" if seq["n"] % 2 else "B"), node="found", len=258, ac=1)
+        return _dead(refused=HEADING + ("A" if seq["n"] % 2 else "B"), refused_note=REASON[:200],
+                     node="found", len=258, ac=1)
     code, tab, spent, _ = wait(lambda c: FakeTab(c, state))
     assert code == 4 and spent >= 5400 and "remote_refused" not in capsys.readouterr().err
 
 
 # ---- the leaf must EQUAL a heading, and be a leaf (the two structural rules that need their own cases) -----
 
-def _notice_with(heading_text, *, wrap_in_div=False, extra_sibling=None):
-    """The captured notice with a different heading leaf, outside any markdown container."""
-    head = "E('P',{'class':'font-semibold'},[],%s)" % json.dumps(heading_text)
-    if wrap_in_div:                                   # the heading's text carried by a NON-leaf container
-        head = "E('DIV',{},[E('SPAN',{},[],%s)])" % json.dumps(heading_text)
-    kids = head + ("," + extra_sibling if extra_sibling else "")
-    return ("E('DIV',{'data-turn-key':'k3'},[%s,unit('t3:2:assistant',[E('DIV',{},[E('DIV',{},[%s])])])])"
-            % (_user(3, RID), kids))
-
-
 def test_a_leaf_that_only_starts_with_the_heading_is_not_a_refusal_even_outside_markdown():
-    """Whole-leaf equality, not a prefix: a notice-shaped element whose text merely BEGINS with the heading
-    (here the heading and its reason fused in one leaf, outside markdown) is not the heading."""
+    """Whole-leaf equality, not a prefix: with the full notice around it (reason, link), a heading leaf that
+    merely BEGINS with the words is not the heading."""
     fused = HEADING + " This content was flagged for possible cybersecurity risk."
-    assert _detect(_page(_notice_with(fused)))["refused"] is None
-    assert _detect(_page(_notice_with(HEADING + ".")))["refused"] is None
-    assert _detect(_page(_notice_with(HEADING)))["refused"] == HEADING
+    assert _detect(_one(heading=fused))["refused"] is None
+    assert _detect(_one(heading=HEADING + "."))["refused"] is None
+    assert _detect(_one())["refused"] == HEADING, "the positive control"
 
 
-def test_the_heading_must_be_a_leaf_element_not_a_container_that_holds_it():
-    """A DIV whose only content is a SPAN holding the heading: the SPAN is the leaf and is read once; a block
-    that holds the heading AND other text (a container) is not a heading, however it starts."""
-    holds_more = "E('DIV',{},[E('SPAN',{},[],%s),E('SPAN',{},[],' and more text')])" % json.dumps(HEADING)
-    page = _page("E('DIV',{'data-turn-key':'k3'},[%s,unit('t3:2:assistant',[%s])])" % (_user(3, RID), holds_more))
-    assert _detect(page)["refused"] == HEADING, "the inner SPAN leaf IS the heading; the container is not"
+def test_the_heading_must_be_a_leaf_p_not_a_container_that_holds_it():
+    """A <p> whose only content is a <span> holding the heading: the <span> is the leaf and is not a <p>, and the
+    <p> is not a leaf. With the full notice around it, that is not the heading; a block that holds the heading
+    AND other text is not one either."""
+    wrapped = ("E('DIV',{'data-turn-key':'k3'},[%s,unit('t3:2:assistant',[E('DIV',{},["
+               "E('P',{},[E('SPAN',{},[],%s)]),E('P',{},[],%s),E('A',{'href':'https://chatgpt.com/x'},[],'Learn')])])])"
+               % (_user(3, RID), json.dumps(HEADING), json.dumps(REASON)))
+    assert _detect(_page(wrapped))["refused"] is None
     both = ("E('DIV',{'data-turn-key':'k3'},[%s,unit('t3:2:assistant',[E('DIV',{},[E('SPAN',{},[],%s),"
             "E('SPAN',{},[],' and more text')])])])" % (_user(3, RID), json.dumps("Intro: " + HEADING)))
     assert _detect(_page(both))["refused"] is None
@@ -780,5 +809,129 @@ def test_a_heading_split_across_several_leaves_is_not_a_heading_leaf():
     the wait falls back to its own budget rather than guess from joined fragments."""
     a, b = HEADING[:12], HEADING[12:]
     split = ("E('DIV',{'data-turn-key':'k3'},[%s,unit('t3:2:assistant',[E('DIV',{},[E('P',{},[E('SPAN',{},[],%s),"
-             "E('SPAN',{},[],%s)])])])])" % (_user(3, RID), json.dumps(a), json.dumps(b)))
+             "E('SPAN',{},[],%s)]),E('P',{},[],%s),E('A',{'href':'https://chatgpt.com/x'},[],'Learn')])])])"
+             % (_user(3, RID), json.dumps(a), json.dumps(b), json.dumps(REASON)))
     assert _detect(_page(split))["refused"] is None
+
+
+# ===== review round 3 (Sol): the notice is a POSITIVE structural match =====================================
+# heading <p> + next-sibling reason <p> + a chatgpt.com <a> under the shared parent, none of it in an
+# attachment card. "Outside markdown" alone also accepted the repo's own file card.
+
+def test_a_file_card_named_like_the_heading_is_not_a_refusal():
+    """Sol's counterexample, built with the repo's card(name) shape: a normal 3400-char unwrapped answer with an
+    attached file named "This content can\u2019t be shown". The card sits outside markdown, so 'outside markdown'
+    read it as a refusal (refused_note 'Code') and the wait exited remote_refused at t=20 s."""
+    answer = ("A long unwrapped answer. " * 140)[:3400]
+    unit_html = "unit('t1:2:assistant',[md([%s]),card(%s)])" % (json.dumps(answer), json.dumps(HEADING))
+    page = _page("E('DIV',{'data-turn-key':'k1'},[%s,%s])" % (_user(1, RID), unit_html))
+    st = _detect(page)
+    assert st["refused"] is None and st["refused_note"] is None, st
+    bare = _page("E('DIV',{'data-turn-key':'k1'},[%s,unit('t1:2:assistant',[card(%s)])])"
+                 % (_user(1, RID), json.dumps(HEADING)))
+    assert _detect(bare)["refused"] is None, "a card with nothing else in the unit"
+
+
+def test_the_positive_control_reads_with_its_reason():
+    st = _detect(_one())
+    assert st["refused"] == HEADING and st["refused_note"].startswith("This content was flagged for possible")
+
+
+@pytest.mark.parametrize("tag", ["SPAN", "DIV", "H3"])
+def test_the_heading_leaf_must_be_a_p(tag):
+    assert _detect(_one(heading_tag=tag))["refused"] is None
+
+
+def test_a_heading_with_no_reason_p_is_not_a_refusal():
+    assert _detect(_one(reason=None))["refused"] is None
+
+
+@pytest.mark.parametrize("kw", [
+    dict(reason_tag="DIV"),                                                     # the reason is not a <p>
+    dict(reason_tag="SPAN"),
+    dict(reason="Something else entirely."),                                    # a different text
+    dict(reason="Note. This content was flagged for possible risk."),           # must START with the reason
+    dict(reason=""),
+])
+def test_the_next_sibling_must_be_a_p_that_starts_with_the_reason(kw):
+    assert _detect(_one(**kw))["refused"] is None, kw
+
+
+def test_the_reason_must_be_the_NEXT_sibling_not_merely_a_sibling():
+    far = ("E('DIV',{'data-turn-key':'k3'},[%s,unit('t3:2:assistant',[E('DIV',{},["
+           "E('P',{},[],%s),E('P',{},[],'a stray paragraph'),E('P',{},[],%s),E('A',{'href':'https://chatgpt.com/x'},[],'L')"
+           "])])])" % (_user(3, RID), json.dumps(HEADING), json.dumps(REASON)))
+    assert _detect(_page(far))["refused"] is None
+
+
+@pytest.mark.parametrize("kw", [
+    dict(link=None),                                        # no link at all
+    dict(link="https://example.com/cyber"),                 # another host
+    dict(link="http://chatgpt.com/cyber"),                  # another scheme
+    dict(link="https://chatgpt.com.evil.example/x"),        # a host that only STARTS like it
+    dict(link="/cyber"),                                    # relative
+    dict(link_tag="SPAN"),                                  # an href on something that is not an <a>
+    dict(link_outside=True),                                # the <a> is outside the heading/reason's parent
+])
+def test_the_shared_parent_must_hold_a_chatgpt_dot_com_link(kw):
+    assert _detect(_one(**kw))["refused"] is None, kw
+
+
+def test_any_path_on_the_chatgpt_host_is_the_link():
+    assert _detect(_one(link="https://chatgpt.com/other/page"))["refused"] == HEADING
+
+
+def test_a_notice_inside_a_file_reference_subtree_is_not_a_refusal():
+    assert _detect(_one(outer_attrs={"data-file-reference": "true"}))["refused"] is None
+
+
+def test_a_notice_whose_parent_holds_a_file_reference_is_not_a_refusal():
+    assert _detect(_one(inner_file_ref=True))["refused"] is None
+
+
+def test_the_attachment_selector_and_the_notice_vocabulary_live_in_the_contract():
+    facts = json.load(open(os.path.join(SCRIPTS, "chatgpt_contract.json"), encoding="utf-8"))["facts"]
+    for k, kind in (("refusal_reasons", "words"), ("refusal_link_hosts", "words"), ("attachment_card", "sel")):
+        assert CDP._CONTRACT_SCHEMA[k] == kind and k in CDP.UI and k in facts, k
+    assert facts["refusal_link_hosts"]["value"] == ["chatgpt.com"]
+    assert "data-file-reference" in facts["attachment_card"]["value"]
+    assert facts["refusal_reasons"]["value"] == ["This content was flagged for possible"]
+
+
+def test_the_captured_dom_with_its_link_removed_or_its_reason_removed_is_not_a_refusal():
+    """On the replay engine that knows classes: the same captured structure minus one witness."""
+    def strip(tree, tag):
+        def walk(n):
+            if isinstance(n, list) and len(n) == 3 and isinstance(n[0], str):
+                n[2] = [walk(k) for k in n[2] if not (isinstance(k, list) and k[0] == tag)]
+            return n
+        return walk(tree[0]) and tree
+    assert _fx_detect(_captured_page())["refused"] == HEADING
+    assert _fx_detect(strip(_captured_page(), "a"))["refused"] is None
+    assert _fx_detect(strip(_captured_page(), "p"))["refused"] is None, "no heading p, no reason p"
+
+
+def test_the_notes_must_match_across_polls_too(wait, capsys):
+    """refused_note is evidence now, not only log: two polls with the same heading but a different reason are two
+    different reads, not a stable one."""
+    seq = {"n": 0}
+
+    def state(t):
+        seq["n"] += 1
+        return _dead(refused=HEADING, refused_note=REASON[:150] + ("A" if seq["n"] % 2 else "B"),
+                     node="found", len=258, ac=1)
+    code, tab, spent, _ = wait(lambda c: FakeTab(c, state))
+    assert code == 4 and spent >= 5400 and "remote_refused" not in capsys.readouterr().err
+
+
+def test_the_stderr_verdict_carries_the_filters_stated_reason(wait, capsys):
+    code, tab, spent, _ = wait(lambda c: FakeTab(c, _refused_state()))
+    err = capsys.readouterr().err
+    assert code == 4 and "CGC_ERROR remote_refused" in err and "flagged for possible" in err, err
+
+
+def test_a_refused_read_without_its_reason_ends_nothing(wait, capsys):
+    """Defence in depth on the waiter: a reader that reports a heading but no reason is not a positive match."""
+    code, tab, spent, _ = wait(lambda c: FakeTab(c, lambda t: _dead(refused=HEADING, refused_note=None,
+                                                                   node="found", len=258, ac=1)))
+    assert code == 4 and spent >= 5400 and "remote_refused" not in capsys.readouterr().err

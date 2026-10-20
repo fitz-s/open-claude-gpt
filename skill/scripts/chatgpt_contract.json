@@ -59,6 +59,22 @@
       ],
       "why": "Whole text of the leaf heading ChatGPT's safety filter renders in place of a reply: a <p> in the assistant unit, outside the answer's markdown, followed by a notice (\"This content was flagged for possible ...\") and a Learn more link; either apostrophe (2026-10-20)."
     },
+    "refusal_reasons": {
+      "value": [
+        "This content was flagged for possible"
+      ],
+      "why": "How the reason paragraph beside a refusal heading starts: the next element sibling of the heading <p>, \"This content was flagged for possible cybersecurity risk. ...\" (2026-10-20)."
+    },
+    "refusal_link_hosts": {
+      "value": [
+        "chatgpt.com"
+      ],
+      "why": "The host of the Learn more link in a refusal notice's shared parent (https://chatgpt.com/cyber on 2026-10-20); the scheme is https, any path. Together with the heading and the reason it makes the notice a positive match."
+    },
+    "attachment_card": {
+      "value": "[data-file-reference]",
+      "why": "An assistant unit's attachment/file card (a file name, 'Code', 'Open file'), which sits outside the answer's markdown: a file named like a refusal heading is a card, never the notice (2026-09-24)."
+    },
     "prose_container": {
       "value": ".markdown,[class*=\"markdown\"],[data-markdown-text-style]",
       "why": "Where an answer's own words render: the markdown container, or the assistant_body attribute. A refusal notice is a UI element outside both (live DOM, 2026-10-20), so a paragraph inside one that reads like a heading is the model's text."

@@ -42,7 +42,8 @@ SANITIZER_REV = 2
 CAPS = {
     "reader": {"need": ("turn_schemas", "conversation_root"),
                "reads": ("turn_schemas", "conversation_root", "assistant_body", "turn_container",
-                         "failure_markers", "refusal_headings", "prose_container")},
+                         "failure_markers", "refusal_headings", "refusal_reasons",
+                         "refusal_link_hosts", "attachment_card", "prose_container")},
     "composer": {"need": ("composer",),
                  "reads": ("composer", "composer_exclude_ancestor", "trailing_break_class")},
     "mention": {"need": ("mention_popup_attr", "mention_option_attr"),
