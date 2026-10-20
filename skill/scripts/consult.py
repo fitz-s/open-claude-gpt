@@ -1101,7 +1101,7 @@ def main() -> int:
                                           "other"),
                     help="which activation trigger applied (graded per trigger in `stats --week`)")
     pf.add_argument("--decision", help="the action this answer can change")
-    pf.add_argument("--baseline", help="your current answer (or gpt-sol's), frozen BEFORE the answer")
+    pf.add_argument("--baseline", help="your current answer (or a reviewer's), frozen BEFORE the answer")
     pf.add_argument("--check", help="how the result will be judged")
     pf.add_argument("--not-before", help="ISO-8601 time or +DURATION (+90m, +2h, +1d): the daemon will "
                                          "not send before it, so a complete question can wait in the "

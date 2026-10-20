@@ -4,13 +4,14 @@ description: >-
   Use proactively, not only when asked, whenever a consequential decision is still open: a
   design or architecture fork before building, a diagnosis stuck between competing causes, a
   result that contradicts a load-bearing assumption, maths/statistics/probability to derive or
-  check, a disagreement with gpt-sol or a reviewer, an audit before merge or deploy, research on
-  an external contract, or substantive writing. Sends the question to the user's ChatGPT Pro in
-  the background and wakes you with the answer while you keep working. With --mention "WebCodex
-  Demo" the remote model also reads private code, local DBs and logs, and runs checks inside the
-  user's registered workspaces. The user wants the weekly Pro allowance spent on questions like
-  these; the SessionStart line shows what is left. gpt-sol stays the synchronous reviewer for
-  answers needed now; Pro takes the distinct, deeper question. Never paste secrets or .env.
+  check, a disagreement with a reviewer, a bug that survives two fixes, an audit before merge or
+  deploy, research on an external contract, or substantive writing. Sends the question to the
+  user's ChatGPT Pro in the background and wakes you with the answer while you keep working. With
+  a registered workspace app (`consult.py apps`) the remote model also reads private code, local
+  DBs and logs, and runs checks inside the user's workspaces. The user wants the weekly Pro
+  allowance spent on questions like these; the SessionStart line shows what is left. Your usual
+  reviewers stay for answers needed now; Pro takes the distinct, deeper question in parallel.
+  Never paste secrets or .env.
 allowed-tools: Read, Write, Grep, Glob, Bash(python3:*), Bash(bash:*), Bash(mkdir:*), Bash(git status:*), Bash(git diff:*), Bash(git ls-files:*), Bash(git rev-parse:*), Bash(git remote:*), Bash(git branch:*)
 ---
 
@@ -34,13 +35,15 @@ conclusion, or revised passage. Ranked by value per message:
    independent analyst should query and re-run (WebCodex route below).
 3. A reversible but expensive design fork, before the code exists.
 4. A maths/statistics property governs correctness: derive it, or find the counterexample.
-5. Debugging has stalled between competing causes; ask for the discriminating experiment.
-6. You and gpt-sol (or a reviewer) disagree on a consequential claim.
+5. Debugging has stalled: a bug survives two fix attempts, or competing causes remain; ask for the
+   discriminating experiment.
+6. You and a reviewer disagree on a consequential claim, or a fix has been sent back twice.
 7. An obscure external contract (settlement, protocol, API rules) must be researched before it is coded.
 8. Substantive writing with competing framings, judged against evidence.
 
-gpt-sol is the synchronous standing reviewer and answers bounded questions needed now; Pro takes
-the distinct, deeper uncertainty, and either may start first. A complete question that can wait
+Your synchronous reviewers answer bounded questions needed now; Pro takes the distinct, deeper
+uncertainty in parallel, and either may start first. A failed or silent round is a channel
+incident to act on through its envelope, never a reason to stop firing. A complete question that can wait
 goes to the backlog (`--not-before` / `--use-by`). Keep routine fixes, lookups, and anything that
 cannot change an action local. The SessionStart line shows the week's budget, backlog, and
 ungraded answers. Unspent allowance at week's end is lost, so use it on these triggers rather
@@ -81,12 +84,12 @@ python3 ~/.claude/skills/chatgpt-consult/scripts/cgc_spool.py await --rid <rid>
 - No code subject at all (a proof, research, writing) → add `--no-code`.
 - **WebCodex route.** The deciding evidence is local (private or unpushed code, a DB, logs, data,
   a check to run) and lives in a workspace the user registered with WebCodex → add
-  `--workspace <name> --mention "WebCodex Demo"` (no `@`; both must be in `consult.py apps`, else the
+  `--workspace <name> --mention "<app>"` (no `@`; both must be in `consult.py apps`, else the
   round is refused). The remote model then reads files, lists
   directories, runs processes, and observes jobs inside that workspace. In `--task`, name the
   revision or data window and the read/run scope; checks that write go to a temp dir or an isolated
   worktree, never the active one. The daemon picks the app from the composer's @ popup before
-  pasting. A user naming an app (`@WebCodex Demo`) means the same flag.
+  pasting. A user naming an app (`@<app>`) means the same flag.
   Whether the app stays attached for later messages of a thread is NOT verified, so a follow-up
   that needs its tools repeats `--mention`. `--mention` refuses before the send when it cannot be
   confirmed. Never write `@App` into `--task`, never touch the browser.

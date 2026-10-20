@@ -158,7 +158,7 @@ Copyable `--output-file` / `--output-replace` contracts live in [examples/_specs
 python3 skill/scripts/cgc_config.py set CGC_APPS "WebCodex Demo"   # the app's name in ChatGPT's @ menu
 cgc fire --repo owner/repo --ref <sha> --mention "WebCodex Demo" \
   --title "Root-cause: fills lose at 30% vs modeled 70%" \
-  --task "Use the zeus workspace: query the settlement DB, rerun the calibration check, then decide."
+  --task "Use the <name> workspace: query the DB, rerun the check, then decide."
 ```
 
 The daemon picks the app from the composer's @ popup before it pastes the prompt. If the popup does not confirm the app, the round is refused before the send, so no message is spent. When ChatGPT asks for approval of a write, such as "Allow file materialization?", the waiter answers it for the apps listed in `CGC_AUTO_APPROVE` (default: `CGC_APPS`).

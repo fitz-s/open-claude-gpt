@@ -151,7 +151,7 @@ All optional, all local bookkeeping: none of it is rendered into the prompt.
 | `--origin {agent,user}` | Who decided to fire: the agent on its own initiative, or the user asked. |
 | `--trigger {premise-conflict,workspace-evidence,design-fork,math,competing-causes,reviewer-disagreement,external-contract,writing,research,review,other}` | Which activation trigger applied. `stats --week` grades per trigger. |
 | `--decision TEXT` | The action this answer can change. |
-| `--baseline TEXT` | The current local or gpt-sol answer, frozen *before* the answer arrives. |
+| `--baseline TEXT` | The current local or reviewer answer, frozen *before* the answer arrives. |
 | `--check TEXT` | How the result will be judged. |
 | `--not-before ISO8601\|+DURATION` | The daemon will not send before this time (`+90m`, `+2h`, `+1d`, `+1h30m`, or e.g. `2026-10-12T09:00:00+08:00`; a time without an offset is your local time). A complete question can wait in the backlog. To move it, `cancel` and re-fire. |
 | `--use-by ISO8601\|+DURATION` | Past this time the round never sends. It is checked at every claim pass (including a round held by a paused capability), before `begin_send`, and by the driver immediately before the click. Past it, the round ends `failed` with `expired: use-by <t> passed before send`, stamped not-sent-proven, so it is not counted as a spent message and its `--request-key` is free again. A `refire` replays the intent but not the deadline. |
