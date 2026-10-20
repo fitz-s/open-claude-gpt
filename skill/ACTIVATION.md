@@ -5,7 +5,7 @@ A background channel to the user's ChatGPT Pro (GPT-6 Pro by default). It answer
 - a measured result contradicts a load-bearing assumption;
 - the deciding evidence is in a local DB, logs, or private code that an independent analyst should query and re-run;
 - a reversible but expensive design fork comes up before building;
-- a maths or statistics property must be derived or broken;
+- a maths or statistics property must be derived or broken, or a statistic you computed yourself is about to drive a change (a recompute by your usual reviewer does not replace this);
 - you are stuck: a bug survives two fix attempts, or a diagnosis is split between competing causes;
 - you and a reviewer disagree on a consequential claim, or a fix has been sent back twice;
 - an external contract must be researched before it is coded;

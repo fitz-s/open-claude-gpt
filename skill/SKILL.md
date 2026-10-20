@@ -34,7 +34,9 @@ conclusion, or revised passage. Ranked by value per message:
 2. The deciding evidence sits in a local workspace — DB, logs, private or unpushed code — that an
    independent analyst should query and re-run (WebCodex route below).
 3. A reversible but expensive design fork, before the code exists.
-4. A maths/statistics property governs correctness: derive it, or find the counterexample.
+4. A maths/statistics property governs correctness: derive it, or find the counterexample. A
+   statistic you computed yourself that is about to drive a change counts, even after a reviewer
+   recomputed it.
 5. Debugging has stalled: a bug survives two fix attempts, or competing causes remain; ask for the
    discriminating experiment.
 6. You and a reviewer disagree on a consequential claim, or a fix has been sent back twice.
