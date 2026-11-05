@@ -303,7 +303,7 @@ if [ "$STOPPED" = 1 ]; then
       echo "  ! the daemon did not come up — --force: keeping the new install; run: cgc daemon-start" >&2
       KEEP_PREV=1
     else
-      echo "ERROR: the egress daemon did not come up on the new code (log: ${CGC_STATE_DIR:-/tmp/cgc}/daemon.log)." >&2
+      echo "ERROR: the egress daemon did not come up on the new code (log: ${CGC_STATE_DIR:-${CGC_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cgc}}/daemon.log)." >&2
       echo "       Rolling back to the previous install. Retry with --force to keep the new one anyway." >&2
       exit 1
     fi

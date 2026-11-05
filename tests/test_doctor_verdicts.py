@@ -66,6 +66,7 @@ def doc_env(tmp_path, monkeypatch):
     monkeypatch.setenv("CGC_STATE_DIR", str(tmp_path / "cgc-state"))
     monkeypatch.setenv("CGC_DATA_DIR", str(tmp_path / "cgc-data"))
     monkeypatch.setenv("CGC_STORE_DB", str(tmp_path / "cgc-data" / "control.db"))
+    monkeypatch.setenv("CGC_LAUNCH_PLIST", str(tmp_path / "no.plist"))   # never the developer's real LaunchAgent
     monkeypatch.setenv("CGC_CHROME", sys.executable)
     monkeypatch.setenv("CGC_CONFIG", str(tmp_path / "none"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))

@@ -114,6 +114,8 @@ class Sandbox:
             CGC_STORE_DB=str(self.data / "control.db"), CGC_CONFIG=str(self.home / ".config" / "cgc" / "config"),
             CGC_PORT=str(_free_port()), CGC_CHROME=sys.executable,
             CGC_STOP_WAIT_S="3", CGC_START_WAIT_S="4",
+            # the test interpreter may live in a venv, which install-daemon rightly refuses to bake in
+            CGC_ALLOW_UNSTABLE_PYTHON="1",
             STUB_DIR=str(self.sd), STUB_TREE=str(self.dest), STUB_SCRIPTS=SCRIPTS)
         # the one safety property every test leans on: launchctl IS the stub
         which = subprocess.run(["bash", "-c", "command -v launchctl"], env=self.env,
@@ -355,7 +357,7 @@ def test_install_daemon_writes_a_plist_under_home_and_loads_it(sb):
     import plistlib
     with open(sb.plist, "rb") as f:
         pl = plistlib.load(f)
-    assert pl["Label"] == LABEL and pl["KeepAlive"] is True and pl["RunAtLoad"] is True
+    assert pl["Label"] == LABEL and pl["RunAtLoad"] is True
     assert sb.calls() == ["bootstrap"]
     again = sb.cgc("install-daemon")                       # re-run: restart through stop, never a double load
     assert again.returncode == 0, again.stdout + again.stderr

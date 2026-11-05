@@ -141,6 +141,17 @@ def _open(url):
     return _NoSend(raw), raw
 
 
+def _browser_up() -> bool:
+    """Does the debug Chrome answer on its port? The probe never launches Chrome (the send path does);
+    the daemon probes at start, when it is often legitimately not up. Reachability only."""
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{cdp.CGC_PORT}/json/version", timeout=3).close()
+        return True
+    except Exception:
+        return False
+
+
 def _close(raw):
     try:
         raw.close_tab()                     # by its own target id, never another tab
@@ -440,9 +451,14 @@ def run_probe(only=None, mention=None) -> dict:
     if only in (None, "mention") and not app:
         no_app = {"verdict": "unestablished", "phase": "app", "recorded": False,
                   "detail": "no app to insert: set CGC_APPS, or run `cgc probe --mention \"<app>\"`"}
+    caps = _composer_caps(model, app) * composer + ("reader",) * reader
+    if not _browser_up():
+        # Defer, don't fail: every cap would die in _open with the same new_tab_failed, like a real outage.
+        out = {c: {"verdict": "transient", "phase": "deferred", "recorded": False,
+                   "detail": f"browser unreachable on port {cdp.CGC_PORT}"} for c in caps}
+        return {**out, "mention": no_app} if no_app else out
     lease = spool.acquire_browser_lease(shared=True)
     if lease is None:
-        caps = _composer_caps(model, app) * composer + ("reader",) * reader
         return {c: {"verdict": "transient", "phase": "browser", "recorded": False,
                     "detail": "browser under exclusive maintenance"} for c in caps}
     try:
@@ -491,7 +507,14 @@ def print_states(report=None) -> int:
     words = {"pass": "ok", "broken": "BROKEN", "unestablished": "not established",
              "unprovable": "cannot be re-proven (a break is cleared, not kept)",
              "transient": "probe inconclusive (state unchanged)"}
+    deferred = [c for c, v in (report or {}).items() if v["phase"] == "deferred"]
+    if deferred:
+        sys.stderr.write(f"CGC_PROBE deferred ({', '.join(deferred)}): "
+                         f"{report[deferred[0]]['detail']} — not run, nothing recorded; the send path "
+                         "starts Chrome, a later probe checks the UI\n")
     for cap, v in (report or {}).items():
+        if v["phase"] == "deferred":
+            continue
         stale = v["verdict"] == "pass" and not v["recorded"]
         sys.stderr.write(f"CGC_PROBE {cap}: {words[v['verdict']]} — {v['detail']}"
                          + (" (not recorded: a newer failure arrived while it ran)" if stale else "")

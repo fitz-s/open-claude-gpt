@@ -430,6 +430,8 @@ spool = os.environ.get("CGC_SPOOL_DIR") or os.path.join(state, "spool")
 for sub in ("logs", "pending", "processing", "done", "status"):
     plan_dir(os.path.join(spool, sub), SPOOLED, "scratch", seen)
 plan_dir(state, SCRATCH, "scratch", seen)
+if data != state:       # the daemon log lives beside the store unless CGC_STATE_DIR was set
+    plan_dir(data, SCRATCH, "scratch", seen)
 
 # The config file is the user's, never the tool's scratch. It is recognised by IDENTITY: on a
 # case-insensitive filesystem CGC_CONFIG=.../ACTIVE.JSON is the file the scan listed as active.json, and a

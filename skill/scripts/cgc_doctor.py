@@ -466,6 +466,89 @@ def daemon_mismatch(ident: dict):
     return ""
 
 
+LAUNCH_LABEL = "com.open-claude-gpt.daemon"
+
+
+def check_launch_interpreter(r: "Report", plist: str | None = None) -> None:
+    """The installed LaunchAgent's ProgramArguments[0] must exist and be executable (launchd execs it
+    verbatim; a deleted one exits 78 under an apparently healthy supervisor). No plist is not an
+    error: the daemon may be run by hand."""
+    plist = (plist or os.environ.get("CGC_LAUNCH_PLIST")
+             or os.path.expanduser(f"~/Library/LaunchAgents/{LAUNCH_LABEL}.plist"))
+    if not os.path.exists(plist):
+        return
+    import plistlib
+    try:
+        with open(plist, "rb") as f:
+            py = plistlib.load(f)["ProgramArguments"][0]
+    except Exception as e:
+        r.fail("launchd interpreter", f"{plist} is unreadable or has no ProgramArguments ({e})",
+               "rewrite it: `cgc install-daemon`", verdict="can_send")
+        return
+    if os.path.isfile(py) and os.access(py, os.X_OK):
+        r.ok("launchd interpreter", py)
+    else:
+        r.fail("launchd interpreter", f"{plist} runs {py!r}, which is missing or not executable — "
+               "launchd cannot start the daemon (exit 78) and will not restart it",
+               "rewrite the LaunchAgent with a working interpreter: `cgc install-daemon`", verdict="can_send")
+
+
+# Seconds in a state before the doctor says so. `ready` is claimed, so 5 min with no lease holder is a
+# dispatch fault; `queued` can wait behind a full cap of ~25-min consults; post-send waits are bounded
+# by the consult budget, so an hour is stranded.
+_STALL_FAIL_S = {"ready": 300}
+_STALL_WARN_S = {"queued": 900, "sending": 3600, "accepted": 3600, "waiting": 3600,
+                 "possibly_accepted": 3600}
+
+
+def check_oldest_open_round(r: "Report") -> None:
+    """Report the longest-stalled non-terminal round, read-only (a fresh heartbeat does not prove rounds move)."""
+    try:
+        import cgc_spool
+        import cgc_store
+        path = cgc_store.db_path()
+        if path == ":memory:" or not os.path.exists(path):
+            return
+        import datetime
+        import sqlite3
+        import urllib.parse
+        db = sqlite3.connect("file:" + urllib.parse.quote(os.path.abspath(path)) + "?mode=ro", uri=True,
+                             timeout=1)
+        try:
+            watched = tuple(_STALL_FAIL_S) + tuple(_STALL_WARN_S)
+            rows = db.execute("SELECT rid,state,updated_at FROM rounds WHERE state IN (%s)"
+                              % ",".join("?" * len(watched)), watched).fetchall()
+        finally:
+            db.close()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        worst = None        # (excess over its limit, hard, rid, state, age)
+        for rid, state, upd in rows:
+            ts = datetime.datetime.fromisoformat(upd)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=datetime.timezone.utc)
+            age = (now - ts).total_seconds()
+            hard = state in _STALL_FAIL_S
+            limit = _STALL_FAIL_S.get(state) or _STALL_WARN_S[state]
+            if hard and not cgc_spool.rid_lease_free(rid):
+                continue    # a leased worker is progressing (gate / lease wait)
+            if age > limit and (worst is None or (hard, age - limit) > (worst[1], worst[0])):
+                worst = (age - limit, hard, rid, state, age)
+    except Exception as e:
+        r.warn("oldest open round", f"could not read the store ({e})")
+        return
+    if worst is None:
+        r.ok("oldest open round", "none stalled")
+        return
+    _, hard, rid, state, age = worst
+    msg = f"{rid} has sat `{state}` for {int(age // 60)} min"
+    fix = f"`cgc status --rid {rid}` (or cgc_spool.py diagnose); check the daemon log"
+    if hard:
+        r.fail("oldest open round", msg + " with no worker — the daemon is not dispatching", fix,
+               verdict="can_send")
+    else:
+        r.warn("oldest open round", msg, fix)
+
+
 def _check_store(r: "Report") -> None:
     """can_read: the store file opens read-only and its schema is one this code understands. A newer
     schema (written by a newer install) is refused by the store itself, so it also blocks sending."""
@@ -709,7 +792,17 @@ def run(deep: bool, secure: bool = False) -> Report:
                        "com.open-claude-gpt.daemon` (or stop the foreground `cgc watch` and start it again)",
                        verdict="can_send")
             else:
-                r.ok("daemon", f"egress daemon running, pid {ident.get('pid')}, serves {ident.get('db_path')}")
+                exe = ident.get("executable")
+                if exe and not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+                    r.fail("daemon", f"pid {ident.get('pid')} is alive but its interpreter {exe!r} is gone; "
+                           "every worker spawn fails, so it can send nothing",
+                           "restart it with a working interpreter: `cgc install-daemon`", verdict="can_send")
+                else:
+                    r.ok("daemon", f"egress daemon running, pid {ident.get('pid')}, serves "
+                         f"{ident.get('db_path')}" + (f", runs {exe}" if exe else " (interpreter unreported: "
+                         "old code)"))
+        check_launch_interpreter(r)
+        check_oldest_open_round(r)
         try:
             cgc_spool.ensure_dirs()
         except Exception as e:

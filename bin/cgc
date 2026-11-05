@@ -82,6 +82,8 @@ S="$(find_scripts)"
 LABEL="com.open-claude-gpt.daemon"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 GUI="gui/$(id -u)"
+# Not /tmp: the daemon log is the only record of why a daemon stopped sending, and /tmp is wiped at boot.
+DAEMON_LOG="${CGC_STATE_DIR:-${CGC_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cgc}}/daemon.log"
 
 # "Is there a launchd to manage" is asked of PATH, not of uname: the same answer on a Mac, and a
 # launchctl stub on PATH is all a test needs.
@@ -184,14 +186,38 @@ case "$cmd" in
       echo "  unit for: $(command -v python3) $S/cgc_daemon.py" >&2; exit 2; }
     label="$LABEL"
     plist="$PLIST"
-    log="${CGC_STATE_DIR:-/tmp/cgc}/daemon.log"
+    log="$DAEMON_LOG"
+    # The interpreter launchd will exec, verified here. Absolute but NOT realpath'd: a Homebrew
+    # `bin/python3` symlink survives upgrades, its versioned Cellar target does not.
+    py="${CGC_PYTHON:-$(command -v python3 || true)}"
+    case "$py" in /*) ;; *) py="" ;; esac
+    if [ -z "$py" ] || [ ! -f "$py" ] || [ ! -x "$py" ]; then
+      echo "cgc install-daemon: no executable python3 to bake into the LaunchAgent (${py:-none on PATH})." >&2
+      echo "  set CGC_PYTHON=/absolute/path/to/python3 and re-run." >&2; exit 2
+    fi
+    # Refuse an interpreter inside a tree that gets deleted or rebuilt (path heuristic).
+    real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$py" 2>/dev/null || echo "$py")"
+    case "$py $real" in
+      */miniconda*|*/anaconda*|*/miniforge*|*/mambaforge*|*/conda/*|*/envs/*|*/.venv/*|*/venv/*|*/.pyenv/*|*/.asdf/*|*/.virtualenvs/*)
+        if [ "${CGC_ALLOW_UNSTABLE_PYTHON:-0}" != 1 ]; then
+          echo "cgc install-daemon: refusing $py — it sits inside an environment manager's tree that can be" >&2
+          echo "  deleted or rebuilt, which silently kills a LaunchAgent. Re-run with a system or Homebrew" >&2
+          echo "  python3 first on PATH (or pin it: CGC_PYTHON=/opt/homebrew/bin/python3 cgc install-daemon);" >&2
+          echo "  CGC_ALLOW_UNSTABLE_PYTHON=1 overrides. No other interpreter is substituted for you." >&2
+          exit 2
+        fi ;;
+    esac
     mkdir -p "$HOME/Library/LaunchAgents" "$(dirname "$log")"
     # Generate the plist with plistlib rather than hand-rolled XML (escaping is not our problem to
     # get wrong). Bake the CURRENT PATH: a LaunchAgent otherwise gets a minimal one and the gate's
     # `gh` repo-visibility check — the thing that keeps private code from being sent — would fail.
-    python3 - "$plist" "$label" "$(command -v python3)" "$S/cgc_daemon.py" "$log" "$PATH" <<'PYEOF'
+    python3 - "$plist" "$label" "$py" "$S/cgc_daemon.py" "$log" "$PATH" <<'PYEOF'
 import os, plistlib, sys
 plist_path, label, py, script, log, path = sys.argv[1:7]
+# launchctl accepts a plist naming a missing interpreter, then exits 78 forever: fail before writing.
+if not (os.path.isfile(py) and os.access(py, os.X_OK)):
+    sys.stderr.write(f"cgc install-daemon: {py!r} is not an executable file — LaunchAgent not written.\n")
+    sys.exit(2)
 env = {"PATH": path}
 env.update({k: v for k, v in os.environ.items() if k.startswith("CGC_")})
 with open(plist_path, "wb") as f:
@@ -199,7 +225,10 @@ with open(plist_path, "wb") as f:
         "Label": label,
         "ProgramArguments": [py, script],
         "RunAtLoad": True,        # up as soon as you log in
-        "KeepAlive": True,        # respawn if it ever dies
+        # Unconditional, NOT {"SuccessfulExit": false}: a singleton loser exits 0 and must be respawned.
+        # ThrottleInterval bounds the respawn loop. (daemon.log is not rotated.)
+        "KeepAlive": True,
+        "ThrottleInterval": 30,
         "StandardOutPath": log,
         "StandardErrorPath": log,
         "EnvironmentVariables": env,
@@ -249,7 +278,7 @@ PYEOF
     if [ "$rc" = 3 ]; then
       heartbeat $hb_mode >/dev/null || true       # prints why the live daemon is not this install's
     else
-      echo "cgc: no live daemon heartbeat ${CGC_START_WAIT_S:-30}s after loading $PLIST (log: ${CGC_STATE_DIR:-/tmp/cgc}/daemon.log)." >&2
+      echo "cgc: no live daemon heartbeat ${CGC_START_WAIT_S:-30}s after loading $PLIST (log: $DAEMON_LOG)." >&2
     fi
     exit 1
     ;;
@@ -263,7 +292,7 @@ PYEOF
     if python3 "$S/cgc_spool.py" status 2>/dev/null | grep -q '^daemon: UP'; then
       echo "cgc up: daemon already running."
     else
-      logf="${CGC_STATE_DIR:-/tmp/cgc}/daemon.log"
+      logf="$DAEMON_LOG"
       mkdir -p "$(dirname "$logf")"
       nohup python3 "$S/cgc_daemon.py" >>"$logf" 2>&1 &
       sleep 1
