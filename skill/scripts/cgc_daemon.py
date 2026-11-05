@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -73,6 +74,15 @@ _LAUNCH = os.path.join(_HERE, "cdp_launch.sh")
 # to the reaper: a lease-refused worker never owned the round, so its death says NOTHING about that
 # round's send state and must never trigger a possibly_accepted promotion.
 EXIT_LEASE_REFUSED = 86
+# sys.executable not runnable: every worker spawn would fail under a fresh heartbeat. 78 = EX_CONFIG.
+EXIT_NO_INTERPRETER = 78
+
+
+def _interpreter_fault() -> str | None:
+    exe = sys.executable
+    if exe and os.path.isfile(exe) and os.access(exe, os.X_OK):
+        return None
+    return f"sys.executable={exe!r} is not an executable file"
 
 
 def _last_json(stdout: str) -> dict:
@@ -240,6 +250,34 @@ def run_worker_store_resume(rid: str) -> int:
     return 0
 
 
+# rid -> [permanent failures, all failures, monotonic instant before which we do not retry]. In-heap:
+# a daemon restart is itself the retry.
+_SPAWNS: dict = {}
+_SPAWN_MAX, _SPAWN_BACKOFF_S, _SPAWN_BACKOFF_CAP_S = 5, 4.0, 60.0
+# Errnos that name THIS executable, so the retry can only fail the same way. Resource pressure (EMFILE,
+# EAGAIN, ENOMEM) backs off but never counts toward failing a round.
+_SPAWN_PERMANENT = (errno.ENOENT, errno.EACCES, errno.ENOEXEC, errno.EISDIR)
+# A gate- or probe-held ready-orphan parks in `queued` this long (claim_ready honours not_before).
+_HOLD_PARK_S = 10.0
+
+
+def _fail_unspawnable(rid: str, why: str) -> None:
+    """Fail a `ready` round whose worker can never start. `failed`, not `blocked`: the cause is this
+    host's interpreter, which no human clearing a ChatGPT-side blocker can fix. `failed` with no attempt
+    row is what _release_eligible reads as proven-not-sent (key released, refire offered). A lost CAS
+    leaves the round untouched."""
+    with store_mod.Store() as s:
+        try:
+            s.set_state(rid, store_mod.FAILED, expect=store_mod.READY,
+                        error_code=f"spawn_failed: {why}"[:400])
+        except (store_mod.IllegalTransition, KeyError):
+            return
+        s.record_event("spawn_failed", rid=rid, detail=why[:400])
+    _SPAWNS.pop(rid, None)
+    sys.stderr.write(f"CGC_DAEMON {rid} FAILED: cannot start a send worker ({why}) after "
+                     f"{_SPAWN_MAX} attempts — the daemon is structurally broken, not busy\n")
+
+
 def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str,
                     sends=True) -> None:
     """Claim ready rounds AND reattach orphaned accepted/waiting rounds (no live worker), each in its
@@ -247,16 +285,35 @@ def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str,
     conversation, so a daemon restart mid-consult does not strand or duplicate a round. sends=False
     (a UI probe is running) claims only read-only retrieves; queued sends wait for the probe, and
     everything already claimed still runs."""
+    broke = False       # a spawn failed this poll: claiming more would only strand them in `ready`
+
     def _spawn(arg, rid, tag):
         """Spawn a worker, guarding Popen: a spawn that raises must NOT silently drop the round. A
         `ready` row whose spawn failed stays `ready` (pre-send, so re-running it is safe) and is
-        picked up as a ready-orphan next loop — never stranded."""
+        picked up as a ready-orphan next loop — never stranded. Retries back off; after _SPAWN_MAX
+        PERMANENT failures a `ready` round is failed (_fail_unspawnable). Resume spawns are never
+        failed: the send already happened and the answer may still be retrievable."""
+        nonlocal broke
+        if time.monotonic() < _SPAWNS.get(rid, (0, 0, 0.0))[2]:
+            return False        # backing off — not a new failure, not a new line
         env = dict(os.environ, CGC_DAEMON_INSTANCE=daemon_instance_id)
         try:
             p = subprocess.Popen([sys.executable, os.path.abspath(__file__), arg, rid], env=env)
         except OSError as e:
-            sys.stderr.write(f"CGC_DAEMON {tag} spawn failed for {rid}: {e} — retried next loop\n")
+            broke = True
+            perm, n, _ = _SPAWNS.get(rid, (0, 0, 0.0))
+            perm, n = perm + (e.errno in _SPAWN_PERMANENT), n + 1
+            _SPAWNS[rid] = (perm, n, time.monotonic()
+                             + min(_SPAWN_BACKOFF_S * 2 ** (n - 1), _SPAWN_BACKOFF_CAP_S))
+            why = f"{e} (executable {sys.executable!r})"
+            sys.stderr.write(f"CGC_DAEMON {tag} spawn failed for {rid} ({n}): {why}\n")
+            if n <= _SPAWN_MAX:
+                with store_mod.Store() as s:
+                    s.record_event("spawn_failed", rid=rid, detail=f"{n}: {why}"[:400])
+            if perm >= _SPAWN_MAX and arg == "--worker-store":
+                _fail_unspawnable(rid, why)
             return False
+        _SPAWNS.pop(rid, None)
         children[rid] = p
         sys.stderr.write(f"CGC_DAEMON {tag} {rid} pid={p.pid} ({len(children)}/{concurrency})\n")
         return True
@@ -270,6 +327,10 @@ def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str,
     # Reattach first: an in-flight round that lost its worker is more urgent than a new send.
     with store_mod.Store() as s:
         rec = s.recover()
+        # drop spawn history of rounds no longer dispatchable (bounds the map)
+        live = set(rec["dispatchable"]) | set(rec["reattach"]) | set(rec["retrievable"])
+        for rid in [k for k in _SPAWNS if k not in live]:
+            del _SPAWNS[rid]
         reattach = _unowned(rec["reattach"])
         # possibly_accepted + conversation → one-shot read-only auto-retrieve (never re-sends).
         retrievable = _unowned(rec["retrievable"])
@@ -288,11 +349,13 @@ def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str,
         for rid in ready_orphans:
             r = s.get_round(rid)
             if r["kind"] != "retrieve" and (not sends or s.gated_by(r)):
+                nb = (datetime.datetime.now(datetime.timezone.utc)
+                      + datetime.timedelta(seconds=_HOLD_PARK_S)).isoformat()
                 try:
-                    s.set_state(rid, store_mod.QUEUED, expect=store_mod.READY)
-                    held.append(rid)
+                    s.set_state(rid, store_mod.QUEUED, expect=store_mod.READY, not_before=nb)
                 except store_mod.IllegalTransition:
-                    held.append(rid)      # it moved under us — not ours to dispatch either way
+                    pass          # it moved under us — not ours to dispatch either way
+                held.append(rid)
         ready_orphans = [rid for rid in ready_orphans if rid not in held]
     for rid in reattach:
         if len(children) >= concurrency:
@@ -306,7 +369,7 @@ def _dispatch_store(children: dict, concurrency: int, daemon_instance_id: str,
         if len(children) >= concurrency:
             return
         _spawn("--worker-store", rid, "ready-orphan(store)")
-    while len(children) < concurrency:
+    while len(children) < concurrency and not broke:
         with store_mod.Store() as s:
             rnd = s.claim_ready(daemon_instance_id, retrieve_only=not sends)
         if rnd is None:
@@ -938,6 +1001,13 @@ def _run(cmd, timeout, rid=None, stdin_text=None, env_extra=None, pass_fds=()):
 # ---- the loop ---------------------------------------------------------------
 
 def run_loop(poll: float, concurrency: int, once: bool) -> int:
+    fault = _interpreter_fault()
+    if fault:
+        # Before the singleton and heartbeat: never look alive, never hold the lock a working daemon needs.
+        sys.stderr.write(f"CGC_DAEMON FATAL: {fault} — cannot spawn send workers, so this daemon can "
+                         "do nothing. Exiting; fix the interpreter path (`cgc install-daemon` rewrites "
+                         "the LaunchAgent with a stable one).\n")
+        return EXIT_NO_INTERPRETER
     spool.ensure_dirs()
     # Enforce a single daemon per spool: two supervisors (launchd + `cgc watch` + an ad-hoc start)
     # would each keep their own concurrency count and child map, silently doubling the global cap
@@ -971,7 +1041,8 @@ def run_loop(poll: float, concurrency: int, once: bool) -> int:
         with store_mod.Store() as _s:
             identity = {"protocol": 1, "schema_version": store_mod.SCHEMA_VERSION,
                         "db_path": os.path.abspath(store_mod.db_path()),
-                        "store_uuid": _s.store_uuid(), "daemon_instance_id": daemon_instance_id}
+                        "store_uuid": _s.store_uuid(), "daemon_instance_id": daemon_instance_id,
+                        "executable": sys.executable, "concurrency": concurrency}
         sys.stderr.write(f"CGC_DAEMON store (instance {daemon_instance_id[:8]}); "
                          f"{len(moved)} interrupted send(s) marked possibly_accepted.\n")
         next_maintenance = 0.0

@@ -210,6 +210,8 @@ def store_status(up: bool, rid: str | None = None) -> int:
                 fields["answer_on_disk"] = bool(out and os.path.exists(out))
                 fields["conversation"] = s.conversation_of(rid)
                 fields["send"] = s.send_evidence(rid)
+                age = age_in_state(rr)
+                fields["age_in_state"] = None if age is None else round(age)   # seconds
                 gate = s.gated_by(rr) if rr["state"] == store_mod.QUEUED else {}
                 if gate:
                     fields["human_action"] = paused_text(gate)
@@ -220,7 +222,8 @@ def store_status(up: bool, rid: str | None = None) -> int:
                          answer_path=d["answer_path"],
                          detail=None if rr["state"] in _DONE_STATES else rr["error_code"],
                          retryable=d["retryable"], answer_on_disk=d["answer_path"] is not None,
-                         conversation=fields["conversation"], daemon_up=up)
+                         conversation=fields["conversation"], daemon_up=up,
+                         age_in_state=fields["age_in_state"])
             else:
                 print(f"  round[{rid}]: (not in store)")
                 envelope(rid=rid, state="missing", code="not_found", detail="no such round in the store")
@@ -1034,7 +1037,7 @@ _ERRORS = {
     "service_unavailable": (
         "store_mismatch attach_failed cdp_attach_failed new_tab new_tab_failed new_tab_no_ws no_page_target "
         "browser_unreachable chrome chrome_unavailable not_sent_preclick unverified daemon_down "
-        "submit_failed_before followup_failed_before reconciled_not_sent"),
+        "submit_failed_before followup_failed_before reconciled_not_sent spawn_failed"),
     "human_required": "login_needed captcha rate_limit approval_needed mention_not_found "
                       "request_key_locked attribution_mismatch",
     "ui_contract_broken": "contract_invalid selector_drift composer_not_ready model_not_selectable wrong_page "
@@ -1303,6 +1306,57 @@ _NO_GENERATION_ACTION = ("the thread shows no generation and no reply, so nothin
 _CONTINUE_FINAL = (None, "landed", "not_sent")
 
 
+# A `ready`/`queued` round unmoved this long with no send attempt is stalled: a fresh heartbeat only
+# proves a pid is alive. Far past a normal claim→begin_send, below any awaiter's patience.
+PRESEND_STALL_S = 180
+
+
+def age_in_state(r: dict) -> float | None:
+    """Seconds since the round last changed state, or None if unreadable (unknown, never "stalled")."""
+    try:
+        ts = datetime.datetime.fromisoformat(r["updated_at"])
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+        return (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+_LIVE = (store_mod.READY, store_mod.SENDING, store_mod.ACCEPTED, store_mod.WAITING)
+
+
+def _presend_stalled(s, r: dict) -> bool:
+    """A `ready`/`queued` round past PRESEND_STALL_S with no attempt row that the daemon could be
+    working on and is not.
+      - `ready`: stalled only if no process holds its rid lease: a worker holds it through the gate
+        (the gh probe can take ~2400s) and the conversation-lease wait, both before begin_send.
+      - `queued`: stalled only if a worker slot is free (live rounds < heartbeat concurrency, default
+        3), `not_before` has passed, and no live round fences its follow-up thread."""
+    if r["state"] not in (store_mod.READY, store_mod.QUEUED):
+        return False
+    age = age_in_state(r)
+    if age is None or age < PRESEND_STALL_S or s.has_send_attempt(r["rid"]):
+        return False
+    import cgc_spool as _spool
+    if r["state"] == store_mod.READY:
+        return _spool.rid_lease_free(r["rid"])
+    nb = r.get("not_before")
+    if nb and not store_mod.past(nb):
+        return False
+    q = ",".join("?" * len(_LIVE))
+    live = s.db.execute(f"SELECT count(*) FROM rounds WHERE rid!=? AND state IN ({q})",
+                        (r["rid"], *_LIVE)).fetchone()[0]
+    if live >= int((_spool.daemon_identity() or {}).get("concurrency") or 3):
+        return False
+    # Mirror claim_ready's fence, which is follow-up only: a retrieve is the recovery path and is never
+    # fenced, so a live sibling must not excuse a stalled retrieve.
+    if r.get("kind") == "followup" and r.get("thread_id") and s.db.execute(
+            f"SELECT 1 FROM rounds WHERE rid!=? AND thread_id=? AND state IN ({q}) LIMIT 1",
+            (r["rid"], r["thread_id"], *_LIVE)).fetchone():
+        return False
+    return True
+
+
 def decide(s, r: dict, *, daemon_up: bool = True, out: str | None = None) -> dict:
     """THE controller decision for a round — await, diagnose and status all print this, so the three
     never disagree. From the store alone: {code, next_command, human_action, retryable,
@@ -1349,6 +1403,12 @@ def decide(s, r: dict, *, daemon_up: bool = True, out: str | None = None) -> dic
                  retryable=not daemon_up,
                  human_action=None if daemon_up else "run `cgc install-daemon` (the daemon is not "
                                                      "running)")
+        if daemon_up and _presend_stalled(s, r):
+            # nothing went out and the service is the missing piece; re-arming await would just wait
+            d.update(code="service_unavailable", next_command=diagnose_cmd(rid), retryable=True,
+                     human_action=f"the round has sat `{state}` for {int(age_in_state(r) // 60)} min "
+                                  "with no send attempt: the daemon is alive but not dispatching it. "
+                                  "Run next_command, and check the daemon log and `cgc doctor`")
         return d
     if d["code"] == "ok":   # cancelled before send
         return d
@@ -1378,7 +1438,10 @@ def decide(s, r: dict, *, daemon_up: bool = True, out: str | None = None) -> dic
             d["retryable"] = str(err or "").startswith("unverified:")
             return d
         why = ("fix the UI (`cgc probe` must pass)" if d["code"] == "ui_contract_broken" else
-               "fix the cause in `detail`" if state == store_mod.BLOCKED else "if still needed")
+               "fix the cause in `detail`" if state == store_mod.BLOCKED else
+               "the daemon could not start a send worker (`detail`): repair its interpreter and "
+               "restart it (`cgc install-daemon`)" if str(err or "").startswith("spawn_failed") else
+               "if still needed")
         d.update(next_command=_cmd("cgc_spool.py", "refire", "--rid", rid), retryable=True,
                  human_action=f"nothing was sent: {why}, then run next_command")
         return d

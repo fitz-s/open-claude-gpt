@@ -235,8 +235,12 @@ def test_probe_hold_applies_to_ready_orphans(daemon, hold):
     assert ["--worker-store", "REQ-20261013-000000-00b001"] not in daemon.spawned
     assert ["--worker-store", "REQ-20261013-000000-00b002"] in daemon.spawned
     with sm.Store() as s:
-        assert s.get_round("REQ-20261013-000000-00b001")["state"] == sm.QUEUED
-    # once the hold clears it is claimed and dispatched like any queued round
+        held = s.get_round("REQ-20261013-000000-00b001")
+        assert held["state"] == sm.QUEUED
+        assert held["not_before"], "a held round is parked with a backoff, not re-claimed at poll cadence"
+    # once the hold clears (and the backoff elapses) it is claimed and dispatched like any queued round
+    with sm.Store() as s:
+        s.db.execute("UPDATE rounds SET not_before=NULL")
     if hold == "broken":
         with sm.Store() as s:
             s.db.execute("DELETE FROM meta WHERE key LIKE 'ui.%'")
