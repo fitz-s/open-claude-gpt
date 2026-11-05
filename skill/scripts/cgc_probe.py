@@ -454,8 +454,9 @@ def run_probe(only=None, mention=None) -> dict:
     caps = _composer_caps(model, app) * composer + ("reader",) * reader
     if not _browser_up():
         # Defer, don't fail: every cap would die in _open with the same new_tab_failed, like a real outage.
-        return {c: {"verdict": "transient", "phase": "deferred", "recorded": False,
-                    "detail": f"browser unreachable on port {cdp.CGC_PORT}"} for c in caps}
+        out = {c: {"verdict": "transient", "phase": "deferred", "recorded": False,
+                   "detail": f"browser unreachable on port {cdp.CGC_PORT}"} for c in caps}
+        return {**out, "mention": no_app} if no_app else out
     lease = spool.acquire_browser_lease(shared=True)
     if lease is None:
         return {c: {"verdict": "transient", "phase": "browser", "recorded": False,

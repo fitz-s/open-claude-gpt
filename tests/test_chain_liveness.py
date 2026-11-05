@@ -418,3 +418,14 @@ def test_probe_defers_with_one_line_when_the_browser_is_unreachable(tmp_path, mo
     err = capsys.readouterr().err
     assert err.count("CGC_PROBE deferred") == 1 and "new_tab_failed" not in err
     assert not re.search(r"CGC_PROBE composer:", err)
+
+
+def test_a_deferred_probe_still_says_how_to_name_an_app(tmp_path, monkeypatch):
+    sys.modules.pop("cgc_probe", None)
+    probe = _load("cgc_probe_cl", "cgc_probe.py")
+    monkeypatch.setenv("CGC_APPS", "")
+    monkeypatch.setattr(probe, "_browser_up", lambda: False)
+    monkeypatch.setattr(probe, "_open", lambda url: pytest.fail("no tab may be opened with no browser"))
+    report = probe.run_probe()
+    assert report["mention"]["verdict"] == "unestablished"
+    assert all(v["phase"] == "deferred" for c, v in report.items() if c != "mention")

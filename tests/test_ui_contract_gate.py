@@ -38,6 +38,7 @@ def env(tmp_path, monkeypatch):
     backend = _load("cgc_backend")
     cdp = _load("cdp_consult")
     probe = _load("cgc_probe")
+    monkeypatch.setattr(probe, "_browser_up", lambda: True)   # the fake tabs stand in for Chrome
     s = store_mod.Store()
     yield argparse.Namespace(store_mod=store_mod, spool=spool, backend=backend, cdp=cdp, probe=probe,
                              s=s, tmp=tmp_path)
